@@ -1,8 +1,3 @@
-@dp.message_handler(content_types=['photo'])
-async def get_file_id(message: types.Message):
-    # Берем ID самого качественного (последнего) фото
-    file_id = message.photo[-1].file_id
-    await message.answer(f"Твой file_id:\n<code>{file_id}</code>", parse_mode='HTML')
 import os
 import stripe
 import asyncio
@@ -30,6 +25,12 @@ stripe.api_key = STRIPE_SECRET_KEY
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
+@dp.message_handler(content_types=['photo'])
+async def get_file_id(message: types.Message):
+    # Берем ID самого качественного (последнего) фото
+    file_id = message.photo[-1].file_id
+    await message.answer(f"Твой file_id:\n<code>{file_id}</code>", parse_mode='HTML')
+    
 # Глобальная переменная для БД
 conn = None
 
