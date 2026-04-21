@@ -2,7 +2,8 @@
 async def get_file_id(message: types.Message):
     # Берем ID самого качественного (последнего) фото
     file_id = message.photo[-1].file_id
-    await message.answer(f"Твой file_id:\n<code>{file_id}</code>", parse_mode='HTML')import os
+    await message.answer(f"Твой file_id:\n<code>{file_id}</code>", parse_mode='HTML')
+import os
 import stripe
 import asyncio
 import logging
