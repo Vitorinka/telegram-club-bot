@@ -179,12 +179,14 @@ async def on_startup(app):
     # Для polling просто игнорируем, бот запустится через start_polling ниже
 
 if __name__ == "__main__":
-    # Запуск сервера
-    app = web.Application()
-    app.router.add_post('/webhook', stripe_webhook)
-    app.on_startup.append(on_startup)
-    
-    # Запуск бота и сервера
-    # Важно: это правильный способ запустить обоих вместе
     from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+    
+    # Запускаем через webhook, это "склеивает" бота и веб-сервер
+    executor.start_webhook(
+        dispatcher=dp,
+        webhook_path='/webhook',
+        on_startup=on_startup,
+        skip_updates=True,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8080))
+    )
