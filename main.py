@@ -178,15 +178,28 @@ async def on_startup(app):
     # Если ты используешь вебхуки для ТГ, тут надо делать set_webhook
     # Для polling просто игнорируем, бот запустится через start_polling ниже
 
+# === ИСПРАВЛЕННЫЙ БЛОК ЗАПУСКА ===
+async def on_startup(app):
+    # Указываем Telegram, куда слать сообщения (путь /bot)
+    webhook_url = f"{YOUR_DOMAIN}/bot"
+    await bot.set_webhook(webhook_url)
+    logging.info(f"Telegram webhook set to {webhook_url}")
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+
 if __name__ == "__main__":
-    from aiogram import executor
+    from aiogram.dispatcher.webhook import get_new_configured_app
     
-    # Запускаем через webhook, это "склеивает" бота и веб-сервер
-    executor.start_webhook(
-        dispatcher=dp,
-        webhook_path='/webhook',
-        on_startup=on_startup,
-        skip_updates=True,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8080))
-    )
+    # Создаем приложение, которое слушает и ТГ, и Stripe
+    app = get_new_configured_app(dispatcher=dp, path='/bot')
+    
+    # Добавляем маршрут для Stripe
+    app.router.add_post('/webhook', stripe_webhook)
+    
+    # Настраиваем жизненный цикл
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # Запускаем
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
