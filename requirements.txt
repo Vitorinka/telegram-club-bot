@@ -1,0 +1,4 @@
+aiogram
+stripe
+psycopg2-binary
+aiohttp
