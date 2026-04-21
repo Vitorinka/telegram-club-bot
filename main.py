@@ -49,7 +49,7 @@ async def start(message: types.Message):
     # 1. Сначала фото + текст
     # Замени URL на свою ссылку или file_id
     await message.answer_photo(
-        photo="file_id:AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
+        photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
         caption="""Добро пожаловать в обновлённую версию онлайн-клуба
 Это пространство про осознанную работу с телом: без перегрузок, но с результатом.
 Здесь вы найдёте систему тренировок и практик, которую можно встроить в свою жизнь: в своём ритме, в удобное время и с пониманием, что вы делаете.
@@ -110,7 +110,7 @@ async def start(message: types.Message):
     )
     
     await message.answer_photo(
-        photo="file_id:AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA",
+        photo="AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA",
         caption="""Готова начать? 
 Выбирай формат участия ниже и присоединяйся к нам 👇""",
         reply_markup=keyboard
