@@ -47,7 +47,11 @@ def init_db():
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
     # Используем await для отправки
-    await message.answer("Добро пожаловать в закрытый клуб ✨\n\nТы получишь поддержку, окружение и доступ к закрытому комьюнити.")
+    await message.answer("Добро пожаловать в обновлённую версию онлайн-клуба
+Это пространство про осознанную работу с телом: без перегрузок, но с результатом.
+Здесь вы найдёте систему тренировок и практик, которую можно встроить в свою жизнь: в своём ритме, в удобное время и с пониманием, что вы делаете.
+Я рядом, в чате и на живых встречах.
+Чувствуйте себя комфортно и относитесь бережно к себе, к своему телу и друг другу.")
     
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -60,13 +64,18 @@ async def start(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("sub_"))
 async def process_sub(callback_query: types.CallbackQuery):
+    # 1. ОБЯЗАТЕЛЬНО отвечаем на callback, чтобы убрать «загрузку»
+    await callback_query.answer()
+    
     user_id = callback_query.from_user.id
     data = callback_query.data
     
-    price = PRICE_1M if data == "sub_1" else (PRICE_6M if data == "sub_6" else PRICE_12M)
+    # Добавим логирование, чтобы видеть в консоли Railway, что кнопка нажата
+    logging.info(f"Пользователь {user_id} нажал кнопку: {data}")
 
-    # Создание чекаута
     try:
+        price = PRICE_1M if data == "sub_1" else (PRICE_6M if data == "sub_6" else PRICE_12M)
+
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{'price': price, 'quantity': 1}],
@@ -76,9 +85,11 @@ async def process_sub(callback_query: types.CallbackQuery):
             metadata={"user_id": str(user_id)}
         )
         await bot.send_message(user_id, f"Оплата здесь 👇\n{session.url}")
+        
     except Exception as e:
-        await bot.send_message(user_id, "Ошибка при создании оплаты. Попробуй позже.")
-        logging.error(e)
+        # Если ошибка, мы её увидим в логах и бот пришлет уведомление
+        logging.error(f"Ошибка Stripe: {e}")
+        await bot.send_message(user_id, "Произошла ошибка при создании платежа. Попробуй позже.")
 
 # === WEBHOOK STUFF ===
 async def stripe_webhook(request):
