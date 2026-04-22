@@ -32,6 +32,7 @@ dp = Dispatcher(bot)
 
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
+    logging.info(f"Бот получил команду /start от пользователя {message.from_user.id}") # <-- Добавь эту строчку
     # 1. Первое фото
     await message.answer_photo(
         photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
