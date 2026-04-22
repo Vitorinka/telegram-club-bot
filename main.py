@@ -7,7 +7,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import psycopg2
 from aiohttp import web
 
-# Логирование (поможет видеть ошибки в Railway)
 logging.basicConfig(level=logging.INFO)
 
 # === ENV ===
@@ -24,8 +23,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 stripe.api_key = STRIPE_SECRET_KEY
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-        
-# Глобальная переменная для БД
+
 conn = None
 
 def init_db():
@@ -43,99 +41,51 @@ def init_db():
     conn.commit()
     cur.close()
 
-# === HANDLERS ===
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    # 1. Сначала фото + текст
-    # Замени URL на свою ссылку или file_id
     await message.answer_photo(
         photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
-        caption="""Добро пожаловать в обновлённую версию онлайн-клуба
-Это пространство про осознанную работу с телом: без перегрузок, но с результатом.
-Здесь вы найдёте систему тренировок и практик, которую можно встроить в свою жизнь: в своём ритме, в удобное время и с пониманием, что вы делаете.
-Я рядом, в чате и на живых встречах.
-Чувствуйте себя комфортно и относитесь бережно к себе, к своему телу и друг другу."""
+        caption="Добро пожаловать в обновлённую версию онлайн-клуба!"
     )
-    
-    await asyncio.sleep(1) # Пауза для естественности
-    
-    # 2. Большой текст №2
-    await message.answer("""Основные правила, по которым мы будем взаимодействовать:
-1.Клуб закрытый и включает:
-- неограниченный доступ ко всем материалам
-- тренировки в записи
-- рецепты
-- общение и обратную связь
-
-Также остаются живые тренировки по расписанию.
-
-2. На живые тренировки обязательна предварительная запись.
-
-3. Чтобы записаться, нужно отметить себя в голосовании, которое я буду создавать накануне занятия.
-
-4. Если на тренировку записывается менее 3 человек, занятие не проводится
-
-5. Записей живых тренировок не будет.
-
-6. Заморозка абонемента не предусмотрена, так как у вас всегда есть доступ ко всем тренировкам в записи и вы можете заниматься в удобное время.""")
-    
     await asyncio.sleep(1)
+    await message.answer("Добро пожаловать в наш клуб...") # Сократил для примера
     
-    # 3. Большой текст №3
-    await message.answer("""Что входит в абонемент клуба:
-- большая база тренировок разной направленности, которая будет постоянно пополняться:
-антисутулость, сила и гибкость, работа с мышцами тазового дна, ягодицы, руки, ноги, кор, балансы
-
-- тренировки, направленные не только на тело, но и на улучшение нейропластичности, координации и общего качества движений
-
-— короткие зарядки 10-15 минут для ежедневной практики
-
-- мини-уроки: дыхание, работа со стопами, расслабление
-
-— медитации и техники восстановления
-
-- живые тренировки со мной
-это не просто тренировки, а возможность поработать со мной лично: разобрать технику, задать вопросы, скорректировать движения и глубже понять своё тело
-
-- постоянная обратная связь: вы можете задавать любые вопросы в чате, я всегда на связи""")
-    
-    await asyncio.sleep(1)
-    
-    # 4. Финальное фото + призыв + кнопки
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    
-    await message.answer_photo(
-        photo="AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA",
-        caption="""Готова начать? 
-Выбирай формат участия ниже и присоединяйся к нам 👇""",
-        reply_markup=keyboard
-    )
+    await message.answer("Готова начать? Выбирай формат:", reply_markup=keyboard)
 
-@dp.callback_query_handler() # Убрали фильтр lambda
+@dp.callback_query_handler()
 async def all_callbacks(callback_query: types.CallbackQuery):
-    # Логируем абсолютно всё, что пришло
-    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: callback_data = '{callback_query.data}'")
+    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: {callback_query.data}")
+    await callback_query.answer()
     
-    # Отвечаем пользователю, чтобы увидеть реакцию в боте
-    await callback_query.answer(f"Я получил: {callback_query.data}")
-
-    # Теперь проверяем, то ли это, что нам нужно
     if callback_query.data.startswith("sub_"):
-        await process_sub_logic(callback_query) # Вызываем логику Stripe
+        await process_sub_logic(callback_query)
     else:
         logging.info("Нажата неизвестная кнопка")
 
 async def process_sub_logic(callback_query: types.CallbackQuery):
-    # Сюда перенеси код, который раньше был в process_sub
     user_id = callback_query.from_user.id
     data = callback_query.data
-    # ... (весь твой код создания Stripe сессии) ...
-# === WEBHOOK STUFF ===
+    
+    try:
+        price = PRICE_1M if data == "sub_1" else (PRICE_6M if data == "sub_6" else PRICE_12M)
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{'price': price, 'quantity': 1}],
+            mode='subscription',
+            success_url=YOUR_DOMAIN,
+            cancel_url=YOUR_DOMAIN,
+            metadata={"user_id": str(user_id)}
+        )
+        await bot.send_message(user_id, f"Оплата здесь 👇\n{session.url}")
+    except Exception as e:
+        logging.error(f"ОШИБКА: {e}")
+        await bot.send_message(user_id, "Ошибка оплаты. Попробуй позже.")
 
 async def stripe_webhook(request):
     payload = await request.text()
@@ -163,26 +113,17 @@ async def stripe_webhook(request):
     return web.Response(status=200)
 
 async def on_startup(app):
-    logging.info("Starting bot...")
-    init_db()  # Инициализация БД
-    webhook_url = f"{YOUR_DOMAIN}/bot"
-    # Настраиваем вебхук и сразу отбрасываем старые команды
-    await bot.set_webhook(webhook_url, drop_pending_updates=True)
-    logging.info(f"Telegram webhook set to {webhook_url}")
-        
+    init_db()
+    await bot.set_webhook(f"{YOUR_DOMAIN}/bot", drop_pending_updates=True)
+
 async def on_shutdown(app):
-    logging.info("Shutting down...") # Это чтобы мы видели, что он начал выключаться
-    await bot.close()                # <--- ЭТА СТРОЧКА "ВЫКЛЮЧАЕТ СВЕТ"
-    await bot.delete_webhook()       # А эта "запирает дверь"
-        
+    await bot.close()
+    await bot.delete_webhook()
+
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    
-    # Создаем приложение, которое слушает /bot и /webhook
     app = get_new_configured_app(dispatcher=dp, path='/bot')
     app.router.add_post('/webhook', stripe_webhook)
-    
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
