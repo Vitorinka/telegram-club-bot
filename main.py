@@ -4,23 +4,7 @@ import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
-
-import psycopg2 # Убедись, что этот импорт есть наверху
-
-# Подключение к БД
-def init_db():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        telegram_id BIGINT PRIMARY KEY,
-        paid BOOLEAN DEFAULT FALSE,
-        expiry_date TIMESTAMP
-    )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+import psycopg2 
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -30,9 +14,35 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
+# Подключение к БД
+def init_db():
+    try:
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            logging.error("DATABASE_URL не найден в настройках Railway!")
+            return
+            
+        conn = psycopg2.connect(db_url, sslmode='require')
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id BIGINT PRIMARY KEY,
+            paid BOOLEAN DEFAULT FALSE,
+            expiry_date TIMESTAMP
+        )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info("БАЗА ДАННЫХ УСПЕШНО ИНИЦИАЛИЗИРОВАНА")
+    except Exception as e:
+        logging.error(f"ОШИБКА ПОДКЛЮЧЕНИЯ К БД: {e}")
+
+# Хендлер /start (Твой оригинальный код)
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    logging.info(f"Бот получил команду /start от пользователя {message.from_user.id}") # <-- Добавь эту строчку
+    logging.info(f"Получена команда /start от {message.from_user.id}")
+    
     # 1. Первое фото
     await message.answer_photo(
         photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
@@ -61,10 +71,17 @@ async def start(message: types.Message):
         reply_markup=keyboard
     )
 
-# Техническая часть (Вебхук)
+# Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
-    init_db() # Добавь эту строчку
-    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/bot", drop_pending_updates=True)
+    logging.info("Запуск бота...")
+    init_db() # Создаем таблицу, если ее нет
+    
+    domain = os.getenv("YOUR_DOMAIN")
+    if domain:
+        await bot.set_webhook(f"{domain}/bot", drop_pending_updates=True)
+        logging.info(f"Вебхук установлен на {domain}/bot")
+    else:
+        logging.error("ПЕРЕМЕННАЯ YOUR_DOMAIN НЕ ЗАДАНА В RAILWAY!")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
