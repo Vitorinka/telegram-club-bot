@@ -25,6 +25,13 @@ stripe.api_key = STRIPE_SECRET_KEY
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
+@dp.callback_query_handler(lambda c: True) # Ловит ВООБЩЕ ВСЁ
+async def debug_everything(callback_query: types.CallbackQuery):
+    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: {callback_query.data}")
+    # И сразу вызываем наш старый обработчик, если это sub_...
+    if callback_query.data.startswith("sub_"):
+        await process_sub(callback_query)
+        
 # Глобальная переменная для БД
 conn = None
 
