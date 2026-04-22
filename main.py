@@ -118,17 +118,15 @@ async def start(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("sub_"))
 async def process_sub(callback_query: types.CallbackQuery):
-    # 1. ОБЯЗАТЕЛЬНО отвечаем на callback, чтобы убрать «загрузку»
     await callback_query.answer()
-    
     user_id = callback_query.from_user.id
     data = callback_query.data
     
-    # Добавим логирование, чтобы видеть в консоли Railway, что кнопка нажата
-    logging.info(f"Пользователь {user_id} нажал кнопку: {data}")
-
+    logging.info(f"DEBUG: Нажата кнопка {data}. Пытаюсь создать сессию...")
+    
     try:
         price = PRICE_1M if data == "sub_1" else (PRICE_6M if data == "sub_6" else PRICE_12M)
+        logging.info(f"DEBUG: Использую Price ID: {price}")
 
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
@@ -138,13 +136,13 @@ async def process_sub(callback_query: types.CallbackQuery):
             cancel_url=YOUR_DOMAIN,
             metadata={"user_id": str(user_id)}
         )
+        
+        logging.info(f"DEBUG: Сессия создана: {session.url}")
         await bot.send_message(user_id, f"Оплата здесь 👇\n{session.url}")
         
     except Exception as e:
-        # Если ошибка, мы её увидим в логах и бот пришлет уведомление
-        logging.error(f"Ошибка Stripe: {e}")
-        await bot.send_message(user_id, "Произошла ошибка при создании платежа. Попробуй позже.")
-
+        logging.error(f"DEBUG: ОШИБКА СТРАЙПА: {e}") # ЭТО ВАЖНО
+        await bot.send_message(user_id, f"Ошибка оплаты: {e}")
 # === WEBHOOK STUFF ===
 async def stripe_webhook(request):
     payload = await request.text()
