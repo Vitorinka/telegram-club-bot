@@ -53,7 +53,7 @@ async def stripe_webhook(request):
         if link:
             await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
 
-    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ (ДОБАВЛЯЕМ СЮДА)
+    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
         
@@ -65,7 +65,7 @@ async def stripe_webhook(request):
             subscription = stripe.Subscription.retrieve(subscription_id)
             telegram_id = subscription.get('metadata', {}).get('telegram_id')
             
-          if telegram_id:
+            if telegram_id:
                 # Получаем дату следующего списания
                 next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
                 date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
@@ -73,7 +73,6 @@ async def stripe_webhook(request):
                 # Обновляем дату в базе данных
                 conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
                 cur = conn.cursor()
-                
                 # Используем UPSERT (обновление или вставка)
                 cur.execute("""
                     INSERT INTO users (telegram_id, paid, expiry_date)
@@ -81,7 +80,6 @@ async def stripe_webhook(request):
                     ON CONFLICT (telegram_id)
                     DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
                 """, (int(telegram_id), next_payment_timestamp, next_payment_timestamp))
-                
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -91,6 +89,7 @@ async def stripe_webhook(request):
                     chat_id=int(telegram_id),
                     text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
                 )
+                
     # 3. ОБРАБОТКА ОТМЕНЫ/ОКОНЧАНИЯ ПОДПИСКИ
     elif event['type'] == 'customer.subscription.deleted':
         subscription = event['data']['object']
