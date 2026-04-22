@@ -170,8 +170,10 @@ async def on_startup(app):
     logging.info(f"Telegram webhook set to {webhook_url}")
 
 async def on_shutdown(app):
-    await bot.delete_webhook()
-
+    logging.info("Shutting down...") # Это чтобы мы видели, что он начал выключаться
+    await bot.close()                # <--- ЭТА СТРОЧКА "ВЫКЛЮЧАЕТ СВЕТ"
+    await bot.delete_webhook()       # А эта "запирает дверь"
+        
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     
