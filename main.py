@@ -24,7 +24,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 stripe.api_key = STRIPE_SECRET_KEY
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-        
+
 # Глобальная переменная для БД
 conn = None
 
