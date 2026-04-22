@@ -166,7 +166,8 @@ async def on_startup(app):
     logging.info("Starting bot...")
     init_db() # Инициализация БД здесь!
     webhook_url = f"{YOUR_DOMAIN}/bot"
-    await bot.set_webhook(webhook_url)
+    # Добавляем drop_pending_updates=True — это отбрасывает все старые сообщения
+await bot.set_webhook(webhook_url, drop_pending_updates=True)
     logging.info(f"Telegram webhook set to {webhook_url}")
 
 async def on_shutdown(app):
