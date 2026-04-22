@@ -7,7 +7,8 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import psycopg2 
 from datetime import datetime
-from aiogram.utils.exceptions import BotBlocked, TelegramForbidden # Добавь эту строчку к остальным импортам
+from aiogram.utils.exceptions import BotBlocked, TelegramForbidden
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Логирование
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -68,6 +69,16 @@ async def stripe_webhook(request):
                 # Получаем дату следующего списания
                 next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
                 date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
+
+                # Обновляем дату в базе данных
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+            cur = conn.cursor()
+            # Обновляем expiry_date на дату окончания подписки (timestamp)
+            cur.execute("UPDATE users SET paid = TRUE, expiry_date = to_timestamp(%s) WHERE telegram_id = %s;", 
+                        (next_payment_timestamp, int(telegram_id)))
+            conn.commit()
+            cur.close()
+            conn.close()
                 
                 # Отправляем сообщение
                 await bot.send_message(
@@ -262,6 +273,38 @@ async def broadcast_private(message: types.Message):
 
     await message.answer(f"✅ Рассылка завершена!\nУспешно: {count}\nЗаблокировали бота: {blocked}")
 
+async def send_renewal_reminders():
+    logging.info("Запуск проверки подписок для напоминаний...")
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
+        
+        # Ищем пользователей, у которых expiry_date наступает через 2 дня
+        # ::date отбрасывает время, чтобы сравнить только даты
+        query = """
+        SELECT telegram_id 
+        FROM users 
+        WHERE expiry_date::date = (CURRENT_DATE + INTERVAL '2 days')::date;
+        """
+        cur.execute(query)
+        users_to_remind = cur.fetchall()
+        
+        for user in users_to_remind:
+            user_id = user[0]
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="Привет! 👋 Напоминаю, что твоя подписка продлевается через 2 дня. Позаботься о том, чтобы на карте были средства!"
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить напоминание {user_id}: {e}")
+        
+        cur.close()
+        conn.close()
+        logging.info(f"Напоминания отправлены {len(users_to_remind)} пользователям.")
+    except Exception as e:
+        logging.error(f"Ошибка в планировщике: {e}")
+
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
     logging.info("--- ЗАПУСК БОТА ---")
@@ -279,6 +322,11 @@ async def on_startup(app):
             logging.error(f"--- ОШИБКА УСТАНОВКИ ВЕБХУКА: {e} ---")
     else:
         logging.error("--- ПЕРЕМЕННАЯ YOUR_DOMAIN НЕ ЗАДАНА! ---")
+    # Инициализация планировщика
+    scheduler = AsyncIOScheduler()
+    # Запускаем проверку каждый день в 10:00 утра
+    scheduler.add_job(send_renewal_reminders, 'cron', hour=10, minute=0)
+    scheduler.start()
         
 async def on_shutdown(app):
     logging.info("--- ОСТАНОВКА БОТА ---")
