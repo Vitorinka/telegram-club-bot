@@ -65,21 +65,23 @@ async def stripe_webhook(request):
             subscription = stripe.Subscription.retrieve(subscription_id)
             telegram_id = subscription.get('metadata', {}).get('telegram_id')
             
-            if telegram_id:
+          if telegram_id:
                 # Получаем дату следующего списания
                 next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
                 date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
 
                 # Обновляем дату в базе данных
-            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+                conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
                 cur = conn.cursor()
-                # UPSERT запрос (если запись есть — обновить, если нет — вставить)
+                
+                # Используем UPSERT (обновление или вставка)
                 cur.execute("""
                     INSERT INTO users (telegram_id, paid, expiry_date)
                     VALUES (%s, TRUE, to_timestamp(%s))
                     ON CONFLICT (telegram_id)
                     DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
                 """, (int(telegram_id), next_payment_timestamp, next_payment_timestamp))
+                
                 conn.commit()
                 cur.close()
                 conn.close()
