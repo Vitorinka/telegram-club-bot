@@ -12,8 +12,9 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 
 # Инициализация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID") # ID твоей группы (например, -100123456789)
-stripe.api_key = os.getenv("STRIPE_API_KEY") 
+GROUP_ID = os.getenv("-1003983497950") # ID твоей группы (например, -100123456789)
+stripe.api_key = os.getenv("STRIPE_API_KEY")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
@@ -28,7 +29,7 @@ PRICES = {
 async def generate_invite_link():
     try:
         invite = await bot.create_chat_invite_link(
-            chat_id=GROUP_ID,
+            chat_id=-1003983497950,
             member_limit=1, # Ссылка на 1 человека
             expire_date=None
         )
@@ -36,6 +37,26 @@ async def generate_invite_link():
     except Exception as e:
         logging.error(f"Ошибка создания ссылки: {e}")
         return None
+
+# ВЕБХУК ДЛЯ АВТОМАТИКИ (авто-выдача ссылки)
+async def stripe_webhook(request):
+    payload = await request.read()
+    sig_header = request.headers.get('Stripe-Signature')
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+    except Exception as e:
+        return web.Response(status=400)
+
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        user_id = session.get('client_reference_id') # Тот самый ID, который мы передали
+        
+        # Отправляем ссылку сразу
+        link = await generate_invite_link()
+        if link:
+            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша персональная ссылка в клуб: {link}")
+            
+    return web.Response(status=200)
         
 # Подключение к БД
 def init_db():
@@ -128,6 +149,30 @@ async def get_link(message: types.Message):
         await message.answer(f"Вот твоя персональная ссылка на вступление: {link}")
     else:
         await message.answer("Не удалось создать ссылку. Проверь права бота в группе.")
+
+# ХЕНДЛЕР ОПЛАТЫ (теперь с кнопкой)
+@dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
+async def process_payment(callback_query: types.CallbackQuery):
+    price_id = PRICES.get(callback_query.data)
+    
+    session = stripe.checkout.Session.create(
+        payment_method_types=['card'],
+        line_items=[{'price': price_id, 'quantity': 1}],
+        mode='subscription',
+        success_url='https://t.me/Natalia_SoulFit_bot',
+        cancel_url='https://t.me/Natalia_SoulFit_bot',
+        client_reference_id=str(callback_query.from_user.id) # ПЕРЕДАЕМ ID ПОЛЬЗОВАТЕЛЯ
+    )
+    
+    # Кнопка вместо текста
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("💳 Оплатить", url=session.url))
+    
+    await bot.send_message(
+        callback_query.from_user.id, 
+        "Нажмите кнопку ниже для оплаты:",
+        reply_markup=keyboard
+    )
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
