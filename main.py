@@ -72,13 +72,17 @@ async def stripe_webhook(request):
 
                 # Обновляем дату в базе данных
             conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-            cur = conn.cursor()
-            # Обновляем expiry_date на дату окончания подписки (timestamp)
-            cur.execute("UPDATE users SET paid = TRUE, expiry_date = to_timestamp(%s) WHERE telegram_id = %s;", 
-                        (next_payment_timestamp, int(telegram_id)))
-            conn.commit()
-            cur.close()
-            conn.close()
+                cur = conn.cursor()
+                # UPSERT запрос (если запись есть — обновить, если нет — вставить)
+                cur.execute("""
+                    INSERT INTO users (telegram_id, paid, expiry_date)
+                    VALUES (%s, TRUE, to_timestamp(%s))
+                    ON CONFLICT (telegram_id)
+                    DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
+                """, (int(telegram_id), next_payment_timestamp, next_payment_timestamp))
+                conn.commit()
+                cur.close()
+                conn.close()
                 
                 # Отправляем сообщение
                 await bot.send_message(
@@ -275,12 +279,12 @@ async def broadcast_private(message: types.Message):
 
 async def send_renewal_reminders():
     logging.info("Запуск проверки подписок для напоминаний...")
+    conn = None
     try:
         conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
         cur = conn.cursor()
         
         # Ищем пользователей, у которых expiry_date наступает через 2 дня
-        # ::date отбрасывает время, чтобы сравнить только даты
         query = """
         SELECT telegram_id 
         FROM users 
@@ -300,10 +304,13 @@ async def send_renewal_reminders():
                 logging.error(f"Не удалось отправить напоминание {user_id}: {e}")
         
         cur.close()
-        conn.close()
         logging.info(f"Напоминания отправлены {len(users_to_remind)} пользователям.")
     except Exception as e:
         logging.error(f"Ошибка в планировщике: {e}")
+    finally:
+        if conn:
+            conn.close()
+            logging.info("Соединение с БД закрыто.")
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
