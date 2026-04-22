@@ -150,9 +150,14 @@ async def on_startup(app):
 async def on_shutdown(app):
     await bot.delete_webhook()
 
+# --- ХЕНДЛЕР ДЛЯ ПРОВЕРКИ ЗДОРОВЬЯ (HEALTH CHECK) ---
+async def health_check(request):
+    return web.Response(text="Bot is running", status=200)
+
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/bot')
+    app.router.add_get('/', health_check)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
