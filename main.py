@@ -46,9 +46,9 @@ cur.close()
 # === HANDLERS ===
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    # 1. Сначала фото + текст
-    # Замени URL на свою ссылку или file_id
-    await message.answer_photo(
+# 1. Сначала фото + текст
+# Замени URL на свою ссылку или file_id
+await message.answer_photo(
         photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA", 
         caption="""Добро пожаловать в обновлённую версию онлайн-клуба
 Это пространство про осознанную работу с телом: без перегрузок, но с результатом.
