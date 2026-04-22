@@ -5,6 +5,23 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 
+import psycopg2 # Убедись, что этот импорт есть наверху
+
+# Подключение к БД
+def init_db():
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id BIGINT PRIMARY KEY,
+        paid BOOLEAN DEFAULT FALSE,
+        expiry_date TIMESTAMP
+    )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
 # Логирование
 logging.basicConfig(level=logging.INFO)
 
@@ -45,6 +62,7 @@ async def start(message: types.Message):
 
 # Техническая часть (Вебхук)
 async def on_startup(app):
+    init_db() # Добавь эту строчку
     await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/bot", drop_pending_updates=True)
 
 async def on_shutdown(app):
