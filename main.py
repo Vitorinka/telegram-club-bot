@@ -30,9 +30,9 @@ conn = None
 
 def init_db():
 global conn
-    conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-    cur = conn.cursor()
-    cur.execute("""
+conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+cur = conn.cursor()
+cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         telegram_id BIGINT PRIMARY KEY,
         paid BOOLEAN DEFAULT FALSE,
@@ -40,8 +40,8 @@ global conn
         expiry_date TIMESTAMP
     )
     """)
-    conn.commit()
-    cur.close()
+conn.commit()
+cur.close()
 
 # === HANDLERS ===
 @dp.message_handler(commands=['start'])
