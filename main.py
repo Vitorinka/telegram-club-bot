@@ -193,7 +193,10 @@ async def on_startup(app):
         logging.error("--- ПЕРЕМЕННАЯ YOUR_DOMAIN НЕ ЗАДАНА! ---")
         
 async def on_shutdown(app):
+    logging.info("--- ОСТАНОВКА БОТА ---")
     await bot.delete_webhook()
+    await bot.close() # ЭТО ЗАКРОЕТ СОЕДИНЕНИЕ И УБЕРЕТ ОШИБКУ
+    logging.info("--- БОТ УСПЕШНО ЗАКРЫТ ---")
 
 # --- ХЕНДЛЕР ДЛЯ ПРОВЕРКИ ЗДОРОВЬЯ (HEALTH CHECK) ---
 async def health_check(request):
