@@ -8,7 +8,7 @@ from aiohttp import web
 import psycopg2 
 
 # Логирование
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # Инициализация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -131,16 +131,22 @@ async def get_link(message: types.Message):
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
-    logging.info("Запуск бота...")
-    init_db() # Создаем таблицу, если ее нет
+    logging.info("--- ЗАПУСК БОТА ---")
+    init_db() 
+    logging.info("--- БД ИНИЦИАЛИЗИРОВАНА ---")
     
     domain = os.getenv("YOUR_DOMAIN")
+    logging.info(f"--- ПЫТАЮСЬ УСТАНОВИТЬ ВЕБХУК НА: {domain}/bot ---")
+    
     if domain:
-        await bot.set_webhook(f"{domain}/bot", drop_pending_updates=True)
-        logging.info(f"Вебхук установлен на {domain}/bot")
+        try:
+            await bot.set_webhook(f"{domain}/bot", drop_pending_updates=True)
+            logging.info("--- ВЕБХУК УСПЕШНО УСТАНОВЛЕН! ---")
+        except Exception as e:
+            logging.error(f"--- ОШИБКА УСТАНОВКИ ВЕБХУКА: {e} ---")
     else:
-        logging.error("ПЕРЕМЕННАЯ YOUR_DOMAIN НЕ ЗАДАНА В RAILWAY!")
-
+        logging.error("--- ПЕРЕМЕННАЯ YOUR_DOMAIN НЕ ЗАДАНА! ---")
+        
 async def on_shutdown(app):
     await bot.delete_webhook()
 
