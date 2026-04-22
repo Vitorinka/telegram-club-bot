@@ -29,7 +29,7 @@ dp = Dispatcher(bot)
 conn = None
 
 def init_db():
-    global conn
+global conn
     conn = psycopg2.connect(DATABASE_URL, sslmode='require')
     cur = conn.cursor()
     cur.execute("""
@@ -56,9 +56,9 @@ async def start(message: types.Message):
 Я рядом, в чате и на живых встречах.
 Чувствуйте себя комфортно и относитесь бережно к себе, к своему телу и друг другу."""
     )
-    
+
     await asyncio.sleep(1) # Пауза для естественности
-    
+
     # 2. Большой текст №2
     await message.answer("""Основные правила, по которым мы будем взаимодействовать:
 1.Клуб закрытый и включает:
@@ -78,9 +78,9 @@ async def start(message: types.Message):
 5. Записей живых тренировок не будет.
 
 6. Заморозка абонемента не предусмотрена, так как у вас всегда есть доступ ко всем тренировкам в записи и вы можете заниматься в удобное время.""")
-    
+   
     await asyncio.sleep(1)
-    
+   
     # 3. Большой текст №3
     await message.answer("""Что входит в абонемент клуба:
 - большая база тренировок разной направленности, которая будет постоянно пополняться:
@@ -98,9 +98,9 @@ async def start(message: types.Message):
 это не просто тренировки, а возможность поработать со мной лично: разобрать технику, задать вопросы, скорректировать движения и глубже понять своё тело
 
 - постоянная обратная связь: вы можете задавать любые вопросы в чате, я всегда на связи""")
-    
+ 
     await asyncio.sleep(1)
-    
+
     # 4. Финальное фото + призыв + кнопки
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -108,7 +108,7 @@ async def start(message: types.Message):
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    
+ 
     await message.answer_photo(
         photo="AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA",
         caption="""Готова начать? 
@@ -120,7 +120,7 @@ async def start(message: types.Message):
 async def all_callbacks(callback_query: types.CallbackQuery):
     # Логируем абсолютно всё, что пришло
     logging.info(f"!!! ПРИШЛО СОБЫТИЕ: callback_data = '{callback_query.data}'")
-    
+
     # Отвечаем пользователю, чтобы увидеть реакцию в боте
     await callback_query.answer(f"Я получил: {callback_query.data}")
 
@@ -149,7 +149,7 @@ async def stripe_webhook(request):
         session = event["data"]["object"]
         user_id = int(session["metadata"]["user_id"])
         sub_id = session["subscription"]
-        
+      
         cur = conn.cursor()
         cur.execute("""
         INSERT INTO users (telegram_id, paid, subscription_id, expiry_date)
@@ -169,22 +169,20 @@ async def on_startup(app):
     # Настраиваем вебхук и сразу отбрасываем старые команды
     await bot.set_webhook(webhook_url, drop_pending_updates=True)
     logging.info(f"Telegram webhook set to {webhook_url}")
-        
+       
 async def on_shutdown(app):
     logging.info("Shutting down...") # Это чтобы мы видели, что он начал выключаться
     await bot.close()                # <--- ЭТА СТРОЧКА "ВЫКЛЮЧАЕТ СВЕТ"
     await bot.delete_webhook()       # А эта "запирает дверь"
-        
+      
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    
+
     # Создаем приложение, которое слушает /bot и /webhook
     app = get_new_configured_app(dispatcher=dp, path='/bot')
     app.router.add_post('/webhook', stripe_webhook)
-    
+ 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    
+ 
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
-бот перестал на старт слать сообщения снова
