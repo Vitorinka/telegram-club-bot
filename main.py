@@ -164,12 +164,12 @@ async def stripe_webhook(request):
 
 async def on_startup(app):
     logging.info("Starting bot...")
-    init_db() # Инициализация БД здесь!
+    init_db()  # Инициализация БД
     webhook_url = f"{YOUR_DOMAIN}/bot"
-    # Добавляем drop_pending_updates=True — это отбрасывает все старые сообщения
-await bot.set_webhook(webhook_url, drop_pending_updates=True)
+    # Настраиваем вебхук и сразу отбрасываем старые команды
+    await bot.set_webhook(webhook_url, drop_pending_updates=True)
     logging.info(f"Telegram webhook set to {webhook_url}")
-
+        
 async def on_shutdown(app):
     logging.info("Shutting down...") # Это чтобы мы видели, что он начал выключаться
     await bot.close()                # <--- ЭТА СТРОЧКА "ВЫКЛЮЧАЕТ СВЕТ"
