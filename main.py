@@ -22,7 +22,7 @@ dp = Dispatcher(bot)
 PRICES = {
     "sub_1": "price_1TOGfWLHHLEfZoWaJT8ED6TN",  # Твой ID для 1 месяца
     "sub_6": "price_1TOGg7LHHLEfZoWaXDDBtD1f",  # Твой ID для 6 месяцев
-    "sub_12": "price_1TOGg7LHHLEfZoWaXDDBtD1f"  # Твой ID для 12 месяцев
+    "sub_12": "price_1TOGgWLHHLEfZoWaPDASHrp3"  # Твой ID для 12 месяцев
 }
 
 # --- ФУНКЦИЯ СОЗДАНИЯ ССЫЛКИ ---
@@ -121,23 +121,41 @@ async def start(message: types.Message):
         reply_markup=keyboard
     )
 
+# Забираем цены из переменных окружения (из твоего скриншота)
+PRICES = {
+    "sub_1": os.getenv("PRICE_1M"),
+    "sub_6": os.getenv("PRICE_6M"),
+    "sub_12": os.getenv("PRICE_12M")
+}
+
+# ХЕНДЛЕР ОПЛАТЫ (теперь с кнопкой)
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
 async def process_payment(callback_query: types.CallbackQuery):
     price_id = PRICES.get(callback_query.data)
     
+    # Создаем сессию Stripe
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': price_id, 'quantity': 1}],
         mode='subscription',
         success_url='https://t.me/Natalia_SoulFit_bot',
         cancel_url='https://t.me/Natalia_SoulFit_bot',
+        client_reference_id=str(callback_query.from_user.id)
     )
     
+    # Создаем кнопку, которая сразу ведет на оплату
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("💳 Оплатить", url=session.url))
+    
+    # Отправляем сообщение только с кнопкой
     await bot.send_message(
         callback_query.from_user.id, 
-        f"Оплати подписку здесь: {session.url}\n\n"
-        "После оплаты напиши мне /getlink, и я пришлю тебе приглашение в закрытый клуб!"
+        "Оплата (Stripe):", 
+        reply_markup=keyboard
     )
+    
+    # Удаляем или редактируем старое сообщение, чтобы не засорять чат (опционально)
+    await callback_query.message.delete()
 
 # --- НОВАЯ КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ССЫЛКИ ---
 @dp.message_handler(commands=['getlink'])
@@ -150,29 +168,18 @@ async def get_link(message: types.Message):
     else:
         await message.answer("Не удалось создать ссылку. Проверь права бота в группе.")
 
-# ХЕНДЛЕР ОПЛАТЫ (теперь с кнопкой)
-@dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
-async def process_payment(callback_query: types.CallbackQuery):
-    price_id = PRICES.get(callback_query.data)
-    
-    session = stripe.checkout.Session.create(
-        payment_method_types=['card'],
-        line_items=[{'price': price_id, 'quantity': 1}],
-        mode='subscription',
-        success_url='https://t.me/Natalia_SoulFit_bot',
-        cancel_url='https://t.me/Natalia_SoulFit_bot',
-        client_reference_id=str(callback_query.from_user.id) # ПЕРЕДАЕМ ID ПОЛЬЗОВАТЕЛЯ
-    )
-    
-    # Кнопка вместо текста
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton("💳 Оплатить", url=session.url))
-    
-    await bot.send_message(
-        callback_query.from_user.id, 
-        "Нажмите кнопку ниже для оплаты:",
-        reply_markup=keyboard
-    )
+# Команда для админа: /testlink
+@dp.message_handler(commands=['testlink'])
+async def test_invite_link(message: types.Message):
+    # Добавь проверку, что это именно ты (твой ID)
+    if message.from_user.id == 309993986: # Укажи свой ID (из логов выше)
+        link = await generate_invite_link()
+        if link:
+            await message.answer(f"✅ Тестовая ссылка: {link}")
+        else:
+            await message.answer("❌ Ошибка: проверь права бота в группе.")
+    else:
+        await message.answer("У вас нет доступа к этой команде.")
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
