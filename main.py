@@ -24,13 +24,6 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
 stripe.api_key = STRIPE_SECRET_KEY
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-
-@dp.callback_query_handler(lambda c: True) # Ловит ВООБЩЕ ВСЁ
-async def debug_everything(callback_query: types.CallbackQuery):
-    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: {callback_query.data}")
-    # И сразу вызываем наш старый обработчик, если это sub_...
-    if callback_query.data.startswith("sub_"):
-        await process_sub(callback_query)
         
 # Глобальная переменная для БД
 conn = None
@@ -125,6 +118,9 @@ async def start(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("sub_"))
 async def process_sub(callback_query: types.CallbackQuery):
+    # Логируем, что нажатие пришло
+    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: {callback_query.data}")
+    
     await callback_query.answer()
     user_id = callback_query.from_user.id
     data = callback_query.data
@@ -148,10 +144,9 @@ async def process_sub(callback_query: types.CallbackQuery):
         await bot.send_message(user_id, f"Оплата здесь 👇\n{session.url}")
         
     except Exception as e:
-        logging.error(f"DEBUG: ОШИБКА СТРАЙПА: {e}") # ЭТО ВАЖНО
+        logging.error(f"DEBUG: ОШИБКА СТРАЙПА: {e}")
         await bot.send_message(user_id, f"Ошибка оплаты: {e}")
 # === WEBHOOK STUFF ===
-# === WEBHOOK И ЗАПУСК (Вставь этот блок в самый конец файла) ===
 
 async def stripe_webhook(request):
     payload = await request.text()
