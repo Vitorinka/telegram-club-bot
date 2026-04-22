@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import psycopg2 
+from datetime import datetime
 
 # Логирование
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -43,19 +44,42 @@ async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET"))
     except Exception as e:
+        logging.error(f"Ошибка вебхука: {e}")
         return web.Response(status=400)
 
+    # 1. ОБРАБОТКА ПЕРВОЙ ПОКУПКИ
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        user_id = session.get('client_reference_id') # Тот самый ID, который мы передали
-        
-        # Отправляем ссылку сразу
+        user_id = session.get('client_reference_id')
         link = await generate_invite_link()
         if link:
-            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша персональная ссылка в клуб: {link}")
+            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
+
+    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ (ДОБАВЛЯЕМ СЮДА)
+    elif event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object']
+        
+        # Проверяем, что это именно продление, а не первая оплата
+        if invoice.get('billing_reason') == 'subscription_cycle':
+            subscription_id = invoice.get('subscription')
             
+            # Получаем объект подписки, чтобы достать metadata
+            subscription = stripe.Subscription.retrieve(subscription_id)
+            telegram_id = subscription.get('metadata', {}).get('telegram_id')
+            
+            if telegram_id:
+                # Получаем дату следующего списания
+                next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
+                date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
+                
+                # Отправляем сообщение
+                await bot.send_message(
+                    chat_id=int(telegram_id),
+                    text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
+                )
+
     return web.Response(status=200)
         
 # Подключение к БД
@@ -140,7 +164,13 @@ async def process_payment(callback_query: types.CallbackQuery):
         mode='subscription',
         success_url='https://t.me/Natalia_SoulFit_bot',
         cancel_url='https://t.me/Natalia_SoulFit_bot',
-        client_reference_id=str(callback_query.from_user.id)
+        client_reference_id=str(callback_query.from_user.id),
+    subscription_data={
+        "metadata": {
+            "telegram_id": str(callback_query.from_user.id)
+        }
+    }
+)
     )
     
     # Создаем кнопку, которая сразу ведет на оплату
