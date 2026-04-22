@@ -13,18 +13,12 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 
 # Инициализация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("-1003983497950") # ID твоей группы (например, -100123456789)
+GROUP_ID = "-1003983497950" # ID твоей группы (например, -100123456789)
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-
-PRICES = {
-    "sub_1": "price_1TOGfWLHHLEfZoWaJT8ED6TN",  # Твой ID для 1 месяца
-    "sub_6": "price_1TOGg7LHHLEfZoWaXDDBtD1f",  # Твой ID для 6 месяцев
-    "sub_12": "price_1TOGgWLHHLEfZoWaPDASHrp3"  # Твой ID для 12 месяцев
-}
 
 # --- ФУНКЦИЯ СОЗДАНИЯ ССЫЛКИ ---
 async def generate_invite_link():
@@ -171,7 +165,6 @@ async def process_payment(callback_query: types.CallbackQuery):
         }
     }
 )
-    )
     
     # Создаем кнопку, которая сразу ведет на оплату
     keyboard = InlineKeyboardMarkup()
