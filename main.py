@@ -73,7 +73,29 @@ async def stripe_webhook(request):
                     chat_id=int(telegram_id),
                     text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
                 )
-
+    # 3. ОБРАБОТКА ОТМЕНЫ/ОКОНЧАНИЯ ПОДПИСКИ
+    elif event['type'] == 'customer.subscription.deleted':
+        subscription = event['data']['object']
+        telegram_id = subscription.get('metadata', {}).get('telegram_id')
+        
+        if telegram_id:
+            try:
+                # 1. Исключаем пользователя из группы (бан)
+                # ban_chat_member автоматически выкидывает человека
+                await bot.ban_chat_member(chat_id=GROUP_ID, user_id=int(telegram_id))
+                
+                # 2. Сразу "разбаниваем", чтобы если он оплатит снова, 
+                # он мог вступить по новой ссылке (иначе он останется в ЧС)
+                await bot.unban_chat_member(chat_id=GROUP_ID, user_id=int(telegram_id))
+                
+                # 3. Отправляем уведомление
+                await bot.send_message(
+                    chat_id=int(telegram_id),
+                    text="Твоя подписка закончилась, доступ в клуб закрыт. Будем ждать снова! ❤️"
+                )
+            except Exception as e:
+                logging.error(f"Не удалось исключить пользователя {telegram_id}: {e}")
+                
     return web.Response(status=200)
         
 # Подключение к БД
