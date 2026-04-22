@@ -116,36 +116,25 @@ async def start(message: types.Message):
         reply_markup=keyboard
     )
 
-@dp.callback_query_handler(lambda c: c.data.startswith("sub_"))
-async def process_sub(callback_query: types.CallbackQuery):
-    # Логируем, что нажатие пришло
-    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: {callback_query.data}")
+@dp.callback_query_handler() # Убрали фильтр lambda
+async def all_callbacks(callback_query: types.CallbackQuery):
+    # Логируем абсолютно всё, что пришло
+    logging.info(f"!!! ПРИШЛО СОБЫТИЕ: callback_data = '{callback_query.data}'")
     
-    await callback_query.answer()
+    # Отвечаем пользователю, чтобы увидеть реакцию в боте
+    await callback_query.answer(f"Я получил: {callback_query.data}")
+
+    # Теперь проверяем, то ли это, что нам нужно
+    if callback_query.data.startswith("sub_"):
+        await process_sub_logic(callback_query) # Вызываем логику Stripe
+    else:
+        logging.info("Нажата неизвестная кнопка")
+
+async def process_sub_logic(callback_query: types.CallbackQuery):
+    # Сюда перенеси код, который раньше был в process_sub
     user_id = callback_query.from_user.id
     data = callback_query.data
-    
-    logging.info(f"DEBUG: Нажата кнопка {data}. Пытаюсь создать сессию...")
-    
-    try:
-        price = PRICE_1M if data == "sub_1" else (PRICE_6M if data == "sub_6" else PRICE_12M)
-        logging.info(f"DEBUG: Использую Price ID: {price}")
-
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{'price': price, 'quantity': 1}],
-            mode='subscription',
-            success_url=YOUR_DOMAIN,
-            cancel_url=YOUR_DOMAIN,
-            metadata={"user_id": str(user_id)}
-        )
-        
-        logging.info(f"DEBUG: Сессия создана: {session.url}")
-        await bot.send_message(user_id, f"Оплата здесь 👇\n{session.url}")
-        
-    except Exception as e:
-        logging.error(f"DEBUG: ОШИБКА СТРАЙПА: {e}")
-        await bot.send_message(user_id, f"Ошибка оплаты: {e}")
+    # ... (весь твой код создания Stripe сессии) ...
 # === WEBHOOK STUFF ===
 
 async def stripe_webhook(request):
