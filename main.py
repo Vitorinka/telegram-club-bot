@@ -176,9 +176,6 @@ async def process_payment(callback_query: types.CallbackQuery):
         "Оплата (Stripe):", 
         reply_markup=keyboard
     )
-    
-    # Удаляем или редактируем старое сообщение, чтобы не засорять чат (опционально)
-    await callback_query.message.delete()
 
 # --- НОВАЯ КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ССЫЛКИ ---
 @dp.message_handler(commands=['getlink'])
