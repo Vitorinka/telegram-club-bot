@@ -7,6 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import psycopg2 
 from datetime import datetime
+from aiogram.utils.exceptions import BotBlocked, TelegramForbidden # Добавь эту строчку к остальным импортам
 
 # Логирование
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -222,6 +223,44 @@ async def test_invite_link(message: types.Message):
             await message.answer("❌ Ошибка: проверь права бота в группе.")
     else:
         await message.answer("У вас нет доступа к этой команде.")
+
+# --- РАССЫЛКА НА ВСЕХ ПОЛЬЗОВАТЕЛЕЙ ---
+@dp.message_handler(commands=['broadcast_private'])
+async def broadcast_private(message: types.Message):
+    # Проверка, что команду пишешь только ты (твой ID 309993986)
+    if message.from_user.id != 309993986: 
+        return
+
+    text_to_send = message.get_args()
+    if not text_to_send:
+        await message.answer("Используй: /broadcast_private <текст>")
+        return
+
+    # Подключаемся к БД
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM users;")
+    users = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    count = 0
+    blocked = 0
+    
+    await message.answer(f"Начинаю рассылку на {len(users)} пользователей...")
+
+    for user in users:
+        user_id = user[0]
+        try:
+            await bot.send_message(chat_id=user_id, text=text_to_send)
+            count += 1
+            await asyncio.sleep(0.05) 
+        except (BotBlocked, TelegramForbidden):
+            blocked += 1
+        except Exception as e:
+            logging.error(f"Ошибка при отправке {user_id}: {e}")
+
+    await message.answer(f"✅ Рассылка завершена!\nУспешно: {count}\nЗаблокировали бота: {blocked}")
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
