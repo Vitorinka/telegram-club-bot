@@ -11,9 +11,31 @@ logging.basicConfig(level=logging.INFO)
 
 # Инициализация
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = os.getenv("GROUP_ID") # ID твоей группы (например, -100123456789)
+stripe.api_key = os.getenv("STRIPE_API_KEY") 
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
+PRICES = {
+    "sub_1": "price_1TOGfWLHHLEfZoWaJT8ED6TN",  # Твой ID для 1 месяца
+    "sub_6": "price_1TOGg7LHHLEfZoWaXDDBtD1f",  # Твой ID для 6 месяцев
+    "sub_12": "price_1TOGg7LHHLEfZoWaXDDBtD1f"  # Твой ID для 12 месяцев
+}
+
+# --- ФУНКЦИЯ СОЗДАНИЯ ССЫЛКИ ---
+async def generate_invite_link():
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            member_limit=1, # Ссылка на 1 человека
+            expire_date=None
+        )
+        return invite.invite_link
+    except Exception as e:
+        logging.error(f"Ошибка создания ссылки: {e}")
+        return None
+        
 # Подключение к БД
 def init_db():
     conn = None
@@ -76,6 +98,35 @@ async def start(message: types.Message):
         caption="Готова начать? Выбирай формат участия:",
         reply_markup=keyboard
     )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
+async def process_payment(callback_query: types.CallbackQuery):
+    price_id = PRICES.get(callback_query.data)
+    
+    session = stripe.checkout.Session.create(
+        payment_method_types=['card'],
+        line_items=[{'price': price_id, 'quantity': 1}],
+        mode='subscription',
+        success_url='https://t.me/Natalia_SoulFit_bot',
+        cancel_url='https://t.me/Natalia_SoulFit_bot',
+    )
+    
+    await bot.send_message(
+        callback_query.from_user.id, 
+        f"Оплати подписку здесь: {session.url}\n\n"
+        "После оплаты напиши мне /getlink, и я пришлю тебе приглашение в закрытый клуб!"
+    )
+
+# --- НОВАЯ КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ССЫЛКИ ---
+@dp.message_handler(commands=['getlink'])
+async def get_link(message: types.Message):
+    # Тут можно добавить проверку: платил человек или нет?
+    # Но пока просто выдаем ссылку
+    link = await generate_invite_link()
+    if link:
+        await message.answer(f"Вот твоя персональная ссылка на вступление: {link}")
+    else:
+        await message.answer("Не удалось создать ссылку. Проверь права бота в группе.")
 
 # Техническая часть (Вебхук + Инициализация)
 async def on_startup(app):
