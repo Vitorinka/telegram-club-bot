@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import stripe
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
