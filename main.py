@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiohttp import web
 import psycopg2 
 from datetime import datetime
-from aiogram.utils.exceptions import BotBlocked, Forbidden
+from aiogram.utils.exceptions import BotBlocked
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Логирование
@@ -271,8 +271,13 @@ async def broadcast_private(message: types.Message):
             await bot.send_message(chat_id=user_id, text=text_to_send)
             count += 1
             await asyncio.sleep(0.05) 
-        except (BotBlocked, Forbidden):
+        except BotBlocked:
+            # Если пользователь заблокировал бота
             blocked += 1
+        except Exception:
+            # Если произошла любая другая ошибка (например, пользователь удалил чат), 
+            # просто идем дальше, не останавливая рассылку
+            pass
         except Exception as e:
             logging.error(f"Ошибка при отправке {user_id}: {e}")
 
