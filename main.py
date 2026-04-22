@@ -16,13 +16,16 @@ dp = Dispatcher(bot)
 
 # Подключение к БД
 def init_db():
+    conn = None
     try:
+        # Убедись, что DATABASE_URL в Railway точно есть
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
-            logging.error("DATABASE_URL не найден в настройках Railway!")
+            logging.error("DATABASE_URL отсутствует!")
             return
-            
-        conn = psycopg2.connect(db_url, sslmode='require')
+
+        # Подключаемся с таймаутом (connect_timeout=5 секунд)
+        conn = psycopg2.connect(db_url, sslmode='require', connect_timeout=5)
         cur = conn.cursor()
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -33,10 +36,13 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        conn.close()
-        logging.info("БАЗА ДАННЫХ УСПЕШНО ИНИЦИАЛИЗИРОВАНА")
+        logging.info("База данных успешно инициализирована")
     except Exception as e:
-        logging.error(f"ОШИБКА ПОДКЛЮЧЕНИЯ К БД: {e}")
+        # Теперь бот не сломается, если база недоступна, а просто напишет ошибку
+        logging.error(f"Не удалось подключиться к БД: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 # Хендлер /start (Твой оригинальный код)
 @dp.message_handler(commands=['start'])
