@@ -144,11 +144,11 @@ async def stripe_webhook(request):
         conn.close()
             
         link = await generate_invite_link()
-            if link:
-                try:
-                    await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
-                except Exception as e:
-                    logging.error(f"Не удалось отправить ссылку: {e}")
+        if link:
+            try:
+                await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
+            except Exception as e:
+                logging.error(f"Не удалось отправить ссылку: {e}")
             else:
                 logging.error("Не удалось сгенерировать ссылку-приглашение")
     
