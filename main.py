@@ -236,7 +236,9 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        sub_id = session.get('subscription')
+        
+        # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ID ПОДПИСКИ
+        sub_id = getattr(session, 'subscription', None)
         
         if user_id:
             # --- ЗАЩИТА ОТ СПАМА (ПРОВЕРКА БД) ---
