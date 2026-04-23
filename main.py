@@ -111,22 +111,33 @@ async def process_payment(callback_query: types.CallbackQuery):
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
+    
+    # 1. Проверка подписи
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET"))
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписи Stripe: {e}")
         return web.Response(status=400)
 
+    # 2. Обработка успешного платежа
     if event.type == 'checkout.session.completed':
         session = event.data.object
-        user_id = session.get('client_reference_id')
+        
+        # Исправление: обращаемся к атрибуту напрямую через точку, а не через .get()
+        user_id = session.client_reference_id
+        
         if user_id:
+            logging.info(f"Платеж получен от пользователя: {user_id}")
             await asyncio.to_thread(save_user_to_db, int(user_id))
+            
             link = await generate_invite_link()
             if link:
                 try:
                     await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
                 except Exception as e:
                     logging.error(f"Не удалось отправить ссылку: {e}")
+            else:
+                logging.error("Не удалось сгенерировать ссылку-приглашение")
     
     return web.Response(status=200)
 
