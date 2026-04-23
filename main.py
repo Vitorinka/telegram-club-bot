@@ -225,7 +225,9 @@ async def stripe_webhook(request):
     
     # 1. Проверка подписи
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET"))
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+        )
     except Exception as e:
         logging.error(f"Ошибка проверки подписи Stripe: {e}")
         return web.Response(status=400)
@@ -234,48 +236,55 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        sub_id = session.subscription  # <-- ВОТ ЭТОТ ID МЫ ПОЛУЧАЕМ
-    
-    if user_id:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-        cur = conn.cursor()
-        # Обновляем БД, сохраняя sub_id
-        cur.execute("""
-            UPDATE users SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days', stripe_subscription_id = %s
-            WHERE telegram_id = %s;
-        """, (sub_id, int(user_id)))
-        conn.commit()
-        cur.close()
-        conn.close()
-            
-        link = await generate_invite_link()
-        if link:
-            try:
-                await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
-            except Exception as e:
-                logging.error(f"Не удалось отправить ссылку: {e}")
-            else:
-                logging.error("Не удалось сгенерировать ссылку-приглашение")
-    
-    return web.Response(status=200)
-    # ... внутри stripe_webhook, там где сохраняем пользователя:
-    if event.type == 'checkout.session.completed':
-        session = event.data.object
-        user_id = session.client_reference_id
+        sub_id = session.get('subscription')
         
         if user_id:
-            # 1. Сначала разбаниваем (чтобы он мог войти по новой ссылке)
+            # --- ЗАЩИТА ОТ СПАМА (ПРОВЕРКА БД) ---
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+            cur = conn.cursor()
+            cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
+            row = cur.fetchone()
+            
+            # Если юзер уже есть и у него paid = TRUE, ничего не делаем, чтобы не спамить
+            if row and row[0] is True:
+                cur.close()
+                conn.close()
+                return web.Response(status=200)
+            
+            # --- ОБРАБОТКА ОПЛАТЫ ---
             try:
+                # Разбан
                 await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-            except:
-                pass 
+                
+                # Обновление БД
+                cur.execute("""
+                    UPDATE users SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days', stripe_subscription_id = %s
+                    WHERE telegram_id = %s;
+                """, (sub_id, int(user_id)))
+                conn.commit()
+                
+                # Генерация временной ссылки
+                link = await generate_invite_link()
+                if link:
+                    await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
+                else:
+                    await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha, мы всё исправим!")
             
-            # 2. Сохраняем в БД
-            await asyncio.to_thread(save_user_to_db, int(user_id))
+            except Exception as e:
+                logging.error(f"Ошибка обработки успешной оплаты: {e}")
+                await bot.send_message(user_id, "Произошла ошибка при начислении доступа. Пожалуйста, напишите @re_tasha, мы всё проверим.")
             
-            # 3. Генерируем ссылку
-            link = await generate_invite_link()
-            # ... далее отправка ссылки ...
+            cur.close()
+            conn.close()
+
+    # 3. Обработка ошибок (сессия истекла или оплата не прошла)
+    elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
+        session = event.data.object
+        user_id = session.client_reference_id
+        if user_id:
+            await bot.send_message(user_id, "❌ Оплата не прошла или сессия истекла. Если деньги списались, пожалуйста, напишите @re_tasha и пришлите чек.")
+
+    return web.Response(status=200)
 
 async def send_renewal_reminders():
     logging.info("Запуск проверки истекших подписок...")
