@@ -46,26 +46,31 @@ async def stripe_webhook(request):
         return web.Response(status=400)
 
     # 1. ОБРАБОТКА ПЕРВОЙ ПОКУПКИ
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        user_id = session.get('client_reference_id')
-        link = await generate_invite_link()
-        if link:
-            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
+if event['type'] == 'checkout.session.completed':
+    # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
+    session = event['data']['object'].to_dict() 
+    user_id = session.get('client_reference_id')
+    link = await generate_invite_link()
+    if link:
+        await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
 
-    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
-    elif event['type'] == 'invoice.payment_succeeded':
-        invoice = event['data']['object']
+# 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
+elif event['type'] == 'invoice.payment_succeeded':
+    # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
+    invoice = event['data']['object'].to_dict()
+    
+    # Проверяем, что это именно продление, а не первая оплата
+    if invoice.get('billing_reason') == 'subscription_cycle':
+        subscription_id = invoice.get('subscription')
         
-        # Проверяем, что это именно продление, а не первая оплата
-        if invoice.get('billing_reason') == 'subscription_cycle':
-            subscription_id = invoice.get('subscription')
-            
-            # Получаем объект подписки, чтобы достать metadata
-            subscription = stripe.Subscription.retrieve(subscription_id)
-            telegram_id = subscription.get('metadata', {}).get('telegram_id')
-            
-            if telegram_id:
+        # Получаем объект подписки
+        subscription = stripe.Subscription.retrieve(subscription_id)
+        # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
+        sub_data = subscription.to_dict()
+        telegram_id = sub_data.get('metadata', {}).get('telegram_id')
+        
+        if telegram_id:
+            # ... остальной код (conn, cursor и т.д.)
                 # Получаем дату следующего списания
                 next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
                 date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
