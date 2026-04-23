@@ -143,7 +143,7 @@ async def stripe_webhook(request):
         cur.close()
         conn.close()
             
-            link = await generate_invite_link()
+        link = await generate_invite_link()
             if link:
                 try:
                     await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
