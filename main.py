@@ -244,6 +244,12 @@ async def cancel_subscription(callback: types.CallbackQuery):
     cur.close()
     conn.close()
 
+# --- ОБРАБОТКА ПОМОЩИ ---
+# Обработка команды /help (если пользователь напишет это сам)
+@dp.message_handler(commands=['help'])
+async def help_command(message: types.Message):
+    await message.answer("По всем вопросам можно связаться с @re_tasha")
+
 # --- ЗАПУСК ---
 async def on_startup(app):
     init_db()
