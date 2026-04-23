@@ -69,11 +69,6 @@ if __name__ == '__main__':
     # Запускаем и бота (polling), и веб-сервер
     # В Railway лучше использовать PORT из переменных окружения
     port = int(os.environ.get("PORT", 8080))
-    
-    # Запускаем через встроенный в aiogram "executor", 
-    # который позволяет запускать и web-app, и бота вместе
-    executor.start_polling(dp, skip_updates=True, on_startup=lambda _: web.run_app(app, port=port))
-
 
 # --- ФУНКЦИЯ СОЗДАНИЯ ССЫЛКИ ---
 async def generate_invite_link():
