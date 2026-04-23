@@ -34,8 +34,8 @@ async def generate_invite_link():
     except Exception as e:
         logging.error(f"Ошибка создания ссылки: {e}")
         return None
-
-# ВЕБХУК ДЛЯ АВТОМАТИКИ (авто-выдача ссылки)
+        
+# ВЕБХУК ДЛЯ АВТОМАТИКИ
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -46,39 +46,29 @@ async def stripe_webhook(request):
         return web.Response(status=400)
 
     # 1. ОБРАБОТКА ПЕРВОЙ ПОКУПКИ
-if event['type'] == 'checkout.session.completed':
-    # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
-    session = event['data']['object'].to_dict() 
-    user_id = session.get('client_reference_id')
-    link = await generate_invite_link()
-    if link:
-        await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object'].to_dict() 
+        user_id = session.get('client_reference_id')
+        link = await generate_invite_link()
+        if link:
+            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
 
-# 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
-elif event['type'] == 'invoice.payment_succeeded':
-    # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
-    invoice = event['data']['object'].to_dict()
-    
-    # Проверяем, что это именно продление, а не первая оплата
-    if invoice.get('billing_reason') == 'subscription_cycle':
-        subscription_id = invoice.get('subscription')
+    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
+    elif event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object'].to_dict()
         
-        # Получаем объект подписки
-        subscription = stripe.Subscription.retrieve(subscription_id)
-        # ИЗМЕНЕНИЕ ЗДЕСЬ: добавляем .to_dict()
-        sub_data = subscription.to_dict()
-        telegram_id = sub_data.get('metadata', {}).get('telegram_id')
-        
-        if telegram_id:
-            # ... остальной код (conn, cursor и т.д.)
-                # Получаем дату следующего списания
+        if invoice.get('billing_reason') == 'subscription_cycle':
+            subscription_id = invoice.get('subscription')
+            subscription = stripe.Subscription.retrieve(subscription_id)
+            sub_data = subscription.to_dict()
+            telegram_id = sub_data.get('metadata', {}).get('telegram_id')
+            
+            if telegram_id:
                 next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
                 date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
 
-                # Обновляем дату в базе данных
                 conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
                 cur = conn.cursor()
-                # Используем UPSERT (обновление или вставка)
                 cur.execute("""
                     INSERT INTO users (telegram_id, paid, expiry_date)
                     VALUES (%s, TRUE, to_timestamp(%s))
@@ -89,12 +79,11 @@ elif event['type'] == 'invoice.payment_succeeded':
                 cur.close()
                 conn.close()
                 
-                # Отправляем сообщение
                 await bot.send_message(
                     chat_id=int(telegram_id),
                     text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
                 )
-                
+          
     # 3. ОБРАБОТКА ОТМЕНЫ/ОКОНЧАНИЯ ПОДПИСКИ
     elif event['type'] == 'customer.subscription.deleted':
         subscription = event['data']['object']
