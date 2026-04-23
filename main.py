@@ -22,7 +22,7 @@ stripe.api_key = os.getenv("STRIPE_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 
 # --- СОСТОЯНИЯ (FSM) ---
