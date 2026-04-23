@@ -184,7 +184,7 @@ PRICES = {
 async def process_payment(callback_query: types.CallbackQuery):
     price_id = PRICES.get(callback_query.data)
     
-    # Создаем сессию Stripe
+    # 1. Создаем сессию Stripe (как и было)
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': price_id, 'quantity': 1}],
@@ -192,23 +192,26 @@ async def process_payment(callback_query: types.CallbackQuery):
         success_url='https://t.me/Natalia_SoulFit_bot',
         cancel_url='https://t.me/Natalia_SoulFit_bot',
         client_reference_id=str(callback_query.from_user.id),
-    subscription_data={
-        "metadata": {
-            "telegram_id": str(callback_query.from_user.id)
+        subscription_data={
+            "metadata": {
+                "telegram_id": str(callback_query.from_user.id)
+            }
         }
-    }
-)
+    )
     
-    # Создаем кнопку, которая сразу ведет на оплату
+    # 2. Создаем кнопку оплаты
     keyboard = InlineKeyboardMarkup()
     keyboard.add(InlineKeyboardButton("💳 Оплатить", url=session.url))
     
-    # Отправляем сообщение только с кнопкой
-    await bot.send_message(
-        callback_query.from_user.id, 
-        "Оплата (Stripe):", 
-        reply_markup=keyboard
-    )
+    # 3. Редактируем то же самое сообщение, где были кнопки тарифов
+    # Мы меняем кнопки на кнопку оплаты
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
+    
+    # ОПЦИОНАЛЬНО: Если хотите поменять и текст (например, написать "Перейдите к оплате")
+    await callback_query.message.edit_caption(caption="Отлично! Переходите по ссылке для оплаты:")
+
+    # Отвечаем на сам клик, чтобы убрать "часики" (загрузку) на кнопке
+    await callback_query.answer()
 
 # --- НОВАЯ КОМАНДА ДЛЯ ПОЛУЧЕНИЯ ССЫЛКИ ---
 @dp.message_handler(commands=['getlink'])
