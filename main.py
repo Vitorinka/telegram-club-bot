@@ -20,6 +20,10 @@ GROUP_ID = os.getenv("GROUP_ID")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 
+# Вставьте сюда ссылки на ваши фото или ID файлов из Telegram
+PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA" 
+PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
+
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -72,6 +76,39 @@ def save_user_to_db(user_id):
         conn.close()
     except Exception as e:
         logging.error(f"Ошибка сохранения в БД: {e}")
+
+async def check_subscriptions():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
+    users = cur.fetchall()
+    now = datetime.now()
+    
+    for user_id, expiry in users:
+        # 1. Уведомление за 2 дня
+        if expiry - timedelta(days=2) < now < expiry - timedelta(days=1, hours=23):
+            await bot.send_message(user_id, "⏳ Ваш пробный период или подписка заканчивается через 2 дня. Скоро мы напомним о продлении!")
+        
+        # 2. Окончание периода
+        if expiry < now:
+            try:
+                # Баним в группе
+                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
+                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (user_id,))
+                
+                # Предлагаем 3 тарифа
+                kb = InlineKeyboardMarkup(row_width=1).add(
+                    InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
+                    InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
+                    InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
+                )
+                await bot.send_message(user_id, "⚠️ Время вышло! Доступ в клуб ограничен.\n\nВыберите подписку, чтобы продолжить путь к телу вашей мечты:", reply_markup=kb)
+            except Exception as e:
+                logging.error(f"Ошибка при бане пользователя {user_id}: {e}")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def generate_invite_link():
@@ -129,27 +166,34 @@ async def broadcast(message: types.Message):
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
     await RegistrationStates.intro.set()
-    keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
-    await message.answer("Добро пожаловать в клуб! Это пространство про осознанную работу с телом. Шаг 1/2", reply_markup=keyboard)
+    text = ("🌟 **Добро пожаловать в закрытый клуб!**\n\n"
+            "Здесь мы работаем над телом осознанно. Вас ждут тренировки, поддержка комьюнити и ежедневные инсайты.\n"
+            "Готовы начать?")
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
+    await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb)
 
 @dp.callback_query_handler(text="to_rules", state=RegistrationStates.intro)
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.rules.set()
-    keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Понятно, далее", callback_data="to_subs"))
-    await callback.message.edit_text("Правила нашего клуба:\n1. Клуб закрытый.\n2. Уважение к участникам.\nШаг 2/2", reply_markup=keyboard)
+    text = ("📜 **Правила клуба:**\n"
+            "1. Уважение к каждому участнику.\n"
+            "2. Никакого негатива.\n"
+            "3. Регулярность — залог успеха.\n\n"
+            "Вы принимаете наши правила?")
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Да, я готов(а)!", callback_data="to_subs"))
+    await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query_handler(text="to_subs", state=RegistrationStates.rules)
 async def show_subs(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
     keyboard = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("💎 Пробная неделя (разово)", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    await callback.message.edit_text("Отлично! Выбирай формат участия:", reply_markup=keyboard)
-    await callback.answer()
+    await callback.message.answer("✨ Выберите свой формат участия:", reply_markup=keyboard)
 
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
 async def process_payment(callback_query: types.CallbackQuery):
@@ -161,16 +205,19 @@ async def process_payment(callback_query: types.CallbackQuery):
     }
     price_id = os.getenv(price_map.get(callback_query.data))
     
+    # ЛОГИКА: trial - разовый платеж (payment), остальные - подписка (subscription)
+    mode = 'payment' if callback_query.data == "sub_trial" else 'subscription'
+    
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
         line_items=[{'price': price_id, 'quantity': 1}],
-        mode='subscription',
+        mode=mode,
         success_url='https://t.me/Natalia_SoulFit_bot',
         client_reference_id=str(callback_query.from_user.id)
     )
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 Оплатить", url=session.url))
-    await callback_query.message.edit_text("Переходите по ссылке для оплаты:", reply_markup=kb)
-
+    await callback_query.message.answer("Переходите к оплате:", reply_markup=kb)
+    
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
     payload = await request.read()
