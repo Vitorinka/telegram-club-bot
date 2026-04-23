@@ -23,6 +23,8 @@ dp = Dispatcher(bot)
 def init_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
     cur = conn.cursor()
+    
+    # 1. Создаем таблицу, если её нет
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -31,10 +33,14 @@ def init_db():
             expiry_date TIMESTAMP
         );
     """)
+    
+    # 2. Добавляем колонку для подписки, если её нет (это и есть то самое обновление)
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
+    
     conn.commit()
     cur.close()
     conn.close()
-    logging.info("--- БД ИНИЦИАЛИЗИРОВАНА ---")
+    logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
 
 def save_user_to_db(user_id):
     try:
@@ -122,13 +128,20 @@ async def stripe_webhook(request):
     # 2. Обработка успешного платежа
     if event.type == 'checkout.session.completed':
         session = event.data.object
-        
-        # Исправление: обращаемся к атрибуту напрямую через точку, а не через .get()
         user_id = session.client_reference_id
-        
-        if user_id:
-            logging.info(f"Платеж получен от пользователя: {user_id}")
-            await asyncio.to_thread(save_user_to_db, int(user_id))
+        sub_id = session.subscription  # <-- ВОТ ЭТОТ ID МЫ ПОЛУЧАЕМ
+    
+    if user_id:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
+        # Обновляем БД, сохраняя sub_id
+        cur.execute("""
+            UPDATE users SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days', stripe_subscription_id = %s
+            WHERE telegram_id = %s;
+        """, (sub_id, int(user_id)))
+        conn.commit()
+        cur.close()
+        conn.close()
             
             link = await generate_invite_link()
             if link:
@@ -185,6 +198,51 @@ async def send_renewal_reminders():
         conn.close()
     except Exception as e:
         logging.error(f"Ошибка проверки подписок: {e}")
+
+@dp.message_handler(commands=['profile'])
+async def profile(message: types.Message):
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (message.from_user.id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user or not user[0]:
+        await message.answer("У вас пока нет активной подписки. Нажмите /start, чтобы оформить её.")
+    else:
+        expiry = user[1].strftime('%d.%m.%Y')
+        text = f"Ваша подписка активна до: {expiry}\n\nХотите отменить автопродление?"
+        
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
+        
+        await message.answer(text, reply_markup=keyboard)
+
+@dp.callback_query_handler(text="cancel_subscription")
+async def cancel_subscription(callback: types.CallbackQuery):
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
+    result = cur.fetchone()
+    
+    if result and result[0]:
+        sub_id = result[0]
+        try:
+            # Отменяем в Stripe
+            stripe.Subscription.delete(sub_id)
+            # Обновляем в БД
+            cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
+            conn.commit()
+            await callback.message.edit_text("✅ Подписка успешно отменена. Доступ сохранится до конца оплаченного периода.")
+        except Exception as e:
+            await callback.answer("Ошибка при отмене подписки. Напишите администратору.")
+            logging.error(f"Ошибка Stripe: {e}")
+    else:
+        await callback.answer("Не удалось найти подписку.")
+    
+    cur.close()
+    conn.close()
 
 # --- ЗАПУСК ---
 async def on_startup(app):
