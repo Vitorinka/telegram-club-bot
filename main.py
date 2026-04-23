@@ -32,8 +32,10 @@ scheduler = AsyncIOScheduler()
 # --- СОСТОЯНИЯ (FSM) ---
 class RegistrationStates(StatesGroup):
     intro = State()
+    description = State()  # Вот это пропущенное состояние
     rules = State()
-
+    choice = State()       # И это состояние тебе тоже понадобится для этапа выбора тарифа
+    
 # --- ФУНКЦИИ БАЗЫ ---
 def get_db_conn():
     return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
