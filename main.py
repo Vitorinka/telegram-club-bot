@@ -10,6 +10,24 @@ from datetime import datetime
 from aiogram.utils.exceptions import BotBlocked
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+def init_db():
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            username TEXT,
+            subscription_end TIMESTAMP
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("Таблица создана или уже существует.")
+
+# Вызовите init_db() при старте бота
+
 # Логирование
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -21,6 +39,41 @@ WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+
+# 2. Ваш обработчик вебхука (вставьте сюда)
+async def stripe_webhook_handler(request):
+    payload = await request.read()
+    # ВАЖНО: Stripe подписывает запросы. Для продакшена обязательно проверьте сигнатуру!
+    
+    event = json.loads(payload)
+
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        tg_id = session['metadata']['telegram_id']
+        
+        # ЛОГИКА: Обновляем базу данных здесь
+        print(f"Пользователь {tg_id} оплатил! Добавляем в базу.")
+
+    return web.Response(status=200)
+
+# 3. Настройка веб-сервера aiohttp
+async def on_startup(app):
+    # Эта функция выполнится при старте, можно добавить логику запуска бота
+    pass
+
+app = web.Application()
+app.router.add_post('/webhook', stripe_webhook_handler)
+
+# 4. Основной блок запуска
+if __name__ == '__main__':
+    # Запускаем и бота (polling), и веб-сервер
+    # В Railway лучше использовать PORT из переменных окружения
+    port = int(os.environ.get("PORT", 8080))
+    
+    # Запускаем через встроенный в aiogram "executor", 
+    # который позволяет запускать и web-app, и бота вместе
+    executor.start_polling(dp, skip_updates=True, on_startup=lambda _: web.run_app(app, port=port))
+
 
 # --- ФУНКЦИЯ СОЗДАНИЯ ССЫЛКИ ---
 async def generate_invite_link():
