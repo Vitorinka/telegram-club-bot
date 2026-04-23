@@ -385,3 +385,38 @@ if __name__ == "__main__":
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
     web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+# --- ФУНКЦИЯ ДЛЯ ПЕРВОЙ ПОКУПКИ ---
+def save_user_to_db(user_id):
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid, expiry_date)
+            VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
+            ON CONFLICT (telegram_id) DO UPDATE SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
+        """, (user_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Пользователь {user_id} сохранен в БД")
+    except Exception as e:
+        logging.error(f"Ошибка записи в БД: {e}")
+
+# --- ФУНКЦИЯ ДЛЯ АВТОПРОДЛЕНИЯ ---
+def update_db_sub(telegram_id, timestamp):
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid, expiry_date)
+            VALUES (%s, TRUE, to_timestamp(%s))
+            ON CONFLICT (telegram_id) 
+            DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
+        """, (telegram_id, timestamp, timestamp))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Подписка пользователя {telegram_id} продлена в БД")
+    except Exception as e:
+        logging.error(f"Ошибка обновления подписки в БД: {e}")
