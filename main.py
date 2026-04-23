@@ -126,46 +126,50 @@ async def broadcast(message: types.Message):
     await message.answer("Рассылка завершена.")
 
 # --- ХЕНДЛЕРЫ ---
-@dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    # Приветствие
-    await bot.send_photo(
-        chat_id=message.chat.id,
-        photo="AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA",
-        caption="Добро пожаловать в обновлённую версию онлайн-клуба! Это пространство про осознанную работу с телом..."
-    )
-    await message.answer("Основные правила нашего клуба:\n1. Клуб закрытый...\n2. Запись обязательна...")
-    await message.answer("Что входит в абонемент:\n- База тренировок\n- Живые тренировки\n- Обратная связь")
-    
-    # Кнопки подписки
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
+@dp.message_handler(commands=['start'], state='*')
+async def start(message: types.Message, state: FSMContext):
+    await RegistrationStates.intro.set()
+    keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
+    await message.answer("Добро пожаловать в клуб! Это пространство про осознанную работу с телом. Шаг 1/2", reply_markup=keyboard)
+
+@dp.callback_query_handler(text="to_rules", state=RegistrationStates.intro)
+async def show_rules(callback: types.CallbackQuery, state: FSMContext):
+    await RegistrationStates.rules.set()
+    keyboard = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Понятно, далее", callback_data="to_subs"))
+    await callback.message.edit_text("Правила нашего клуба:\n1. Клуб закрытый.\n2. Уважение к участникам.\nШаг 2/2", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query_handler(text="to_subs", state=RegistrationStates.rules)
+async def show_subs(callback: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    keyboard = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    await bot.send_photo(
-        chat_id=message.chat.id,
-        photo="AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA",
-        caption="Готова начать? Выбирай формат участия:",
-        reply_markup=keyboard
-    )
+    await callback.message.edit_text("Отлично! Выбирай формат участия:", reply_markup=keyboard)
+    await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
 async def process_payment(callback_query: types.CallbackQuery):
-    price_map = {"sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
-    price_env_var = price_map.get(callback_query.data)
+    price_map = {
+        "sub_trial": "PRICE_TRIAL",
+        "sub_1": "PRICE_1M", 
+        "sub_6": "PRICE_6M",
+        "sub_12": "PRICE_12M"
+    }
+    price_id = os.getenv(price_map.get(callback_query.data))
     
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
-        line_items=[{'price': os.getenv(price_env_var), 'quantity': 1}],
+        line_items=[{'price': price_id, 'quantity': 1}],
         mode='subscription',
         success_url='https://t.me/Natalia_SoulFit_bot',
         client_reference_id=str(callback_query.from_user.id)
     )
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 Оплатить", url=session.url))
-    await callback_query.message.edit_caption(caption="Отлично! Переходите по ссылке для оплаты:", reply_markup=kb)
-    await callback_query.answer()
+    await callback_query.message.edit_text("Переходите по ссылке для оплаты:", reply_markup=kb)
 
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
