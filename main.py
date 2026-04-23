@@ -5,7 +5,10 @@ import stripe
 import psycopg2
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.exceptions import BotBlocked
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime
@@ -14,10 +17,22 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID") 
+ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
 dp = Dispatcher(bot)
+scheduler = AsyncIOScheduler()
+
+# --- СОСТОЯНИЯ (FSM) ---
+class RegistrationStates(StatesGroup):
+    intro = State()
+    rules = State()
+
+# --- ФУНКЦИИ БАЗЫ ---
+def get_db_conn():
+    return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
@@ -70,6 +85,45 @@ async def generate_invite_link():
 async def send_renewal_reminders():
     # Логика напоминаний (заглушка, которую вы можете дописать)
     logging.info("Проверка подписок для напоминаний...")
+
+# --- АВТОМАТИЗАЦИЯ (ПРОВЕРКА ПО УТРАМ) ---
+async def check_subscriptions():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
+    users = cur.fetchall()
+    
+    now = datetime.now()
+    for user_id, expiry in users:
+        # Если срок истек
+        if expiry < now:
+            try:
+                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
+                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (user_id,))
+                await bot.send_message(user_id, "Ваша подписка истекла. Доступ закрыт. Продлите подписку, написав /start")
+            except Exception as e:
+                logging.error(f"Ошибка бана {user_id}: {e}")
+        # Если срок истекает завтра (напоминание)
+        elif expiry - timedelta(days=1) < now < expiry:
+            await bot.send_message(user_id, "Ваша подписка заканчивается завтра! Успейте продлить.")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# --- ХЕНДЛЕРЫ ---
+@dp.message_handler(commands=['broadcast'])
+async def broadcast(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    text = message.text.replace('/broadcast ', '')
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM users")
+    users = cur.fetchall()
+    for user in users:
+        try: await bot.send_message(user[0], text)
+        except: continue
+    await message.answer("Рассылка завершена.")
 
 # --- ХЕНДЛЕРЫ ---
 @dp.message_handler(commands=['start'])
