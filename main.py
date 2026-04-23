@@ -140,6 +140,51 @@ async def stripe_webhook(request):
                 logging.error("Не удалось сгенерировать ссылку-приглашение")
     
     return web.Response(status=200)
+    # ... внутри stripe_webhook, там где сохраняем пользователя:
+    if event.type == 'checkout.session.completed':
+        session = event.data.object
+        user_id = session.client_reference_id
+        
+        if user_id:
+            # 1. Сначала разбаниваем (чтобы он мог войти по новой ссылке)
+            try:
+                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
+            except:
+                pass 
+            
+            # 2. Сохраняем в БД
+            await asyncio.to_thread(save_user_to_db, int(user_id))
+            
+            # 3. Генерируем ссылку
+            link = await generate_invite_link()
+            # ... далее отправка ссылки ...
+
+async def send_renewal_reminders():
+    logging.info("Запуск проверки истекших подписок...")
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
+        # Ищем тех, у кого срок истек
+        cur.execute("SELECT telegram_id FROM users WHERE expiry_date < NOW() AND paid = TRUE")
+        expired_users = cur.fetchall()
+
+        for user in expired_users:
+            telegram_id = user[0]
+            try:
+                # 1. Кикаем из группы (ban в Telegram удаляет пользователя и запрещает вход)
+                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
+                # 2. Обновляем статус в БД
+                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (telegram_id,))
+                await bot.send_message(telegram_id, "Ваша подписка истекла. Доступ в клуб ограничен.")
+                logging.info(f"Пользователь {telegram_id} исключен.")
+            except Exception as e:
+                logging.error(f"Не удалось исключить {telegram_id}: {e}")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписок: {e}")
 
 # --- ЗАПУСК ---
 async def on_startup(app):
