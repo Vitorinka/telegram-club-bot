@@ -93,14 +93,28 @@ async def stripe_webhook(request):
         logging.error(f"Ошибка вебхука: {e}")
         return web.Response(status=400)
 
-    # 1. ОБРАБОТКА ПЕРВОЙ ПОКУПКИ
+    # 1. Первая покупка (обновленный блок)
     if event['type'] == 'checkout.session.completed':
-        session = event['data']['object'].to_dict() 
+        session = event['data']['object']
         user_id = session.get('client_reference_id')
-        link = await generate_invite_link()
-        if link:
-            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Вот ваша ссылка для вступления: {link}")
+        
+        # Записываем в базу при первой покупке
+        if user_id:
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+            cur = conn.cursor()
+            # Допустим, подписка на 30 дней от текущего момента
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date)
+                VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
+                ON CONFLICT (telegram_id) DO UPDATE SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
+            """, (int(user_id),))
+            conn.commit()
+            cur.close()
+            conn.close()
 
+        link = await generate_invite_link()
+        if link and user_id:
+            await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка: {link}")
     # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object'].to_dict()
