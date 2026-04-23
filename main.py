@@ -84,6 +84,8 @@ async def generate_invite_link():
         return None
         
 # ВЕБХУК ДЛЯ АВТОМАТИКИ
+import asyncio # Добавьте в импорты
+
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -93,75 +95,61 @@ async def stripe_webhook(request):
         logging.error(f"Ошибка вебхука: {e}")
         return web.Response(status=400)
 
-    # 1. Первая покупка (обновленный блок)
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        user_id = session.get('client_reference_id')
+    # 1. Первая покупка
+    if event.type == 'checkout.session.completed':
+        session = event.data.object
+        user_id = getattr(session, 'client_reference_id', None)
         
-        # Записываем в базу при первой покупке
         if user_id:
-            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-            cur = conn.cursor()
-            # Допустим, подписка на 30 дней от текущего момента
-            cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date)
-                VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
-                ON CONFLICT (telegram_id) DO UPDATE SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
-            """, (int(user_id),))
-            conn.commit()
-            cur.close()
-            conn.close()
+            await asyncio.to_thread(save_user_to_db, int(user_id))
 
         link = await generate_invite_link()
         if link and user_id:
             await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка: {link}")
-    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
-    elif event['type'] == 'invoice.payment_succeeded':
-        invoice = event['data']['object'].to_dict()
-        
-        if invoice.get('billing_reason') == 'subscription_cycle':
-            subscription_id = invoice.get('subscription')
-            subscription = stripe.Subscription.retrieve(subscription_id)
-            sub_data = subscription.to_dict()
-            telegram_id = sub_data.get('metadata', {}).get('telegram_id')
-            
-            if telegram_id:
-                next_payment_timestamp = invoice.get('lines', {}).get('data', [{}])[0].get('period', {}).get('end')
-                date_str = datetime.fromtimestamp(next_payment_timestamp).strftime('%d.%m.%Y')
 
-                conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO users (telegram_id, paid, expiry_date)
-                    VALUES (%s, TRUE, to_timestamp(%s))
-                    ON CONFLICT (telegram_id)
-                    DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
-                """, (int(telegram_id), next_payment_timestamp, next_payment_timestamp))
-                conn.commit()
-                cur.close()
-                conn.close()
+    # 2. ОБРАБОТКА АВТО-ПРОДЛЕНИЯ
+    elif event.type == 'invoice.payment_succeeded':
+        invoice = event.data.object
+        
+        # Проверяем, что это оплата за подписку
+        if getattr(invoice, 'billing_reason', None) == 'subscription_cycle':
+            sub_id = getattr(invoice, 'subscription', None)
+            if sub_id:
+                # Получаем подписку
+                subscription = stripe.Subscription.retrieve(sub_id)
+                # Достаем метаданные через getattr
+                metadata = getattr(subscription, 'metadata', {})
+                telegram_id = getattr(metadata, 'telegram_id', None)
                 
-                await bot.send_message(
-                    chat_id=int(telegram_id),
-                    text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
-                )
-          
-    # 3. ОБРАБОТКА ОТМЕНЫ/ОКОНЧАНИЯ ПОДПИСКИ
-    elif event['type'] == 'customer.subscription.deleted':
-        subscription = event['data']['object']
-        telegram_id = subscription.get('metadata', {}).get('telegram_id')
+                if telegram_id:
+                    # Безопасно достаем период (lines -> data -> period -> end)
+                    lines = getattr(invoice, 'lines', None)
+                    data = getattr(lines, 'data', [])
+                    if data:
+                        period = getattr(data[0], 'period', {})
+                        end_timestamp = getattr(period, 'end', None)
+                        
+                        if end_timestamp:
+                            date_str = datetime.fromtimestamp(end_timestamp).strftime('%d.%m.%Y')
+                            
+                            # Выполняем запись в БД через поток
+                            await asyncio.to_thread(update_db_sub, int(telegram_id), end_timestamp)
+                            
+                            await bot.send_message(
+                                chat_id=int(telegram_id),
+                                text=f"Вижу, что оплата прошла!\nДоступ продлён на месяц ❤️\nСледующая оплата спишется {date_str}"
+                            )
+
+    # 3. ОБРАБОТКА ОТМЕНЫ
+    elif event.type == 'customer.subscription.deleted':
+        subscription = event.data.object
+        metadata = getattr(subscription, 'metadata', {})
+        telegram_id = getattr(metadata, 'telegram_id', None)
         
         if telegram_id:
             try:
-                # 1. Исключаем пользователя из группы (бан)
-                # ban_chat_member автоматически выкидывает человека
                 await bot.ban_chat_member(chat_id=GROUP_ID, user_id=int(telegram_id))
-                
-                # 2. Сразу "разбаниваем", чтобы если он оплатит снова, 
-                # он мог вступить по новой ссылке (иначе он останется в ЧС)
                 await bot.unban_chat_member(chat_id=GROUP_ID, user_id=int(telegram_id))
-                
-                # 3. Отправляем уведомление
                 await bot.send_message(
                     chat_id=int(telegram_id),
                     text="Твоя подписка закончилась, доступ в клуб закрыт. Будем ждать снова! ❤️"
@@ -170,36 +158,20 @@ async def stripe_webhook(request):
                 logging.error(f"Не удалось исключить пользователя {telegram_id}: {e}")
                 
     return web.Response(status=200)
-        
-# Подключение к БД
-def init_db():
-    conn = None
-    try:
-        # Убедись, что DATABASE_URL в Railway точно есть
-        db_url = os.getenv("DATABASE_URL")
-        if not db_url:
-            logging.error("DATABASE_URL отсутствует!")
-            return
 
-        # Подключаемся с таймаутом (connect_timeout=5 секунд)
-        conn = psycopg2.connect(db_url, sslmode='require', connect_timeout=5)
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id BIGINT PRIMARY KEY,
-            paid BOOLEAN DEFAULT FALSE,
-            expiry_date TIMESTAMP
-        )
-        """)
-        conn.commit()
-        cur.close()
-        logging.info("База данных успешно инициализирована")
-    except Exception as e:
-        # Теперь бот не сломается, если база недоступна, а просто напишет ошибку
-        logging.error(f"Не удалось подключиться к БД: {e}")
-    finally:
-        if conn is not None:
-            conn.close()
+# Добавьте еще одну функцию для обновления БД, чтобы не смешивать с первичной вставкой
+def update_db_sub(telegram_id, timestamp):
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (telegram_id, paid, expiry_date)
+        VALUES (%s, TRUE, to_timestamp(%s))
+        ON CONFLICT (telegram_id) 
+        DO UPDATE SET paid = TRUE, expiry_date = to_timestamp(%s);
+    """, (telegram_id, timestamp, timestamp))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # Хендлер /start (Твой оригинальный код)
 @dp.message_handler(commands=['start'])
