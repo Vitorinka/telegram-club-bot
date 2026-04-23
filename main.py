@@ -163,50 +163,53 @@ async def broadcast(message: types.Message):
     await message.answer("Рассылка завершена.")
 
 # --- ХЕНДЛЕРЫ ---
+# --- 1. ПРИВЕТСТВИЕ (ФОТО) ---
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
     await RegistrationStates.intro.set()
-    text = ("🌟 **Добро пожаловать в закрытый клуб!**\n\n"
-            "Здесь мы работаем над телом осознанно. Вас ждут тренировки, поддержка комьюнити и ежедневные инсайты.\n"
-            "Готовы начать?")
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
+    text = "🌟 **Добро пожаловать в закрытый клуб!**\n\nТекст приветствия..."
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_desc"))
     await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb)
 
-@dp.callback_query_handler(text="to_rules", state=RegistrationStates.intro)
+# --- 2. ОПИСАНИЕ (ТЕКСТ) ---
+@dp.callback_query_handler(text="to_desc", state=RegistrationStates.intro)
+async def show_description(callback: types.CallbackQuery, state: FSMContext):
+    await RegistrationStates.description.set()
+    text = "ℹ️ **О клубе:**\nЗдесь мы делаем то-то и то-то..."
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
+    # Отправляем новым сообщением, ничего не удаляем
+    await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
+
+# --- 3. ПРАВИЛА (ТЕКСТ) ---
+@dp.callback_query_handler(text="to_rules", state=RegistrationStates.description)
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.rules.set()
-    text = ("📜 **Правила клуба:**\n"
-            "1. Уважение к каждому участнику.\n"
-            "2. Никакого негатива.\n"
-            "3. Регулярность — залог успеха.\n\n"
-            "Вы принимаете наши правила?")
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("✅ Да, я готов(а)!", callback_data="to_subs"))
-    await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
-    await callback.answer()
+    text = "📜 **Правила клуба:**\n1. Не спамить.\n2. Уважать других."
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_choice"))
+    await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
 
-@dp.callback_query_handler(text="to_subs", state=RegistrationStates.rules)
-async def show_subs(callback: types.CallbackQuery, state: FSMContext):
-    await state.finish()
-    keyboard = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💎 Пробная неделя (разово)", callback_data="sub_trial"),
+# --- 4. ВЫБОР ТАРИФА (ФОТО) ---
+@dp.callback_query_handler(text="to_choice", state=RegistrationStates.rules)
+async def show_choice(callback: types.CallbackQuery, state: FSMContext):
+    await RegistrationStates.choice.set()
+    text = "💎 **Выберите свой формат участия:**"
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    await callback.message.answer("✨ Выберите свой формат участия:", reply_markup=keyboard)
+    # Отправляем фото
+    await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('sub_'))
-async def process_payment(callback_query: types.CallbackQuery):
-    price_map = {
-        "sub_trial": "PRICE_TRIAL",
-        "sub_1": "PRICE_1M", 
-        "sub_6": "PRICE_6M",
-        "sub_12": "PRICE_12M"
-    }
-    price_id = os.getenv(price_map.get(callback_query.data))
+# --- 5. ВЫБОР ТАРИФА И ОПЛАТА (РЕДАКТИРОВАНИЕ) ---
+@dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state=RegistrationStates.choice)
+async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
+    sub_type = callback_query.data
     
-    # ЛОГИКА: trial - разовый платеж (payment), остальные - подписка (subscription)
-    mode = 'payment' if callback_query.data == "sub_trial" else 'subscription'
+    price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
+    price_id = os.getenv(price_map.get(sub_type))
+    mode = 'payment' if sub_type == "sub_trial" else 'subscription'
     
     session = stripe.checkout.Session.create(
         payment_method_types=['card'],
@@ -215,8 +218,27 @@ async def process_payment(callback_query: types.CallbackQuery):
         success_url='https://t.me/Natalia_SoulFit_bot',
         client_reference_id=str(callback_query.from_user.id)
     )
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 Оплатить", url=session.url))
-    await callback_query.message.answer("Переходите к оплате:", reply_markup=kb)
+    
+    # Меняем кнопки: "Оплатить" и "Назад"
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💳 Оплатить", url=session.url),
+        InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
+    )
+    await callback_query.message.edit_caption(caption=f"✅ Вы выбрали тариф. Переходите к оплате:", reply_markup=kb)
+    await callback_query.answer()
+
+# --- 6. КНОПКА НАЗАД ---
+@dp.callback_query_handler(text="back_to_tariffs", state=RegistrationStates.choice)
+async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
+    # Восстанавливаем кнопки выбора тарифа
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
+        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
+        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
+    )
+    await callback_query.message.edit_caption(caption="💎 **Выберите свой формат участия:**", reply_markup=kb)
+    await callback_query.answer()
     
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
