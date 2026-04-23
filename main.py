@@ -354,6 +354,7 @@ async def health_check(request):
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/bot')
+    app.router.add_post('/webhook', stripe_webhook)
     app.router.add_get('/', health_check)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
