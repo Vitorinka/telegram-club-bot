@@ -43,8 +43,9 @@ def get_db_conn():
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-    cur = conn.cursor()
+    db_url = os.getenv("DATABASE_URL")
+    logging.info(f"ПОДКЛЮЧАЮСЬ К БАЗЕ: {db_url}") # Проверь это в логах!
+    conn = psycopg2.connect(db_url, sslmode='require')
     
     # 1. Создаем таблицу, если её нет
     cur.execute("""
