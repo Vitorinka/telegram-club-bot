@@ -449,6 +449,15 @@ async def cancel_subscription(callback: types.CallbackQuery):
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам можно связаться с @re_tasha")
 
+@dp.message_handler(commands=['test_expiry'])
+async def test_expiry(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("Запускаю проверку подписок...")
+        await send_renewal_reminders()
+        await message.answer("Проверка завершена.")
+    else:
+        await message.answer("У вас нет прав для этого.")
+
 # --- ЗАПУСК ---
 async def on_startup(app):
     init_db()
