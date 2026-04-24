@@ -407,10 +407,15 @@ async def on_startup(app):
     # Вебхук
     await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook")
 
+async def on_shutdown(app):
+    await bot.close() # Закрываем сессию бота при выключении
+    logging.info("Бот остановлен, сессия закрыта.")
+
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/')
     app.router.add_post('/stripe-payment', stripe_webhook)    
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown) # <-- Добавь эту строку
     port = int(os.environ.get("PORT", 8080))
     web.run_app(app, host='0.0.0.0', port=port)
