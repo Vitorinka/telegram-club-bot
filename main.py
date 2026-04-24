@@ -43,26 +43,37 @@ def get_db_conn():
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
-    db_url = os.getenv("DATABASE_URL")
-    logging.info(f"ПОДКЛЮЧАЮСЬ К БАЗЕ: {db_url}") # Проверь это в логах!
-    conn = psycopg2.connect(db_url, sslmode='require')
-    
-    # 1. Создаем таблицу, если её нет
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL,
-            paid BOOLEAN DEFAULT FALSE,
-            expiry_date TIMESTAMP
-        );
-    """)
-    
-    # 2. Добавляем колонку для подписки, если её нет (это и есть то самое обновление)
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
-    
-    conn.commit()
-    cur.close()
-    conn.close()
+    conn = None
+    try:
+        # Подключаемся
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()  # <--- ВОТ ЭТА СТРОКА БЫЛА УДАЛЕНА
+        
+        # 1. Создаем таблицу, если её нет
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT UNIQUE NOT NULL,
+                paid BOOLEAN DEFAULT FALSE,
+                expiry_date TIMESTAMP,
+                stripe_subscription_id TEXT
+            );
+        """)
+        
+        # 2. Добавляем колонку, если её нет
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
+        
+        conn.commit()
+        cur.close()
+        logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
+        
+    except Exception as e:
+        logging.error(f"ОШИБКА ИНИЦИАЛИЗАЦИИ БД: {e}")
+        
+    finally:
+        # Всегда закрываем соединение, если оно было создано
+        if conn is not None:
+            conn.close()
     logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
 
 def save_user_to_db(user_id):
