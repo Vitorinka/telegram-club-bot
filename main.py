@@ -263,6 +263,10 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
+    provided_token = request.rel_url.query.get('token')
+    if provided_token != os.getenv("WEBHOOK_SECRET"):
+        logging.warning("Попытка несанкционированного доступа к вебхуку!")
+        return web.Response(status=403) # Forbidden
     # ДОБАВЬ ЭТОТ БЛОК ДЛЯ ОТЛАДКИ:
     headers = dict(request.headers)
     logging.info(f"Получены заголовки: {headers}")
@@ -431,7 +435,8 @@ async def on_startup(app):
     scheduler.add_job(send_renewal_reminders, 'cron', hour=10)
     scheduler.start()
     # Вебхук
-    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook")
+    secret = os.getenv("WEBHOOK_SECRET")
+    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
 
 async def on_shutdown(app):
     await bot.close() # Закрываем сессию бота при выключении
