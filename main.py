@@ -289,13 +289,20 @@ async def stripe_webhook(request):
             try:
                 # Разбан
                 await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-                
-                # Обновление БД
+    
+                # ИСПОЛЬЗУЕМ INSERT ON CONFLICT (UPSERT)
                 cur.execute("""
-                    UPDATE users SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days', stripe_subscription_id = %s
-                    WHERE telegram_id = %s;
-                """, (sub_id, int(user_id)))
+                    INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
+                    VALUES (%s, TRUE, NOW() + INTERVAL '30 days', %s)
+                    ON CONFLICT (telegram_id) 
+                    DO UPDATE SET 
+                        paid = TRUE, 
+                        expiry_date = NOW() + INTERVAL '30 days', 
+                        stripe_subscription_id = EXCLUDED.stripe_subscription_id;
+                """, (int(user_id), sub_id))
+    
                 conn.commit()
+                logging.info(f"Данные успешно записаны в БД для {user_id}")
                 
                 # Генерация временной ссылки
                 link = await generate_invite_link()
