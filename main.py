@@ -282,14 +282,6 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
-    provided_token = request.rel_url.query.get('token')
-    if provided_token != os.getenv("WEBHOOK_SECRET"):
-        logging.warning("Попытка несанкционированного доступа к вебхуку!")
-        return web.Response(status=403) # Forbidden
-    # ДОБАВЬ ЭТОТ БЛОК ДЛЯ ОТЛАДКИ:
-    headers = dict(request.headers)
-    logging.info(f"Получены заголовки: {headers}")
-    
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
     logging.info(f"Заголовок Stripe-Signature: {sig_header}")
