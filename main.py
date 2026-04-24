@@ -413,7 +413,7 @@ async def on_shutdown(app):
 
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    app = get_new_configured_app(dispatcher=dp, path='/')
+    app = get_new_configured_app(dispatcher=dp, path='/webhook')    
     app.router.add_post('/stripe-payment', stripe_webhook)    
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown) # <-- Добавь эту строку
