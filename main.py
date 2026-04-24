@@ -11,7 +11,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -132,7 +132,7 @@ async def check_subscriptions():
     cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
     users = cur.fetchall()
     
-    now = datetime.now()
+    now = datetime.utcnow()
     for user_id, expiry in users:
         # Если срок истек
         if expiry < now:
@@ -398,7 +398,7 @@ async def on_startup(app):
     scheduler.add_job(send_renewal_reminders, 'cron', hour=10)
     scheduler.start()
     # Вебхук
-    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/bot")
+    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook")
 
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
