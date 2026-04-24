@@ -172,15 +172,28 @@ async def broadcast(message: types.Message):
     cur = conn.cursor()
     cur.execute("SELECT telegram_id FROM users")
     users = cur.fetchall()
+    
+    success_count = 0
+    blocked_count = 0
+    
     for user in users:
-        try: await bot.send_message(user[0], text)
-        except: continue
-    await message.answer("Рассылка завершена.")
+        try: 
+            await bot.send_message(user[0], text)
+            success_count += 1
+        except BotBlocked:
+            blocked_count += 1
+        except Exception as e:
+            logging.error(f"Ошибка отправки пользователю {user[0]}: {e}")
+            
+    cur.close()
+    conn.close()
+    await message.answer(f"Рассылка завершена. Успешно: {success_count}, заблокировали бота: {blocked_count}.")
 
 # --- ХЕНДЛЕРЫ ---
 # --- 1. ПРИВЕТСТВИЕ (ФОТО) ---
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
+    await state.finish()
     await RegistrationStates.intro.set()
     text = """Приветствую! Добро пожаловать в закрытый клуб Натальи Ребковец.
 
@@ -329,9 +342,15 @@ async def stripe_webhook(request):
                 # Генерация временной ссылки
                 link = await generate_invite_link()
                 if link:
-                    await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
+                    try:
+                        await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
+                    except BotBlocked:
+                        logging.warning(f"Оплата принята, но пользователь {user_id} заблокировал бота.")
                 else:
-                    await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha, мы всё исправим!")
+                    try:
+                        await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha, мы всё исправим!")
+                    except BotBlocked:
+                        logging.warning(f"Ошибка оплаты (нет ссылки), но пользователь {user_id} заблокировал бота.")
             
             except Exception as e:
                 logging.error(f"Ошибка обработки успешной оплаты: {e}")
@@ -365,8 +384,11 @@ async def send_renewal_reminders():
                 await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
                 # 2. Обновляем статус в БД
                 cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (telegram_id,))
-                await bot.send_message(telegram_id, "Ваша подписка истекла. Доступ в клуб ограничен.")
-                logging.info(f"Пользователь {telegram_id} исключен.")
+                # 3. Отправляем сообщение (с защитой!)
+                try:
+                    await bot.send_message(telegram_id, "Ваша подписка истекла. Доступ в клуб ограничен.")
+                except BotBlocked:
+                    logging.info(f"Пользователь {telegram_id} заблокировал бота, уведомление не отправлено.")
             except Exception as e:
                 logging.error(f"Не удалось исключить {telegram_id}: {e}")
         
