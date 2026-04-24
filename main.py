@@ -339,7 +339,9 @@ async def send_renewal_reminders():
     except Exception as e:
         logging.error(f"Ошибка проверки подписок: {e}")
 
-@dp.message_handler(commands=['profile'])
+# --- ОБНОВЛЕННЫЕ ХЕНДЛЕРЫ ---
+
+@dp.message_handler(commands=['profile'], state='*') # Добавили state='*'
 async def profile(message: types.Message):
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
     cur = conn.cursor()
@@ -353,10 +355,8 @@ async def profile(message: types.Message):
     else:
         expiry = user[1].strftime('%d.%m.%Y')
         text = f"Ваша подписка активна до: {expiry}\n\nХотите отменить автопродление?"
-        
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
-        
         await message.answer(text, reply_markup=keyboard)
 
 @dp.callback_query_handler(text="cancel_subscription")
@@ -386,7 +386,7 @@ async def cancel_subscription(callback: types.CallbackQuery):
 
 # --- ОБРАБОТКА ПОМОЩИ ---
 # Обработка команды /help (если пользователь напишет это сам)
-@dp.message_handler(commands=['help'])
+@dp.message_handler(commands=['help'], state='*') # Добавили state='*'
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам можно связаться с @re_tasha")
 
