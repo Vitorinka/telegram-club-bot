@@ -153,7 +153,7 @@ async def check_subscriptions():
 # --- ХЕНДЛЕРЫ ---
 @dp.message_handler(commands=['broadcast'])
 async def broadcast(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
+    if message.from_user.id not in ADMIN_IDS: return
     text = message.text.replace('/broadcast ', '')
     conn = get_db_conn()
     cur = conn.cursor()
@@ -402,7 +402,7 @@ async def on_startup(app):
 
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    app = get_new_configured_app(dispatcher=dp, path='/bot')
+    app = get_new_configured_app(dispatcher=dp, path='/')
     app.router.add_post('/webhook', stripe_webhook)
     app.on_startup.append(on_startup)
     port = int(os.environ.get("PORT", 8080))
