@@ -354,18 +354,18 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     await callback_query.answer()
 
 # --- БЕЗОПАСНАЯ ЗАМЕНА СООБЩЕНИЯ ---
-        try:
-            # Сначала пробуем изменить подпись, как вы и хотели
-            await callback_query.message.edit_caption(
-                caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-                reply_markup=kb
-            )
-        except Exception:
-            # Если не получилось (нет подписи), просто меняем текст сообщения
-            await callback_query.message.edit_text(
-                text=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-                reply_markup=kb
-            )
+    try:
+        # Сначала пробуем изменить подпись, как вы и хотели
+        await callback_query.message.edit_caption(
+            caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
+            reply_markup=kb
+        )
+    except Exception:
+        # Если не получилось (нет подписи), просто меняем текст сообщения
+        await callback_query.message.edit_text(
+            text=f"✅ Вы выбрали тариф. Переходите к оплате:", 
+            reply_markup=kb
+        )
 
 # --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
 @dp.callback_query_handler(text="cancel_subscription", state='*')
