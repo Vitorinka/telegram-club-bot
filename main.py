@@ -284,11 +284,8 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
-    logging.info(f"Заголовок Stripe-Signature: {sig_header}")
-    payload = await request.read()
-    sig_header = request.headers.get('Stripe-Signature')
     
-    # 1. Проверка подписи
+    # 1. Проверка подписи Stripe
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -302,99 +299,88 @@ async def stripe_webhook(request):
         session = event.data.object
         user_id = session.client_reference_id
         
-        # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ID ПОДПИСКИ
-        sub_id = getattr(session, 'subscription', None)
+        if not user_id:
+            return web.Response(status=200)
+
+        # Подключаемся к БД
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        cur = conn.cursor()
         
-        if user_id:
-            # --- ЗАЩИТА ОТ СПАМА (ПРОВЕРКА БД) ---
-            conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-            cur = conn.cursor()
+        try:
+            # Защита от дублей (если вебхук пришел дважды)
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             
-            # Если юзер уже есть и у него paid = TRUE, ничего не делаем, чтобы не спамить
+            # Если юзер уже есть и оплата была — проверяем, нужно ли слать уведомление
+            # Если нужно разрешить повторную оплату, можно убрать этот блок или изменить логику
             if row and row[0] is True:
-                cur.close()
-                conn.close()
-                return web.Response(status=200)
+                # Можно добавить логирование, что вебхук повторный
+                logging.info(f"Повторный вебхук для {user_id}, пропускаем отправку сообщения.")
             
-            # --- ОБРАБОТКА ОПЛАТЫ ---
+            # ОПРЕДЕЛЕНИЕ ТАРИФА
             try:
-                # Разбан
-                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-    
-                # ИСПОЛЬЗУЕМ INSERT ON CONFLICT (UPSERT)
-                cur.execute("""
-                    INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
-                    VALUES (%s, TRUE, NOW() + INTERVAL '30 days', %s)
-                    ON CONFLICT (telegram_id) 
-                    DO UPDATE SET 
-                        paid = TRUE, 
-                        expiry_date = NOW() + INTERVAL '30 days', 
-                        stripe_subscription_id = EXCLUDED.stripe_subscription_id;
-                """, (int(user_id), sub_id))
-    
-                conn.commit()
-                logging.info(f"Данные успешно записаны в БД для {user_id}")
-                
-                # Генерация временной ссылки
-                link = await generate_invite_link()
-                if link:
-                    try:
-                        await bot.send_message(user_id, f"✅ Оплата прошла успешно! Ваша ссылка в клуб: {link}")
-                    except BotBlocked:
-                        logging.warning(f"Оплата принята, но пользователь {user_id} заблокировал бота.")
-                else:
-                    try:
-                        await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha, мы всё исправим!")
-                    except BotBlocked:
-                        logging.warning(f"Ошибка оплаты (нет ссылки), но пользователь {user_id} заблокировал бота.")
+                line_items = stripe.checkout.Session.list_line_items(session.id)
+                price_id = line_items.data[0].price.id
+                duration_map = {
+                    os.getenv("PRICE_TRIAL"): 7,
+                    os.getenv("PRICE_1M"): 30,
+                    os.getenv("PRICE_6M"): 180,
+                    os.getenv("PRICE_12M"): 365
+                }
+                days = duration_map.get(price_id, 30)
+                interval_query = f"{days} days"
+            except:
+                days = 30
+                interval_query = "30 days"
             
-            except Exception as e:
-                logging.error(f"Ошибка обработки успешной оплаты: {e}")
-                await bot.send_message(user_id, "Произошла ошибка при начислении доступа. Пожалуйста, напишите @re_tasha, мы всё проверим.")
+            sub_id = getattr(session, 'subscription', None)
+
+            # ОБНОВЛЕНИЕ БАЗЫ (UPSERT с логикой продления)
+            sql = f"""
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
+                VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s)
+                ON CONFLICT (telegram_id) 
+                DO UPDATE SET 
+                    paid = TRUE, 
+                    expiry_date = CASE 
+                        WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
+                        ELSE NOW() + INTERVAL '{interval_query}'
+                    END,
+                    stripe_subscription_id = EXCLUDED.stripe_subscription_id;
+            """
+            cur.execute(sql, (int(user_id), sub_id))
+            conn.commit()
+
+            # РАЗБАН И ССЫЛКА
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
+            link = await generate_invite_link()
+            if link:
+                try:
+                    await bot.send_message(user_id, f"✅ Оплата прошла успешно! Доступ продлен на {days} дней. Ваша ссылка: {link}")
+                except BotBlocked:
+                    logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
+            else:
+                await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha!")
+
+        except Exception as e:
+            logging.error(f"Критическая ошибка в Stripe Webhook: {e}")
+            conn.rollback() # Откатываем транзакцию при ошибке
+        finally:
             cur.close()
             conn.close()
 
-    # 3. Обработка ошибок (сессия истекла или оплата не прошла)
+    # 3. Обработка истечения
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
         session = event.data.object
         user_id = session.client_reference_id
         if user_id:
-            await bot.send_message(user_id, "❌ Оплата не прошла или сессия истекла. Если деньги списались, пожалуйста, напишите @re_tasha и пришлите чек.")
+            try:
+                await bot.send_message(user_id, "❌ Оплата не прошла. Если деньги списались, напишите @re_tasha")
+            except:
+                pass
 
     return web.Response(status=200)
-
-async def send_renewal_reminders():
-    logging.info("Запуск проверки истекших подписок...")
-    try:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-        cur = conn.cursor()
-        # Ищем тех, у кого срок истек
-        cur.execute("SELECT telegram_id FROM users WHERE expiry_date < NOW() AND paid = TRUE")
-        expired_users = cur.fetchall()
-
-        for user in expired_users:
-            telegram_id = user[0]
-            try:
-                # 1. Кикаем из группы (ban в Telegram удаляет пользователя и запрещает вход)
-                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
-                # 2. Обновляем статус в БД
-                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (telegram_id,))
-                # 3. Отправляем сообщение (с защитой!)
-                try:
-                    await bot.send_message(telegram_id, "Ваша подписка истекла. Доступ в клуб ограничен.")
-                except BotBlocked:
-                    logging.info(f"Пользователь {telegram_id} заблокировал бота, уведомление не отправлено.")
-            except Exception as e:
-                logging.error(f"Не удалось исключить {telegram_id}: {e}")
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Ошибка проверки подписок: {e}")
 
 # --- ОБНОВЛЕННЫЕ ХЕНДЛЕРЫ ---
 
