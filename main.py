@@ -451,21 +451,25 @@ async def stripe_webhook(request):
                 logging.error(f"Ошибка определения тарифа: {e}. Ставим 30 дней по умолчанию.")
                 days = 30
                 interval_query = "30 days"
+                
+            should_auto_renew = (price_id != os.getenv("PRICE_TRIAL"))
 
             # 2. ОБНОВЛЕНИЕ БАЗЫ
             sql = f"""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
-                VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s)
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
+                VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s, %s)
                 ON CONFLICT (telegram_id) 
                 DO UPDATE SET 
                     paid = TRUE, 
+                    auto_renew = EXCLUDED.auto_renew, -- Обновляем статус при покупке
                     expiry_date = CASE 
                         WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
                         ELSE NOW() + INTERVAL '{interval_query}'
                     END,
-                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id);
+                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id);
             """
-            cur.execute(sql, (int(user_id), sub_id))
+            # Обратите внимание, добавился третий аргумент в execute: should_auto_renew
+            cur.execute(sql, (int(user_id), sub_id, should_auto_renew))
             conn.commit()
 
             # 3. РАЗБАН И ОТПРАВКА СООБЩЕНИЯ
