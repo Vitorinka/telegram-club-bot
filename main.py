@@ -485,22 +485,22 @@ async def stripe_webhook(request):
         conn = get_db_conn()
         cur = conn.cursor()
         try:
+            # Получаем объект подписки
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- ОТЛАДКА И БЕЗОПАСНОЕ ЧТЕНИЕ ---
-            # Логируем, чтобы увидеть структуру объекта в консоли
-            logging.info(f"DEBUG: Полный объект подписки: {subscription}")
+            # --- ПРИНУДИТЕЛЬНОЕ ПРЕОБРАЗОВАНИЕ В СЛОВАРЬ ---
+            # Это исключит ошибки обращения к атрибутам StripeObject
+            sub_data = subscription.to_dict()
             
-            # Используем .get() — это работает и для словарей, и для StripeObject
-            end_timestamp = subscription.get('current_period_end')
+            end_timestamp = sub_data.get('current_period_end')
             
+            # Если поле пустое, логируем ключи, чтобы понять структуру
             if not end_timestamp:
-                # Если всё-таки не нашли, выводим ошибку в логи и выходим
-                logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: У подписки {sub_id} нет поля current_period_end!")
+                logging.error(f"У подписки {sub_id} НЕТ поля current_period_end. Доступные ключи: {list(sub_data.keys())}")
                 return web.Response(status=200)
 
             new_expiry_date = datetime.fromtimestamp(end_timestamp)
-            # ------------------------------------
+            # -----------------------------------------------
             
             cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
@@ -514,7 +514,8 @@ async def stripe_webhook(request):
                     pass
                     
         except Exception as e:
-            logging.error(f"Ошибка в блоке invoice.payment_succeeded: {e}")
+            # Логируем тип ошибки, чтобы точно понимать, где упало
+            logging.error(f"Ошибка в блоке invoice.payment_succeeded: {type(e).__name__} - {str(e)}")
             conn.rollback()
             return web.Response(status=500)
         finally:
