@@ -601,13 +601,14 @@ async def test_expiry(message: types.Message):
 # --- ЗАПУСК ---
 async def on_startup(app):
     init_db()
+    await bot.delete_webhook() 
+    
+    # Затем устанавливаем актуальный
+    secret = os.getenv("WEBHOOK_SECRET")
+    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
     # Используем глобальный scheduler
     scheduler.add_job(send_renewal_reminders, 'cron', hour=10)
     scheduler.start()
-    
-    secret = os.getenv("WEBHOOK_SECRET")
-    # Убедитесь, что YOUR_DOMAIN указан без лишних слэшей в конце
-    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
 
 async def on_shutdown(app):
     # Правильный способ закрытия сессии в Aiogram 2.x
