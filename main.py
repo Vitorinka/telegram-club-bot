@@ -56,12 +56,14 @@ def init_db():
                 telegram_id BIGINT UNIQUE NOT NULL,
                 paid BOOLEAN DEFAULT FALSE,
                 expiry_date TIMESTAMP,
-                stripe_subscription_id TEXT
+                stripe_subscription_id TEXT,
+                reminder_sent BOOLEAN DEFAULT FALSE
             );
         """)
         
         # 2. Добавляем колонку, если её нет
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE;")
         
         conn.commit()
         cur.close()
@@ -636,7 +638,8 @@ async def help_command(message: types.Message):
 async def test_expiry(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
         await message.answer("Запускаю проверку подписок...")
-        await send_renewal_reminders()
+        # Исправлено имя функции здесь:
+        await check_subscriptions_and_reminders() 
         await message.answer("Проверка завершена.")
     else:
         await message.answer("У вас нет прав для этого.")
