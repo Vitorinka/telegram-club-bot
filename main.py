@@ -414,10 +414,11 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
+        # Добавляем вот эту строку:
+        sub_id = session.get('subscription') 
         
         if not user_id:
             return web.Response(status=200)
-
         # Подключаемся к БД
         conn = get_db_conn()
         cur = conn.cursor()
