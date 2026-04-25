@@ -294,7 +294,6 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
     sub_type = callback_query.data
     
-    # Карта цен
     price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
     price_id = os.getenv(price_map.get(sub_type))
     
@@ -313,24 +312,30 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
             client_reference_id=str(callback_query.from_user.id)
         )
         
-        # Меняем кнопки: "Оплатить" и "Назад"
         kb = InlineKeyboardMarkup(row_width=1).add(
             InlineKeyboardButton("💳 Оплатить", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
         )
         
-        # Завершаем FSM, так как пользователь переходит на внешнюю страницу оплаты
         await state.finish() 
         
-        await callback_query.message.edit_caption(
-            caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-            reply_markup=kb
-        )
+        # БЕЗОПАСНАЯ ЗАМЕНА
+        try:
+            await callback_query.message.edit_caption(
+                caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
+                reply_markup=kb
+            )
+        except Exception:
+            await callback_query.message.edit_text(
+                text=f"✅ Вы выбрали тариф. Переходите к оплате:", 
+                reply_markup=kb
+            )
+
     except Exception as e:
-        error_text = f"Критическая ошибка при создании Stripe сессии для пользователя {callback_query.from_user.id}: {e}"
+        error_text = f"Критическая ошибка создания сессии для {callback_query.from_user.id}: {e}"
         logging.error(error_text)
-        await notify_admins(error_text) # <--- ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
-        await callback_query.answer("Произошла ошибка при оплате. Администратор уже оповещен.")
+        await notify_admins(error_text)
+        await callback_query.answer("Ошибка при оплате. Администратор оповещен.")
         
     await callback_query.answer()
 
@@ -352,20 +357,6 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
         reply_markup=kb
     )
     await callback_query.answer()
-
-# --- БЕЗОПАСНАЯ ЗАМЕНА СООБЩЕНИЯ ---
-    try:
-        # Сначала пробуем изменить подпись, как вы и хотели
-        await callback_query.message.edit_caption(
-            caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-            reply_markup=kb
-        )
-    except Exception:
-        # Если не получилось (нет подписи), просто меняем текст сообщения
-        await callback_query.message.edit_text(
-            text=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-            reply_markup=kb
-        )
 
 # --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
 @dp.callback_query_handler(text="cancel_subscription", state='*')
@@ -647,8 +638,8 @@ async def on_shutdown(app):
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/webhook')    
-    app.router.add_post('/stripe-payment', stripe_webhook)    
+    app.router.add_post('/webhook', stripe_webhook)    
     app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown) # <-- Добавь эту строку
+    app.on_shutdown.append(on_shutdown) 
     port = int(os.environ.get("PORT", 8080))
     web.run_app(app, host='0.0.0.0', port=port)
