@@ -414,33 +414,26 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        # Добавляем вот эту строку:
-        sub_id = session.get('subscription') 
+        
+        # Исправление: используем getattr для StripeObject
+        sub_id = getattr(session, 'subscription', None)
         
         if not user_id:
             return web.Response(status=200)
+
         # Подключаемся к БД
         conn = get_db_conn()
         cur = conn.cursor()
 
-        # --- ВОТ ТУТ МЫ НАЧИНАЕМ БЛОК ---
         try:
-            # 1. Защита от дублей
-            cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
-            row = cur.fetchone()
-            
-            if row and row[0] is True:
-                logging.info(f"Повторный вебхук для {user_id}, пропускаем отправку сообщения.")
-            
-            # 2. ОПРЕДЕЛЕНИЕ ТАРИФА
+            # 1. ОПРЕДЕЛЕНИЕ ТАРИФА
             try:
                 line_items = stripe.checkout.Session.list_line_items(session.id)
                 price_id = line_items.data[0].price.id
                 
-                # --- ПРИНУДИТЕЛЬНАЯ ЛОГИКА ---
+                # --- ЛОГИКА ТАРИФОВ ---
                 if price_id == os.getenv("PRICE_TRIAL"):
                     days = 7
-                    logging.info(f"Определен ТРИАЛ (ID: {price_id}). Принудительно ставим 7 дней.")
                 else:
                     duration_map = {
                         os.getenv("PRICE_1M"): 30,
@@ -448,7 +441,6 @@ async def stripe_webhook(request):
                         os.getenv("PRICE_12M"): 365
                     }
                     days = duration_map.get(price_id, 30)
-                    logging.info(f"Определен платный тариф (ID: {price_id}). Ставим {days} дней.")
                 
                 interval_query = f"{days} days"
                 
@@ -457,7 +449,8 @@ async def stripe_webhook(request):
                 days = 30
                 interval_query = "30 days"
 
-            # 3. ОБНОВЛЕНИЕ БАЗЫ
+            # 2. ОБНОВЛЕНИЕ БАЗЫ
+            # Логика: если подписка уже есть, продлеваем её, если нет — создаем новую
             sql = f"""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
                 VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s)
@@ -468,35 +461,39 @@ async def stripe_webhook(request):
                         WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
                         ELSE NOW() + INTERVAL '{interval_query}'
                     END,
-                    stripe_subscription_id = EXCLUDED.stripe_subscription_id;
+                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id);
             """
             cur.execute(sql, (int(user_id), sub_id))
             conn.commit()
 
-            # 4. РАЗБАН И ССЫЛКА
+            # 3. РАЗБАН И ОТПРАВКА СООБЩЕНИЯ (Всегда происходит при успехе)
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
             link = await generate_invite_link()
+            message_text = f"✅ Оплата прошла успешно! Ваша подписка продлена на {days} дней."
+            
             if link:
-                try:
-                    await bot.send_message(user_id, f"✅ Оплата прошла успешно! Доступ продлен на {days} дней. Ваша ссылка: {link}")
-                except BotBlocked:
-                    logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
+                message_text += f"\n\nВаша ссылка для доступа: {link}"
             else:
-                await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha!")
+                message_text += "\n\n(Ссылка не сгенерировалась, свяжитесь с администратором)"
+            
+            try:
+                await bot.send_message(user_id, message_text)
+                logging.info(f"Уведомление об оплате отправлено пользователю {user_id}")
+            except BotBlocked:
+                logging.warning(f"Оплата принята, но пользователь {user_id} заблокировал бота.")
 
-        # --- А ВОТ ТУТ МЫ ЛОВИМ ОШИБКИ ---
         except Exception as e:
             error_text = f"Ошибка в обработке платежа (Stripe Webhook) для пользователя {user_id}: {e}"
             logging.error(error_text)
             await notify_admins(error_text) 
-            conn.rollback() # Откатываем транзакцию
+            conn.rollback() # Откатываем транзакцию при ошибке
             
         finally:
             cur.close()
             conn.close()
 
-    # 3. Обработка истечения
+    # 3. Обработка ошибок оплаты/истечения
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
         session = event.data.object
         user_id = session.client_reference_id
