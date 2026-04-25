@@ -595,11 +595,10 @@ async def profile(message: types.Message):
         await message.answer("У вас пока нет активной подписки. Нажмите /start, чтобы оформить её.")
     else:
         expiry_date = user[1]
-        days_left = (expiry_date - datetime.utcnow()).days
-        
-        days_text = "меньше 1 дня" if days_left <= 0 else f"{days_left} дн."
+        # Форматируем дату в красивый вид (день.месяц.год)
+        date_text = expiry_date.strftime("%d.%m.%Y")
 
-        text = f"✅ Ваша подписка активна.\n⏳ Истекает через: {days_text}\n\nХотите продлить доступ?"
+        text = f"✅ Ваша подписка активна.\n📅 Действует до: {date_text}\n\nХотите продлить доступ?"
         
         keyboard = InlineKeyboardMarkup(row_width=1)
         # Кнопка продления есть у всех
