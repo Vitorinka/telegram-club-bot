@@ -292,6 +292,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 # --- 5. ВЫБОР ТАРИФА И ОПЛАТА ---
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer()
     sub_type = callback_query.data
     
     price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
