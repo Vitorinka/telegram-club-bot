@@ -354,7 +354,7 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
 async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
     
-    # Проверяем, платил ли пользователь раньше
+    # 1. Проверяем, платил ли пользователь раньше
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (callback_query.from_user.id,))
@@ -362,32 +362,19 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     cur.close()
     conn.close()
     
-    # Если пользователь найден и paid=True (значит, он уже клиент) -> убираем триал
+    # 2. Собираем клавиатуру (триал будет только у того, кто еще не paid)
     is_client = user and user[0] is True
     kb = get_tariffs_keyboard(show_trial=not is_client)
     
     text = "Выберите свой формат участия:"
 
+    # 3. Редактируем сообщение (безопасный вариант)
     try:
+        # Пытаемся редактировать как фото с подписью
         await callback_query.message.edit_caption(caption=text, reply_markup=kb)
     except Exception:
+        # Если это не фото, а просто текст — редактируем как текст
         await callback_query.message.edit_text(text=text, reply_markup=kb)
-        
-    await callback_query.answer()
-
-    # БЕЗОПАСНАЯ ЗАМЕНА
-    try:
-        # Пытаемся отредактировать как фото (с подписью)
-        await callback_query.message.edit_caption(
-            caption=text, 
-            reply_markup=kb
-        )
-    except Exception:
-        # Если не получилось (значит это просто текст), редактируем как обычное сообщение
-        await callback_query.message.edit_text(
-            text=text, 
-            reply_markup=kb
-        )
         
     await callback_query.answer()
 
