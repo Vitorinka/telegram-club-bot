@@ -475,49 +475,53 @@ async def stripe_webhook(request):
             conn.close()
 
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
-    # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
         sub_id = getattr(invoice, 'subscription', None)
         
         if not sub_id:
+            logging.info("DEBUG: Нет sub_id в инвойсе.")
             return web.Response(status=200)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
-            end_timestamp = getattr(subscription, 'current_period_end', None)
+            
+            # --- ДИАГНОСТИКА ---
+            logging.info(f"DEBUG: Тип объекта subscription: {type(subscription)}")
+            # Пробуем получить значение через dict (если Stripe вернул словарь) или через атрибут
+            if isinstance(subscription, dict):
+                end_timestamp = subscription.get('current_period_end')
+            else:
+                end_timestamp = getattr(subscription, 'current_period_end', None)
             
             if not end_timestamp:
-                logging.error(f"DEBUG: У подписки {sub_id} НЕТ current_period_end")
+                logging.error(f"DEBUG: У подписки {sub_id} значение current_period_end пустое или отсутствует. Объект: {subscription}")
                 return web.Response(status=200)
 
             new_expiry_date = datetime.fromtimestamp(end_timestamp)
+            # --------------------
 
-            # 1. Ищем, кому принадлежит эта подписка
+            # Ищем пользователя
             cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
             user = cur.fetchone()
             
             if user:
                 telegram_id = user[0]
-                # 2. Обновляем
                 cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
                 conn.commit()
                 logging.info(f"Успешно продлили подписку для {telegram_id} до {new_expiry_date}")
                 
-                # 3. ОТПРАВЛЯЕМ СООБЩЕНИЕ С СЕРДЕЧКОМ И ОБРАБОТКОЙ БЛОКИРОВКИ
                 try:
                     await bot.send_message(telegram_id, f"✅ Ваша подписка успешно продлена! Новый доступ открыт до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
                 except BotBlocked:
-                    logging.warning(f"Оплата прошла, но не удалось отправить сообщение: пользователь {telegram_id} заблокировал бота.")
-                except Exception as e:
-                    logging.error(f"Ошибка при отправке сообщения в Telegram для {telegram_id}: {e}")
+                    logging.warning(f"Пользователь {telegram_id} заблокировал бота.")
             else:
-                logging.warning(f"ОПЛАТА ПОЛУЧЕНА, но пользователь с подпиской {sub_id} не найден в БД!")
+                logging.warning(f"Оплата получена, но в базе нет записи с stripe_subscription_id = {sub_id}")
                 
         except Exception as e:
-            logging.error(f"Критическая ошибка в обработке: {e}")
+            logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: {type(e).__name__}: {str(e)}")
             conn.rollback()
         finally:
             cur.close()
