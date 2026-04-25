@@ -467,6 +467,39 @@ async def stripe_webhook(request):
         finally:
             cur.close()
             conn.close()
+    
+    elif event.type == 'invoice.payment_succeeded':
+        invoice = event.data.object
+        sub_id = invoice.subscription
+        
+        if sub_id:
+            # Нам нужно найти пользователя в БД по его подписке
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                # Находим пользователя, у которого такой sub_id
+                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                row = cur.fetchone()
+                
+                if row:
+                    user_id = row[0]
+                    # Обновляем дату истечения (например, продлеваем еще на 30 дней)
+                    # Вы можете адаптировать этот запрос под вашу логику
+                    cur.execute("""
+                        UPDATE users 
+                        SET expiry_date = expiry_date + INTERVAL '30 days' 
+                        WHERE stripe_subscription_id = %s
+                    """, (sub_id,))
+                    conn.commit()
+                    
+                    # Отправляем радостное сообщение
+                    await bot.send_message(user_id, "✅ Ваша подписка успешно продлена автоматически! Спасибо, что остаетесь с нами. ❤️")
+                    logging.info(f"Автопродление: уведомление отправлено пользователю {user_id}")
+            except Exception as e:
+                logging.error(f"Ошибка обработки автопродления: {e}")
+            finally:
+                cur.close()
+                conn.close()
 
     # Обработка ошибок/истечений
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
