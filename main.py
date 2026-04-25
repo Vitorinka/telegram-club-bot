@@ -62,8 +62,9 @@ def init_db():
         """)
         
         # 2. Добавляем колонку, если её нет
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;")
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;")
         
         conn.commit()
         cur.close()
@@ -119,34 +120,56 @@ async def check_subscriptions_and_reminders():
     logging.info("--- Запуск ежедневной проверки подписок ---")
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
+    # Выбираем всех активных
+    cur.execute("SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent FROM users WHERE paid = TRUE")
     users = cur.fetchall()
     
     now = datetime.utcnow()
     
-    for telegram_id, expiry in users:
+    for telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent in users:
         time_left = expiry - now
         
-        # 1. Если срок истек — баним
+        # 1. Сценарий: Срок действия истек
         if time_left < timedelta(0):
-            try:
-                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
-                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (telegram_id,))
-                await bot.send_message(telegram_id, "⚠️ Ваша подписка истекла. Доступ закрыт. Выберите тариф для продления:", reply_markup=get_tariffs_keyboard(show_trial=False))
-                logging.info(f"Пользователь {telegram_id} исключен.")
-            except Exception as e:
-                logging.error(f"Ошибка при бане {telegram_id}: {e}")
+            
+            # А) Если была ошибка оплаты — даем льготный период (Grace Period)
+            if payment_failed:
+                if grace_end is None:
+                    # Даем 24 часа (до конца дня)
+                    deadline = now + timedelta(days=1)
+                    cur.execute("UPDATE users SET grace_period_end = %s WHERE telegram_id = %s", (deadline, telegram_id))
+                    await bot.send_message(telegram_id, "⚠️ Оплата вашей подписки не прошла. Пожалуйста, пополните карту до конца дня, чтобы доступ не был ограничен.")
+                
+                # Если время вышло и после grace period
+                elif now > grace_end:
+                    await ban_user_logic(telegram_id, cur) # Функция-хелпер (см. ниже)
+            
+            # Б) Если всё было ок, но срок вышел — просто баним
+            else:
+                await ban_user_logic(telegram_id, cur)
         
-        # 2. Если осталось меньше 48 часов — напоминаем
+        # 2. Сценарий: Срок заканчивается (напоминание)
         elif timedelta(0) < time_left < timedelta(days=2):
-            try:
-                await bot.send_message(telegram_id, "⏳ Ваша подписка заканчивается менее чем через 48 часов! Продлите доступ, чтобы не потерять прогресс.", reply_markup=get_tariffs_keyboard(show_trial=False))
-            except BotBlocked:
-                logging.info(f"Пользователь {telegram_id} заблокировал бота.")
+            # Шлем напоминание ТОЛЬКО если нет автопродления и еще не напоминали
+            if not auto_renew and not reminder_sent:
+                try:
+                    await bot.send_message(telegram_id, "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ вручную.", reply_markup=get_tariffs_keyboard(show_trial=False))
+                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                except BotBlocked:
+                    pass
     
     conn.commit()
     cur.close()
     conn.close()
+
+# Хелпер для бана (чтобы не дублировать код)
+async def ban_user_logic(telegram_id, cur):
+    try:
+        await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
+        cur.execute("UPDATE users SET paid = FALSE, payment_failed = FALSE, grace_period_end = NULL, reminder_sent = FALSE WHERE telegram_id = %s", (telegram_id,))
+        await bot.send_message(telegram_id, "⚠️ Ваша подписка истекла. Доступ закрыт.")
+    except Exception as e:
+        logging.error(f"Ошибка при бане {telegram_id}: {e}")
 
 async def notify_admins(text: str):
     for admin_id in ADMIN_IDS:
@@ -506,6 +529,33 @@ async def stripe_webhook(request):
             finally:
                 cur.close()
                 conn.close()
+
+    elif event.type == 'customer.subscription.updated':
+        sub = event.data.object
+        # Если пользователь отменил автопродление, Stripe пришлет True в поле cancel_at_period_end
+        is_cancelled = sub.cancel_at_period_end
+        
+        conn = get_db_conn()
+        cur = conn.cursor()
+        # Если is_cancelled = True, значит auto_renew = False (инвертируем логику)
+        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (not is_cancelled, sub.id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Статус автопродления обновлен для {sub.id}: {'Включено' if not is_cancelled else 'Отключено'}")
+                
+    elif event.type == 'invoice.payment_failed':
+        invoice = event.data.object
+        sub_id = invoice.subscription
+        
+        conn = get_db_conn()
+        cur = conn.cursor()
+        # Ставим флаг, что оплата не прошла
+        cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Оплата не прошла для подписки {sub_id}")
 
     # Обработка ошибок/истечений
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
