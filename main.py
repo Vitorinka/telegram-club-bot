@@ -474,31 +474,43 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ
+    # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        sub_id = invoice.subscription
-        if invoice.billing_reason == 'subscription_create': return web.Response(status=200)
+        # Безопасное получение ID подписки
+        sub_id = getattr(invoice, 'subscription', None)
+        
+        # Если это не подписка (нет sub_id), просто выходим, это не наша оплата
+        if not sub_id:
+            logging.info(f"Инвойс {invoice.id} не является подпиской, пропускаем.")
+            return web.Response(status=200)
 
-        if sub_id:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            try:
-                subscription = stripe.Subscription.retrieve(sub_id)
-                new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
-                cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
-                conn.commit()
-                
-                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-                row = cur.fetchone()
-                if row:
+        if invoice.billing_reason == 'subscription_create': 
+            return web.Response(status=200)
+
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            subscription = stripe.Subscription.retrieve(sub_id)
+            new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
+            
+            cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
+            conn.commit()
+            
+            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+            row = cur.fetchone()
+            if row:
+                try:
                     await bot.send_message(row[0], f"✅ Ваша подписка успешно продлена! Доступ активен до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
-            except Exception as e:
-                logging.error(f"Ошибка синхронизации даты: {e}")
-                conn.rollback()
-            finally:
-                cur.close()
-                conn.close()
+                except Exception:
+                    pass # Если пользователь заблокировал бота, не роняем скрипт
+        except Exception as e:
+            logging.error(f"Ошибка синхронизации даты инвойса: {e}")
+            conn.rollback()
+            return web.Response(status=500) # Пусть Stripe попробует снова
+        finally:
+            cur.close()
+            conn.close()
 
     # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
     elif event.type == 'customer.subscription.updated':
