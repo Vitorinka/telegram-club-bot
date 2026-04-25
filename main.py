@@ -477,22 +477,26 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        # Безопасное получение ID подписки
         sub_id = getattr(invoice, 'subscription', None)
         
-        # Если это не подписка (нет sub_id), просто выходим, это не наша оплата
         if not sub_id:
             logging.info(f"Инвойс {invoice.id} не является подпиской, пропускаем.")
-            return web.Response(status=200)
-
-        if invoice.billing_reason == 'subscription_create': 
             return web.Response(status=200)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
-            new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
+            
+            # --- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
+            # Проверяем, есть ли поле current_period_end
+            if hasattr(subscription, 'current_period_end'):
+                new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
+            else:
+                # Если даты нет, логируем весь объект, чтобы понять, что прислал Stripe
+                logging.error(f"У полученной подписки {sub_id} нет поля current_period_end! Объект: {subscription}")
+                return web.Response(status=200) # Пропускаем, чтобы не спамить ошибками
+            # ----------------------------------
             
             cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
@@ -503,11 +507,12 @@ async def stripe_webhook(request):
                 try:
                     await bot.send_message(row[0], f"✅ Ваша подписка успешно продлена! Доступ активен до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
                 except Exception:
-                    pass # Если пользователь заблокировал бота, не роняем скрипт
+                    pass
+                    
         except Exception as e:
             logging.error(f"Ошибка синхронизации даты инвойса: {e}")
             conn.rollback()
-            return web.Response(status=500) # Пусть Stripe попробует снова
+            return web.Response(status=500)
         finally:
             cur.close()
             conn.close()
