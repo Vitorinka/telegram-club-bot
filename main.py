@@ -507,44 +507,50 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
     
-    elif event.type == 'invoice.payment_succeeded':
-        invoice = event.data.object
-        sub_id = invoice.subscription
+        elif event.type == 'invoice.payment_succeeded':
+            invoice = event.data.object
+            sub_id = invoice.subscription
 
-        if invoice.billing_reason == 'subscription_create':
-            return web.Response(status=200)
+            # Игнорируем создание, так как это обрабатывается в checkout.session.completed
+            if invoice.billing_reason == 'subscription_create':
+                return web.Response(status=200)
 
-        conn = get_db_conn()
-        cur = conn.cursor()
-        
-        if sub_id:
-            # Нам нужно найти пользователя в БД по его подписке
-            conn = get_db_conn()
-            cur = conn.cursor()
-            try:
-                # Находим пользователя, у которого такой sub_id
-                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-                row = cur.fetchone()
+            if sub_id:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    # 1. Запрашиваем актуальные данные подписки из Stripe
+                    subscription = stripe.Subscription.retrieve(sub_id)
                 
-                if row:
-                    user_id = row[0]
-                    # Обновляем дату истечения (например, продлеваем еще на 30 дней)
-                    # Вы можете адаптировать этот запрос под вашу логику
+                    # 2. Получаем дату окончания следующего периода из Stripe
+                    period_end_timestamp = subscription.current_period_end
+                    new_expiry_date = datetime.fromtimestamp(period_end_timestamp)
+
+                    # 3. Обновляем базу данных точной датой
                     cur.execute("""
                         UPDATE users 
-                        SET expiry_date = expiry_date + INTERVAL '30 days' 
+                        SET expiry_date = %s 
                         WHERE stripe_subscription_id = %s
-                    """, (sub_id,))
+                    """, (new_expiry_date, sub_id))
+                
                     conn.commit()
-                    
-                    # Отправляем радостное сообщение
-                    await bot.send_message(user_id, "✅ Ваша подписка успешно продлена автоматически! Спасибо, что остаетесь с нами. ❤️")
-                    logging.info(f"Автопродление: уведомление отправлено пользователю {user_id}")
-            except Exception as e:
-                logging.error(f"Ошибка обработки автопродления: {e}")
-            finally:
-                cur.close()
-                conn.close()
+                
+                    # Отправляем сообщение
+                    # Находим telegram_id для отправки уведомления
+                    cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                    row = cur.fetchone()
+                    if row:
+                        user_id = row[0]
+                        await bot.send_message(user_id, "✅ Ваша подписка успешно продлена! Доступ активен до " + new_expiry_date.strftime("%d.%m.%Y") + ". ❤️")
+                
+                    logging.info(f"Подписка {sub_id} продлена до {new_expiry_date}")
+            
+                except Exception as e:
+                    logging.error(f"Ошибка синхронизации даты при автопродлении: {e}")
+                    conn.rollback()
+                finally:
+                    cur.close()
+                    conn.close()
 
     elif event.type == 'customer.subscription.updated':
         sub = event.data.object
