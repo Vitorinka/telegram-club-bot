@@ -405,7 +405,6 @@ async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
     
-    # 1. Проверка подписи Stripe
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -414,199 +413,124 @@ async def stripe_webhook(request):
         logging.error(f"Ошибка проверки подписи Stripe: {e}")
         return web.Response(status=400)
 
-    # 2. Обработка успешного платежа
+    # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        
-        # Безопасное получение sub_id
         sub_id = getattr(session, 'subscription', None)
         
-        if not user_id:
-            return web.Response(status=200)
+        if not user_id: return web.Response(status=200)
 
-        # Подключаемся к БД
         conn = get_db_conn()
         cur = conn.cursor()
-
         try:
-            # ПРОВЕРКА: является ли пользователь уже "оплатившим"
+            # Проверка, был ли пользователь уже в БД
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
-            # 1. ОПРЕДЕЛЕНИЕ ТАРИФА
-            try:
-                line_items = stripe.checkout.Session.list_line_items(session.id)
-                price_id = line_items.data[0].price.id
-                
-                # Логика тарифов
-                if price_id == os.getenv("PRICE_TRIAL"):
-                    days = 7
-                else:
-                    duration_map = {
-                        os.getenv("PRICE_1M"): 30,
-                        os.getenv("PRICE_6M"): 180,
-                        os.getenv("PRICE_12M"): 365
-                    }
-                    days = duration_map.get(price_id, 30)
-                
-                interval_query = f"{days} days"
-                
-            except Exception as e:
-                logging.error(f"Ошибка определения тарифа: {e}. Ставим 30 дней по умолчанию.")
-                days = 30
-                interval_query = "30 days"
-                
-            should_auto_renew = (price_id != os.getenv("PRICE_TRIAL"))
+            # Получаем дату окончания из Stripe (работает универсально для всех тарифов)
+            sub = stripe.Subscription.retrieve(sub_id)
+            expiry_date = datetime.fromtimestamp(sub.current_period_end)
 
-            # 2. ОБНОВЛЕНИЕ БАЗЫ
-            sql = f"""
+            cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
-                VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s, %s)
-                ON CONFLICT (telegram_id) 
-                DO UPDATE SET 
+                VALUES (%s, TRUE, %s, %s, TRUE)
+                ON CONFLICT (telegram_id) DO UPDATE SET 
                     paid = TRUE, 
-                    auto_renew = EXCLUDED.auto_renew, -- Обновляем статус при покупке
-                    expiry_date = CASE 
-                        WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
-                        ELSE NOW() + INTERVAL '{interval_query}'
-                    END,
-                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id);
-            """
-            # Обратите внимание, добавился третий аргумент в execute: should_auto_renew
-            cur.execute(sql, (int(user_id), sub_id, should_auto_renew))
+                    expiry_date = EXCLUDED.expiry_date,
+                    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
+                    auto_renew = TRUE;
+            """, (int(user_id), expiry_date, sub_id))
             conn.commit()
 
-            # 3. РАЗБАН И ОТПРАВКА СООБЩЕНИЯ
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
-            # Формируем текст в зависимости от того, новый пользователь или старый
+            # Разная логика сообщений для новых и старых
             if is_existing_user:
-                message_text = f"✅ Ваша подписка успешно продлена на {days} дней. Спасибо, что остаетесь с нами! Желаем вам отличного настроения и море вдохновения. ❤️"
+                message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. Спасибо, что остаетесь с нами! ❤️"
             else:
                 link = await generate_invite_link()
-                if link:
-                    message_text = f"✅ Оплата прошла успешно! Доступ открыт на {days} дней. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! Мы очень рады, что вы теперь с нами. ❤️"
-                else:
-                    message_text = "✅ Оплата прошла успешно! Доступ открыт. (Ссылка не сгенерировалась, свяжитесь с администратором!) ❤️"
+                message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
             
             try:
                 await bot.send_message(user_id, message_text)
-                logging.info(f"Уведомление об оплате отправлено пользователю {user_id}")
             except BotBlocked:
                 logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
 
         except Exception as e:
             error_text = f"Ошибка в обработке платежа для {user_id}: {e}"
             logging.error(error_text)
-            await notify_admins(error_text) 
-            conn.rollback() 
-            
+            await notify_admins(error_text) # Оповещаем админа об ошибке
+            conn.rollback()
         finally:
             cur.close()
             conn.close()
-    
-        elif event.type == 'invoice.payment_succeeded':
-            invoice = event.data.object
-            sub_id = invoice.subscription
 
-            # Игнорируем создание, так как это обрабатывается в checkout.session.completed
-            if invoice.billing_reason == 'subscription_create':
-                return web.Response(status=200)
+    # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ
+    elif event.type == 'invoice.payment_succeeded':
+        invoice = event.data.object
+        sub_id = invoice.subscription
+        if invoice.billing_reason == 'subscription_create': return web.Response(status=200)
 
-            if sub_id:
-                conn = get_db_conn()
-                cur = conn.cursor()
-                try:
-                    # 1. Запрашиваем актуальные данные подписки из Stripe
-                    subscription = stripe.Subscription.retrieve(sub_id)
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                subscription = stripe.Subscription.retrieve(sub_id)
+                new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
+                cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
+                conn.commit()
                 
-                    # 2. Получаем дату окончания следующего периода из Stripe
-                    period_end_timestamp = subscription.current_period_end
-                    new_expiry_date = datetime.fromtimestamp(period_end_timestamp)
+                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                row = cur.fetchone()
+                if row:
+                    await bot.send_message(row[0], f"✅ Ваша подписка успешно продлена! Доступ активен до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
+            except Exception as e:
+                logging.error(f"Ошибка синхронизации даты: {e}")
+                conn.rollback()
+            finally:
+                cur.close()
+                conn.close()
 
-                    # 3. Обновляем базу данных точной датой
-                    cur.execute("""
-                        UPDATE users 
-                        SET expiry_date = %s 
-                        WHERE stripe_subscription_id = %s
-                    """, (new_expiry_date, sub_id))
-                
-                    conn.commit()
-                
-                    # Отправляем сообщение
-                    # Находим telegram_id для отправки уведомления
-                    cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-                    row = cur.fetchone()
-                    if row:
-                        user_id = row[0]
-                        await bot.send_message(user_id, "✅ Ваша подписка успешно продлена! Доступ активен до " + new_expiry_date.strftime("%d.%m.%Y") + ". ❤️")
-                
-                    logging.info(f"Подписка {sub_id} продлена до {new_expiry_date}")
-            
-                except Exception as e:
-                    logging.error(f"Ошибка синхронизации даты при автопродлении: {e}")
-                    conn.rollback()
-                finally:
-                    cur.close()
-                    conn.close()
-
+    # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
     elif event.type == 'customer.subscription.updated':
         sub = event.data.object
-        # Если пользователь отменил автопродление, Stripe пришлет True в поле cancel_at_period_end
-        is_cancelled = sub.cancel_at_period_end
-        
+        auto_renew = not sub.cancel_at_period_end
         conn = get_db_conn()
         cur = conn.cursor()
-        # Если is_cancelled = True, значит auto_renew = False (инвертируем логику)
-        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (not is_cancelled, sub.id))
+        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (auto_renew, sub.id))
         conn.commit()
         cur.close()
         conn.close()
-        logging.info(f"Статус автопродления обновлен для {sub.id}: {'Включено' if not is_cancelled else 'Отключено'}")
                 
+    # 4. ОШИБКА ОПЛАТЫ
     elif event.type == 'invoice.payment_failed':
-        invoice = event.data.object
-        sub_id = invoice.subscription
-        
+        sub_id = event.data.object.subscription
         conn = get_db_conn()
         cur = conn.cursor()
-        # Ставим флаг, что оплата не прошла
         cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
         conn.commit()
         cur.close()
         conn.close()
-        logging.info(f"Оплата не прошла для подписки {sub_id}")
 
+    # 5. УДАЛЕНИЕ ПОДПИСКИ
     elif event.type == 'customer.subscription.deleted':
         sub = event.data.object
         conn = get_db_conn()
         cur = conn.cursor()
-        
-        # Полностью отключаем доступ, так как подписки больше нет
-        cur.execute("""
-            UPDATE users 
-            SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL 
-            WHERE stripe_subscription_id = %s
-        """, (sub.id,))
-        
+        cur.execute("UPDATE users SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", (sub.id,))
         conn.commit()
         cur.close()
         conn.close()
-        logging.info(f"Подписка {sub.id} удалена из Stripe. Доступ отозван.")
 
-    # Обработка ошибок/истечений
+    # 6. ОШИБКИ СЕССИИ (Пользователь не оплатил)
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
         session = event.data.object
         user_id = session.client_reference_id
         if user_id:
             try:
-                await bot.send_message(
-                    user_id, 
-                    "❌ Оплата не прошла или время сессии истекло.\n\n"
-                    "Если деньги списались, пожалуйста, пришлите скриншот или ID транзакции администратору @re_tasha, мы во всем разберемся!"
-                )
+                await bot.send_message(user_id, "❌ Оплата не прошла или время сессии истекло. Если деньги списались, напишите администратору @re_tasha.")
             except:
                 pass
 
