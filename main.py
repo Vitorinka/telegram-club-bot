@@ -401,6 +401,7 @@ async def cancel_subscription(callback: types.CallbackQuery):
     conn.close()
     
 # --- WEBHOOK STRIPE ---
+# --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -417,28 +418,25 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        sub_id = getattr(session, 'subscription', None) # Здесь будет None для триала
+        sub_id = getattr(session, 'subscription', None)
         
-        if not user_id: return web.Response(status=200)
+        if not user_id: 
+            return web.Response(status=200)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            # Проверка, был ли пользователь уже в БД
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
-            # --- ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ДАТЫ ---
             if sub_id:
                 # Если это полноценная подписка
                 sub = stripe.Subscription.retrieve(sub_id)
                 expiry_date = datetime.fromtimestamp(sub.current_period_end)
             else:
-                # Если это триал (оплата прошла, но subscription ID нет)
-                # Добавляем 7 дней
+                # Если это триал (нет sub_id)
                 expiry_date = datetime.utcnow() + timedelta(days=7)
-            # ---------------------------------------------
 
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
@@ -448,12 +446,11 @@ async def stripe_webhook(request):
                     expiry_date = EXCLUDED.expiry_date,
                     stripe_subscription_id = EXCLUDED.stripe_subscription_id,
                     auto_renew = EXCLUDED.auto_renew;
-            """, (int(user_id), expiry_date, sub_id, (sub_id is not None))) # auto_renew True только если есть sub_id
+            """, (int(user_id), expiry_date, sub_id, (sub_id is not None)))
             conn.commit()
 
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
-            # Разная логика сообщений
             if is_existing_user:
                 message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. Спасибо, что остаетесь с нами! ❤️"
             else:
@@ -466,9 +463,8 @@ async def stripe_webhook(request):
                 logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
 
         except Exception as e:
-            error_text = f"Ошибка в обработке платежа для {user_id}: {e}"
-            logging.error(error_text)
-            await notify_admins(error_text)
+            logging.error(f"Ошибка в обработке платежа для {user_id}: {e}")
+            await notify_admins(f"Ошибка покупки: {e}")
             conn.rollback()
         finally:
             cur.close()
@@ -477,57 +473,34 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        logging.info(f"!!! DEBUG: Начало обработки invoice. Тип объекта: {type(invoice)}")
+        sub_id = invoice.get('subscription')
         
-        # Безопасно пытаемся достать ID
-        try:
-            sub_id = invoice.get('subscription')
-        except:
-            sub_id = getattr(invoice, 'subscription', None)
-        
-        logging.info(f"!!! DEBUG: ID подписки: {sub_id}")
-        
-        if not sub_id:
-            logging.error("!!! DEBUG: sub_id не найден!")
-            return web.Response(status=200)
-
-        conn = get_db_conn()
-        cur = conn.cursor()
-        try:
-            subscription = stripe.Subscription.retrieve(sub_id)
-            logging.info(f"!!! DEBUG: Объект подписки получен. Keys: {subscription.keys()}")
-            
-            # Прямой доступ к дате
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
             try:
-                # Пробуем как словарь
-                end_timestamp = subscription['current_period_end']
-                logging.info(f"!!! DEBUG: Дата найдена: {end_timestamp}")
-            except Exception as e:
-                # Если упало, выводим вообще всё
-                logging.error(f"!!! DEBUG: НЕ УДАЛОСЬ НАЙТИ ДАТУ. Ошибка: {e}. Полный объект: {subscription}")
-                return web.Response(status=200)
-
-            new_expiry_date = datetime.fromtimestamp(end_timestamp)
-            
-            cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
-            conn.commit()
-            logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
-            
-            # (Код уведомления остается без изменений)
-            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-            user = cur.fetchone()
-            if user:
-                await bot.send_message(user[0], f"✅ Ваша подписка успешно продлена до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
+                subscription = stripe.Subscription.retrieve(sub_id)
+                # Безопасно берем дату (используем атрибут объекта Stripe)
+                end_timestamp = getattr(subscription, 'current_period_end', None)
                 
-        except Exception as e:
-            logging.error(f"!!! DEBUG: Критическая ошибка в try-блоке: {e}")
-            conn.rollback()
-        finally:
-            cur.close()
-            conn.close()
-        return web.Response(status=200)
+                if end_timestamp:
+                    new_expiry_date = datetime.fromtimestamp(end_timestamp)
+                    cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
+                    conn.commit()
+                    logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
+                    
+                    cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                    user = cur.fetchone()
+                    if user:
+                        await bot.send_message(user[0], f"✅ Ваша подписка успешно продлена до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
+            except Exception as e:
+                logging.error(f"Критическая ошибка обновления подписки {sub_id}: {e}")
+                conn.rollback()
+            finally:
+                cur.close()
+                conn.close()
         
-    # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
+    # 3. ИЗМЕНЕНИЕ СТАТУСА
     elif event.type == 'customer.subscription.updated':
         sub = event.data.object
         auto_renew = not sub.cancel_at_period_end
@@ -541,12 +514,13 @@ async def stripe_webhook(request):
     # 4. ОШИБКА ОПЛАТЫ
     elif event.type == 'invoice.payment_failed':
         sub_id = event.data.object.subscription
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
 
     # 5. УДАЛЕНИЕ ПОДПИСКИ
     elif event.type == 'customer.subscription.deleted':
