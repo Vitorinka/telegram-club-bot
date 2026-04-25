@@ -112,13 +112,9 @@ def get_tariffs_keyboard(show_trial=True):
     )
     return kb
 
-async def send_renewal_reminders():
-    logging.info("Запуск проверки подписок...")
-    
-    # Клавиатура
-    # Клавиатура (триал здесь не нужен, так как это продление)
-    kb = get_tariffs_keyboard(show_trial=False)
-    
+# --- АВТОМАТИЗАЦИЯ (ПРОВЕРКА ПО УТРАМ) ---
+async def check_subscriptions_and_reminders():
+    logging.info("--- Запуск ежедневной проверки подписок ---")
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
@@ -127,51 +123,24 @@ async def send_renewal_reminders():
     now = datetime.utcnow()
     
     for telegram_id, expiry in users:
-        # Разница во времени
         time_left = expiry - now
         
-        # 1. Если срок истек (time_left < 0)
+        # 1. Если срок истек — баним
         if time_left < timedelta(0):
             try:
                 await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
                 cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (telegram_id,))
-                await bot.send_message(telegram_id, "⚠️ Ваша подписка истекла. Доступ закрыт. Выберите тариф для продления:", reply_markup=kb)
+                await bot.send_message(telegram_id, "⚠️ Ваша подписка истекла. Доступ закрыт. Выберите тариф для продления:", reply_markup=get_tariffs_keyboard(show_trial=False))
                 logging.info(f"Пользователь {telegram_id} исключен.")
             except Exception as e:
                 logging.error(f"Ошибка при бане {telegram_id}: {e}")
         
-        # 2. Если до конца осталось 48 часов или меньше
-        elif time_left < timedelta(days=2):
+        # 2. Если осталось меньше 48 часов — напоминаем
+        elif timedelta(0) < time_left < timedelta(days=2):
             try:
-                # Отправляем напоминание
-                await bot.send_message(telegram_id, "⏳ Ваша подписка заканчивается менее чем через 48 часов! Продлите доступ, чтобы не потерять прогресс:", reply_markup=kb)
+                await bot.send_message(telegram_id, "⏳ Ваша подписка заканчивается менее чем через 48 часов! Продлите доступ, чтобы не потерять прогресс.", reply_markup=get_tariffs_keyboard(show_trial=False))
             except BotBlocked:
                 logging.info(f"Пользователь {telegram_id} заблокировал бота.")
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# --- АВТОМАТИЗАЦИЯ (ПРОВЕРКА ПО УТРАМ) ---
-async def check_subscriptions():
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT telegram_id, expiry_date FROM users WHERE paid = TRUE")
-    users = cur.fetchall()
-    
-    now = datetime.utcnow()
-    for user_id, expiry in users:
-        # Если срок истек
-        if expiry < now:
-            try:
-                await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
-                cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (user_id,))
-                await bot.send_message(user_id, "Ваша подписка истекла. Доступ закрыт. Продлите подписку, написав /start")
-            except Exception as e:
-                logging.error(f"Ошибка бана {user_id}: {e}")
-        # Если срок истекает завтра (напоминание)
-        elif expiry - timedelta(days=1) < now < expiry:
-            await bot.send_message(user_id, "Ваша подписка заканчивается завтра! Успейте продлить.")
     
     conn.commit()
     cur.close()
