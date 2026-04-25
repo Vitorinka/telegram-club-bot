@@ -202,6 +202,17 @@ async def broadcast(message: types.Message):
     conn.close()
     await message.answer(f"Рассылка завершена. Успешно: {success_count}, заблокировали бота: {blocked_count}.")
 
+def get_tariffs_keyboard(show_trial=True):
+    kb = InlineKeyboardMarkup(row_width=1)
+    if show_trial:
+        kb.add(InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"))
+    kb.add(
+        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
+        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
+        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
+    )
+    return kb
+
 # --- ХЕНДЛЕРЫ ---
 # --- 1. ПРИВЕТСТВИЕ (ФОТО) ---
 @dp.message_handler(commands=['start'], state='*')
@@ -282,12 +293,8 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 Годовой абонемент за 410 евро — самое выгодное предложение для долгосрочной заботы о себе.
 
 Нажмите на кнопку ниже, чтобы оформить подписку и присоединиться к нам. Буду рада видеть вас в числе участников!"""
-    kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
-        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
-    )
+    kb = get_tariffs_keyboard(show_trial=True)
+    
     # Отправляем фото
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
     await callback.answer()
@@ -345,17 +352,28 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
 # --- 6. КНОПКА НАЗАД (ИСПРАВЛЕННАЯ) ---
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
-    # Возвращаем пользователя в состояние выбора
     await RegistrationStates.choice.set()
     
-    kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
-        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
-    )
+    # Проверяем, платил ли пользователь раньше
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (callback_query.from_user.id,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    # Если пользователь найден и paid=True (значит, он уже клиент) -> убираем триал
+    is_client = user and user[0] is True
+    kb = get_tariffs_keyboard(show_trial=not is_client)
     
     text = "Выберите свой формат участия:"
+
+    try:
+        await callback_query.message.edit_caption(caption=text, reply_markup=kb)
+    except Exception:
+        await callback_query.message.edit_text(text=text, reply_markup=kb)
+        
+    await callback_query.answer()
 
     # БЕЗОПАСНАЯ ЗАМЕНА
     try:
@@ -542,11 +560,8 @@ async def profile(message: types.Message):
 
 @dp.callback_query_handler(text="show_renew_options", state='*')
 async def show_renew_options(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
-    )
+    # Сразу передаем False, так как это меню продления
+    kb = get_tariffs_keyboard(show_trial=False)
     
     await callback.message.edit_text(
         "Выберите тариф для продления доступа:", 
