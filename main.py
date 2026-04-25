@@ -512,6 +512,20 @@ async def profile(message: types.Message):
         
         await message.answer(text, reply_markup=keyboard)
 
+@dp.callback_query_handler(text="show_renew_options", state='*')
+async def show_renew_options(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
+        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
+        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
+    )
+    
+    await callback.message.edit_text(
+        "Выберите тариф для продления доступа:", 
+        reply_markup=kb
+    )
+    await callback.answer()
+
 @dp.message_handler(commands=['give_access'], state='*')
 async def give_access_command(message: types.Message):
     # 1. Проверка прав (только админы)
