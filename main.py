@@ -477,6 +477,7 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
+        # Безопасно получаем sub_id
         sub_id = getattr(invoice, 'subscription', None)
         
         if not sub_id:
@@ -485,35 +486,30 @@ async def stripe_webhook(request):
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            # 1. Загружаем подписку
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # 2. ВЫВОДИМ В ЛОГИ ВСЁ
-            # Превращаем в словарь и логируем
-            sub_dict = subscription.to_dict()
-            logging.info(f"DEBUG_DUMP: Ключи в объекте: {list(sub_dict.keys())}")
-            logging.info(f"DEBUG_DUMP: Значение current_period_end: {sub_dict.get('current_period_end')}")
-            logging.info(f"DEBUG_DUMP: Полный объект: {sub_dict}")
+            # --- ГЛАВНОЕ ИЗМЕНЕНИЕ ---
+            # Используем getattr, чтобы НИКОГДА не было ошибки AttributeError
+            # Если поля нет, end_timestamp будет равен None
+            end_timestamp = getattr(subscription, 'current_period_end', None)
+            
+            if not end_timestamp:
+                logging.error(f"DEBUG: У подписки {sub_id} поле current_period_end отсутствует или пустое!")
+                return web.Response(status=200)
 
-            # 3. Пытаемся обновить, используя явный индекс (это 100% должно сработать)
-            # Если ключа нет, мы это увидим в логах выше
-            if 'current_period_end' in sub_dict:
-                end_timestamp = sub_dict['current_period_end']
-                new_expiry_date = datetime.fromtimestamp(end_timestamp)
-                
-                cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
-                conn.commit()
-                logging.info(f"Успешно обновили дату для {sub_id}")
-            else:
-                logging.error(f"КЛЮЧ 'current_period_end' НЕ НАЙДЕН В СЛОВАРЕ! Ищем причину...")
-
+            new_expiry_date = datetime.fromtimestamp(end_timestamp)
+            # --------------------------
+            
+            cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
+            conn.commit()
+            logging.info(f"Успешно продлили подписку {sub_id}")
+            
         except Exception as e:
-            logging.error(f"DEBUG_FATAL: {str(e)}")
+            logging.error(f"Критическая ошибка в обработке: {e}")
             conn.rollback()
         finally:
             cur.close()
             conn.close()
-            
         return web.Response(status=200)
 
     # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
