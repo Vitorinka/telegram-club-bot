@@ -280,8 +280,10 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
             reply_markup=kb
         )
     except Exception as e:
-        logging.error(f"Ошибка создания Stripe сессии: {e}")
-        await callback_query.answer("Ошибка при создании ссылки на оплату. Попробуйте позже.")
+        error_text = f"Критическая ошибка при создании Stripe сессии для пользователя {callback_query.from_user.id}: {e}"
+        logging.error(error_text)
+        await notify_admins(error_text) # <--- ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+        await callback_query.answer("Произошла ошибка при оплате. Администратор уже оповещен.")
         
     await callback_query.answer()
 
@@ -353,6 +355,13 @@ async def stripe_webhook(request):
         # Подключаемся к БД
         conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
         cur = conn.cursor()
+
+# ... внутри блока try-except в stripe_webhook
+        except Exception as e:
+            error_text = f"Ошибка в обработке платежа (Stripe Webhook) для пользователя {user_id if 'user_id' in locals() else 'Unknown'}: {e}"
+            logging.error(error_text)
+            await notify_admins(error_text) # <--- ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
+            conn.rollback()
         
         try:
             # Защита от дублей (если вебхук пришел дважды)
@@ -449,6 +458,54 @@ async def profile(message: types.Message):
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
         await message.answer(text, reply_markup=keyboard)
+
+@dp.message_handler(commands=['give_access'], state='*')
+async def give_access_command(message: types.Message):
+    # 1. Проверка прав (только админы)
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    # 2. Получаем ID пользователя из сообщения (например: /give_access 123456789)
+    args = message.get_args()
+    if not args:
+        await message.reply("⚠️ Использование: `/give_access <user_id>`", parse_mode="Markdown")
+        return
+    
+    target_user_id = args.strip()
+
+    # 3. Обновляем БД (даем доступ на 30 дней)
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        
+        # Обновляем или добавляем пользователя с активной подпиской
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid, expiry_date)
+            VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
+            ON CONFLICT (telegram_id) DO UPDATE 
+            SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
+        """, (int(target_user_id),))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # 4. Генерируем ссылку
+        link = await generate_invite_link()
+        
+        # 5. Отправляем пользователю
+        try:
+            if link:
+                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ к клубу! Ваша ссылка: {link}")
+                await message.answer(f"✅ Доступ пользователю {target_user_id} успешно предоставлен.")
+            else:
+                await message.answer("❌ Доступ в БД обновлен, но не удалось создать ссылку. Проверьте настройки бота.")
+        except BotBlocked:
+            await message.answer("⚠️ Доступ в БД обновлен, но пользователь заблокировал бота, отправить ссылку невозможно.")
+            
+    except Exception as e:
+        logging.error(f"Ошибка при ручной выдаче доступа: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
 
 @dp.callback_query_handler(text="cancel_subscription")
 async def cancel_subscription(callback: types.CallbackQuery):
