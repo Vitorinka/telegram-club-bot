@@ -242,41 +242,66 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     # Отправляем фото
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
 
-# --- 5. ВЫБОР ТАРИФА И ОПЛАТА (ИСПРАВЛЕНО) ---
+# --- 5. ВЫБОР ТАРИФА И ОПЛАТА ---
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
     sub_type = callback_query.data
     
+    # Карта цен
     price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
     price_id = os.getenv(price_map.get(sub_type))
+    
+    if not price_id:
+        await callback_query.answer("Ошибка конфигурации тарифа. Напишите администратору.")
+        return
+
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
     
-    session = stripe.checkout.Session.create(
-        payment_method_types=['card'],
-        line_items=[{'price': price_id, 'quantity': 1}],
-        mode=mode,
-        success_url='https://t.me/Natalia_SoulFit_bot',
-        client_reference_id=str(callback_query.from_user.id)
-    )
-    
-    # Меняем кнопки: "Оплатить" и "Назад"
-    kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💳 Оплатить", url=session.url),
-        InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
-    )
-    await callback_query.message.edit_caption(caption=f"✅ Вы выбрали тариф. Переходите к оплате:", reply_markup=kb)
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{'price': price_id, 'quantity': 1}],
+            mode=mode,
+            success_url='https://t.me/Natalia_SoulFit_bot',
+            client_reference_id=str(callback_query.from_user.id)
+        )
+        
+        # Меняем кнопки: "Оплатить" и "Назад"
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("💳 Оплатить", url=session.url),
+            InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
+        )
+        
+        # Завершаем FSM, так как пользователь переходит на внешнюю страницу оплаты
+        await state.finish() 
+        
+        await callback_query.message.edit_caption(
+            caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
+            reply_markup=kb
+        )
+    except Exception as e:
+        logging.error(f"Ошибка создания Stripe сессии: {e}")
+        await callback_query.answer("Ошибка при создании ссылки на оплату. Попробуйте позже.")
+        
     await callback_query.answer()
 
-# --- 6. КНОПКА НАЗАД (ИСПРАВЛЕНО) ---
+# --- 6. КНОПКА НАЗАД ---
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
+    # Возвращаем пользователя в состояние выбора
+    await RegistrationStates.choice.set()
+    
     kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
-    await callback_query.message.edit_caption(caption="💎 **Выберите свой формат участия:**", reply_markup=kb)
+    
+    await callback_query.message.edit_caption(
+        caption="💎 **Выберите свой формат участия:**", 
+        reply_markup=kb
+    )
     await callback_query.answer()
 
 # --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
