@@ -361,7 +361,7 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
 # --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
 @dp.callback_query_handler(text="cancel_subscription", state='*')
 async def cancel_subscription(callback: types.CallbackQuery):
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
     result = cur.fetchone()
@@ -405,7 +405,7 @@ async def stripe_webhook(request):
             return web.Response(status=200)
 
         # Подключаемся к БД
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+        conn = get_db_conn()
         cur = conn.cursor()
 
         # --- ВОТ ТУТ МЫ НАЧИНАЕМ БЛОК ---
@@ -578,31 +578,6 @@ async def give_access_command(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка при ручной выдаче доступа: {e}")
         await message.answer(f"❌ Ошибка: {e}")
-
-@dp.callback_query_handler(text="cancel_subscription")
-async def cancel_subscription(callback: types.CallbackQuery):
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-    cur = conn.cursor()
-    cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
-    result = cur.fetchone()
-    
-    if result and result[0]:
-        sub_id = result[0]
-        try:
-            # Отменяем в Stripe
-            stripe.Subscription.delete(sub_id)
-            # Обновляем в БД
-            cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
-            conn.commit()
-            await callback.message.edit_text("✅ Подписка успешно отменена. Доступ сохранится до конца оплаченного периода.")
-        except Exception as e:
-            await callback.answer("Ошибка при отмене подписки. Напишите администратору.")
-            logging.error(f"Ошибка Stripe: {e}")
-    else:
-        await callback.answer("Не удалось найти подписку.")
-    
-    cur.close()
-    conn.close()
 
 # --- ОБРАБОТКА ПОМОЩИ ---
 # Обработка команды /help (если пользователь напишет это сам)
