@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logging.info(f"DEBUG: Подключаюсь к БД: {os.getenv('DATABASE_URL')}")
+logging.info("Начинаю подключение к базе данных...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID") 
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
@@ -500,6 +500,12 @@ async def stripe_webhook(request):
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
         sub_id = invoice.subscription
+
+        if invoice.billing_reason == 'subscription_create':
+            return web.Response(status=200)
+
+        conn = get_db_conn()
+        cur = conn.cursor()
         
         if sub_id:
             # Нам нужно найти пользователя в БД по его подписке
