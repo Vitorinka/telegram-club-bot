@@ -292,7 +292,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 # --- 5. ВЫБОР ТАРИФА И ОПЛАТА ---
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer()
+    await callback_query.answer("Загрузка...")
     sub_type = callback_query.data
     
     price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
@@ -379,18 +379,23 @@ async def cancel_subscription(callback: types.CallbackQuery):
     cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
     result = cur.fetchone()
     
+    # --- ИСПРАВЛЕННЫЙ БЛОК ОТМЕНЫ ---
     if result and result[0]:
         sub_id = result[0]
         try:
-            stripe.Subscription.delete(sub_id)
-            cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
+            # Ставим флаг "отменить в конце периода", а не удаляем сразу
+            stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+        
+            # Обновляем только флаг auto_renew, но НЕ ТРОГАЕМ paid
+            cur.execute("UPDATE users SET auto_renew = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
             conn.commit()
-            await callback.message.edit_text("✅ Подписка успешно отменена. Доступ сохранится до конца оплаченного периода.")
+        
+            await callback.message.edit_text("✅ Автопродление отключено. Ваш доступ сохранится до конца оплаченного периода.")
         except Exception as e:
-            await callback.answer("Ошибка при отмене подписки. Напишите администратору.")
+            await callback.answer("Ошибка при отмене. Напишите администратору.")
             logging.error(f"Ошибка Stripe: {e}")
-    else:
-        await callback.answer("Не удалось найти подписку.")
+        else:
+            await callback.answer("Не удалось найти подписку.")
     
     cur.close()
     conn.close()
@@ -567,6 +572,23 @@ async def stripe_webhook(request):
         cur.close()
         conn.close()
         logging.info(f"Оплата не прошла для подписки {sub_id}")
+
+    elif event.type == 'customer.subscription.deleted':
+        sub = event.data.object
+        conn = get_db_conn()
+        cur = conn.cursor()
+        
+        # Полностью отключаем доступ, так как подписки больше нет
+        cur.execute("""
+            UPDATE users 
+            SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL 
+            WHERE stripe_subscription_id = %s
+        """, (sub.id,))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        logging.info(f"Подписка {sub.id} удалена из Stripe. Доступ отозван.")
 
     # Обработка ошибок/истечений
     elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
