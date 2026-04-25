@@ -217,8 +217,7 @@ async def start(message: types.Message, state: FSMContext):
 Добро пожаловать в сообщество, где здоровое и сильное тело — это не случайность, а результат регулярной и бережной практики."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_desc"))
     await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb)
-    await callback.answer()
-
+    
 # --- 2. ОПИСАНИЕ (ТЕКСТ) ---
 @dp.callback_query_handler(text="to_desc", state=RegistrationStates.intro)
 async def show_description(callback: types.CallbackQuery, state: FSMContext):
@@ -291,6 +290,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     )
     # Отправляем фото
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
+    await callback.answer()
 
 # --- 5. ВЫБОР ТАРИФА И ОПЛАТА ---
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
