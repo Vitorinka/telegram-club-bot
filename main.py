@@ -595,7 +595,7 @@ async def on_startup(app):
     secret = os.getenv("WEBHOOK_SECRET")
     await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
     # Используем глобальный scheduler
-    scheduler.add_job(send_renewal_reminders, 'cron', hour=10)
+    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10)    
     scheduler.start()
 
 async def on_shutdown(app):
