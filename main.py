@@ -403,25 +403,16 @@ async def stripe_webhook(request):
         conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
         cur = conn.cursor()
 
-# ... внутри блока try-except в stripe_webhook
-        except Exception as e:
-            error_text = f"Ошибка в обработке платежа (Stripe Webhook) для пользователя {user_id if 'user_id' in locals() else 'Unknown'}: {e}"
-            logging.error(error_text)
-            await notify_admins(error_text) # <--- ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ
-            conn.rollback()
-        
+        # --- ВОТ ТУТ МЫ НАЧИНАЕМ БЛОК ---
         try:
-            # Защита от дублей (если вебхук пришел дважды)
+            # 1. Защита от дублей
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             
-            # Если юзер уже есть и оплата была — проверяем, нужно ли слать уведомление
-            # Если нужно разрешить повторную оплату, можно убрать этот блок или изменить логику
             if row and row[0] is True:
-                # Можно добавить логирование, что вебхук повторный
                 logging.info(f"Повторный вебхук для {user_id}, пропускаем отправку сообщения.")
             
-            # ОПРЕДЕЛЕНИЕ ТАРИФА
+            # 2. ОПРЕДЕЛЕНИЕ ТАРИФА
             try:
                 line_items = stripe.checkout.Session.list_line_items(session.id)
                 price_id = line_items.data[0].price.id
@@ -439,7 +430,7 @@ async def stripe_webhook(request):
             
             sub_id = getattr(session, 'subscription', None)
 
-            # ОБНОВЛЕНИЕ БАЗЫ (UPSERT с логикой продления)
+            # 3. ОБНОВЛЕНИЕ БАЗЫ
             sql = f"""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id)
                 VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}', %s)
@@ -455,7 +446,7 @@ async def stripe_webhook(request):
             cur.execute(sql, (int(user_id), sub_id))
             conn.commit()
 
-            # РАЗБАН И ССЫЛКА
+            # 4. РАЗБАН И ССЫЛКА
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
             link = await generate_invite_link()
@@ -467,9 +458,13 @@ async def stripe_webhook(request):
             else:
                 await bot.send_message(user_id, "✅ Оплата прошла успешно, но не удалось создать ссылку. Напишите @re_tasha!")
 
+        # --- А ВОТ ТУТ МЫ ЛОВИМ ОШИБКИ ---
         except Exception as e:
-            logging.error(f"Критическая ошибка в Stripe Webhook: {e}")
-            conn.rollback() # Откатываем транзакцию при ошибке
+            error_text = f"Ошибка в обработке платежа (Stripe Webhook) для пользователя {user_id}: {e}"
+            logging.error(error_text)
+            await notify_admins(error_text) 
+            conn.rollback() # Откатываем транзакцию
+            
         finally:
             cur.close()
             conn.close()
