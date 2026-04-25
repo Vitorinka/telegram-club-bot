@@ -566,28 +566,25 @@ async def show_renew_options(callback: types.CallbackQuery):
 
 @dp.message_handler(commands=['give_access'], state='*')
 async def give_access_command(message: types.Message):
-    # 1. Проверка прав (только админы)
+    # 1. Проверка прав
     if message.from_user.id not in ADMIN_IDS:
         return
 
     # 2. Парсинг аргументов
-    # Ожидаем: /give_access 123456789 30
     args = message.get_args().split()
-    
     if len(args) < 1:
-        await message.reply("⚠️ Использование: `/give_access <user_id> <дней>`\nПример: `/give_access 123456789 30`", parse_mode="Markdown")
+        await message.reply("⚠️ Использование: `/give_access <user_id> <дней>`", parse_mode="Markdown")
         return
     
     target_user_id = args[0]
-    # Если дни не указаны, ставим 30 по умолчанию
     days = int(args[1]) if len(args) > 1 else 30
 
     # 3. Обновляем БД
+    conn = None # Инициализируем переменную для finally
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         
-        # Формируем интервал
         interval_query = f"{days} days"
         
         cur.execute(f"""
@@ -603,13 +600,11 @@ async def give_access_command(message: types.Message):
         
         conn.commit()
         cur.close()
-        conn.close()
-
+        
         # 4. Генерируем ссылку
         link = await generate_invite_link()
         
         # 5. Отправляем пользователю
-        # Замени этот блок внутри give_access_command
         try:
             if link:
                 await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ к клубу на {days} дней!\nВаша ссылка: {link}")
@@ -619,13 +614,18 @@ async def give_access_command(message: types.Message):
         except BotBlocked:
             await message.answer("⚠️ Доступ в БД обновлен, но пользователь заблокировал бота.")
         except Exception: 
-            # Это сработает, если пользователь еще не нажимал /start
-            await message.answer(
-                f"⚠️ Доступ в БД обновлен!\n\n"
-                f"НО: не удалось отправить сообщение пользователю {target_user_id}.\n"
-                "Вероятно, он еще не нажал /start в боте. Попросите его сделать это, и он автоматически получит доступ."
-            )
+            await message.answer(f"⚠️ Доступ в БД обновлен, но не удалось отправить сообщение пользователю {target_user_id}.")
 
+    except Exception as e:
+        logging.error(f"Критическая ошибка в give_access: {e}")
+        await message.answer(f"❌ Ошибка при работе с базой данных: {e}")
+        if conn:
+            conn.rollback()
+            
+    finally:
+        if conn:
+            conn.close()
+            
 # --- ОБРАБОТКА ПОМОЩИ ---
 # Обработка команды /help (если пользователь напишет это сам)
 @dp.message_handler(commands=['help'], state='*') # Добавили state='*'
