@@ -477,11 +477,9 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        # Получаем ID подписки. Обратите внимание: используем getattr, 
-        # так как invoice - это объект Stripe, а не словарь.
-        sub_id = getattr(invoice, 'subscription', None)
-        
-        if not sub_id:
+        try:
+            sub_id = invoice['subscription']
+        except Exception:
             return web.Response(status=200)
 
         conn = get_db_conn()
@@ -489,32 +487,26 @@ async def stripe_webhook(request):
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- ПОПЫТКА ДОСТУПА #1 (Свойство) ---
-            end_timestamp = getattr(subscription, 'current_period_end', None)
-            
-            # --- ПОПЫТКА ДОСТУПА #2 (Если не вышло, пробуем как словарь) ---
-            if not end_timestamp:
-                try:
-                    end_timestamp = subscription['current_period_end']
-                except:
-                    end_timestamp = None
-            
-            # --- ДИАГНОСТИКА: Если данные все еще не получены ---
-            if not end_timestamp:
-                # ВЫВОДИМ В ЛОГИ ВСЁ, ЧТО ЕСТЬ В ОБЪЕКТЕ
-                logging.error(f"DEBUG_FAIL: Не удалось прочитать current_period_end. Объект: {subscription}")
+            # --- ДИАГНОСТИКА: Пытаемся достать данные ---
+            try:
+                # Пробуем разные варианты, где может лежать дата
+                end_timestamp = subscription.get('current_period_end') 
+                
+                if end_timestamp is None:
+                    # Если пусто, выводим ВСЕ, что есть в объекте, чтобы мы увидели структуру
+                    logging.error(f"DEBUG_DUMP: Объект подписки не имеет current_period_end. Полные данные: {subscription}")
+                    return web.Response(status=200)
+
+            except Exception as e:
+                logging.error(f"DEBUG_CRITICAL: Ошибка при доступе к полю: {e}. Объект: {subscription}")
                 return web.Response(status=200)
 
-            # Если дошли сюда, значит дату нашли
             new_expiry_date = datetime.fromtimestamp(end_timestamp)
             
             cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
             logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
             
-            # (Код отправки сообщения остается без изменений)
-            # ...
-
         except Exception as e:
             logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
             conn.rollback()
@@ -522,7 +514,6 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
         return web.Response(status=200)
-
     # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
     elif event.type == 'customer.subscription.updated':
         sub = event.data.object
