@@ -436,19 +436,26 @@ async def stripe_webhook(request):
             try:
                 line_items = stripe.checkout.Session.list_line_items(session.id)
                 price_id = line_items.data[0].price.id
-                duration_map = {
-                    os.getenv("PRICE_TRIAL"): 7,
-                    os.getenv("PRICE_1M"): 30,
-                    os.getenv("PRICE_6M"): 180,
-                    os.getenv("PRICE_12M"): 365
-                }
-                days = duration_map.get(price_id, 30)
+                
+                # --- ПРИНУДИТЕЛЬНАЯ ЛОГИКА ---
+                if price_id == os.getenv("PRICE_TRIAL"):
+                    days = 7
+                    logging.info(f"Определен ТРИАЛ (ID: {price_id}). Принудительно ставим 7 дней.")
+                else:
+                    duration_map = {
+                        os.getenv("PRICE_1M"): 30,
+                        os.getenv("PRICE_6M"): 180,
+                        os.getenv("PRICE_12M"): 365
+                    }
+                    days = duration_map.get(price_id, 30)
+                    logging.info(f"Определен платный тариф (ID: {price_id}). Ставим {days} дней.")
+                
                 interval_query = f"{days} days"
-            except:
+                
+            except Exception as e:
+                logging.error(f"Ошибка при определении тарифа: {e}. Ставим 30 дней по умолчанию.")
                 days = 30
                 interval_query = "30 days"
-            
-            sub_id = getattr(session, 'subscription', None)
 
             # 3. ОБНОВЛЕНИЕ БАЗЫ
             sql = f"""
