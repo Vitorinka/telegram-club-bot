@@ -281,7 +281,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 
 Нажмите на кнопку ниже, чтобы оформить подписку и присоединиться к нам. Буду рада видеть вас в числе участников!"""
     kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
@@ -341,14 +341,14 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     await RegistrationStates.choice.set()
     
     kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
     
     await callback_query.message.edit_caption(
-        caption="💎 **Выберите свой формат участия:**", 
+        caption="Выберите свой формат участия:", 
         reply_markup=kb
     )
     await callback_query.answer()
@@ -483,11 +483,11 @@ async def stripe_webhook(request):
 
 # --- ОБНОВЛЕННЫЕ ХЕНДЛЕРЫ ---
 
-@dp.message_handler(commands=['profile'], state='*') # Добавили state='*'
+@dp.message_handler(commands=['profile'], state='*')
 async def profile(message: types.Message):
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    conn = get_db_conn() # Используем вашу функцию подключения
     cur = conn.cursor()
-    cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (message.from_user.id,))
+    cur.execute("SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s", (message.from_user.id,))
     user = cur.fetchone()
     cur.close()
     conn.close()
@@ -495,10 +495,21 @@ async def profile(message: types.Message):
     if not user or not user[0]:
         await message.answer("У вас пока нет активной подписки. Нажмите /start, чтобы оформить её.")
     else:
-        expiry = user[1].strftime('%d.%m.%Y')
-        text = f"Ваша подписка активна до: {expiry}\n\nХотите отменить автопродление?"
-        keyboard = InlineKeyboardMarkup()
-        keyboard.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
+        expiry_date = user[1]
+        days_left = (expiry_date - datetime.utcnow()).days
+        
+        # Если осталось 0 или меньше дней, считаем, что истекает сегодня/истекла
+        days_text = "меньше 1 дня" if days_left <= 0 else f"{days_left} дн."
+
+        text = f"✅ Ваша подписка активна.\n⏳ Истекает через: {days_text}\n\nХотите продлить доступ?"
+        
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(InlineKeyboardButton("Продлить доступ", callback_data="show_renew_options"))
+        
+        # Кнопку отмены оставляем, но можно сделать её менее заметной или оставить только для полных подписок
+        if user[2]: # Если есть ID подписки (значит это не разовая пробная)
+             keyboard.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+        
         await message.answer(text, reply_markup=keyboard)
 
 @dp.message_handler(commands=['give_access'], state='*')
