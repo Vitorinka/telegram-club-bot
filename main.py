@@ -485,42 +485,36 @@ async def stripe_webhook(request):
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            # Получаем объект подписки
+            # 1. Загружаем подписку
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- ПРИНУДИТЕЛЬНОЕ ПРЕОБРАЗОВАНИЕ В СЛОВАРЬ ---
-            # Это исключит ошибки обращения к атрибутам StripeObject
-            sub_data = subscription.to_dict()
-            
-            end_timestamp = sub_data.get('current_period_end')
-            
-            # Если поле пустое, логируем ключи, чтобы понять структуру
-            if not end_timestamp:
-                logging.error(f"У подписки {sub_id} НЕТ поля current_period_end. Доступные ключи: {list(sub_data.keys())}")
-                return web.Response(status=200)
+            # 2. ВЫВОДИМ В ЛОГИ ВСЁ
+            # Превращаем в словарь и логируем
+            sub_dict = subscription.to_dict()
+            logging.info(f"DEBUG_DUMP: Ключи в объекте: {list(sub_dict.keys())}")
+            logging.info(f"DEBUG_DUMP: Значение current_period_end: {sub_dict.get('current_period_end')}")
+            logging.info(f"DEBUG_DUMP: Полный объект: {sub_dict}")
 
-            new_expiry_date = datetime.fromtimestamp(end_timestamp)
-            # -----------------------------------------------
-            
-            cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
-            conn.commit()
-            
-            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-            row = cur.fetchone()
-            if row:
-                try:
-                    await bot.send_message(row[0], f"✅ Подписка продлена до {new_expiry_date.strftime('%d.%m.%Y')}.")
-                except:
-                    pass
-                    
+            # 3. Пытаемся обновить, используя явный индекс (это 100% должно сработать)
+            # Если ключа нет, мы это увидим в логах выше
+            if 'current_period_end' in sub_dict:
+                end_timestamp = sub_dict['current_period_end']
+                new_expiry_date = datetime.fromtimestamp(end_timestamp)
+                
+                cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
+                conn.commit()
+                logging.info(f"Успешно обновили дату для {sub_id}")
+            else:
+                logging.error(f"КЛЮЧ 'current_period_end' НЕ НАЙДЕН В СЛОВАРЕ! Ищем причину...")
+
         except Exception as e:
-            # Логируем тип ошибки, чтобы точно понимать, где упало
-            logging.error(f"Ошибка в блоке invoice.payment_succeeded: {type(e).__name__} - {str(e)}")
+            logging.error(f"DEBUG_FATAL: {str(e)}")
             conn.rollback()
-            return web.Response(status=500)
         finally:
             cur.close()
             conn.close()
+            
+        return web.Response(status=200)
 
     # 3. ИЗМЕНЕНИЕ СТАТУСА (Отмена)
     elif event.type == 'customer.subscription.updated':
