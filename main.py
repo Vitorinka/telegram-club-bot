@@ -101,15 +101,23 @@ async def generate_invite_link():
         logging.error(f"Ошибка ссылки: {e}")
         return None
 
-async def send_renewal_reminders():
-    logging.info("Запуск проверки подписок...")
-    
-    # Клавиатура
-    kb = InlineKeyboardMarkup(row_width=1).add(
+def get_tariffs_keyboard(show_trial=True):
+    kb = InlineKeyboardMarkup(row_width=1)
+    if show_trial:
+        kb.add(InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"))
+    kb.add(
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
+    return kb
+
+async def send_renewal_reminders():
+    logging.info("Запуск проверки подписок...")
+    
+    # Клавиатура
+    # Клавиатура (триал здесь не нужен, так как это продление)
+    kb = get_tariffs_keyboard(show_trial=False)
     
     conn = get_db_conn()
     cur = conn.cursor()
@@ -202,18 +210,6 @@ async def broadcast(message: types.Message):
     conn.close()
     await message.answer(f"Рассылка завершена. Успешно: {success_count}, заблокировали бота: {blocked_count}.")
 
-def get_tariffs_keyboard(show_trial=True):
-    kb = InlineKeyboardMarkup(row_width=1)
-    if show_trial:
-        kb.add(InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"))
-    kb.add(
-        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
-    )
-    return kb
-
-# --- ХЕНДЛЕРЫ ---
 # --- 1. ПРИВЕТСТВИЕ (ФОТО) ---
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
@@ -368,12 +364,10 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
     
     text = "Выберите свой формат участия:"
 
-    # 3. Редактируем сообщение (безопасный вариант)
+    # 3. Редактируем сообщение (безопасно)
     try:
-        # Пытаемся редактировать как фото с подписью
         await callback_query.message.edit_caption(caption=text, reply_markup=kb)
     except Exception:
-        # Если это не фото, а просто текст — редактируем как текст
         await callback_query.message.edit_text(text=text, reply_markup=kb)
         
     await callback_query.answer()
