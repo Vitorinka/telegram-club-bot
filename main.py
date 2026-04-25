@@ -310,9 +310,13 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
         error_text = f"Критическая ошибка создания сессии для {callback_query.from_user.id}: {e}"
         logging.error(error_text)
         await notify_admins(error_text)
-        await callback_query.answer("Ошибка при оплате. Администратор оповещен.")
         
-    await callback_query.answer()
+        # Новый вариант с модальным окном
+        await callback_query.answer(
+            "⚠️ Произошла техническая ошибка при переходе к оплате.\n\n"
+            "Пожалуйста, напишите администратору @re_tasha, мы уже получили уведомление о проблеме и свяжемся с вами!",
+            show_alert=True
+        )
 
 # --- 6. КНОПКА НАЗАД (ИСПРАВЛЕННАЯ) ---
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
@@ -507,7 +511,11 @@ async def stripe_webhook(request):
         user_id = session.client_reference_id
         if user_id:
             try:
-                await bot.send_message(user_id, "❌ Оплата не прошла. Если деньги списались, напишите @re_tasha")
+                await bot.send_message(
+                    user_id, 
+                    "❌ Оплата не прошла или время сессии истекло.\n\n"
+                    "Если деньги списались, пожалуйста, пришлите скриншот или ID транзакции администратору @re_tasha, мы во всем разберемся!"
+                )
             except:
                 pass
 
