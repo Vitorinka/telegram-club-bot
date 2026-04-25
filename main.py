@@ -417,7 +417,7 @@ async def stripe_webhook(request):
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = session.client_reference_id
-        sub_id = getattr(session, 'subscription', None)
+        sub_id = getattr(session, 'subscription', None) # Здесь будет None для триала
         
         if not user_id: return web.Response(status=200)
 
@@ -429,24 +429,31 @@ async def stripe_webhook(request):
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
-            # Получаем дату окончания из Stripe (работает универсально для всех тарифов)
-            sub = stripe.Subscription.retrieve(sub_id)
-            expiry_date = datetime.fromtimestamp(sub.current_period_end)
+            # --- ИСПРАВЛЕННАЯ ЛОГИКА ОПРЕДЕЛЕНИЯ ДАТЫ ---
+            if sub_id:
+                # Если это полноценная подписка
+                sub = stripe.Subscription.retrieve(sub_id)
+                expiry_date = datetime.fromtimestamp(sub.current_period_end)
+            else:
+                # Если это триал (оплата прошла, но subscription ID нет)
+                # Добавляем 7 дней
+                expiry_date = datetime.utcnow() + timedelta(days=7)
+            # ---------------------------------------------
 
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
-                VALUES (%s, TRUE, %s, %s, TRUE)
+                VALUES (%s, TRUE, %s, %s, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET 
                     paid = TRUE, 
                     expiry_date = EXCLUDED.expiry_date,
                     stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-                    auto_renew = TRUE;
-            """, (int(user_id), expiry_date, sub_id))
+                    auto_renew = EXCLUDED.auto_renew;
+            """, (int(user_id), expiry_date, sub_id, (sub_id is not None))) # auto_renew True только если есть sub_id
             conn.commit()
 
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
-            # Разная логика сообщений для новых и старых
+            # Разная логика сообщений
             if is_existing_user:
                 message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. Спасибо, что остаетесь с нами! ❤️"
             else:
@@ -461,7 +468,7 @@ async def stripe_webhook(request):
         except Exception as e:
             error_text = f"Ошибка в обработке платежа для {user_id}: {e}"
             logging.error(error_text)
-            await notify_admins(error_text) # Оповещаем админа об ошибке
+            await notify_admins(error_text)
             conn.rollback()
         finally:
             cur.close()
