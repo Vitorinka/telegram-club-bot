@@ -480,7 +480,6 @@ async def stripe_webhook(request):
         sub_id = getattr(invoice, 'subscription', None)
         
         if not sub_id:
-            logging.info(f"Инвойс {invoice.id} не является подпиской, пропускаем.")
             return web.Response(status=200)
 
         conn = get_db_conn()
@@ -488,15 +487,20 @@ async def stripe_webhook(request):
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
-            # Проверяем, есть ли поле current_period_end
-            if hasattr(subscription, 'current_period_end'):
-                new_expiry_date = datetime.fromtimestamp(subscription.current_period_end)
-            else:
-                # Если даты нет, логируем весь объект, чтобы понять, что прислал Stripe
-                logging.error(f"У полученной подписки {sub_id} нет поля current_period_end! Объект: {subscription}")
-                return web.Response(status=200) # Пропускаем, чтобы не спамить ошибками
-            # ----------------------------------
+            # --- ОТЛАДКА И БЕЗОПАСНОЕ ЧТЕНИЕ ---
+            # Логируем, чтобы увидеть структуру объекта в консоли
+            logging.info(f"DEBUG: Полный объект подписки: {subscription}")
+            
+            # Используем .get() — это работает и для словарей, и для StripeObject
+            end_timestamp = subscription.get('current_period_end')
+            
+            if not end_timestamp:
+                # Если всё-таки не нашли, выводим ошибку в логи и выходим
+                logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: У подписки {sub_id} нет поля current_period_end!")
+                return web.Response(status=200)
+
+            new_expiry_date = datetime.fromtimestamp(end_timestamp)
+            # ------------------------------------
             
             cur.execute("UPDATE users SET expiry_date = %s WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
@@ -505,12 +509,12 @@ async def stripe_webhook(request):
             row = cur.fetchone()
             if row:
                 try:
-                    await bot.send_message(row[0], f"✅ Ваша подписка успешно продлена! Доступ активен до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
-                except Exception:
+                    await bot.send_message(row[0], f"✅ Подписка продлена до {new_expiry_date.strftime('%d.%m.%Y')}.")
+                except:
                     pass
                     
         except Exception as e:
-            logging.error(f"Ошибка синхронизации даты инвойса: {e}")
+            logging.error(f"Ошибка в блоке invoice.payment_succeeded: {e}")
             conn.rollback()
             return web.Response(status=500)
         finally:
