@@ -570,25 +570,35 @@ async def give_access_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    # 2. Получаем ID пользователя из сообщения (например: /give_access 123456789)
-    args = message.get_args()
-    if not args:
-        await message.reply("⚠️ Использование: `/give_access <user_id>`", parse_mode="Markdown")
+    # 2. Парсинг аргументов
+    # Ожидаем: /give_access 123456789 30
+    args = message.get_args().split()
+    
+    if len(args) < 1:
+        await message.reply("⚠️ Использование: `/give_access <user_id> <дней>`\nПример: `/give_access 123456789 30`", parse_mode="Markdown")
         return
     
-    target_user_id = args.strip()
+    target_user_id = args[0]
+    # Если дни не указаны, ставим 30 по умолчанию
+    days = int(args[1]) if len(args) > 1 else 30
 
-    # 3. Обновляем БД (даем доступ на 30 дней)
+    # 3. Обновляем БД
     try:
         conn = get_db_conn()
         cur = conn.cursor()
         
-        # Обновляем или добавляем пользователя с активной подпиской
-        cur.execute("""
+        # Формируем интервал
+        interval_query = f"{days} days"
+        
+        cur.execute(f"""
             INSERT INTO users (telegram_id, paid, expiry_date)
-            VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
+            VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}')
             ON CONFLICT (telegram_id) DO UPDATE 
-            SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
+            SET paid = TRUE, 
+                expiry_date = CASE 
+                    WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
+                    ELSE NOW() + INTERVAL '{interval_query}'
+                END;
         """, (int(target_user_id),))
         
         conn.commit()
@@ -599,18 +609,22 @@ async def give_access_command(message: types.Message):
         link = await generate_invite_link()
         
         # 5. Отправляем пользователю
+        # Замени этот блок внутри give_access_command
         try:
             if link:
-                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ к клубу! Ваша ссылка: {link}")
-                await message.answer(f"✅ Доступ пользователю {target_user_id} успешно предоставлен.")
+                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ к клубу на {days} дней!\nВаша ссылка: {link}")
+                await message.answer(f"✅ Доступ пользователю {target_user_id} предоставлен.")
             else:
-                await message.answer("❌ Доступ в БД обновлен, но не удалось создать ссылку. Проверьте настройки бота.")
+                await message.answer("❌ Доступ в БД обновлен, но не удалось создать ссылку.")
         except BotBlocked:
-            await message.answer("⚠️ Доступ в БД обновлен, но пользователь заблокировал бота, отправить ссылку невозможно.")
-            
-    except Exception as e:
-        logging.error(f"Ошибка при ручной выдаче доступа: {e}")
-        await message.answer(f"❌ Ошибка: {e}")
+            await message.answer("⚠️ Доступ в БД обновлен, но пользователь заблокировал бота.")
+        except Exception: 
+            # Это сработает, если пользователь еще не нажимал /start
+            await message.answer(
+                f"⚠️ Доступ в БД обновлен!\n\n"
+                f"НО: не удалось отправить сообщение пользователю {target_user_id}.\n"
+                "Вероятно, он еще не нажал /start в боте. Попросите его сделать это, и он автоматически получит доступ."
+            )
 
 # --- ОБРАБОТКА ПОМОЩИ ---
 # Обработка команды /help (если пользователь напишет это сам)
