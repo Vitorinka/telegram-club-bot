@@ -342,7 +342,7 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
         
     await callback_query.answer()
 
-# --- 6. КНОПКА НАЗАД ---
+# --- 6. КНОПКА НАЗАД (ИСПРАВЛЕННАЯ) ---
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
     # Возвращаем пользователя в состояние выбора
@@ -355,10 +355,22 @@ async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
     
-    await callback_query.message.edit_caption(
-        caption="Выберите свой формат участия:", 
-        reply_markup=kb
-    )
+    text = "Выберите свой формат участия:"
+
+    # БЕЗОПАСНАЯ ЗАМЕНА
+    try:
+        # Пытаемся отредактировать как фото (с подписью)
+        await callback_query.message.edit_caption(
+            caption=text, 
+            reply_markup=kb
+        )
+    except Exception:
+        # Если не получилось (значит это просто текст), редактируем как обычное сообщение
+        await callback_query.message.edit_text(
+            text=text, 
+            reply_markup=kb
+        )
+        
     await callback_query.answer()
 
 # --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
