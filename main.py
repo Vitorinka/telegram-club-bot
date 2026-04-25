@@ -493,8 +493,9 @@ async def stripe_webhook(request):
 
 @dp.message_handler(commands=['profile'], state='*')
 async def profile(message: types.Message):
-    conn = get_db_conn() # Используем вашу функцию подключения
+    conn = get_db_conn()
     cur = conn.cursor()
+    # Снова запрашиваем stripe_subscription_id, чтобы проверить его наличие
     cur.execute("SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s", (message.from_user.id,))
     user = cur.fetchone()
     cur.close()
@@ -506,17 +507,17 @@ async def profile(message: types.Message):
         expiry_date = user[1]
         days_left = (expiry_date - datetime.utcnow()).days
         
-        # Если осталось 0 или меньше дней, считаем, что истекает сегодня/истекла
         days_text = "меньше 1 дня" if days_left <= 0 else f"{days_left} дн."
 
         text = f"✅ Ваша подписка активна.\n⏳ Истекает через: {days_text}\n\nХотите продлить доступ?"
         
         keyboard = InlineKeyboardMarkup(row_width=1)
-        keyboard.add(InlineKeyboardButton("Продлить доступ", callback_data="show_renew_options"))
+        # Кнопка продления есть у всех
+        keyboard.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
         
-        # Кнопку отмены оставляем, но можно сделать её менее заметной или оставить только для полных подписок
-        if user[2]: # Если есть ID подписки (значит это не разовая пробная)
-             keyboard.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+        # «Умная» кнопка отмены: появится только если есть ID подписки в базе
+        if user[2]: 
+            keyboard.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
         
         await message.answer(text, reply_markup=keyboard)
 
