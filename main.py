@@ -477,7 +477,9 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        sub_id = invoice.get('subscription') # Используем .get для словарей
+        # invoice - это тоже объект, для безопасности превращаем и его в словарь
+        invoice_dict = dict(invoice)
+        sub_id = invoice_dict.get('subscription')
         
         if not sub_id:
             return web.Response(status=200)
@@ -487,32 +489,35 @@ async def stripe_webhook(request):
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- УНИВЕРСАЛЬНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
-            # 1. Пробуем как словарь
-            end_timestamp = subscription.get('current_period_end')
+            # --- КЛЮЧЕВОЙ МОМЕНТ: Превращаем в обычный dict ---
+            # Теперь это просто словарь, методы Stripe его больше не трогают
+            sub_dict = dict(subscription)
             
-            # 2. Если не вышло, пробуем как атрибут объекта
-            if not end_timestamp:
-                end_timestamp = getattr(subscription, 'current_period_end', None)
+            end_timestamp = sub_dict.get('current_period_end')
             
             if not end_timestamp:
-                logging.error(f"КРИТИЧЕСКИ: Не удалось извлечь current_period_end. Объект: {subscription}")
+                logging.error(f"Не удалось найти current_period_end. Данные: {sub_dict}")
                 return web.Response(status=200)
 
             new_expiry_date = datetime.fromtimestamp(end_timestamp)
-            # ------------------------------------
-
+            
+            # Обновляем БД
             cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
             logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
             
+            # Отправка сообщения
             try:
-                await bot.send_message(invoice.get('customer_email') or "1866531683", f"✅ Ваша подписка успешно продлена до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
-            except Exception:
-                pass
+                # Получаем telegram_id из БД, так как в stripe его нет
+                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                user = cur.fetchone()
+                if user:
+                    await bot.send_message(user[0], f"✅ Ваша подписка успешно продлена! Новый доступ открыт до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
+            except Exception as e:
+                logging.warning(f"Не удалось отправить уведомление пользователю: {e}")
                 
         except Exception as e:
-            logging.error(f"Ошибка при обновлении БД: {e}")
+            logging.error(f"КРИТИЧЕСКАЯ ОШИБКА ОБРАБОТКИ: {e}")
             conn.rollback()
         finally:
             cur.close()
