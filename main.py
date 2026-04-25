@@ -242,8 +242,8 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     # Отправляем фото
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
 
-# --- 5. ВЫБОР ТАРИФА И ОПЛАТА (РЕДАКТИРОВАНИЕ) ---
-@dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state=RegistrationStates.choice)
+# --- 5. ВЫБОР ТАРИФА И ОПЛАТА (ИСПРАВЛЕНО) ---
+@dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
     sub_type = callback_query.data
     
@@ -267,18 +267,41 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
     await callback_query.message.edit_caption(caption=f"✅ Вы выбрали тариф. Переходите к оплате:", reply_markup=kb)
     await callback_query.answer()
 
-# --- 6. КНОПКА НАЗАД ---
-@dp.callback_query_handler(text="back_to_tariffs", state=RegistrationStates.choice)
+# --- 6. КНОПКА НАЗАД (ИСПРАВЛЕНО) ---
+@dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
-    # Восстанавливаем кнопки выбора тарифа
     kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💎 Пробная неделя", callback_data="sub_trial"),
+        InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"),
         InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
         InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
         InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
     )
     await callback_query.message.edit_caption(caption="💎 **Выберите свой формат участия:**", reply_markup=kb)
     await callback_query.answer()
+
+# --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
+@dp.callback_query_handler(text="cancel_subscription", state='*')
+async def cancel_subscription(callback: types.CallbackQuery):
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    cur = conn.cursor()
+    cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
+    result = cur.fetchone()
+    
+    if result and result[0]:
+        sub_id = result[0]
+        try:
+            stripe.Subscription.delete(sub_id)
+            cur.execute("UPDATE users SET paid = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
+            conn.commit()
+            await callback.message.edit_text("✅ Подписка успешно отменена. Доступ сохранится до конца оплаченного периода.")
+        except Exception as e:
+            await callback.answer("Ошибка при отмене подписки. Напишите администратору.")
+            logging.error(f"Ошибка Stripe: {e}")
+    else:
+        await callback.answer("Не удалось найти подписку.")
+    
+    cur.close()
+    conn.close()
     
 # --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
@@ -445,18 +468,19 @@ async def test_expiry(message: types.Message):
 # --- ЗАПУСК ---
 async def on_startup(app):
     init_db()
-    # Планировщик
-    scheduler = AsyncIOScheduler()
+    # Используем глобальный scheduler
     scheduler.add_job(send_renewal_reminders, 'cron', hour=10)
     scheduler.start()
-    # Вебхук
+    
     secret = os.getenv("WEBHOOK_SECRET")
+    # Убедитесь, что YOUR_DOMAIN указан без лишних слэшей в конце
     await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
 
 async def on_shutdown(app):
-    await bot.close() # Закрываем сессию бота при выключении
+    # Правильный способ закрытия сессии в Aiogram 2.x
+    await bot.session.close() 
     logging.info("Бот остановлен, сессия закрыта.")
-
+    
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/webhook')    
