@@ -169,6 +169,13 @@ async def check_subscriptions():
     cur.close()
     conn.close()
 
+async def notify_admins(text: str):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"⚠️ **Уведомление от бота:**\n{text}")
+        except Exception as e:
+            logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
 # --- ХЕНДЛЕРЫ ---
 @dp.message_handler(commands=['broadcast'])
 async def broadcast(message: types.Message):
