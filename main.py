@@ -477,10 +477,9 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        sub_id = getattr(invoice, 'subscription', None)
+        sub_id = invoice.get('subscription') # Используем .get для словарей
         
         if not sub_id:
-            # Это нормально, если приходят технические события без подписки
             return web.Response(status=200)
 
         conn = get_db_conn()
@@ -488,31 +487,32 @@ async def stripe_webhook(request):
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
             
-            # --- ВАШ СПИОН ---
-            # Выводим в логи ВСЕ атрибуты объекта, чтобы увидеть, где лежит дата
-            logging.info(f"DEBUG: Получил объект подписки. Доступные поля: {dir(subscription)}")
+            # --- УНИВЕРСАЛЬНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
+            # 1. Пробуем как словарь
+            end_timestamp = subscription.get('current_period_end')
             
-            # Пробуем достать дату разными способами
-            end_timestamp = getattr(subscription, 'current_period_end', None)
+            # 2. Если не вышло, пробуем как атрибут объекта
+            if not end_timestamp:
+                end_timestamp = getattr(subscription, 'current_period_end', None)
             
             if not end_timestamp:
-                logging.error(f"DEBUG: ОШИБКА! Поле current_period_end не найдено. Объект выглядит так: {subscription}")
-                # Если в subscription.data есть нужные поля (иногда API возвращает вложенность)
+                logging.error(f"КРИТИЧЕСКИ: Не удалось извлечь current_period_end. Объект: {subscription}")
                 return web.Response(status=200)
 
             new_expiry_date = datetime.fromtimestamp(end_timestamp)
-            # -----------------
+            # ------------------------------------
 
             cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
             conn.commit()
-            logging.info(f"Успешно продлили подписку для {sub_id}")
+            logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
             
-            # (Код отправки сообщения оставляем как был)
-            # ...
+            try:
+                await bot.send_message(invoice.get('customer_email') or "1866531683", f"✅ Ваша подписка успешно продлена до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
+            except Exception:
+                pass
                 
         except Exception as e:
-            # Теперь мы точно узнаем, почему это падает
-            logging.error(f"КРИТИЧЕСКАЯ ОШИБКА ОБРАБОТКИ: {e}")
+            logging.error(f"Ошибка при обновлении БД: {e}")
             conn.rollback()
         finally:
             cur.close()
