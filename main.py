@@ -718,6 +718,16 @@ async def on_startup(app):
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
 
+async def main():
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        # Логируем ошибку, чтобы понять, почему бот падает
+        logging.error(f"Критическая ошибка работы бота: {e}", exc_info=True)
+        # Не даем боту просто умереть
+        await asyncio.sleep(5) 
+        await main() # Рекурсивный перезапуск
+
 async def on_shutdown(app):
     session = await bot.get_session()
     await session.close()
