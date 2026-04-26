@@ -67,6 +67,7 @@ def init_db():
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;")
         
         conn.commit()
         cur.close()
@@ -448,6 +449,7 @@ async def stripe_webhook(request):
         logging.info(f"DEBUG: Получен вебхук завершения оплаты. Client Reference ID: {getattr(session, 'client_reference_id', 'None')}, Subscription ID: {getattr(session, 'subscription', 'None')}")
         user_id = getattr(session, 'client_reference_id', None)
         sub_id = getattr(session, 'subscription', None)
+        is_trial = (session.get('mode') == 'payment')
         
         if not user_id: 
             return web.Response(status=200)
@@ -479,12 +481,12 @@ async def stripe_webhook(request):
                 # Здесь можно добавить логику: если price_id == PRICE_TRIAL -> 7 дней
                 expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
 
+            # Запрос с учетом корректной переменной is_trial
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
                 VALUES (%s, TRUE, %s, %s, %s, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET 
                     paid = TRUE,
-                    -- Логика продления: если подписка - ставим новую дату, если оплата - прибавляем к старой
                     expiry_date = CASE 
                         WHEN EXCLUDED.stripe_subscription_id IS NOT NULL THEN EXCLUDED.expiry_date
                         WHEN users.expiry_date > NOW() THEN users.expiry_date + (%s * INTERVAL '1 day')
