@@ -451,44 +451,36 @@ async def stripe_webhook(request):
     # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
-        logging.info(f"DEBUG: Получен вебхук завершения оплаты. Client Reference ID: {getattr(session, 'client_reference_id', 'None')}, Subscription ID: {getattr(session, 'subscription', 'None')}")
         user_id = getattr(session, 'client_reference_id', None)
         sub_id = getattr(session, 'subscription', None)
         
         if not user_id: 
             return web.Response(status=200)
 
+        # Подготовка данных
         days_to_add = int(session.metadata.get('days', 30)) if not sub_id else 0
-        is_trial = (days_to_add == 7) # <-- ВОТ ЭТО БЫЛО ПРОПУЩЕНО
+        is_trial = (days_to_add == 7)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            # Получаем статус пользователя
+            # 1. Проверяем текущий статус
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
-            # --- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
-            # Получаем длительность из метаданных сессии (если есть) или берем 30 дней по умолчанию
-            # Для триала у вас должно быть четко указано 7 дней
-            days_to_add = int(session.metadata.get('days', 30)) if not sub_id else 0
-
+            # 2. Вычисляем дату истечения
             if sub_id:
                 try:
                     sub = stripe.Subscription.retrieve(sub_id)
                     ts = getattr(sub, 'current_period_end', 0)
                     expiry_date = datetime.fromtimestamp(ts) if ts > 0 else (datetime.utcnow() + timedelta(days=30))
-                    logging.info(f"DEBUG: Подписка {sub_id}. Дата окончания из Stripe: {expiry_date}")
-                except Exception as e:
-                    logging.error(f"Ошибка получения подписки: {e}")
+                except:
                     expiry_date = datetime.utcnow() + timedelta(days=30)
             else:
-                # Если это разовый платеж, считаем от сегодня + дней из метаданных (или 7 для триала)
-                # Здесь можно добавить логику: если price_id == PRICE_TRIAL -> 7 дней
                 expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
 
-            # ВАЖНО: Запрос исправлен
+            # 3. SQL запрос
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
                 VALUES (%s, TRUE, %s, %s, TRUE, %s)
@@ -502,37 +494,18 @@ async def stripe_webhook(request):
                     trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
             """, (int(user_id), expiry_date, sub_id, is_trial, days_to_add, is_trial))
 
-            # !!! КРИТИЧЕСКИ ВАЖНО: ЭТО СОХРАНЯЕТ ДАННЫЕ !!!
-            conn.commit() 
-            logging.info(f"Успешно записано в БД для пользователя {user_id}")
-            
-            # ... (код разбана и отправки сообщения)
-
-            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-            
-            if is_existing_user:
-                message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. Спасибо, что остаетесь с нами! ❤️"
-            else:
-                link = await generate_invite_link()
-                message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
-            
-           # --- ВАШ ВАРИАНТ ---
-        try:
-            # 1. Сначала ваш SQL запрос (UPDATE/INSERT)
-            cur.execute("""...ваш запрос...""", (params...))
-            
-            # !!! ВОТ ЭТОГО СТРОКИ НЕ БЫЛО В СТАРОЙ ЛОГИКЕ !!!
+            # 4. ФИКСАЦИЯ
             conn.commit() 
             logging.info(f"Транзакция успешно зафиксирована в БД для {user_id}")
 
-            # 2. Только ПОСЛЕ commit делаем действия бота
+            # 5. Действия бота
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
             if is_existing_user:
-                message_text = f"✅ Ваша подписка успешно продлена..."
+                message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️"
             else:
                 link = await generate_invite_link()
-                message_text = f"✅ Оплата прошла успешно!..."
+                message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
             
             try:
                 await bot.send_message(user_id, message_text)
@@ -540,12 +513,10 @@ async def stripe_webhook(request):
                 logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
 
         except Exception as e:
-            # Если произошла ошибка SQL, мы откатываем изменения
-            conn.rollback() 
+            conn.rollback()
             logging.error(f"Ошибка в обработке платежа для {user_id}: {e}")
             await notify_admins(f"Ошибка покупки: {e}")
         finally:
-            # Закрываем всё
             cur.close()
             conn.close()
 
