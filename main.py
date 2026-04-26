@@ -468,8 +468,8 @@ async def stripe_webhook(request):
             cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
-            current_expiry = row[1] if (row and row[1]) else datetime.utcnow()
-
+            current_expiry = row[1] if (row and row[1]) else datetime.utcnow() 
+            
             # 2. Вычисляем дату истечения: Считаем от СЕГОДНЯ + дни из метаданных
             # Stripe сам продлит подписку, нам важно записать дату в БД
             expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
