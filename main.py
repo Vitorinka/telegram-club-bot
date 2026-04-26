@@ -449,10 +449,12 @@ async def stripe_webhook(request):
         logging.info(f"DEBUG: Получен вебхук завершения оплаты. Client Reference ID: {getattr(session, 'client_reference_id', 'None')}, Subscription ID: {getattr(session, 'subscription', 'None')}")
         user_id = getattr(session, 'client_reference_id', None)
         sub_id = getattr(session, 'subscription', None)
-        is_trial = (session.get('mode') == 'payment')
         
         if not user_id: 
             return web.Response(status=200)
+
+        days_to_add = int(session.metadata.get('days', 30)) if not sub_id else 0
+        is_trial = (days_to_add == 7) # <-- ВОТ ЭТО БЫЛО ПРОПУЩЕНО
 
         conn = get_db_conn()
         cur = conn.cursor()
