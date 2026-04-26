@@ -530,7 +530,11 @@ async def stripe_webhook(request):
     elif event.type == 'customer.subscription.deleted':
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("UPDATE users SET paid = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", (getattr(data, 'id', ''),))        conn.commit()
+        cur.execute(
+            "UPDATE users SET paid = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", 
+            (getattr(data, 'id', ''),)
+        )
+        conn.commit()
         cur.close()
         conn.close()
 
