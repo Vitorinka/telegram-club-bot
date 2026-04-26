@@ -457,47 +457,36 @@ async def stripe_webhook(request):
         if not user_id: 
             return web.Response(status=200)
 
-        # Подготовка данных
-        days_to_add = int(session.metadata.get('days', 30)) if not sub_id else 0
+        # ИСПРАВЛЕНИЕ: Берем дни из метаданных всегда, независимо от sub_id
+        days_to_add = int(session.metadata.get('days', 30))
         is_trial = (days_to_add == 7)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
             # 1. Проверяем текущий статус
-            cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
+            cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
+            current_expiry = row[1] if (row and row[1]) else datetime.utcnow()
 
-            # 2. Вычисляем дату истечения
-            if sub_id:
-                try:
-                    sub = stripe.Subscription.retrieve(sub_id)
-                    ts = getattr(sub, 'current_period_end', 0)
-                    expiry_date = datetime.fromtimestamp(ts) if ts > 0 else (datetime.utcnow() + timedelta(days=30))
-                except:
-                    expiry_date = datetime.utcnow() + timedelta(days=30)
-            else:
-                expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
+            # 2. Вычисляем дату истечения: Считаем от СЕГОДНЯ + дни из метаданных
+            # Stripe сам продлит подписку, нам важно записать дату в БД
+            expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
 
-            # 3. SQL запрос
+            # 3. SQL запрос (упрощенный и надежный)
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
                 VALUES (%s, TRUE, %s, %s, TRUE, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET 
                     paid = TRUE,
-                    expiry_date = CASE 
-                        WHEN EXCLUDED.stripe_subscription_id IS NOT NULL THEN EXCLUDED.expiry_date
-                        ELSE users.expiry_date + (%s * INTERVAL '1 day')
-                    END,
+                    expiry_date = %s,
                     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
                     trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
-            """, (int(user_id), expiry_date, sub_id, is_trial, days_to_add, is_trial))
+            """, (int(user_id), expiry_date, sub_id, is_trial, expiry_date, is_trial))
 
-            # 4. ФИКСАЦИЯ
             conn.commit() 
-            logging.info(f"Транзакция успешно зафиксирована в БД для {user_id}")
-
+            logging.info(f"Транзакция зафиксирована: {user_id}, новая дата: {expiry_date}")
             # 5. Действия бота
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
