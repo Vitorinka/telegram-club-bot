@@ -473,7 +473,7 @@ async def stripe_webhook(request):
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
         invoice = event.data.object
-        sub_id = invoice.get('subscription')
+        sub_id = invoice['subscription'] if 'subscription' in invoice else None 
         
         if sub_id:
             conn = get_db_conn()
