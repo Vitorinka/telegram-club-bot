@@ -457,6 +457,11 @@ async def stripe_webhook(request):
         if not user_id: 
             return web.Response(status=200)
 
+        try:
+            metadata = session.metadata.to_dict()
+        except AttributeError:
+            metadata = dict(session.metadata) if session.metadata else {}
+
         # ИСПРАВЛЕНИЕ: Берем дни из метаданных всегда, независимо от sub_id
         days_to_add = int(session.metadata.get('days', 30))
         is_trial = (days_to_add == 7)
