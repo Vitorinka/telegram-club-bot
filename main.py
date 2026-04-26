@@ -3,6 +3,8 @@ import logging
 import asyncio
 import stripe
 import psycopg2
+import subprocess
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -672,6 +674,37 @@ async def test_expiry(message: types.Message):
     else:
         await message.answer("У вас нет прав для этого.")
 
+async def send_db_backup():
+    filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.dump"
+    db_url = os.getenv("DATABASE_URL")
+    
+    try:
+        # Выполняем дамп базы
+        # pg_dump считывает настройки из DATABASE_URL автоматически
+        dump_cmd = f"pg_dump '{db_url}' -F c -f {filename}"
+        process = await asyncio.create_subprocess_shell(dump_cmd)
+        await process.communicate()
+        
+        if process.returncode != 0:
+            raise Exception("Ошибка при создании дампа (pg_dump)")
+
+        # Отправляем файл админам
+        for admin_id in ADMIN_IDS:
+            try:
+                with open(filename, 'rb') as file:
+                    await bot.send_document(admin_id, file, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+            except Exception as e:
+                logging.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
+        
+    except Exception as e:
+        await notify_admins(f"⚠️ Ошибка автоматического бэкапа: {e}")
+        logging.error(f"Ошибка бэкапа: {e}")
+    
+    finally:
+        # Удаляем файл, чтобы не занимать место в контейнере
+        if os.path.exists(filename):
+            os.remove(filename)
+
 # --- ЗАПУСК ---
 async def on_startup(app):
     init_db()
@@ -681,7 +714,8 @@ async def on_startup(app):
     secret = os.getenv("WEBHOOK_SECRET")
     await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
     # Используем глобальный scheduler
-    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10)    
+    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10)
+    scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
 
 async def on_shutdown(app):
