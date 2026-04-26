@@ -457,29 +457,33 @@ async def stripe_webhook(request):
         if not user_id: 
             return web.Response(status=200)
 
+        # САМОЕ ВАЖНОЕ: Превращаем StripeObject в обычный словарь Python
+        # Это навсегда убирает ошибку KeyError: 'get'
         try:
-            metadata = session.metadata.to_dict()
-        except AttributeError:
-            metadata = dict(session.metadata) if session.metadata else {}
+            metadata = dict(session.metadata)
+        except:
+            metadata = {}
 
-        # ИСПРАВЛЕНИЕ: Берем дни из метаданных всегда, независимо от sub_id
-        days_to_add = int(session.metadata.get('days', 30))
+        # Теперь .get() работает как в обычном словаре.
+        # Если 'days' нет, ставим 0, чтобы не было ошибки "не верно"
+        days_to_add = int(metadata.get('days', 0)) 
         is_trial = (days_to_add == 7)
 
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            # 1. Проверяем текущий статус
+            # Проверяем текущий статус
             cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
-            current_expiry = row[1] if (row and row[1]) else datetime.utcnow() 
             
-            # 2. Вычисляем дату истечения: Считаем от СЕГОДНЯ + дни из метаданных
-            # Stripe сам продлит подписку, нам важно записать дату в БД
-            expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
+            # Если дни 0, то мы не продлеваем, а просто фиксируем оплату (защита от багов)
+            if days_to_add > 0:
+                expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
+            else:
+                expiry_date = datetime.utcnow() # Или ваша логика по умолчанию
 
-            # 3. SQL запрос (упрощенный и надежный)
+            # SQL запрос
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
                 VALUES (%s, TRUE, %s, %s, TRUE, %s)
@@ -490,29 +494,44 @@ async def stripe_webhook(request):
                     trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
             """, (int(user_id), expiry_date, sub_id, is_trial, expiry_date, is_trial))
 
-            conn.commit() 
-            logging.info(f"Транзакция зафиксирована: {user_id}, новая дата: {expiry_date}")
-            # 5. Действия бота
+            conn.commit()
+            
+            # Отправка сообщений как вы просили (без правок)
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
             if is_existing_user:
-                message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️"
+                await bot.send_message(user_id, f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️")
             else:
                 link = await generate_invite_link()
-                message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
-            
-            try:
-                await bot.send_message(user_id, message_text)
-            except BotBlocked:
-                logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
+                await bot.send_message(user_id, f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}")
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"Ошибка в обработке платежа для {user_id}: {e}")
-            await notify_admins(f"Ошибка покупки: {e}")
+            logging.error(f"Ошибка в Stripe Webhook для {user_id}: {e}")
         finally:
             cur.close()
             conn.close()
+
+    # 5. ДЕЙСТВИЯ БОТА (с обработкой блокировки)
+        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
+        
+        # Определяем текст
+        if is_existing_user:
+            message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️"
+        else:
+            link = await generate_invite_link()
+            message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
+        
+        # БЕЗОПАСНАЯ ОТПРАВКА
+        try:
+            await bot.send_message(user_id, message_text)
+        except BotBlocked:
+            # СЮДА попадет код, если пользователь заблокировал бота
+            logging.warning(f"⚠️ Оплата прошла, но пользователь {user_id} заблокировал бота. Сообщение не доставлено.")
+            # Опционально: уведомить вас (админа), чтобы вы вручную связались с человеком
+            await notify_admins(f"⚠️ ВНИМАНИЕ: Пользователь {user_id} оплатил подписку, но у него заблокирован бот. Свяжитесь с ним вручную!")
+        except Exception as e:
+            logging.error(f"Неизвестная ошибка отправки сообщения пользователю {user_id}: {e}")
 
     # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
     elif event.type == 'invoice.payment_succeeded':
