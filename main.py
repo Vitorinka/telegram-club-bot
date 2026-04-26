@@ -414,7 +414,6 @@ async def stripe_webhook(request):
         return web.Response(status=400)
 
     # 1. ПОКУПКА / ПОДПИСКА
-    # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
         user_id = getattr(session, 'client_reference_id', None)
@@ -513,7 +512,8 @@ async def stripe_webhook(request):
         auto_renew = not getattr(data, 'cancel_at_period_end', False)
         cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (auto_renew, getattr(data, 'id', '')))
         conn.commit()
-        cur.close(); conn.close()
+        cur.close();
+        conn.close()
                 
     # 4. ОШИБКА ОПЛАТЫ
     elif event.type == 'invoice.payment_failed':
