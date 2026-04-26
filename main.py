@@ -488,21 +488,24 @@ async def stripe_webhook(request):
                 # Здесь можно добавить логику: если price_id == PRICE_TRIAL -> 7 дней
                 expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
 
-            # Запрос с учетом корректной переменной is_trial
+            # ВАЖНО: Запрос исправлен
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
-                VALUES (%s, TRUE, %s, %s, %s, %s)
+                VALUES (%s, TRUE, %s, %s, TRUE, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET 
                     paid = TRUE,
                     expiry_date = CASE 
                         WHEN EXCLUDED.stripe_subscription_id IS NOT NULL THEN EXCLUDED.expiry_date
-                        WHEN users.expiry_date > NOW() THEN users.expiry_date + (%s * INTERVAL '1 day')
-                        ELSE NOW() + (%s * INTERVAL '1 day')
+                        ELSE users.expiry_date + (%s * INTERVAL '1 day')
                     END,
                     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
                     trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
-            """, (int(user_id), expiry_date, sub_id, (sub_id is not None), is_trial, days_to_add, days_to_add, is_trial))
+            """, (int(user_id), expiry_date, sub_id, is_trial, days_to_add, is_trial))
 
+            # !!! КРИТИЧЕСКИ ВАЖНО: ЭТО СОХРАНЯЕТ ДАННЫЕ !!!
+            conn.commit() 
+            logging.info(f"Успешно записано в БД для пользователя {user_id}")
+            
             # ... (код разбана и отправки сообщения)
 
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
@@ -513,16 +516,36 @@ async def stripe_webhook(request):
                 link = await generate_invite_link()
                 message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
             
+           # --- ВАШ ВАРИАНТ ---
+        try:
+            # 1. Сначала ваш SQL запрос (UPDATE/INSERT)
+            cur.execute("""...ваш запрос...""", (params...))
+            
+            # !!! ВОТ ЭТОГО СТРОКИ НЕ БЫЛО В СТАРОЙ ЛОГИКЕ !!!
+            conn.commit() 
+            logging.info(f"Транзакция успешно зафиксирована в БД для {user_id}")
+
+            # 2. Только ПОСЛЕ commit делаем действия бота
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
+            
+            if is_existing_user:
+                message_text = f"✅ Ваша подписка успешно продлена..."
+            else:
+                link = await generate_invite_link()
+                message_text = f"✅ Оплата прошла успешно!..."
+            
             try:
                 await bot.send_message(user_id, message_text)
             except BotBlocked:
                 logging.warning(f"Оплата принята, но {user_id} заблокировал бота.")
 
         except Exception as e:
+            # Если произошла ошибка SQL, мы откатываем изменения
+            conn.rollback() 
             logging.error(f"Ошибка в обработке платежа для {user_id}: {e}")
             await notify_admins(f"Ошибка покупки: {e}")
-            conn.rollback()
         finally:
+            # Закрываем всё
             cur.close()
             conn.close()
 
