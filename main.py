@@ -401,7 +401,6 @@ async def cancel_subscription(callback: types.CallbackQuery):
     conn.close()
     
 # --- WEBHOOK STRIPE ---
-# --- WEBHOOK STRIPE ---
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -415,9 +414,10 @@ async def stripe_webhook(request):
         return web.Response(status=400)
 
     # 1. ПОКУПКА / ПОДПИСКА
+    # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
-        user_id = session.client_reference_id
+        user_id = getattr(session, 'client_reference_id', None)
         sub_id = getattr(session, 'subscription', None)
         
         if not user_id: 
@@ -426,18 +426,22 @@ async def stripe_webhook(request):
         conn = get_db_conn()
         cur = conn.cursor()
         try:
+            # Получаем статус пользователя
             cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
+            # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ
             if sub_id:
-                # Если это полноценная подписка
                 sub = stripe.Subscription.retrieve(sub_id)
-                expiry_date = datetime.fromtimestamp(sub.current_period_end)
+                # Используем getattr с дефолтным значением 0
+                ts = getattr(sub, 'current_period_end', 0)
+                expiry_date = datetime.fromtimestamp(ts) if ts else (datetime.utcnow() + timedelta(days=30))
             else:
-                # Если это триал (нет sub_id)
+                # Если это триал без sub_id
                 expiry_date = datetime.utcnow() + timedelta(days=7)
 
+            # ... (далее ваш SQL INSERT / UPDATE)
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
                 VALUES (%s, TRUE, %s, %s, %s)
@@ -448,6 +452,8 @@ async def stripe_webhook(request):
                     auto_renew = EXCLUDED.auto_renew;
             """, (int(user_id), expiry_date, sub_id, (sub_id is not None)))
             conn.commit()
+
+            # ... (код разбана и отправки сообщения)
 
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
             
@@ -502,33 +508,29 @@ async def stripe_webhook(request):
         
     # 3. ИЗМЕНЕНИЕ СТАТУСА
     elif event.type == 'customer.subscription.updated':
-        sub = event.data.object
-        auto_renew = not sub.cancel_at_period_end
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (auto_renew, sub.id))
+        auto_renew = not getattr(data, 'cancel_at_period_end', False)
+        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (auto_renew, getattr(data, 'id', '')))
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
                 
     # 4. ОШИБКА ОПЛАТЫ
     elif event.type == 'invoice.payment_failed':
-        sub_id = event.data.object.subscription
+        sub_id = getattr(data, 'subscription', None)
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
-            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
+            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,)
             conn.commit()
             cur.close()
             conn.close()
 
     # 5. УДАЛЕНИЕ ПОДПИСКИ
     elif event.type == 'customer.subscription.deleted':
-        sub = event.data.object
         conn = get_db_conn()
         cur = conn.cursor()
-        cur.execute("UPDATE users SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", (sub.id,))
-        conn.commit()
+        cur.execute("UPDATE users SET paid = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", (getattr(data, 'id', ''),))        conn.commit()
         cur.close()
         conn.close()
 
