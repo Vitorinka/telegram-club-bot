@@ -296,23 +296,43 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer("Загрузка...")
     sub_type = callback_query.data
+    user_id = callback_query.from_user.id
     
+    # 1. ЗАЩИТА ОТ ПОВТОРНОГО ТРИАЛА
+    if sub_type == "sub_trial":
+        conn = get_db_conn() # ваша функция подключения к БД
+        cur = conn.cursor()
+        cur.execute("SELECT trial_used FROM users WHERE telegram_id = %s", (user_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if row and row[0] is True:
+            await callback_query.answer("⚠️ Вы уже использовали пробную неделю.", show_alert=True)
+            return
+
+    # 2. НАСТРОЙКИ ТАРИФОВ
     price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
-    price_id = os.getenv(price_map.get(sub_type))
+    days_map = {"sub_trial": 7, "sub_1": 30, "sub_6": 180, "sub_12": 365}
     
+    price_id = os.getenv(price_map.get(sub_type))
+    days = days_map.get(sub_type, 30)
+
     if not price_id:
-        await callback_query.answer("Ошибка конфигурации тарифа. Напишите администратору.")
+        await callback_query.answer("Ошибка конфигурации тарифа.")
         return
 
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
     
+    # 3. СОЗДАНИЕ СЕССИИ С МЕТАДАННЫМИ
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{'price': price_id, 'quantity': 1}],
             mode=mode,
             success_url='https://t.me/Natalia_SoulFit_bot',
-            client_reference_id=str(callback_query.from_user.id)
+            client_reference_id=str(user_id),
+            metadata={'days': str(days)} # ВАЖНО: передаем количество дней
         )
         
         kb = InlineKeyboardMarkup(row_width=1).add(
@@ -320,7 +340,12 @@ async def process_payment(callback_query: types.CallbackQuery, state: FSMContext
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
         )
         
-        await state.finish() 
+        await callback_query.message.edit_text("Перейдите по ссылке для оплаты:", reply_markup=kb)
+        await state.finish()
+        
+    except Exception as e:
+        logging.error(f"Ошибка Stripe: {e}")
+        await callback_query.answer("Ошибка при создании платежа.")
         
         # БЕЗОПАСНАЯ ЗАМЕНА
         try:
@@ -435,28 +460,39 @@ async def stripe_webhook(request):
             row = cur.fetchone()
             is_existing_user = (row and row[0] is True)
 
-            # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ
-            if sub_id:
-                sub = stripe.Subscription.retrieve(sub_id)
-                logging.info(f"DEBUG: Stripe прислал подписку {sub_id}. Дата окончания (timestamp): {getattr(sub, 'current_period_end', 'Нет данных')}")
-                # Используем getattr с дефолтным значением 0
-                ts = getattr(sub, 'current_period_end', 0)
-                expiry_date = datetime.fromtimestamp(ts) if ts else (datetime.utcnow() + timedelta(days=30))
-            else:
-                # Если это триал без sub_id
-                expiry_date = datetime.utcnow() + timedelta(days=7)
+            # --- БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ ---
+            # Получаем длительность из метаданных сессии (если есть) или берем 30 дней по умолчанию
+            # Для триала у вас должно быть четко указано 7 дней
+            days_to_add = int(session.metadata.get('days', 30)) if not sub_id else 0
 
-            # ... (далее ваш SQL INSERT / UPDATE)
+            if sub_id:
+                try:
+                    sub = stripe.Subscription.retrieve(sub_id)
+                    ts = getattr(sub, 'current_period_end', 0)
+                    expiry_date = datetime.fromtimestamp(ts) if ts > 0 else (datetime.utcnow() + timedelta(days=30))
+                    logging.info(f"DEBUG: Подписка {sub_id}. Дата окончания из Stripe: {expiry_date}")
+                except Exception as e:
+                    logging.error(f"Ошибка получения подписки: {e}")
+                    expiry_date = datetime.utcnow() + timedelta(days=30)
+            else:
+                # Если это разовый платеж, считаем от сегодня + дней из метаданных (или 7 для триала)
+                # Здесь можно добавить логику: если price_id == PRICE_TRIAL -> 7 дней
+                expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
+
             cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew)
-                VALUES (%s, TRUE, %s, %s, %s)
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
+                VALUES (%s, TRUE, %s, %s, %s, %s)
                 ON CONFLICT (telegram_id) DO UPDATE SET 
-                    paid = TRUE, 
-                    expiry_date = EXCLUDED.expiry_date,
-                    stripe_subscription_id = EXCLUDED.stripe_subscription_id,
-                    auto_renew = EXCLUDED.auto_renew;
-            """, (int(user_id), expiry_date, sub_id, (sub_id is not None)))
-            conn.commit()
+                    paid = TRUE,
+                    -- Логика продления: если подписка - ставим новую дату, если оплата - прибавляем к старой
+                    expiry_date = CASE 
+                        WHEN EXCLUDED.stripe_subscription_id IS NOT NULL THEN EXCLUDED.expiry_date
+                        WHEN users.expiry_date > NOW() THEN users.expiry_date + (%s * INTERVAL '1 day')
+                        ELSE NOW() + (%s * INTERVAL '1 day')
+                    END,
+                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+                    trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
+            """, (int(user_id), expiry_date, sub_id, (sub_id is not None), is_trial, days_to_add, days_to_add, is_trial))
 
             # ... (код разбана и отправки сообщения)
 
