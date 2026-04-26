@@ -448,6 +448,19 @@ async def stripe_webhook(request):
 
     data = event.data.object
 
+    # Внутри вашего обработчика вебхука
+    session_id = event.data.object.id # ID сессии из Stripe
+
+    # 1. Проверяем, есть ли этот ID в нашей базе (создайте для этого таблицу processed_events или проверяйте по уже существующей)
+    if await db.is_event_processed(session_id):
+        return Response(status=200) # Уже обработано, просто возвращаем 200 OK для Stripe
+
+    # 2. Если не обработано — выполняем логику
+    await process_payment(event)
+
+    # 3. Помечаем событие как обработанное в базе данных
+    await db.mark_event_processed(session_id)
+
     # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
