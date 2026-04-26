@@ -413,6 +413,8 @@ async def stripe_webhook(request):
         logging.error(f"Ошибка проверки подписи Stripe: {e}")
         return web.Response(status=400)
 
+    data = event.data.object
+
     # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
