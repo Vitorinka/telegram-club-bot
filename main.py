@@ -21,6 +21,11 @@ logging.info("Начинаю подключение к базе данных..."
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID") 
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+
+# !!! СРАЗУ ПРОВЕРЯЕМ !!!
+if not DATABASE_URL:
+    raise ValueError("Критическая ошибка: DATABASE_URL не задан! Проверьте файл .env или настройки сервера.")
+
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 
 # Вставьте сюда ссылки на ваши фото или ID файлов из Telegram
