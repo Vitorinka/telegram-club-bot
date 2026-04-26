@@ -719,8 +719,8 @@ async def on_startup(app):
     scheduler.start()
 
 async def on_shutdown(app):
-    # Правильный способ закрытия сессии в Aiogram 2.x
-    await bot.session.close() 
+    session = await bot.get_session()
+    await session.close()
     logging.info("Бот остановлен, сессия закрыта.")
     
 if __name__ == "__main__":
