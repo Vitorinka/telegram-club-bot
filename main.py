@@ -19,14 +19,14 @@ from datetime import datetime, timedelta
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info("Начинаю подключение к базе данных...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 GROUP_ID = os.getenv("GROUP_ID") 
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
+stripe.api_key = os.getenv("STRIPE_API_KEY")
 
 # !!! СРАЗУ ПРОВЕРЯЕМ !!!
 if not DATABASE_URL:
     raise ValueError("Критическая ошибка: DATABASE_URL не задан! Проверьте файл .env или настройки сервера.")
-
-stripe.api_key = os.getenv("STRIPE_API_KEY")
 
 # Вставьте сюда ссылки на ваши фото или ID файлов из Telegram
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA" 
