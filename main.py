@@ -521,7 +521,7 @@ async def stripe_webhook(request):
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
-            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,)
+            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
             conn.commit()
             cur.close()
             conn.close()
