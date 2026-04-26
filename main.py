@@ -420,6 +420,7 @@ async def stripe_webhook(request):
     # 1. ПОКУПКА / ПОДПИСКА
     if event.type == 'checkout.session.completed':
         session = event.data.object
+        logging.info(f"DEBUG: Получен вебхук завершения оплаты. Client Reference ID: {getattr(session, 'client_reference_id', 'None')}, Subscription ID: {getattr(session, 'subscription', 'None')}")
         user_id = getattr(session, 'client_reference_id', None)
         sub_id = getattr(session, 'subscription', None)
         
@@ -437,6 +438,7 @@ async def stripe_webhook(request):
             # БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ДАТЫ
             if sub_id:
                 sub = stripe.Subscription.retrieve(sub_id)
+                logging.info(f"DEBUG: Stripe прислал подписку {sub_id}. Дата окончания (timestamp): {getattr(sub, 'current_period_end', 'Нет данных')}")
                 # Используем getattr с дефолтным значением 0
                 ts = getattr(sub, 'current_period_end', 0)
                 expiry_date = datetime.fromtimestamp(ts) if ts else (datetime.utcnow() + timedelta(days=30))
@@ -729,8 +731,10 @@ async def main():
         await main() # Рекурсивный перезапуск
 
 async def on_shutdown(app):
+    # Исправленный способ закрытия сессии
     session = await bot.get_session()
-    await session.close()
+    if session:
+        await session.close()
     logging.info("Бот остановлен, сессия закрыта.")
     
 if __name__ == "__main__":
