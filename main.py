@@ -301,7 +301,6 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             await callback.answer("⚠️ Вы уже использовали пробную неделю.", show_alert=True)
             return
 
-    # Маппинг тарифов
     price_map = {
         "sub_trial": "PRICE_TRIAL",
         "sub_1": "PRICE_1M",
@@ -318,7 +317,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     days = days_map[sub_type]
 
     if not price_id:
-        await callback.answer("Ошибка конфигурации тарифа. Свяжитесь с администратором.", show_alert=True)
+        await callback.answer("Ошибка конфигурации тарифа.", show_alert=True)
         return
 
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
@@ -337,12 +336,24 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
         )
-        await callback.message.edit_caption(caption="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:", reply_markup=kb)
+        # --- Универсальное редактирование ---
+        if callback.message.photo:
+            await callback.message.edit_caption(
+                caption="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:",
+                reply_markup=kb
+            )
+        else:
+            await callback.message.edit_text(
+                text="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:",
+                reply_markup=kb
+            )
         await state.finish()
     except Exception as e:
         logging.error(f"Stripe ошибка: {e}")
-        await callback.answer("Техническая ошибка. Попробуйте позже или напишите @re_tasha", show_alert=True)
-
+        await callback.answer(
+            "Техническая ошибка. Попробуйте позже или напишите @re_tasha",
+            show_alert=True
+        )
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
