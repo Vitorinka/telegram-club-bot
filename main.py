@@ -618,24 +618,6 @@ async def on_shutdown(app):
     await bot.close()
     logging.info("Бот остановлен.")
 
-@dp.message_handler(commands=['fix_grace_period'])
-async def fix_grace_period(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Нет прав.")
-        return
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("ALTER TABLE users ALTER COLUMN grace_period_end TYPE TIMESTAMP USING NULL;")
-        cur.execute("ALTER TABLE users ALTER COLUMN grace_period_end DROP DEFAULT;")
-        conn.commit()
-        await message.answer("✅ Колонка `grace_period_end` успешно изменена на TIMESTAMP.")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
     app = get_new_configured_app(dispatcher=dp, path='/webhook')
