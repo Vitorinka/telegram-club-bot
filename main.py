@@ -508,20 +508,23 @@ async def stripe_webhook(request):
     if await is_event_processed(event_id):
         return web.Response(status=200)
 
-    # --- Обработка checkout.session.completed ---
+    # ---------- CHECKOUT.SESSION.COMPLETED ----------
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        # Используем getattr, потому что у StripeObject нет метода .get()
         user_id = getattr(session, 'client_reference_id', None)
         if not user_id:
             await mark_event_processed(event_id)
             return web.Response(status=200)
 
         sub_id = getattr(session, 'subscription', None)
-        # Метаданные – это тоже StripeObject, конвертируем в dict
-        metadata = getattr(session, 'metadata', {})
-        if hasattr(metadata, 'items'):
-            metadata = dict(metadata)
+        metadata_raw = getattr(session, 'metadata', None)
+        if metadata_raw is None:
+            metadata = {}
+        else:
+            try:
+                metadata = dict(metadata_raw)
+            except Exception:
+                metadata = {}
         days_to_add = int(metadata.get('days', 0))
         is_trial = (days_to_add == 7)
 
@@ -563,7 +566,6 @@ async def stripe_webhook(request):
                 await bot.send_message(int(user_id), msg)
             except BotBlocked:
                 await notify_admins(f"Пользователь {user_id} оплатил, но заблокировал бота.")
-
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
         except Exception as e:
             conn.rollback()
@@ -572,7 +574,7 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # --- Автопродление invoice.payment_succeeded ---
+    # ---------- INVOICE.PAYMENT_SUCCEEDED ----------
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
         sub_id = getattr(invoice, 'subscription', None)
@@ -596,7 +598,7 @@ async def stripe_webhook(request):
             except Exception as e:
                 logging.error(f"Ошибка invoice.payment_succeeded: {e}")
 
-    # --- Ошибка оплаты → grace period ---
+    # ---------- INVOICE.PAYMENT_FAILED ----------
     elif event['type'] == 'invoice.payment_failed':
         invoice = event['data']['object']
         sub_id = getattr(invoice, 'subscription', None)
@@ -615,7 +617,7 @@ async def stripe_webhook(request):
                 except BotBlocked:
                     pass
 
-    # --- Отмена подписки ---
+    # ---------- CUSTOMER.SUBSCRIPTION.DELETED ----------
     elif event['type'] == 'customer.subscription.deleted':
         sub = event['data']['object']
         sub_id = getattr(sub, 'id', None)
@@ -627,7 +629,7 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # --- Истекшая или неудачная сессия ---
+    # ---------- CHECKOUT.SESSION.EXPIRED or ASYNC_PAYMENT_FAILED ----------
     elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
         session = event['data']['object']
         user_id = getattr(session, 'client_reference_id', None)
@@ -659,7 +661,7 @@ async def on_startup(app):
     scheduler.start()
 
 async def on_shutdown(app):
-    await bot.session.close()
+    await bot.close()
     logging.info("Бот остановлен.")
 
 if __name__ == "__main__":
