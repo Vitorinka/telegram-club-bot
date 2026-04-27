@@ -493,7 +493,6 @@ async def test_expiry(message: types.Message):
     else:
         await message.answer("Нет прав.")
 
-# --- STRIPE WEBHOOK (полностью исправлен) ---
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -509,16 +508,20 @@ async def stripe_webhook(request):
     if await is_event_processed(event_id):
         return web.Response(status=200)
 
-    # Обработка успешной оплаты (первичная или продление через сессию)
+    # --- Обработка checkout.session.completed ---
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
-        user_id = session.get('client_reference_id')
+        # Используем getattr, потому что у StripeObject нет метода .get()
+        user_id = getattr(session, 'client_reference_id', None)
         if not user_id:
             await mark_event_processed(event_id)
             return web.Response(status=200)
 
-        sub_id = session.get('subscription')
-        metadata = session.get('metadata', {})
+        sub_id = getattr(session, 'subscription', None)
+        # Метаданные – это тоже StripeObject, конвертируем в dict
+        metadata = getattr(session, 'metadata', {})
+        if hasattr(metadata, 'items'):
+            metadata = dict(metadata)
         days_to_add = int(metadata.get('days', 0))
         is_trial = (days_to_add == 7)
 
@@ -569,10 +572,10 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # Автопродление
+    # --- Автопродление invoice.payment_succeeded ---
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
-        sub_id = invoice.get('subscription')
+        sub_id = getattr(invoice, 'subscription', None)
         if sub_id:
             try:
                 subscription = stripe.Subscription.retrieve(sub_id)
@@ -593,10 +596,10 @@ async def stripe_webhook(request):
             except Exception as e:
                 logging.error(f"Ошибка invoice.payment_succeeded: {e}")
 
-    # Ошибка оплаты – даём grace period
+    # --- Ошибка оплаты → grace period ---
     elif event['type'] == 'invoice.payment_failed':
         invoice = event['data']['object']
-        sub_id = invoice.get('subscription')
+        sub_id = getattr(invoice, 'subscription', None)
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
@@ -612,10 +615,10 @@ async def stripe_webhook(request):
                 except BotBlocked:
                     pass
 
-    # Отмена подписки пользователем или Stripe
+    # --- Отмена подписки ---
     elif event['type'] == 'customer.subscription.deleted':
         sub = event['data']['object']
-        sub_id = sub.get('id')
+        sub_id = getattr(sub, 'id', None)
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
@@ -624,10 +627,10 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # Если сессия оплаты истекла или не удалась
-    elif event['type'] in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
+    # --- Истекшая или неудачная сессия ---
+    elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
         session = event['data']['object']
-        user_id = session.get('client_reference_id')
+        user_id = getattr(session, 'client_reference_id', None)
         if user_id:
             try:
                 await bot.send_message(int(user_id), "❌ Оплата не прошла или время сессии истекло. Попробуйте снова.")
