@@ -602,7 +602,7 @@ async def stripe_webhook(request):
                     auto_renew = TRUE,
                     reminder_sent = FALSE,
                     first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-            """, (int(user_id), new_expiry, sub_id, is_trial, needs_link, needs_link))
+            """, (int(user_id), new_expiry, sub_id, is_trial, needs_link))
             conn.commit()
 
             if needs_link:
