@@ -519,6 +519,7 @@ async def stripe_webhook(request):
     if await is_event_processed(event_id):
         return web.Response(status=200)
 
+    # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         user_id = getattr(session, 'client_reference_id', None)
@@ -527,12 +528,10 @@ async def stripe_webhook(request):
             return web.Response(status=200)
 
         sub_id = getattr(session, 'subscription', None)
-        # --- Надёжное извлечение days ---
         days_to_add = 0
         metadata_raw = getattr(session, 'metadata', None)
         if metadata_raw is not None:
             try:
-                # Пробуем напрямую как словарь
                 days_to_add = int(metadata_raw['days'])
             except (KeyError, TypeError, ValueError):
                 try:
@@ -584,7 +583,14 @@ async def stripe_webhook(request):
                 await bot.send_message(int(user_id), msg)
             except BotBlocked:
                 await notify_admins(f"Пользователь {user_id} оплатил, но заблокировал бота.")
-            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
+            # Разбан (с игнорированием ошибки для админов)
+            try:
+                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
+            except Exception as e:
+                if "administrator" in str(e).lower():
+                    logging.warning(f"Не удалось разбанить админа {user_id}: {e}")
+                else:
+                    logging.error(f"Ошибка разбана {user_id}: {e}")
         except Exception as e:
             conn.rollback()
             logging.error(f"Ошибка checkout: {e}")
@@ -592,10 +598,100 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
-    # Остальные типы событий (invoice.payment_succeeded, failed, subscription.deleted, expired) – оставьте как было
-    # ... (они не менялись)
+    # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
+    elif event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object']
+        sub_id = getattr(invoice, 'subscription', None)
+        if not sub_id:
+            await mark_event_processed(event_id)
+            return web.Response(status=200)
+        try:
+            subscription = stripe.Subscription.retrieve(sub_id)
+            new_expiry = datetime.fromtimestamp(subscription.current_period_end)
+            conn = get_db_conn()
+            cur = conn.cursor()
+            # Обновляем дату, сбрасываем флаги ошибки и льготного периода
+            cur.execute("""
+                UPDATE users 
+                SET expiry_date = %s, 
+                    paid = TRUE, 
+                    payment_failed = FALSE, 
+                    grace_period_end = NULL 
+                WHERE stripe_subscription_id = %s
+            """, (new_expiry, sub_id))
+            conn.commit()
+            # Найдём user_id для уведомления
+            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                try:
+                    await bot.send_message(row[0], f"✅ Автопродление успешно! Доступ продлён до {new_expiry.strftime('%d.%m.%Y')}. Хорошего дня!")
+                except BotBlocked:
+                    pass
+        except Exception as e:
+            logging.error(f"Ошибка invoice.payment_succeeded: {e}")
+
+    # ---------- 3. ОШИБКА ОПЛАТЫ (invoice.payment_failed) – GRACE PERIOD ----------
+    elif event['type'] == 'invoice.payment_failed':
+        invoice = event['data']['object']
+        sub_id = getattr(invoice, 'subscription', None)
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            # Устанавливаем grace_period_end на 24 часа вперёд
+            cur.execute("""
+                UPDATE users 
+                SET payment_failed = TRUE, 
+                    grace_period_end = NOW() + INTERVAL '1 day' 
+                WHERE stripe_subscription_id = %s
+            """, (sub_id,))
+            conn.commit()
+            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                try:
+                    await bot.send_message(row[0], 
+                        "⚠️ Не удалось списать оплату за подписку. У вас есть 24 часа, чтобы пополнить карту или связаться с администратором.\n"
+                        "После устранения проблемы доступ восстановится автоматически.")
+                except BotBlocked:
+                    pass
+
+    # ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ ПОДПИСКУ (customer.subscription.deleted) ----------
+    elif event['type'] == 'customer.subscription.deleted':
+        sub = event['data']['object']
+        sub_id = getattr(sub, 'id', None)
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE users 
+                SET paid = FALSE, 
+                    stripe_subscription_id = NULL 
+                WHERE stripe_subscription_id = %s
+            """, (sub_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+    # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
+    elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
+        session = event['data']['object']
+        user_id = getattr(session, 'client_reference_id', None)
+        if user_id:
+            try:
+                await bot.send_message(int(user_id), 
+                    "❌ Оплата не прошла или время сессии истекло. Попробуйте снова.")
+            except Exception:
+                pass
+
+    # Помечаем событие обработанным
     await mark_event_processed(event_id)
     return web.Response(status=200)
+    
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
 async def on_startup(app):
     init_db()
