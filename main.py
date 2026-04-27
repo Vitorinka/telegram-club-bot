@@ -659,7 +659,7 @@ async def on_startup(app):
     scheduler.start()
 
 async def on_shutdown(app):
-    await bot.close()
+    await bot.session.close()
     logging.info("Бот остановлен.")
 
 if __name__ == "__main__":
