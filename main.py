@@ -570,7 +570,8 @@ async def stripe_webhook(request):
                     payment_failed = FALSE,
                     grace_period_end = NULL,
                     first_payment_done = CASE WHEN users.first_payment_done = TRUE THEN TRUE ELSE EXCLUDED.first_payment_done END,
-                    auto_renew = TRUE;
+                    auto_renew = TRUE,
+                    reminder_sent = FALSE
             """, (int(user_id), new_expiry, sub_id, is_trial, first_payment))
             conn.commit()
 
@@ -582,8 +583,7 @@ async def stripe_webhook(request):
             try:
                 await bot.send_message(int(user_id), msg)
             except BotBlocked:
-                await notify_admins(f"Пользователь {user_id} оплатил, но заблокировал бота.")
-            # Разбан (с игнорированием ошибки для админов)
+                pass  # не беспокоим админа
             try:
                 await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
             except Exception as e:
@@ -610,17 +610,16 @@ async def stripe_webhook(request):
             new_expiry = datetime.fromtimestamp(subscription.current_period_end)
             conn = get_db_conn()
             cur = conn.cursor()
-            # Обновляем дату, сбрасываем флаги ошибки и льготного периода
             cur.execute("""
                 UPDATE users 
                 SET expiry_date = %s, 
                     paid = TRUE, 
                     payment_failed = FALSE, 
-                    grace_period_end = NULL 
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE
                 WHERE stripe_subscription_id = %s
             """, (new_expiry, sub_id))
             conn.commit()
-            # Найдём user_id для уведомления
             cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
             row = cur.fetchone()
             cur.close()
@@ -640,7 +639,6 @@ async def stripe_webhook(request):
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
-            # Устанавливаем grace_period_end на 24 часа вперёд
             cur.execute("""
                 UPDATE users 
                 SET payment_failed = TRUE, 
@@ -688,7 +686,6 @@ async def stripe_webhook(request):
             except Exception:
                 pass
 
-    # Помечаем событие обработанным
     await mark_event_processed(event_id)
     return web.Response(status=200)
     
