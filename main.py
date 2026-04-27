@@ -581,15 +581,17 @@ async def stripe_webhook(request):
             cur.execute("SELECT paid, expiry_date, first_payment_done FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             now = datetime.utcnow()
+
             if row and row[0] and row[1] and row[1] > now:
                 new_expiry = row[1] + timedelta(days=days_to_add)
             else:
                 new_expiry = now + timedelta(days=days_to_add)
 
-            first_payment = (row is None or not row[2])
+            # Нужна ли ссылка? Да, если нет активной подписки (paid=False или expiry_date < now)
+            needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
-                VALUES (%s, TRUE, %s, %s, TRUE, %s, FALSE, NULL, %s)
+                VALUES (%s, TRUE, %s, %s, TRUE, %s, FALSE, NULL, FALSE)
                 ON CONFLICT (telegram_id) DO UPDATE SET
                     paid = TRUE,
                     expiry_date = EXCLUDED.expiry_date,
@@ -597,13 +599,13 @@ async def stripe_webhook(request):
                     trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
                     payment_failed = FALSE,
                     grace_period_end = NULL,
-                    first_payment_done = CASE WHEN users.first_payment_done = TRUE THEN TRUE ELSE EXCLUDED.first_payment_done END,
                     auto_renew = TRUE,
-                    reminder_sent = FALSE
-            """, (int(user_id), new_expiry, sub_id, is_trial, first_payment))
+                    reminder_sent = FALSE,
+                    first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
+            """, (int(user_id), new_expiry, sub_id, is_trial, needs_link, needs_link))
             conn.commit()
 
-            if first_payment:
+            if needs_link:
                 link = await generate_invite_link()
                 msg = f"✅ Оплата прошла успешно! Доступ до {new_expiry.strftime('%d.%m.%Y')}.\nСсылка для вступления: {link}\n\nДобро пожаловать!"
             else:
