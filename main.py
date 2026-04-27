@@ -202,30 +202,36 @@ async def start(message: types.Message, state: FSMContext):
     await state.finish()
     await RegistrationStates.intro.set()
     text = """Привет! 👋
-Добро пожаловать в закрытый клуб Натальи Ребковец.
+<b>Добро пожаловать в закрытый клуб Натальи Ребковец.</b>
 
 Это место, где тренировки перестают быть борьбой с собой и становятся ресурсом. Мы не выжимаем мышцы до отказа — мы учим тело двигаться естественно, без боли и зажимов.
 
 Здесь нет «быстрых результатов любой ценой». Зато есть система, которая возвращает лёгкость, энергию и радость от движения.
 
-Готовы начать путь к здоровому и сильному телу? Тогда — поехали!"""
+<b>Готовы начать путь к здоровому и сильному телу? Тогда — поехали!</b>"""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_desc"))
-    await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb)
+    await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query_handler(text="to_desc", state=RegistrationStates.intro)
 async def show_description(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.description.set()
-    text = """Внутри клуба вас ждёт:
+    text = """<b>Внутри клуба вас ждёт:</b>
+    
+🧠 <b>Библиотека тренировок</b> — 50+ видео (и постоянно пополняется). От осанки и стоп до силы и гибкости.
 
-🧠 Библиотека тренировок — 50+ видео (и постоянно пополняется). От осанки и стоп до силы и гибкости.
-☀️ Короткие зарядки — 10–15 минут, чтобы проснуться или снять напряжение.
-📚 Мини-уроки — как дышать, как ходить, как поднимать сумки без вреда для спины.
-🧘 Медитации — для нервной системы, чтобы убрать стресс и вернуть спокойствие.
-🎥 Живые эфиры 2–4 раза в месяц — разбираем технику, отвечаем на вопросы.
-🩹 Фитнес-аптечка — готовые решения: болит поясница, затекла шея, отеки.
-💬 Поддержка 24/7 — закрытый чат, где я лично отвечаю."""
+☀️ <b>Короткие зарядки</b> — 10–15 минут, чтобы проснуться или снять напряжение.
+
+📚 <b>Мини-уроки</b> — как дышать, как ходить, как поднимать сумки без вреда для спины.
+
+🧘 <b>Медитации</b> — для нервной системы, чтобы убрать стресс и вернуть спокойствие.
+
+🎥 <b>Живые эфиры</b> 2–4 раза в месяц — разбираем технику, отвечаем на вопросы.
+
+🩹 <b> Фитнес-аптечка</b> — готовые решения: болит поясница, затекла шея, отеки.
+
+💬 <b>Поддержка 24/7</b> — закрытый чат, где я лично отвечаю."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
-    await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
+    await bot.send_message(callback.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query_handler(text="to_rules", state=RegistrationStates.description)
@@ -233,43 +239,34 @@ async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.rules.set()
     text = """Часто спрашивают:
 
-🤔 «Я новичок, справлюсь?»
+🤔 <i>«Я новичок, справлюсь?»</i>
 — Да. Все упражнения имеют упрощённые варианты.
 
-🤔 «У меня болит спина / колено / шея»
+🤔 <i>«У меня болит спина / колено / шея»</i>
 — Клуб помогает восстанавливаться. Но если острый период — сначала к врачу.
 
-🤔 «Нет времени»
+🤔 <i>«Нет времени»</i>
 — У нас есть зарядки на 10 минут. И система, которая встраивается в ваш ритм.
 
-🤔 «Я далеко, в другом часовом поясе»
+🤔 <i>«Я далеко, в другом часовом поясе»</i>
 — Всё онлайн. Доступ из любой точки мира.
 
 Клуб подходит и мужчинам, и женщинам, любому возрасту и уровню подготовки.
 Главное — желание чувствовать себя лучше."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_choice"))
-    await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
+    await bot.send_message(callback.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query_handler(text="to_choice", state=RegistrationStates.rules)
 async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
-    text = """Выберите формат, который подходит вам:
+    text = """<b>Выберите свой формат участия</b>
 
-🌟 Пробная неделя — 15€
-Познакомиться, попробовать, понять, ваше ли это.
+🌟 Пробная неделя — попробуйте формат.
+💳 1, 6 или 12 месяцев — выберите ритм, который подходит именно вам.
 
-💳 1 месяц — 50€
-Идеальный ритм для регулярной практики. Автопродление можно отключить.
-
-💳 6 месяцев — 240€ (экономия 60€)
-Для тех, кто настроен на качественные изменения.
-
-💳 12 месяцев — 410€ (экономия 190€)
-Максимальная выгода. Ваше тело скажет спасибо через год.
-
-Нажмите на кнопку ниже, чтобы оформить подписку.
-Буду рада видеть вас в клубе!"""
+<i>Нажмите на кнопку ниже, чтобы перейти к оплате.</i>
+Буду рада видеть вас в клубе! ❤️"""
     # Определяем, показывать ли пробный период (если пользователь уже paid — не показываем)
     conn = get_db_conn()
     cur = conn.cursor()
@@ -279,7 +276,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     conn.close()
     show_trial = not (row and row[0])
     kb = get_tariffs_keyboard(show_trial=show_trial)
-    await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
+    await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
