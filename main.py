@@ -504,6 +504,34 @@ async def test_expiry(message: types.Message):
     else:
         await message.answer("Нет прав.")
 
+@dp.message_handler(commands=['test_grace'])
+async def test_grace(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.get_args().split()
+    if len(args) != 1:
+        await message.reply("Использование: /test_grace <user_id>")
+        return
+    user_id = args[0]
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE users 
+            SET payment_failed = TRUE, 
+                grace_period_end = NOW() + INTERVAL '1 day'
+            WHERE telegram_id = %s
+        """, (int(user_id),))
+        conn.commit()
+        await message.reply(f"✅ Установлен grace period для {user_id} на 24 часа.")
+        # Отправим уведомление пользователю
+        await bot.send_message(int(user_id), "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
+    except Exception as e:
+        await message.reply(f"Ошибка: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
