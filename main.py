@@ -4,7 +4,7 @@ import asyncio
 import stripe
 import psycopg2
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -13,23 +13,20 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime, timedelta
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info("Начинаю подключение к базе данных...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
-GROUP_ID = os.getenv("GROUP_ID") 
+DATABASE_URL = os.getenv("DATABASE_URL")
+GROUP_ID = os.getenv("GROUP_ID")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 
-# !!! СРАЗУ ПРОВЕРЯЕМ !!!
 if not DATABASE_URL:
-    raise ValueError("Критическая ошибка: DATABASE_URL не задан! Проверьте файл .env или настройки сервера.")
+    raise ValueError("Критическая ошибка: DATABASE_URL не задан!")
 
-# Вставьте сюда ссылки на ваши фото или ID файлов из Telegram
-PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA" 
+PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
 
 bot = Bot(token=BOT_TOKEN)
@@ -37,71 +34,72 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 
-# --- СОСТОЯНИЯ (FSM) ---
+# --- СОСТОЯНИЯ FSM ---
 class RegistrationStates(StatesGroup):
     intro = State()
-    description = State()  # Вот это пропущенное состояние
+    description = State()
     rules = State()
-    choice = State()       # И это состояние тебе тоже понадобится для этапа выбора тарифа
-    
-# --- ФУНКЦИИ БАЗЫ ---
-def get_db_conn():
-    return psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
+    choice = State()
 
-# --- БАЗА ДАННЫХ ---
+# --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
 def init_db():
-    conn = None
-    try:
-        # Подключаемся
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-        cur = conn.cursor()  # <--- ВОТ ЭТА СТРОКА БЫЛА УДАЛЕНА
-        
-        # 1. Создаем таблицу, если её нет
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                paid BOOLEAN DEFAULT FALSE,
-                expiry_date TIMESTAMP,
-                stripe_subscription_id TEXT,
-                reminder_sent BOOLEAN DEFAULT FALSE
-            );
-        """)
-        
-        # 2. Добавляем колонку, если её нет
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;")
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;")
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;")
-        
-        conn.commit()
-        cur.close()
-        logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
-        
-    except Exception as e:
-        logging.error(f"ОШИБКА ИНИЦИАЛИЗАЦИИ БД: {e}")
-        
-    finally:
-        # Всегда закрываем соединение, если оно было создано
-        if conn is not None:
-            conn.close()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    # Основная таблица пользователей
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            paid BOOLEAN DEFAULT FALSE,
+            expiry_date TIMESTAMP,
+            stripe_subscription_id TEXT,
+            reminder_sent BOOLEAN DEFAULT FALSE,
+            payment_failed BOOLEAN DEFAULT FALSE,
+            grace_period_end TIMESTAMP,
+            auto_renew BOOLEAN DEFAULT TRUE,
+            trial_used BOOLEAN DEFAULT FALSE,
+            first_payment_done BOOLEAN DEFAULT FALSE
+        );
+    """)
+    # Таблица для идемпотентности вебхуков Stripe
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_events (
+            event_id TEXT PRIMARY KEY,
+            processed BOOLEAN DEFAULT TRUE,
+            processed_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    # Добавляем недостающие колонки (для старых БД)
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_payment_done BOOLEAN DEFAULT FALSE;")
+    conn.commit()
+    cur.close()
+    conn.close()
     logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
 
-def save_user_to_db(user_id):
-    try:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode='require')
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (telegram_id, paid, expiry_date)
-            VALUES (%s, TRUE, NOW() + INTERVAL '30 days')
-            ON CONFLICT (telegram_id) DO UPDATE 
-            SET paid = TRUE, expiry_date = NOW() + INTERVAL '30 days';
-        """, (int(user_id),))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"Ошибка сохранения в БД: {e}")
+# Идемпотентность вебхуков
+async def is_event_processed(event_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM stripe_events WHERE event_id = %s", (event_id,))
+    exists = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return exists
+
+async def mark_event_processed(event_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO stripe_events (event_id) VALUES (%s) ON CONFLICT DO NOTHING", (event_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def generate_invite_link():
@@ -109,110 +107,96 @@ async def generate_invite_link():
         invite = await bot.create_chat_invite_link(chat_id=int(GROUP_ID), member_limit=1)
         return invite.invite_link
     except Exception as e:
-        logging.error(f"Ошибка ссылки: {e}")
+        logging.error(f"Ошибка создания ссылки: {e}")
         return None
 
 def get_tariffs_keyboard(show_trial=True):
     kb = InlineKeyboardMarkup(row_width=1)
     if show_trial:
-        kb.add(InlineKeyboardButton("Пробная неделя", callback_data="sub_trial"))
+        kb.add(InlineKeyboardButton("🌟 Пробная неделя", callback_data="sub_trial"))
     kb.add(
-        InlineKeyboardButton("💳 1 месяц", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев", callback_data="sub_12")
+        InlineKeyboardButton("💳 1 месяц (50€)", callback_data="sub_1"),
+        InlineKeyboardButton("💳 6 месяцев (240€)", callback_data="sub_6"),
+        InlineKeyboardButton("💳 12 месяцев (410€)", callback_data="sub_12")
     )
     return kb
-
-# --- АВТОМАТИЗАЦИЯ (ПРОВЕРКА ПО УТРАМ) ---
-async def check_subscriptions_and_reminders():
-    logging.info("--- Запуск ежедневной проверки подписок ---")
-    conn = get_db_conn()
-    cur = conn.cursor()
-    # Выбираем всех активных
-    cur.execute("SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent FROM users WHERE paid = TRUE")
-    users = cur.fetchall()
-    
-    now = datetime.utcnow()
-    
-    for telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent in users:
-        time_left = expiry - now
-        
-        # 1. Сценарий: Срок действия истек
-        if time_left < timedelta(0):
-            
-            # А) Если была ошибка оплаты — даем льготный период (Grace Period)
-            if payment_failed:
-                if grace_end is None:
-                    # Даем 24 часа (до конца дня)
-                    deadline = now + timedelta(days=1)
-                    cur.execute("UPDATE users SET grace_period_end = %s WHERE telegram_id = %s", (deadline, telegram_id))
-                    await bot.send_message(telegram_id, "⚠️ Оплата вашей подписки не прошла. Пожалуйста, пополните карту до конца дня, чтобы доступ не был ограничен.")
-                
-                # Если время вышло и после grace period
-                elif now > grace_end:
-                    await ban_user_logic(telegram_id, cur) # Функция-хелпер (см. ниже)
-            
-            # Б) Если всё было ок, но срок вышел — просто баним
-            else:
-                await ban_user_logic(telegram_id, cur)
-        
-        # 2. Сценарий: Срок заканчивается (напоминание)
-        elif timedelta(0) < time_left < timedelta(days=2):
-            # Шлем напоминание ТОЛЬКО если нет автопродления и еще не напоминали
-            if not auto_renew and not reminder_sent:
-                try:
-                    await bot.send_message(telegram_id, "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ вручную.", reply_markup=get_tariffs_keyboard(show_trial=False))
-                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-                except BotBlocked:
-                    pass
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# Хелпер для бана (чтобы не дублировать код)
-async def ban_user_logic(telegram_id, cur):
-    try:
-        await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
-        cur.execute("UPDATE users SET paid = FALSE, payment_failed = FALSE, grace_period_end = NULL, reminder_sent = FALSE WHERE telegram_id = %s", (telegram_id,))
-        await bot.send_message(telegram_id, "⚠️ Ваша подписка истекла. Доступ закрыт.")
-    except Exception as e:
-        logging.error(f"Ошибка при бане {telegram_id}: {e}")
 
 async def notify_admins(text: str):
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, f"⚠️ **Уведомление от бота:**\n{text}")
-        except Exception as e:
-            logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+            await bot.send_message(admin_id, f"⚠️ {text}")
+        except Exception:
+            pass
 
-# --- ХЕНДЛЕРЫ ---
-@dp.message_handler(commands=['broadcast'])
-async def broadcast(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return
-    text = message.text.replace('/broadcast ', '')
+# --- АВТОМАТИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК (КРОН) ---
+async def ban_user_logic(telegram_id, cur):
+    try:
+        # aiogram 2.x использует kick_chat_member для бана
+        await bot.kick_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
+        cur.execute("""
+            UPDATE users 
+            SET paid = FALSE, payment_failed = FALSE, grace_period_end = NULL, reminder_sent = FALSE 
+            WHERE telegram_id = %s
+        """, (telegram_id,))
+        await bot.send_message(telegram_id, 
+            "⚠️ Ваша подписка истекла. Доступ закрыт.\nВы можете оформить новую подписку в любое время.",
+            reply_markup=get_tariffs_keyboard(show_trial=False))
+    except Exception as e:
+        logging.error(f"Ошибка при бане {telegram_id}: {e}")
+
+async def check_subscriptions_and_reminders():
+    logging.info("--- Запуск ежедневной проверки подписок ---")
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM users")
+    cur.execute("""
+        SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent, trial_used
+        FROM users WHERE paid = TRUE
+    """)
     users = cur.fetchall()
-    
-    success_count = 0
-    blocked_count = 0
-    
-    for user in users:
-        try: 
-            await bot.send_message(user[0], text)
-            success_count += 1
-        except BotBlocked:
-            blocked_count += 1
-        except Exception as e:
-            logging.error(f"Ошибка отправки пользователю {user[0]}: {e}")
-            
+    now = datetime.utcnow()
+
+    for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _) in users:
+        time_left = expiry - now
+
+        # Истекший доступ
+        if time_left.total_seconds() < 0:
+            if payment_failed and grace_end and now < grace_end:
+                continue  # льготный период ещё действует
+            else:
+                await ban_user_logic(telegram_id, cur)
+
+        # Напоминание за 48 часов
+        elif timedelta(0) < time_left < timedelta(days=2):
+            if not reminder_sent:
+                text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
+                await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
+                cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+
+    conn.commit()
     cur.close()
     conn.close()
-    await message.answer(f"Рассылка завершена. Успешно: {success_count}, заблокировали бота: {blocked_count}.")
 
-# --- 1. ПРИВЕТСТВИЕ (ФОТО) ---
+# --- БЭКАП БАЗЫ ДАННЫХ ---
+async def send_db_backup():
+    filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.sql"
+    db_url = os.getenv("DATABASE_URL")
+    try:
+        # Добавляем --no-version-check для совместимости версий
+        dump_cmd = f"pg_dump '{db_url}' --no-owner --no-privileges --no-version-check > {filename}"
+        process = await asyncio.create_subprocess_shell(dump_cmd, shell=True)
+        await process.communicate()
+        if process.returncode != 0:
+            raise Exception("pg_dump failed")
+
+        for admin_id in ADMIN_IDS:
+            with open(filename, 'rb') as f:
+                await bot.send_document(admin_id, f, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+        os.remove(filename)
+    except Exception as e:
+        await notify_admins(f"Ошибка бэкапа: {e}")
+        logging.error(f"Ошибка бэкапа: {e}")
+
+# --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
     await state.finish()
@@ -226,8 +210,7 @@ async def start(message: types.Message, state: FSMContext):
 Добро пожаловать в сообщество, где здоровое и сильное тело — это не случайность, а результат регулярной и бережной практики."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_desc"))
     await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb)
-    
-# --- 2. ОПИСАНИЕ (ТЕКСТ) ---
+
 @dp.callback_query_handler(text="to_desc", state=RegistrationStates.intro)
 async def show_description(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.description.set()
@@ -249,11 +232,9 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
 
 Постоянная поддержка — наш закрытый чат, где я лично отвечаю на ваши вопросы, даю рекомендации и сопровождаю на пути к здоровью."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
-    # Отправляем новым сообщением, ничего не удаляем
     await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
     await callback.answer()
 
-# --- 3. ПРАВИЛА (ТЕКСТ) ---
 @dp.callback_query_handler(text="to_rules", state=RegistrationStates.description)
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.rules.set()
@@ -276,7 +257,6 @@ async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await bot.send_message(callback.message.chat.id, text, reply_markup=kb)
     await callback.answer()
 
-# --- 4. ВЫБОР ТАРИФА (ФОТО) ---
 @dp.callback_query_handler(text="to_choice", state=RegistrationStates.rules)
 async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
@@ -291,343 +271,128 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 Годовой абонемент за 410 евро — самое выгодное предложение для долгосрочной заботы о себе.
 
 Нажмите на кнопку ниже, чтобы оформить подписку и присоединиться к нам. Буду рада видеть вас в числе участников!"""
-    kb = get_tariffs_keyboard(show_trial=True)
-    
-    # Отправляем фото
+    # Определяем, показывать ли пробный период (если пользователь уже paid — не показываем)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (callback.from_user.id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    show_trial = not (row and row[0])
+    kb = get_tariffs_keyboard(show_trial=show_trial)
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb)
     await callback.answer()
 
-# --- 5. ВЫБОР ТАРИФА И ОПЛАТА ---
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
-async def process_payment(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer("Загрузка...")
-    sub_type = callback_query.data
-    user_id = callback_query.from_user.id
-    
-    # 1. ЗАЩИТА ОТ ПОВТОРНОГО ТРИАЛА
+async def process_payment(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("⏳ Перенаправляем на оплату...")
+    sub_type = callback.data
+    user_id = callback.from_user.id
+
+    # Защита от повторного триала
     if sub_type == "sub_trial":
-        conn = get_db_conn() # ваша функция подключения к БД
+        conn = get_db_conn()
         cur = conn.cursor()
         cur.execute("SELECT trial_used FROM users WHERE telegram_id = %s", (user_id,))
         row = cur.fetchone()
         cur.close()
         conn.close()
-        
         if row and row[0] is True:
-            await callback_query.answer("⚠️ Вы уже использовали пробную неделю.", show_alert=True)
+            await callback.answer("⚠️ Вы уже использовали пробную неделю.", show_alert=True)
             return
 
-    # 2. НАСТРОЙКИ ТАРИФОВ
-    price_map = {"sub_trial": "PRICE_TRIAL", "sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}
-    days_map = {"sub_trial": 7, "sub_1": 30, "sub_6": 180, "sub_12": 365}
-    
-    price_id = os.getenv(price_map.get(sub_type))
-    days = days_map.get(sub_type, 30)
+    # Маппинг тарифов
+    price_map = {
+        "sub_trial": "PRICE_TRIAL",
+        "sub_1": "PRICE_1M",
+        "sub_6": "PRICE_6M",
+        "sub_12": "PRICE_12M"
+    }
+    days_map = {
+        "sub_trial": 7,
+        "sub_1": 30,
+        "sub_6": 180,
+        "sub_12": 365
+    }
+    price_id = os.getenv(price_map[sub_type])
+    days = days_map[sub_type]
 
     if not price_id:
-        await callback_query.answer("Ошибка конфигурации тарифа.")
+        await callback.answer("Ошибка конфигурации тарифа. Свяжитесь с администратором.", show_alert=True)
         return
 
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
-    
-    # 3. СОЗДАНИЕ СЕССИИ С МЕТАДАННЫМИ
+
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=['card'],
             line_items=[{'price': price_id, 'quantity': 1}],
             mode=mode,
             success_url='https://t.me/Natalia_SoulFit_bot',
+            cancel_url='https://t.me/Natalia_SoulFit_bot',
             client_reference_id=str(user_id),
-            metadata={'days': str(days)} # ВАЖНО: передаем количество дней
+            metadata={'days': str(days)}
         )
-        
         kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("💳 Оплатить", url=session.url),
+            InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
         )
-        
-        await callback_query.message.edit_text("Перейдите по ссылке для оплаты:", reply_markup=kb)
+        await callback.message.edit_caption(caption="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:", reply_markup=kb)
         await state.finish()
-        
     except Exception as e:
-        logging.error(f"Ошибка Stripe: {e}")
-        await callback_query.answer("Ошибка при создании платежа.")
-        
-        # БЕЗОПАСНАЯ ЗАМЕНА
-        try:
-            await callback_query.message.edit_caption(
-                caption=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-                reply_markup=kb
-            )
-        except Exception:
-            await callback_query.message.edit_text(
-                text=f"✅ Вы выбрали тариф. Переходите к оплате:", 
-                reply_markup=kb
-            )
+        logging.error(f"Stripe ошибка: {e}")
+        await callback.answer("Техническая ошибка. Попробуйте позже или напишите @re_tasha", show_alert=True)
 
-    except Exception as e:
-        error_text = f"Критическая ошибка создания сессии для {callback_query.from_user.id}: {e}"
-        logging.error(error_text)
-        await notify_admins(error_text)
-        
-        # Новый вариант с модальным окном
-        await callback_query.answer(
-            "⚠️ Произошла техническая ошибка при переходе к оплате.\n\n"
-            "Пожалуйста, напишите администратору @re_tasha, мы уже получили уведомление о проблеме и свяжемся с вами!",
-            show_alert=True
-        )
-
-# --- 6. КНОПКА НАЗАД (ИСПРАВЛЕННАЯ) ---
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
-async def back_to_tariffs(callback_query: types.CallbackQuery, state: FSMContext):
+async def back_to_tariffs(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
-    
-    # 1. Проверяем, платил ли пользователь раньше
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (callback_query.from_user.id,))
+    cur.execute("SELECT paid FROM users WHERE telegram_id = %s", (callback.from_user.id,))
     user = cur.fetchone()
     cur.close()
     conn.close()
-    
-    # 2. Собираем клавиатуру (триал будет только у того, кто еще не paid)
-    is_client = user and user[0] is True
-    kb = get_tariffs_keyboard(show_trial=not is_client)
-    
+    show_trial = not (user and user[0])
+    kb = get_tariffs_keyboard(show_trial=show_trial)
     text = "Выберите свой формат участия:"
-
-    # 3. Редактируем сообщение (безопасно)
     try:
-        await callback_query.message.edit_caption(caption=text, reply_markup=kb)
+        await callback.message.edit_caption(caption=text, reply_markup=kb)
     except Exception:
-        await callback_query.message.edit_text(text=text, reply_markup=kb)
-        
-    await callback_query.answer()
+        await callback.message.edit_text(text=text, reply_markup=kb)
+    await callback.answer()
 
-# --- ОТМЕНА ПОДПИСКИ (ИСПРАВЛЕНО) ---
 @dp.callback_query_handler(text="cancel_subscription", state='*')
 async def cancel_subscription(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (callback.from_user.id,))
-    result = cur.fetchone()
-    
-    # --- ИСПРАВЛЕННЫЙ БЛОК ОТМЕНЫ ---
-    if result and result[0]:
-        sub_id = result[0]
-        try:
-            # Ставим флаг "отменить в конце периода", а не удаляем сразу
-            stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
-        
-            # Обновляем только флаг auto_renew, но НЕ ТРОГАЕМ paid
-            cur.execute("UPDATE users SET auto_renew = FALSE WHERE telegram_id = %s", (callback.from_user.id,))
-            conn.commit()
-        
-            await callback.message.edit_text("✅ Автопродление отключено. Ваш доступ сохранится до конца оплаченного периода.")
-        except Exception as e:
-            await callback.answer("Ошибка при отмене. Напишите администратору.")
-            logging.error(f"Ошибка Stripe: {e}")
-        else:
-            await callback.answer("Не удалось найти подписку.")
-    
+    cur.execute("SELECT stripe_subscription_id FROM users WHERE telegram_id = %s", (user_id,))
+    row = cur.fetchone()
     cur.close()
     conn.close()
-    
-# --- WEBHOOK STRIPE ---
-async def stripe_webhook(request):
-    payload = await request.read()
-    sig_header = request.headers.get('Stripe-Signature')
-    
+
+    if not row or not row[0]:
+        await callback.answer("Активная подписка не найдена.", show_alert=True)
+        return
+
+    sub_id = row[0]
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
-        )
-    except Exception as e:
-        logging.error(f"Ошибка проверки подписи Stripe: {e}")
-        return web.Response(status=400)
-
-    data = event.data.object
-
-    # Внутри вашего обработчика вебхука
-    session_id = event.data.object.id # ID сессии из Stripe
-
-    # 1. Проверяем, есть ли этот ID в нашей базе (создайте для этого таблицу processed_events или проверяйте по уже существующей)
-    if await db.is_event_processed(session_id):
-        return Response(status=200) # Уже обработано, просто возвращаем 200 OK для Stripe
-
-    # 2. Если не обработано — выполняем логику
-    await process_payment(event)
-
-    # 3. Помечаем событие как обработанное в базе данных
-    await db.mark_event_processed(session_id)
-
-    # 1. ПОКУПКА / ПОДПИСКА
-    if event.type == 'checkout.session.completed':
-        session = event.data.object
-        user_id = getattr(session, 'client_reference_id', None)
-        sub_id = getattr(session, 'subscription', None)
-        
-        if not user_id: 
-            return web.Response(status=200)
-
-        # САМОЕ ВАЖНОЕ: Превращаем StripeObject в обычный словарь Python
-        # Это навсегда убирает ошибку KeyError: 'get'
-        try:
-            metadata = dict(session.metadata)
-        except:
-            metadata = {}
-
-        # Теперь .get() работает как в обычном словаре.
-        # Если 'days' нет, ставим 0, чтобы не было ошибки "не верно"
-        days_to_add = int(metadata.get('days', 0)) 
-        is_trial = (days_to_add == 7)
-
+        stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
         conn = get_db_conn()
         cur = conn.cursor()
-        try:
-            # Проверяем текущий статус
-            cur.execute("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (int(user_id),))
-            row = cur.fetchone()
-            is_existing_user = (row and row[0] is True)
-            
-            # Если дни 0, то мы не продлеваем, а просто фиксируем оплату (защита от багов)
-            if days_to_add > 0:
-                expiry_date = datetime.utcnow() + timedelta(days=days_to_add)
-            else:
-                expiry_date = datetime.utcnow() # Или ваша логика по умолчанию
-
-            # SQL запрос
-            cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used)
-                VALUES (%s, TRUE, %s, %s, TRUE, %s)
-                ON CONFLICT (telegram_id) DO UPDATE SET 
-                    paid = TRUE,
-                    expiry_date = %s,
-                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
-                    trial_used = CASE WHEN %s = TRUE THEN TRUE ELSE users.trial_used END;
-            """, (int(user_id), expiry_date, sub_id, is_trial, expiry_date, is_trial))
-
-            conn.commit()
-            
-            # Отправка сообщений как вы просили (без правок)
-            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-            
-            if is_existing_user:
-                await bot.send_message(user_id, f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️")
-            else:
-                link = await generate_invite_link()
-                await bot.send_message(user_id, f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}")
-
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"Ошибка в Stripe Webhook для {user_id}: {e}")
-        finally:
-            cur.close()
-            conn.close()
-
-    # 5. ДЕЙСТВИЯ БОТА (с обработкой блокировки)
-        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id), only_if_banned=True)
-        
-        # Определяем текст
-        if is_existing_user:
-            message_text = f"✅ Ваша подписка успешно продлена до {expiry_date.strftime('%d.%m.%Y')}. ❤️"
-        else:
-            link = await generate_invite_link()
-            message_text = f"✅ Оплата прошла успешно! Доступ открыт до {expiry_date.strftime('%d.%m.%Y')}. Ваша ссылка: {link}\n\nДобро пожаловать в наше пространство! ❤️"
-        
-        # БЕЗОПАСНАЯ ОТПРАВКА
-        try:
-            await bot.send_message(user_id, message_text)
-        except BotBlocked:
-            # СЮДА попадет код, если пользователь заблокировал бота
-            logging.warning(f"⚠️ Оплата прошла, но пользователь {user_id} заблокировал бота. Сообщение не доставлено.")
-            # Опционально: уведомить вас (админа), чтобы вы вручную связались с человеком
-            await notify_admins(f"⚠️ ВНИМАНИЕ: Пользователь {user_id} оплатил подписку, но у него заблокирован бот. Свяжитесь с ним вручную!")
-        except Exception as e:
-            logging.error(f"Неизвестная ошибка отправки сообщения пользователю {user_id}: {e}")
-
-    # 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ / ОПЛАТА ИНВОЙСА
-    elif event.type == 'invoice.payment_succeeded':
-        invoice = event.data.object
-        sub_id = invoice['subscription'] if 'subscription' in invoice else None 
-        
-        if sub_id:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            try:
-                subscription = stripe.Subscription.retrieve(sub_id)
-                # Безопасно берем дату (используем атрибут объекта Stripe)
-                end_timestamp = getattr(subscription, 'current_period_end', None)
-                
-                if end_timestamp:
-                    new_expiry_date = datetime.fromtimestamp(end_timestamp)
-                    cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE WHERE stripe_subscription_id = %s", (new_expiry_date, sub_id))
-                    conn.commit()
-                    logging.info(f"Успешно продлили подписку {sub_id} до {new_expiry_date}")
-                    
-                    cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
-                    user = cur.fetchone()
-                    if user:
-                        await bot.send_message(user[0], f"✅ Ваша подписка успешно продлена до {new_expiry_date.strftime('%d.%m.%Y')}. ❤️")
-            except Exception as e:
-                logging.error(f"Критическая ошибка обновления подписки {sub_id}: {e}")
-                conn.rollback()
-            finally:
-                cur.close()
-                conn.close()
-        
-    # 3. ИЗМЕНЕНИЕ СТАТУСА
-    elif event.type == 'customer.subscription.updated':
-        conn = get_db_conn()
-        cur = conn.cursor()
-        auto_renew = not getattr(data, 'cancel_at_period_end', False)
-        cur.execute("UPDATE users SET auto_renew = %s WHERE stripe_subscription_id = %s", (auto_renew, getattr(data, 'id', '')))
-        conn.commit()
-        cur.close();
-        conn.close()
-                
-    # 4. ОШИБКА ОПЛАТЫ
-    elif event.type == 'invoice.payment_failed':
-        sub_id = getattr(data, 'subscription', None)
-        if sub_id:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET payment_failed = TRUE WHERE stripe_subscription_id = %s", (sub_id,))
-            conn.commit()
-            cur.close()
-            conn.close()
-
-    # 5. УДАЛЕНИЕ ПОДПИСКИ
-    elif event.type == 'customer.subscription.deleted':
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE users SET paid = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", 
-            (getattr(data, 'id', ''),)
-        )
+        cur.execute("UPDATE users SET auto_renew = FALSE WHERE telegram_id = %s", (user_id,))
         conn.commit()
         cur.close()
         conn.close()
-
-    # 6. ОШИБКИ СЕССИИ (Пользователь не оплатил)
-    elif event.type in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
-        session = event.data.object
-        user_id = session.client_reference_id
-        if user_id:
-            try:
-                await bot.send_message(user_id, "❌ Оплата не прошла или время сессии истекло. Если деньги списались, напишите администратору @re_tasha.")
-            except:
-                pass
-
-    return web.Response(status=200)
-
-# --- ОБНОВЛЕННЫЕ ХЕНДЛЕРЫ ---
+        await callback.message.edit_text("✅ Автопродление отключено. Ваш доступ сохранится до конца оплаченного периода.")
+    except Exception as e:
+        logging.error(f"Ошибка отмены подписки {sub_id}: {e}")
+        await callback.answer("Ошибка при отмене. Напишите администратору.", show_alert=True)
 
 @dp.message_handler(commands=['profile'], state='*')
 async def profile(message: types.Message):
     conn = get_db_conn()
     cur = conn.cursor()
-    # Снова запрашиваем stripe_subscription_id, чтобы проверить его наличие
     cur.execute("SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s", (message.from_user.id,))
     user = cur.fetchone()
     cur.close()
@@ -636,177 +401,269 @@ async def profile(message: types.Message):
     if not user or not user[0]:
         await message.answer("У вас пока нет активной подписки. Нажмите /start, чтобы оформить её.")
     else:
-        expiry_date = user[1]
-        # Форматируем дату в красивый вид (день.месяц.год)
-        date_text = expiry_date.strftime("%d.%m.%Y")
-
+        date_text = user[1].strftime("%d.%m.%Y") if user[1] else "не установлена"
         text = f"✅ Ваша подписка активна.\n📅 Действует до: {date_text}\n\nХотите продлить доступ?"
-        
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        # Кнопка продления есть у всех
-        keyboard.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
-        
-        # «Умная» кнопка отмены: появится только если есть ID подписки в базе
-        if user[2]: 
-            keyboard.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
-        
-        await message.answer(text, reply_markup=keyboard)
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
+        if user[2]:
+            kb.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+        await message.answer(text, reply_markup=kb)
 
 @dp.callback_query_handler(text="show_renew_options", state='*')
 async def show_renew_options(callback: types.CallbackQuery):
-    # Сразу передаем False, так как это меню продления
     kb = get_tariffs_keyboard(show_trial=False)
-    
-    await callback.message.edit_text(
-        "Выберите тариф для продления доступа:", 
-        reply_markup=kb
-    )
+    await callback.message.edit_text("Выберите тариф для продления доступа:", reply_markup=kb)
     await callback.answer()
+
+@dp.message_handler(commands=['broadcast'], state='*')
+async def broadcast(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    text = message.text.replace('/broadcast ', '')
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM users")
+    users = cur.fetchall()
+    success = 0
+    blocked = 0
+    for (user_id,) in users:
+        try:
+            await bot.send_message(user_id, text)
+            success += 1
+        except BotBlocked:
+            blocked += 1
+        except Exception:
+            pass
+    cur.close()
+    conn.close()
+    await message.answer(f"Рассылка завершена. Успешно: {success}, заблокировали: {blocked}.")
 
 @dp.message_handler(commands=['give_access'], state='*')
 async def give_access_command(message: types.Message):
-    # 1. Проверка прав
     if message.from_user.id not in ADMIN_IDS:
         return
-
-    # 2. Парсинг аргументов
     args = message.get_args().split()
     if len(args) < 1:
-        await message.reply("⚠️ Использование: `/give_access <user_id> <дней>`", parse_mode="Markdown")
+        await message.reply("⚠️ Использование: /give_access <user_id> [дней]")
         return
-    
     target_user_id = args[0]
     days = int(args[1]) if len(args) > 1 else 30
-
-    # 3. Обновляем БД
-    conn = None # Инициализируем переменную для finally
+    conn = get_db_conn()
+    cur = conn.cursor()
     try:
-        conn = get_db_conn()
-        cur = conn.cursor()
-        
-        interval_query = f"{days} days"
-        
-        cur.execute(f"""
+        cur.execute("""
             INSERT INTO users (telegram_id, paid, expiry_date)
-            VALUES (%s, TRUE, NOW() + INTERVAL '{interval_query}')
+            VALUES (%s, TRUE, NOW() + INTERVAL '%s days')
             ON CONFLICT (telegram_id) DO UPDATE 
             SET paid = TRUE, 
                 expiry_date = CASE 
-                    WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '{interval_query}'
-                    ELSE NOW() + INTERVAL '{interval_query}'
-                END;
-        """, (int(target_user_id),))
-        
+                    WHEN users.expiry_date > NOW() THEN users.expiry_date + INTERVAL '%s days'
+                    ELSE NOW() + INTERVAL '%s days'
+                END,
+                payment_failed = FALSE,
+                grace_period_end = NULL;
+        """, (int(target_user_id), days, days, days))
         conn.commit()
-        cur.close()
-        
-        # 4. Генерируем ссылку
         link = await generate_invite_link()
-        
-        # 5. Отправляем пользователю
         try:
             if link:
-                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ к клубу на {days} дней!\nВаша ссылка: {link}")
-                await message.answer(f"✅ Доступ пользователю {target_user_id} предоставлен.")
+                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ на {days} дней!\nСсылка: {link}")
             else:
-                await message.answer("❌ Доступ в БД обновлен, но не удалось создать ссылку.")
+                await bot.send_message(target_user_id, f"✅ Администратор предоставил вам доступ на {days} дней. Добро пожаловать!")
+            await message.answer(f"✅ Доступ пользователю {target_user_id} предоставлен.")
         except BotBlocked:
-            await message.answer("⚠️ Доступ в БД обновлен, но пользователь заблокировал бота.")
-        except Exception: 
-            await message.answer(f"⚠️ Доступ в БД обновлен, но не удалось отправить сообщение пользователю {target_user_id}.")
-
+            await message.answer("⚠️ Доступ обновлён, но пользователь заблокировал бота.")
     except Exception as e:
-        logging.error(f"Критическая ошибка в give_access: {e}")
-        await message.answer(f"❌ Ошибка при работе с базой данных: {e}")
-        if conn:
-            conn.rollback()
-            
+        conn.rollback()
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
-        if conn:
-            conn.close()
-            
-# --- ОБРАБОТКА ПОМОЩИ ---
-# Обработка команды /help (если пользователь напишет это сам)
-@dp.message_handler(commands=['help'], state='*') # Добавили state='*'
+        cur.close()
+        conn.close()
+
+@dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
-    await message.answer("По всем вопросам можно связаться с @re_tasha")
+    await message.answer("По всем вопросам @re_tasha")
 
 @dp.message_handler(commands=['test_expiry'])
 async def test_expiry(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
         await message.answer("Запускаю проверку подписок...")
-        # Исправлено имя функции здесь:
-        await check_subscriptions_and_reminders() 
+        await check_subscriptions_and_reminders()
         await message.answer("Проверка завершена.")
     else:
-        await message.answer("У вас нет прав для этого.")
+        await message.answer("Нет прав.")
 
-async def send_db_backup():
-    filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.dump"
-    db_url = os.getenv("DATABASE_URL")
-    
+# --- STRIPE WEBHOOK (полностью исправлен) ---
+async def stripe_webhook(request):
+    payload = await request.read()
+    sig_header = request.headers.get('Stripe-Signature')
     try:
-        # Выполняем дамп базы
-        # pg_dump считывает настройки из DATABASE_URL автоматически
-        dump_cmd = f"pg_dump '{db_url}' -F c -f {filename}"
-        process = await asyncio.create_subprocess_shell(dump_cmd)
-        await process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception("Ошибка при создании дампа (pg_dump)")
-
-        # Отправляем файл админам
-        for admin_id in ADMIN_IDS:
-            try:
-                with open(filename, 'rb') as file:
-                    await bot.send_document(admin_id, file, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-            except Exception as e:
-                logging.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
-        
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+        )
     except Exception as e:
-        await notify_admins(f"⚠️ Ошибка автоматического бэкапа: {e}")
-        logging.error(f"Ошибка бэкапа: {e}")
-    
-    finally:
-        # Удаляем файл, чтобы не занимать место в контейнере
-        if os.path.exists(filename):
-            os.remove(filename)
+        logging.error(f"Ошибка подписи вебхука: {e}")
+        return web.Response(status=400)
 
-# --- ЗАПУСК ---
+    event_id = event['id']
+    if await is_event_processed(event_id):
+        return web.Response(status=200)
+
+    # Обработка успешной оплаты (первичная или продление через сессию)
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        user_id = session.get('client_reference_id')
+        if not user_id:
+            await mark_event_processed(event_id)
+            return web.Response(status=200)
+
+        sub_id = session.get('subscription')
+        metadata = session.get('metadata', {})
+        days_to_add = int(metadata.get('days', 0))
+        is_trial = (days_to_add == 7)
+
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT paid, expiry_date, first_payment_done FROM users WHERE telegram_id = %s", (int(user_id),))
+            row = cur.fetchone()
+            now = datetime.utcnow()
+            if row and row[0] and row[1] and row[1] > now:
+                new_expiry = row[1] + timedelta(days=days_to_add)
+            else:
+                new_expiry = now + timedelta(days=days_to_add)
+
+            first_payment = (row is None or not row[2])
+
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
+                VALUES (%s, TRUE, %s, %s, TRUE, %s, FALSE, NULL, %s)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    paid = TRUE,
+                    expiry_date = EXCLUDED.expiry_date,
+                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+                    trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
+                    payment_failed = FALSE,
+                    grace_period_end = NULL,
+                    first_payment_done = CASE WHEN users.first_payment_done = TRUE THEN TRUE ELSE EXCLUDED.first_payment_done END,
+                    auto_renew = TRUE;
+            """, (int(user_id), new_expiry, sub_id, is_trial, first_payment))
+            conn.commit()
+
+            if first_payment:
+                link = await generate_invite_link()
+                msg = f"✅ Оплата прошла успешно! Доступ до {new_expiry.strftime('%d.%m.%Y')}.\nСсылка для вступления: {link}\n\nДобро пожаловать!"
+            else:
+                msg = f"✅ Ваша подписка продлена до {new_expiry.strftime('%d.%m.%Y')}. Спасибо! ❤️"
+
+            try:
+                await bot.send_message(int(user_id), msg)
+            except BotBlocked:
+                await notify_admins(f"Пользователь {user_id} оплатил, но заблокировал бота.")
+
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Ошибка checkout.session.completed: {e}")
+        finally:
+            cur.close()
+            conn.close()
+
+    # Автопродление
+    elif event['type'] == 'invoice.payment_succeeded':
+        invoice = event['data']['object']
+        sub_id = invoice.get('subscription')
+        if sub_id:
+            try:
+                subscription = stripe.Subscription.retrieve(sub_id)
+                new_expiry = datetime.fromtimestamp(subscription.current_period_end)
+                conn = get_db_conn()
+                cur = conn.cursor()
+                cur.execute("UPDATE users SET expiry_date = %s, paid = TRUE, payment_failed = FALSE, grace_period_end = NULL WHERE stripe_subscription_id = %s", (new_expiry, sub_id))
+                conn.commit()
+                cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row:
+                    try:
+                        await bot.send_message(row[0], f"✅ Автопродление успешно! Доступ до {new_expiry.strftime('%d.%m.%Y')}. Хорошего дня!")
+                    except BotBlocked:
+                        pass
+            except Exception as e:
+                logging.error(f"Ошибка invoice.payment_succeeded: {e}")
+
+    # Ошибка оплаты – даём grace period
+    elif event['type'] == 'invoice.payment_failed':
+        invoice = event['data']['object']
+        sub_id = invoice.get('subscription')
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET payment_failed = TRUE, grace_period_end = NOW() + INTERVAL '1 day' WHERE stripe_subscription_id = %s", (sub_id,))
+            conn.commit()
+            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                try:
+                    await bot.send_message(row[0], "⚠️ Не удалось списать оплату. У вас есть 24 часа, чтобы пополнить карту или связаться с администратором.")
+                except BotBlocked:
+                    pass
+
+    # Отмена подписки пользователем или Stripe
+    elif event['type'] == 'customer.subscription.deleted':
+        sub = event['data']['object']
+        sub_id = sub.get('id')
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("UPDATE users SET paid = FALSE, stripe_subscription_id = NULL WHERE stripe_subscription_id = %s", (sub_id,))
+            conn.commit()
+            cur.close()
+            conn.close()
+
+    # Если сессия оплаты истекла или не удалась
+    elif event['type'] in ['checkout.session.expired', 'checkout.session.async_payment_failed']:
+        session = event['data']['object']
+        user_id = session.get('client_reference_id')
+        if user_id:
+            try:
+                await bot.send_message(int(user_id), "❌ Оплата не прошла или время сессии истекло. Попробуйте снова.")
+            except:
+                pass
+
+    await mark_event_processed(event_id)
+    return web.Response(status=200)
+
+# --- ЗАПУСК И ВЕБХУК TELEGRAM ---
 async def on_startup(app):
     init_db()
-    await bot.delete_webhook() 
-    
-    # Затем устанавливаем актуальный
+    await bot.delete_webhook()
     secret = os.getenv("WEBHOOK_SECRET")
-    await bot.set_webhook(f"{os.getenv('YOUR_DOMAIN')}/webhook?token={secret}")
-    # Используем глобальный scheduler
-    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10)
+    domain = os.getenv("YOUR_DOMAIN")
+    if not domain:
+        logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
+    else:
+        webhook_url = f"{domain}/webhook"
+        if secret:
+            webhook_url += f"?token={secret}"
+        await bot.set_webhook(webhook_url)
+        logging.info(f"Webhook установлен: {webhook_url}")
+    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
 
-async def main():
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        # Логируем ошибку, чтобы понять, почему бот падает
-        logging.error(f"Критическая ошибка работы бота: {e}", exc_info=True)
-        # Не даем боту просто умереть
-        await asyncio.sleep(5) 
-        await main() # Рекурсивный перезапуск
-
 async def on_shutdown(app):
-    # Исправленный способ закрытия сессии
-    session = await bot.get_session()
-    if session:
-        await session.close()
-    logging.info("Бот остановлен, сессия закрыта.")
-    
+    await bot.close()
+    logging.info("Бот остановлен.")
+
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    app = get_new_configured_app(dispatcher=dp, path='/webhook')    
-    app.router.add_post('/stripe-payment', stripe_webhook)    
+    app = get_new_configured_app(dispatcher=dp, path='/webhook')
+    app.router.add_post('/stripe-payment', stripe_webhook)
     app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown) 
+    app.on_shutdown.append(on_shutdown)
     port = int(os.environ.get("PORT", 8080))
     web.run_app(app, host='0.0.0.0', port=port)
