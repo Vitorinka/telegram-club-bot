@@ -196,12 +196,13 @@ async def send_db_backup():
         await notify_admins(f"Ошибка бэкапа: {e}")
         logging.error(f"Ошибка бэкапа: {e}")
 
+# --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
 async def start(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
 
-    # Добавляем пользователя в БД
+    # Добавляем пользователя в БД (если его ещё нет)
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -217,12 +218,7 @@ async def start(message: types.Message, state: FSMContext):
         cur.close()
         conn.close()
 
-    # ... дальше ваш код отправки приветствия
-
-# --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
-@dp.message_handler(commands=['start'], state='*')
-async def start(message: types.Message, state: FSMContext):
-    await state.finish()
+    # Отправка приветствия
     await RegistrationStates.intro.set()
     text = """Привет! 👋
 <b>Добро пожаловать в закрытый клуб Натальи Ребковец.</b>
