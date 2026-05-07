@@ -83,29 +83,6 @@ def init_db():
     conn.close()
     logging.info("--- БД ИНИЦИАЛИЗИРОВАНА И ПРОВЕРЕНА ---")
 
-@dp.message_handler(commands=['start'], state='*')
-async def start(message: types.Message, state: FSMContext):
-    await state.finish()
-    user_id = message.from_user.id
-
-    # Добавляем пользователя в БД, если его ещё нет
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO users (telegram_id, paid)
-            VALUES (%s, FALSE)
-            ON CONFLICT (telegram_id) DO NOTHING
-        """, (user_id,))
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Ошибка добавления пользователя {user_id}: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-    # ... дальше идёт ваш существующий код (отправка приветствия и т.д.)
-
 # Идемпотентность вебхуков
 async def is_event_processed(event_id):
     conn = get_db_conn()
@@ -218,6 +195,29 @@ async def send_db_backup():
     except Exception as e:
         await notify_admins(f"Ошибка бэкапа: {e}")
         logging.error(f"Ошибка бэкапа: {e}")
+
+@dp.message_handler(commands=['start'], state='*')
+async def start(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_id = message.from_user.id
+
+    # Добавляем пользователя в БД
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid)
+            VALUES (%s, FALSE)
+            ON CONFLICT (telegram_id) DO NOTHING
+        """, (user_id,))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка добавления {user_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+    # ... дальше ваш код отправки приветствия
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
