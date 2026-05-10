@@ -180,21 +180,50 @@ async def check_subscriptions_and_reminders():
 async def send_db_backup():
     filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.sql"
     db_url = os.getenv("DATABASE_URL")
-    try:
-        # Добавляем --no-version-check для совместимости версий
-        dump_cmd = f"pg_dump '{db_url}' --no-owner --no-privileges --no-version-check > {filename}"
-        process = await asyncio.create_subprocess_shell(dump_cmd, shell=True)
-        await process.communicate()
-        if process.returncode != 0:
-            raise Exception("pg_dump failed")
 
+    if not db_url:
+        await notify_admins("❌ Ошибка бэкапа: DATABASE_URL не задан!")
+        return
+
+    process = None
+    try:
+        # Безопасный вызов pg_dump с захватом ошибок
+        process = await asyncio.create_subprocess_exec(
+            'pg_dump', db_url,
+            '--no-owner', '--no-privileges', '--no-version-check',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8')
+            logging.error(f"pg_dump failed with code {process.returncode}: {error_msg}")
+            await notify_admins(f"❌ Ошибка создания дампа БД. Код: {process.returncode}. Подробности в логах.")
+            return
+
+        # Записываем успешный дамп во временный файл
+        with open(filename, 'wb') as f:
+            f.write(stdout)
+
+        logging.info(f"Бэкап {filename} успешно создан (размер: {len(stdout)} байт)")
+
+        # --- ОТПРАВКА ФАЙЛА АДМИНИСТРАТОРАМ ---
         for admin_id in ADMIN_IDS:
-            with open(filename, 'rb') as f:
-                await bot.send_document(admin_id, f, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-        os.remove(filename)
+            try:
+                with open(filename, 'rb') as f:
+                    await bot.send_document(admin_id, f, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+            except Exception as e:
+                logging.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
+        # --- КОНЕЦ БЛОКА ОТПРАВКИ ---
+
     except Exception as e:
-        await notify_admins(f"Ошибка бэкапа: {e}")
-        logging.error(f"Ошибка бэкапа: {e}")
+        logging.exception(f"Критическая ошибка при бэкапе: {e}")
+        await notify_admins(f"❌ Непредвиденная ошибка бэкапа: {e}")
+    finally:
+        if os.path.exists(filename):
+            os.remove(filename)
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
