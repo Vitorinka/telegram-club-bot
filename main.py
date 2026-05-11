@@ -180,47 +180,44 @@ async def check_subscriptions_and_reminders():
 async def send_db_backup():
     filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.sql"
     db_url = os.getenv("DATABASE_URL")
-
     if not db_url:
         await notify_admins("❌ Ошибка бэкапа: DATABASE_URL не задан!")
         return
 
-    process = None
+    # Добавляем sslmode=require для Railway
+    conn_string = db_url + "?sslmode=require"
+
     try:
-        # Безопасный вызов pg_dump с захватом ошибок
-        conn_string = db_url + "?sslmode=require"
         process = await asyncio.create_subprocess_exec(
             'pg_dump', conn_string,
             '--no-owner', '--no-privileges',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
             error_msg = stderr.decode('utf-8')
-            logging.error(f"pg_dump failed with code {process.returncode}: {error_msg}")
-            await notify_admins(f"❌ Ошибка создания дампа БД. Код: {process.returncode}. Подробности в логах.")
+            logging.error(f"pg_dump failed (code {process.returncode}): {error_msg}")
+            await notify_admins(f"❌ Ошибка дампа БД. Код: {process.returncode}. Подробности в логах.")
             return
 
-        # Записываем успешный дамп во временный файл
+        # Записываем дамп в файл
         with open(filename, 'wb') as f:
             f.write(stdout)
 
-        logging.info(f"Бэкап {filename} успешно создан (размер: {len(stdout)} байт)")
+        logging.info(f"Бэкап создан: {filename} (размер: {len(stdout)} байт)")
 
-        # --- ОТПРАВКА ФАЙЛА АДМИНИСТРАТОРАМ ---
+        # Отправляем файл каждому админу
         for admin_id in ADMIN_IDS:
             try:
                 with open(filename, 'rb') as f:
                     await bot.send_document(admin_id, f, caption=f"📦 Бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
             except Exception as e:
                 logging.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
-        # --- КОНЕЦ БЛОКА ОТПРАВКИ ---
 
     except Exception as e:
-        logging.exception(f"Критическая ошибка при бэкапе: {e}")
+        logging.exception(f"Критическая ошибка бэкапа: {e}")
         await notify_admins(f"❌ Непредвиденная ошибка бэкапа: {e}")
     finally:
         if os.path.exists(filename):
