@@ -191,7 +191,7 @@ async def send_db_backup():
         conn_string = db_url + "?sslmode=require"
         process = await asyncio.create_subprocess_exec(
             'pg_dump', conn_string,
-            '--no-owner', '--no-privileges', '--no-version-check',
+            '--no-owner', '--no-privileges',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
