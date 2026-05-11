@@ -377,21 +377,13 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             client_reference_id=str(user_id),
             metadata={'days': str(days)}
         )
-        kb = InlineKeyboardMarkup(row_width=1).add(
+        # Новая клавиатура – только кнопка оплаты и "Назад"
+        new_kb = InlineKeyboardMarkup(row_width=1).add(
             InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
         )
-        # --- Универсальное редактирование ---
-        if callback.message.photo:
-            await callback.message.edit_caption(
-                caption="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:",
-                reply_markup=kb
-            )
-        else:
-            await callback.message.edit_text(
-                text="✅ Вы выбрали тариф. Нажмите кнопку для оплаты:",
-                reply_markup=kb
-            )
+        # Безопасно меняем клавиатуру у любого сообщения
+        await callback.message.edit_reply_markup(reply_markup=new_kb)
         await state.finish()
     except Exception as e:
         logging.error(f"Stripe ошибка: {e}")
