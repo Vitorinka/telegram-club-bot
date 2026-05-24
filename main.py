@@ -319,7 +319,7 @@ async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
 @dp.message_handler(content_types=['video'], state=None)
 async def reply_with_video_id(message: types.Message):
     file_id = message.video.file_id
-    await message.reply(f"Ваш video file_id:\n`{file_id}`", parse_mode="Markdown")
+    await message.reply(f"Ваш video file_id:\n{file_id}")
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
