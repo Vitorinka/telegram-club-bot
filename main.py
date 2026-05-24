@@ -414,13 +414,14 @@ async def show_rules(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(text="to_choice", state=RegistrationStates.rules)
 async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
-    text = """<b>Выберите свой формат участия</b>
+    text = """<b>Выберите свой формат участия:</b>
 
-🌟 Пробная неделя — попробуйте формат.
-💳 1, 6 или 12 месяцев — выберите ритм, который подходит именно вам.
+👀 <i>Пробная неделя</i> — чтобы познакомиться с клубом и попробовать формат
+💳 <i>Абонемент на 1, 6 или 12 месяцев</i> — для системной работы с телом
 
-<i>Нажмите на кнопку ниже, чтобы перейти к оплате.</i>
-Буду рада видеть вас в клубе! ❤️"""
+Нажмите на кнопку ниже👇🏽 , чтобы перейти к оплате.
+
+И до встречи на тренировках 🤸🏽‍♀️"""
     # Определяем, показывать ли пробный период (если пользователь уже paid — не показываем)
     conn = get_db_conn()
     cur = conn.cursor()
