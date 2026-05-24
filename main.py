@@ -375,9 +375,19 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
 
 💬 <b>Поддержка 24/7</b> — закрытый чат, где я лично отвечаю."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
-    await bot.send_message(callback.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+    
+    # ВСТАВЬТЕ СЮДА ВАШ VIDEO FILE_ID, КОТОРЫЙ ВЫ ПОЛУЧИЛИ
+    VIDEO_DESCRIPTION = "BAACAgIAAxkBAAIGMmoS7DVlRexpNBTPxk0wPmGESaPYAAKzrgAC-F-YSKfL_HEbOt--OwQ"
+    
+    await bot.send_video(
+        chat_id=callback.message.chat.id,
+        video=VIDEO_DESCRIPTION,
+        caption=text,
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
     await callback.answer()
-
+    
 @dp.callback_query_handler(text="to_rules", state=RegistrationStates.description)
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.rules.set()
