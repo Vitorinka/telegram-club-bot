@@ -226,6 +226,16 @@ async def send_db_backup():
         if os.path.exists(filename):
             os.remove(filename)
 
+@dp.message_handler(content_types=['video'], state=None)
+async def reply_with_video_id(message: types.Message):
+    file_id = message.video.file_id
+    await message.reply(f"Ваш video file_id:\n{file_id}")
+
+@dp.message_handler(content_types=['photo'], state=None)
+async def reply_with_photo_id(message: types.Message):
+    file_id = message.photo[-1].file_id
+    await message.reply(f"Ваш photo file_id:\n{file_id}")
+
 @dp.message_handler(commands=['promo_trial'], state='*')
 async def promo_trial(message: types.Message, state: FSMContext):
     await state.finish()
