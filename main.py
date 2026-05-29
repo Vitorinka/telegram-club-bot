@@ -941,7 +941,6 @@ async def on_startup(app):
         logging.info(f"Webhook установлен: {webhook_url}")
     scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
-    # scheduler.add_job(check_followup, 'cron', hour=12, minute=0)
     scheduler.start()
 
 async def on_shutdown(app):
