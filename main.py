@@ -161,21 +161,26 @@ async def check_subscriptions_and_reminders():
     for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _) in users:
         time_left = expiry - now
 
-    # Истекший доступ
-    if time_left.total_seconds() < 0:
-        if payment_failed and grace_end and now < grace_end:
-            continue
-        # Даём 2 дня grace period
-        if -time_left.total_seconds() < 2 * 86400:
-            if not reminder_sent:
-                await bot.send_message(telegram_id,
-                    "⏳ Ваша подписка истекла, но у вас есть 2 дня, чтобы продлить доступ без потери истории.\n"
-                    "Пожалуйста, продлите подписку как можно скорее.",
-                    reply_markup=get_tariffs_keyboard(show_trial=False))
-                cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-            continue
-        else:
-            await ban_user_logic(telegram_id, cur)
+        time_left = expiry - now
+
+        time_left = expiry - now
+
+        # Истекший доступ
+        if time_left.total_seconds() < 0:
+            # Проверяем grace period от ошибки оплаты (24 часа)
+            if payment_failed and grace_end and now < grace_end:
+                continue
+            # Общий grace period 2 дня
+            if -time_left.total_seconds() < 2 * 86400:
+                if not reminder_sent:
+                    await bot.send_message(telegram_id,
+                        "⏳ Ваша подписка истекла, но у вас есть 2 дня, чтобы продлить доступ без потери истории.\n"
+                        "Пожалуйста, продлите подписку как можно скорее.",
+                        reply_markup=get_tariffs_keyboard(show_trial=False))
+                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                continue  # не баним
+            else:
+                await ban_user_logic(telegram_id, cur)
 
         # Напоминание за 48 часов
         elif timedelta(0) < time_left < timedelta(days=2):
@@ -183,10 +188,7 @@ async def check_subscriptions_and_reminders():
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
                 await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
                 cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-
-    conn.commit()
-    cur.close()
-    conn.close()
+     
 
 # --- БЭКАП БАЗЫ ДАННЫХ ---
 async def send_db_backup():
