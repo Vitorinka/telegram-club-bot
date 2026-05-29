@@ -460,9 +460,9 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     cur.execute("SELECT paid, trial_used FROM users WHERE telegram_id = %s", (callback.from_user.id,))
     row = cur.fetchone()
     show_trial = not (row and (row[0] or row[1])) if row else True
-    cur.close()
     cur.execute("UPDATE users SET registered_at = COALESCE(registered_at, NOW()) WHERE telegram_id = %s", (callback.from_user.id,))
     conn.commit()
+    cur.close()
     conn.close()
     kb = get_tariffs_keyboard(show_trial=show_trial)
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
