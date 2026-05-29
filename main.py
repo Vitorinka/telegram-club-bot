@@ -161,16 +161,13 @@ async def check_subscriptions_and_reminders():
     for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _) in users:
         time_left = expiry - now
 
-        time_left = expiry - now
-
-        time_left = expiry - now
-
-        # Истекший доступ
+        # ----- Истекший доступ -----
         if time_left.total_seconds() < 0:
-            # Проверяем grace period от ошибки оплаты (24 часа)
+            # Льготный период от ошибки оплаты (24 часа)
             if payment_failed and grace_end and now < grace_end:
                 continue
-            # Общий grace period 2 дня
+
+            # Общий льготный период 2 дня
             if -time_left.total_seconds() < 2 * 86400:
                 if not reminder_sent:
                     await bot.send_message(telegram_id,
@@ -182,13 +179,16 @@ async def check_subscriptions_and_reminders():
             else:
                 await ban_user_logic(telegram_id, cur)
 
-        # Напоминание за 48 часов
+        # ----- Напоминание за 48 часов -----
         elif timedelta(0) < time_left < timedelta(days=2):
             if not reminder_sent:
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
                 await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
                 cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-     
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # --- БЭКАП БАЗЫ ДАННЫХ ---
 async def send_db_backup():
@@ -945,7 +945,7 @@ async def on_startup(app):
         logging.info(f"Webhook установлен: {webhook_url}")
     scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
-    scheduler.add_job(check_followup, 'cron', hour=12, minute=0)
+    # scheduler.add_job(check_followup, 'cron', hour=12, minute=0)
     scheduler.start()
 
 async def on_shutdown(app):
