@@ -161,12 +161,21 @@ async def check_subscriptions_and_reminders():
     for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _) in users:
         time_left = expiry - now
 
-        # Истекший доступ
-        if time_left.total_seconds() < 0:
-            if payment_failed and grace_end and now < grace_end:
-                continue  # льготный период ещё действует
-            else:
-                await ban_user_logic(telegram_id, cur)
+    # Истекший доступ
+    if time_left.total_seconds() < 0:
+        if payment_failed and grace_end and now < grace_end:
+            continue
+        # Даём 2 дня grace period
+        if -time_left.total_seconds() < 2 * 86400:
+            if not reminder_sent:
+                await bot.send_message(telegram_id,
+                    "⏳ Ваша подписка истекла, но у вас есть 2 дня, чтобы продлить доступ без потери истории.\n"
+                    "Пожалуйста, продлите подписку как можно скорее.",
+                    reply_markup=get_tariffs_keyboard(show_trial=False))
+                cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+            continue
+        else:
+            await ban_user_logic(telegram_id, cur)
 
         # Напоминание за 48 часов
         elif timedelta(0) < time_left < timedelta(days=2):
@@ -450,6 +459,8 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     row = cur.fetchone()
     show_trial = not (row and (row[0] or row[1])) if row else True
     cur.close()
+    cur.execute("UPDATE users SET registered_at = COALESCE(registered_at, NOW()) WHERE telegram_id = %s", (callback.from_user.id,))
+    conn.commit()
     conn.close()
     kb = get_tariffs_keyboard(show_trial=show_trial)
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
@@ -932,6 +943,7 @@ async def on_startup(app):
         logging.info(f"Webhook установлен: {webhook_url}")
     scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
+    scheduler.add_job(check_followup, 'cron', hour=12, minute=0)
     scheduler.start()
 
 async def on_shutdown(app):
