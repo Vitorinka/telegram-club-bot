@@ -638,7 +638,7 @@ async def broadcast(message: types.Message):
     text = message.text.replace('/broadcast ', '')
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM users")
+    cur.execute("SELECT telegram_id FROM users WHERE (blocked_bot IS NOT TRUE)")
     users = cur.fetchall()
     success = 0
     blocked = 0
