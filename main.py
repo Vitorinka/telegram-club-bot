@@ -155,7 +155,7 @@ async def check_subscriptions_and_reminders():
     cur = conn.cursor()
     cur.execute("""
         SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent, trial_used
-        FROM users WHERE paid = TRUE
+        FROM users WHERE paid = TRUE AND (blocked_bot IS NOT TRUE)
     """)
     users = cur.fetchall()
     now = datetime.utcnow()
@@ -185,7 +185,7 @@ async def check_subscriptions_and_reminders():
 
         # ----- Напоминание за 48 часов -----
         elif timedelta(0) < time_left < timedelta(days=2):
-            if not reminder_sent:
+            if not reminder_sent and auto_renew:
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
                 try:
                     await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
@@ -820,6 +820,8 @@ async def stripe_webhook(request):
             try:
                 await bot.send_message(int(user_id), msg)
             except BotBlocked:
+                cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
+                conn.commit()
                 pass  # не беспокоим админа
             try:
                 await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
@@ -912,6 +914,23 @@ async def stripe_webhook(request):
             cur.close()
             conn.close()
 
+    # ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ (customer.subscription.updated) ----------
+    elif event['type'] == 'customer.subscription.updated':
+        sub = event['data']['object']
+        sub_id = sub.get('id')
+        cancel_at_period_end = sub.get('cancel_at_period_end', False)
+        if sub_id:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE users 
+                SET auto_renew = %s 
+                WHERE stripe_subscription_id = %s
+            """, (not cancel_at_period_end, sub_id))
+            conn.commit()
+            cur.close()
+            conn.close()
+
     # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
     elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
         session = event['data']['object']
@@ -934,6 +953,23 @@ async def test_backup(message: types.Message):
     await message.answer("🔄 Запускаю бэкап...")
     await send_db_backup()
     await message.answer("✅ Бэкап завершён. Проверьте личные сообщения от бота (файл должен прийти админам).")
+
+@dp.message_handler(commands=['unblock_user'], state='*')
+async def unblock_user(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.get_args().split()
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /unblock_user <telegram_id>")
+        return
+    user_id = int(args[0])
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET blocked_bot = FALSE WHERE telegram_id = %s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
     
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
 async def on_startup(app):
