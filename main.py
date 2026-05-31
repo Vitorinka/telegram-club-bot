@@ -82,6 +82,7 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_payment_done BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_at TIMESTAMP DEFAULT NOW();")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_bot BOOLEAN DEFAULT FALSE;")
     conn.commit()
     cur.close()
     conn.close()
@@ -191,6 +192,8 @@ async def check_subscriptions_and_reminders():
                     cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
                 except Exception as e:
                     logging.warning(f"Не удалось отправить напоминание пользователю {telegram_id}: {e}")
+                    if "ChatNotFound" in str(e) or "bot was blocked" in str(e):
+                        cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (telegram_id,))
 
     conn.commit()
     cur.close()
@@ -645,6 +648,8 @@ async def broadcast(message: types.Message):
             success += 1
         except BotBlocked:
             blocked += 1
+            # Помечаем пользователя как заблокировавшего бота
+            cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
         except Exception:
             pass
     cur.close()
