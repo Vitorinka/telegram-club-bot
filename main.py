@@ -164,19 +164,21 @@ async def check_subscriptions_and_reminders():
 
         # ----- Истекший доступ -----
         if time_left.total_seconds() < 0:
-            # Льготный период от ошибки оплаты (24 часа)
             if payment_failed and grace_end and now < grace_end:
                 continue
 
             # Общий льготный период 2 дня
             if -time_left.total_seconds() < 2 * 86400:
                 if not reminder_sent:
-                    await bot.send_message(telegram_id,
-                        "⏳ Ваша подписка истекла, но у вас есть 2 дня, чтобы продлить доступ без потери истории.\n"
-                        "Пожалуйста, продлите подписку как можно скорее.",
-                        reply_markup=get_tariffs_keyboard(show_trial=False))
-                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
-                continue  # не баним
+                    try:
+                        await bot.send_message(telegram_id,
+                            "⏳ Ваша подписка истекла, но у вас есть 2 дня, чтобы продлить доступ без потери истории.\n"
+                            "Пожалуйста, продлите подписку как можно скорее.",
+                            reply_markup=get_tariffs_keyboard(show_trial=False))
+                        cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                    except Exception as e:
+                        logging.warning(f"Не удалось отправить сообщение пользователю {telegram_id}: {e}")
+                continue
             else:
                 await ban_user_logic(telegram_id, cur)
 
@@ -184,8 +186,11 @@ async def check_subscriptions_and_reminders():
         elif timedelta(0) < time_left < timedelta(days=2):
             if not reminder_sent:
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
-                await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
-                cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                try:
+                    await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
+                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                except Exception as e:
+                    logging.warning(f"Не удалось отправить напоминание пользователю {telegram_id}: {e}")
 
     conn.commit()
     cur.close()
