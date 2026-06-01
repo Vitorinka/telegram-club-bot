@@ -844,6 +844,110 @@ async def expired_users_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['user'], state='*')
+async def user_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /user <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT 
+                telegram_id,
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                reminder_sent,
+                payment_failed,
+                grace_period_end,
+                auto_renew,
+                trial_used,
+                first_payment_done,
+                registered_at,
+                blocked_bot
+            FROM users
+            WHERE telegram_id = %s
+        """, (target_user_id,))
+
+        user = cur.fetchone()
+
+        if not user:
+            await message.answer("Пользователь не найден в базе.")
+            return
+
+        (
+            telegram_id,
+            paid,
+            expiry_date,
+            stripe_subscription_id,
+            reminder_sent,
+            payment_failed,
+            grace_period_end,
+            auto_renew,
+            trial_used,
+            first_payment_done,
+            registered_at,
+            blocked_bot
+        ) = user
+
+        now = datetime.utcnow()
+
+        if expiry_date:
+            delta = expiry_date - now
+            if delta.total_seconds() >= 0:
+                access_text = f"осталось {delta.days} дн."
+            else:
+                access_text = f"истекла {abs(delta.days)} дн. назад"
+            expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            access_text = "дата не установлена"
+            expiry_text = "нет"
+
+        grace_text = grace_period_end.strftime("%d.%m.%Y %H:%M") if grace_period_end else "нет"
+        registered_text = registered_at.strftime("%d.%m.%Y %H:%M") if registered_at else "нет"
+
+        stripe_text = "есть" if stripe_subscription_id else "нет"
+
+        text = (
+            f"👤 Пользователь {telegram_id}\n\n"
+            f"paid: {paid}\n"
+            f"expiry_date: {expiry_text}\n"
+            f"статус срока: {access_text}\n"
+            f"stripe_subscription_id: {stripe_text}\n"
+            f"auto_renew: {auto_renew}\n"
+            f"trial_used: {trial_used}\n"
+            f"first_payment_done: {first_payment_done}\n"
+            f"reminder_sent: {reminder_sent}\n"
+            f"payment_failed: {payment_failed}\n"
+            f"grace_period_end: {grace_text}\n"
+            f"blocked_bot: {blocked_bot}\n"
+            f"registered_at: {registered_text}"
+        )
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка user_command: {e}")
+        await message.answer(f"❌ Ошибка получения пользователя: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
