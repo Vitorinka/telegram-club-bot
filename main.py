@@ -888,6 +888,102 @@ def get_free_lesson_feedback_keyboard():
     )
     return kb
 
+async def send_auto_free_lesson(user_id, cur):
+    video_id = os.getenv("FREE_LESSON_VIDEO_ID")
+
+    if not video_id:
+        await notify_admins("FREE_LESSON_VIDEO_ID не задан в Railway Variables. Автоурок не отправлен.")
+        return False
+
+    caption_text = """<b>Я подготовила для вас бесплатную пробную тренировку.</b>
+
+Иногда, чтобы почувствовать больше легкости, подвижности и контакта с телом, не нужен зал, сложное оборудование и час свободного времени. Достаточно коврика и 15 минут правильного движения.
+
+Эта тренировка поможет мягко включиться в практику и почувствовать формат клуба.
+
+<b>Она подойдет, если вы:</b>
+— только начинаете тренироваться;
+— устали от жестких нагрузок;
+— хотите чувствовать тело лучше без перегрузки.
+
+Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
+
+    kb = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("🌟 Начать пробную неделю", callback_data="sub_trial")
+    )
+
+    await bot.send_video(
+        chat_id=int(user_id),
+        video=video_id,
+        caption=caption_text,
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+    cur.execute("""
+        UPDATE users
+        SET video_sent = TRUE,
+            video_sent_at = NOW()
+        WHERE telegram_id = %s
+    """, (int(user_id),))
+
+    return True
+
+async def check_auto_free_lessons():
+    logging.info("--- Проверка автоотправки бесплатного урока ---")
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT telegram_id
+            FROM users
+            WHERE paid = FALSE
+              AND trial_used = FALSE
+              AND video_sent = FALSE
+              AND registered_at IS NOT NULL
+              AND registered_at <= NOW() - INTERVAL '2 days'
+              AND (blocked_bot IS NOT TRUE)
+            ORDER BY registered_at ASC
+            LIMIT 50
+        """)
+
+        users = cur.fetchall()
+
+        sent = 0
+        blocked = 0
+        failed = 0
+
+        for (user_id,) in users:
+            try:
+                was_sent = await send_auto_free_lesson(user_id, cur)
+                if was_sent:
+                    sent += 1
+            except BotBlocked:
+                blocked += 1
+                cur.execute(
+                    "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                    (int(user_id),)
+                )
+            except Exception as e:
+                failed += 1
+                logging.error(f"Ошибка автоотправки бесплатного урока для {user_id}: {e}")
+
+        conn.commit()
+
+        logging.info(
+            f"Автоурок: отправлено={sent}, заблокировали={blocked}, ошибки={failed}"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка check_auto_free_lessons: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 
 async def send_free_lesson_followup(user_id, cur):
     text = (
@@ -2065,6 +2161,58 @@ async def stripe_webhook(request):
     await mark_event_processed(event_id)
     return web.Response(status=200)
 
+@dp.message_handler(commands=['test_auto_lesson'], state='*')
+async def test_auto_lesson_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /test_auto_lesson <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid)
+            VALUES (%s, FALSE)
+            ON CONFLICT (telegram_id) DO NOTHING
+        """, (target_user_id,))
+
+        was_sent = await send_auto_free_lesson(target_user_id, cur)
+        conn.commit()
+
+        if was_sent:
+            await message.answer(f"✅ Тестовый бесплатный урок отправлен пользователю {target_user_id}.")
+        else:
+            await message.answer("⚠️ Урок не отправлен. Проверьте FREE_LESSON_VIDEO_ID.")
+
+    except BotBlocked:
+        cur.execute(
+            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+            (target_user_id,)
+        )
+        conn.commit()
+        await message.answer("⚠️ Пользователь заблокировал бота.")
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка test_auto_lesson для {target_user_id}: {e}")
+        await message.answer(f"❌ Ошибка отправки тестового урока: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['test_backup'])
 async def test_backup(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2132,6 +2280,7 @@ async def on_startup(app):
         logging.info(f"Webhook установлен: {safe_webhook_url}")
 
     scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
+    scheduler.add_job(check_auto_free_lessons, 'interval', hours=1)
     scheduler.add_job(check_free_lesson_followups, 'interval', hours=1)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
