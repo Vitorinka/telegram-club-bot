@@ -1698,6 +1698,13 @@ def get_safe_telegram_webhook_path():
 async def on_startup(app):
     init_db()
     await bot.delete_webhook()
+    
+    await bot.set_my_commands([
+        types.BotCommand("start", "Запуск бота"),
+        types.BotCommand("menu", "Главное меню"),
+        types.BotCommand("profile", "Мой профиль и подписка"),
+        types.BotCommand("help", "Помощь и правила"),
+    ])
 
     domain = os.getenv("YOUR_DOMAIN")
 
