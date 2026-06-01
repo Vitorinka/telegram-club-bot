@@ -401,13 +401,13 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
 
 🔋 <b>Короткие зарядки</b> — 10–15 минут для энергии, снятия напряжения и уменьшения отёков.
 
-🧘🏽‍♀️ <b>Медитации и дыхательные практики</b> — кля расслабления, восстановления и работы с нервной системой.
+🧘🏽‍♀️ <b>Медитации и дыхательные практики</b> — для расслабления, восстановления и работы с нервной системой.
 
-🩹 <b>Фитнес-аптечка</b> — ороткие уроки для быстрой помощи при боли, напряжении и дискомфорте в теле.
+🩹 <b>Фитнес-аптечка</b> — короткие уроки для быстрой помощи при боли, напряжении и дискомфорте в теле.
 
 🥗 <b>Раздел с рецептами</b> и обратной связью от врача-нутрициолога.
 
-👩🏽‍💻 <b>Живые Zoom-уроки 2–4 раза в месяц</b> —  разбор техники, двигательных паттернов, перекосов и индивидуальная коррекция в формате группы.
+👩🏽‍💻 <b>Живые Zoom-уроки 2–4 раза в месяц</b> — разбор техники, двигательных паттернов, перекосов и индивидуальная коррекция в формате группы.
 
 💬 <b>Закрытый чат поддержки,</b> — где я лично отвечаю на вопросы."""
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
@@ -635,27 +635,44 @@ async def show_renew_options(callback: types.CallbackQuery):
 async def broadcast(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    text = message.text.replace('/broadcast ', '')
+
+    text = message.text.replace('/broadcast ', '').strip()
+
+    if not text or text == '/broadcast':
+        await message.answer("⚠️ Использование: /broadcast текст рассылки")
+        return
+
     conn = get_db_conn()
     cur = conn.cursor()
+
     cur.execute("SELECT telegram_id FROM users WHERE (blocked_bot IS NOT TRUE)")
     users = cur.fetchall()
+
     success = 0
     blocked = 0
+    failed = 0
+
     for (user_id,) in users:
         try:
             await bot.send_message(user_id, text)
             success += 1
         except BotBlocked:
             blocked += 1
-            # Помечаем пользователя как заблокировавшего бота
             cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
-        except Exception:
-            pass
+        except Exception as e:
+            failed += 1
+            logging.error(f"Ошибка broadcast для {user_id}: {e}")
+
+    conn.commit()
     cur.close()
     conn.close()
-    await message.answer(f"Рассылка завершена. Успешно: {success}, заблокировали: {blocked}.")
 
+    await message.answer(
+        f"Рассылка завершена.\n"
+        f"Успешно: {success}\n"
+        f"Заблокировали бота: {blocked}\n"
+        f"Другие ошибки: {failed}"
+    )
 @dp.message_handler(commands=['give_access'], state='*')
 async def give_access_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
