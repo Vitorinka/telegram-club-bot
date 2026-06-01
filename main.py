@@ -1387,38 +1387,38 @@ async def stripe_webhook(request):
 
     # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
     elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
-    session = event['data']['object']
-    user_id = getattr(session, 'client_reference_id', None)
+        session = event['data']['object']
+        user_id = getattr(session, 'client_reference_id', None)
 
-    if user_id:
-        kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("🔁 Выбрать тариф заново", callback_data="retry_payment")
-        )
-
-        try:
-            await bot.send_message(
-                int(user_id),
-                "❌ Оплата не прошла или время сессии истекло.\n"
-                "Вы можете выбрать тариф и попробовать снова.",
-                reply_markup=kb
+        if user_id:
+            kb = InlineKeyboardMarkup(row_width=1).add(
+                InlineKeyboardButton("🔁 Выбрать тариф заново", callback_data="retry_payment")
             )
-        except BotBlocked:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
-                    (int(user_id),)
-                )
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
-        except Exception as e:
-            logging.error(f"Не удалось отправить сообщение о неудачной оплате пользователю {user_id}: {e}")
 
-    await mark_event_processed(event_id)
-    return web.Response(status=200)
+            try:
+                await bot.send_message(
+                    int(user_id),
+                    "❌ Оплата не прошла или время сессии истекло.\n"
+                    "Вы можете выбрать тариф и попробовать снова.",
+                    reply_markup=kb
+                )
+            except BotBlocked:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                        (int(user_id),)
+                    )
+                    conn.commit()
+                finally:
+                    cur.close()
+                    conn.close()
+            except Exception as e:
+                logging.error(f"Не удалось отправить сообщение о неудачной оплате пользователю {user_id}: {e}")
+
+        await mark_event_processed(event_id)
+        return web.Response(status=200)
 
 @dp.message_handler(commands=['test_backup'])
 async def test_backup(message: types.Message):
