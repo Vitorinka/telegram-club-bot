@@ -6,7 +6,7 @@ import psycopg2
 import subprocess
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.exceptions import BotBlocked
 from aiogram.dispatcher import FSMContext
@@ -83,6 +83,11 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_payment_done BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_at TIMESTAMP DEFAULT NOW();")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_bot BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS video_sent BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS video_sent_at TIMESTAMP;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent_at TIMESTAMP;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_received BOOLEAN DEFAULT FALSE;")
     conn.commit()
     cur.close()
     conn.close()
@@ -388,6 +393,164 @@ async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Рассылка отменена.")
     await state.finish()
     await callback.answer()
+
+def get_main_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(KeyboardButton("🎁 Бесплатный урок"))
+    kb.add(
+        KeyboardButton("💬 Задать вопрос"),
+        KeyboardButton("🆘 Правила клуба")
+    )
+    kb.add(KeyboardButton("👤 Профиль и подписка"))
+    return kb
+
+
+@dp.message_handler(commands=['menu'], state='*')
+async def show_menu(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(
+        "🌟 Главное меню\n\nВыберите нужный раздел:",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@dp.message_handler(text="👤 Профиль и подписка", state='*')
+async def profile_button_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+    await profile(message)
+
+
+@dp.message_handler(text="🆘 Правила клуба", state='*')
+async def rules_button_handler(message: types.Message, state: FSMContext):
+    await state.finish()
+
+    rules_text = """📜 <b>Правила клуба</b>
+
+1. Уважайте других участников и пространство клуба.
+
+2. Не публикуйте спам, рекламу и сторонние ссылки без согласования.
+
+3. Выполняйте тренировки бережно к себе. Если есть острая боль, травма или медицинские ограничения, сначала проконсультируйтесь со специалистом.
+
+4. Если возник вопрос по упражнениям, доступу или оплате, напишите администратору.
+
+Тренируйтесь в удовольствие и постепенно выстраивайте контакт с телом."""
+
+    await message.answer(rules_text, parse_mode="HTML", reply_markup=get_main_keyboard())
+
+
+@dp.message_handler(text="💬 Задать вопрос", state='*')
+async def ask_question_button(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer(
+        "💬 По всем вопросам напишите @re_tasha.\n\n"
+        "Позже здесь можно будет сделать полноценную переписку с администратором прямо внутри бота.",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@dp.message_handler(text="🎁 Бесплатный урок", state='*')
+async def free_lesson_button(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_id = message.from_user.id
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid)
+            VALUES (%s, FALSE)
+            ON CONFLICT (telegram_id) DO NOTHING
+        """, (user_id,))
+
+        cur.execute("""
+            SELECT video_sent, paid, trial_used
+            FROM users
+            WHERE telegram_id = %s
+        """, (user_id,))
+
+        row = cur.fetchone()
+
+        video_sent = row[0] if row else False
+        paid = row[1] if row else False
+        trial_used = row[2] if row else False
+
+        show_trial = not (paid or trial_used)
+
+        if video_sent:
+            conn.commit()
+            kb = get_tariffs_keyboard(show_trial=show_trial)
+
+            await message.answer(
+                "✅ Вы уже получали бесплатный урок.\n\n"
+                "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:",
+                reply_markup=kb
+            )
+            return
+
+        video_id = os.getenv("FREE_LESSON_VIDEO_ID")
+
+        if not video_id:
+            conn.commit()
+            await message.answer(
+                "🎁 Бесплатный урок скоро появится здесь.\n\n"
+                "Пока вы можете посмотреть тарифы и выбрать удобный формат участия.",
+                reply_markup=get_tariffs_keyboard(show_trial=show_trial)
+            )
+            await notify_admins("FREE_LESSON_VIDEO_ID не задан в Railway Variables.")
+            return
+
+        caption_text = """<b>Чтобы почувствовать изменения в теле и самочувствии, не нужно усложнять.</b>
+
+Для того чтобы уменьшить напряжение, скованность и дискомфорт в теле, не нужен зал, сложное оборудование и час свободного времени. Иногда достаточно коврика и 15 минут правильного движения.
+
+Именно поэтому я подготовила эту пробную тренировку на осанку — приятную, понятную и эффективную.
+
+<b>Она подойдет, если вы:</b>
+— только начинаете тренироваться;
+— устали от жестких нагрузок;
+— хотите чувствовать тело лучше без перегрузки.
+
+<b>После тренировки вы можете почувствовать:</b>
+— больше легкости и подвижности;
+— меньше напряжения в теле;
+— ощущение, что тело наконец стало более собранным.
+
+Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
+
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🌟 Начать пробную неделю", callback_data="sub_trial")
+        )
+
+        await bot.send_video(
+            chat_id=message.chat.id,
+            video=video_id,
+            caption=caption_text,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+        cur.execute("""
+            UPDATE users
+            SET video_sent = TRUE,
+                video_sent_at = NOW()
+            WHERE telegram_id = %s
+        """, (user_id,))
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка free_lesson_button для {user_id}: {e}")
+        await message.answer(
+            "❌ Не удалось отправить бесплатный урок. Попробуйте позже или напишите @re_tasha.",
+            reply_markup=get_main_keyboard()
+        )
+
+    finally:
+        cur.close()
+        conn.close()
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
