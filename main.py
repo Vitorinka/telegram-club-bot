@@ -588,6 +588,41 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             "Техническая ошибка. Попробуйте позже или напишите @re_tasha",
             show_alert=True
         )
+
+@dp.callback_query_handler(text="retry_payment", state='*')
+async def retry_payment(callback: types.CallbackQuery, state: FSMContext):
+    await RegistrationStates.choice.set()
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "SELECT paid, trial_used FROM users WHERE telegram_id = %s",
+            (callback.from_user.id,)
+        )
+        row = cur.fetchone()
+
+        show_trial = not (row and (row[0] or row[1])) if row else True
+        kb = get_tariffs_keyboard(show_trial=show_trial)
+
+        text = "Выберите тариф и попробуйте оплатить еще раз:"
+
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await callback.message.answer(text, reply_markup=kb)
+
+        await callback.answer()
+
+    except Exception as e:
+        logging.error(f"Ошибка retry_payment: {e}")
+        await callback.answer("Ошибка. Попробуйте нажать /start.", show_alert=True)
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.callback_query_handler(text="back_to_tariffs", state='*')
 async def back_to_tariffs(callback: types.CallbackQuery, state: FSMContext):
     await RegistrationStates.choice.set()
@@ -1352,14 +1387,35 @@ async def stripe_webhook(request):
 
     # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
     elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
-        session = event['data']['object']
-        user_id = getattr(session, 'client_reference_id', None)
-        if user_id:
+    session = event['data']['object']
+    user_id = getattr(session, 'client_reference_id', None)
+
+    if user_id:
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("🔁 Выбрать тариф заново", callback_data="retry_payment")
+        )
+
+        try:
+            await bot.send_message(
+                int(user_id),
+                "❌ Оплата не прошла или время сессии истекло.\n"
+                "Вы можете выбрать тариф и попробовать снова.",
+                reply_markup=kb
+            )
+        except BotBlocked:
+            conn = get_db_conn()
+            cur = conn.cursor()
             try:
-                await bot.send_message(int(user_id), 
-                    "❌ Оплата не прошла или время сессии истекло. Попробуйте снова.")
-            except Exception:
-                pass
+                cur.execute(
+                    "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                    (int(user_id),)
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение о неудачной оплате пользователю {user_id}: {e}")
 
     await mark_event_processed(event_id)
     return web.Response(status=200)
