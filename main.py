@@ -327,15 +327,15 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
 
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM users WHERE paid = FALSE")
+    cur.execute("SELECT telegram_id FROM users WHERE paid = FALSE AND (blocked_bot IS NOT TRUE)")
     users = cur.fetchall()
-    cur.close()
-    conn.close()
 
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Начать пробную неделю", callback_data="sub_trial"))
 
     success = 0
     blocked = 0
+    failed = 0
+
     for (user_id,) in users:
         try:
             if media_type == 'photo':
@@ -345,12 +345,21 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
             success += 1
         except BotBlocked:
             blocked += 1
+            cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
         except Exception as e:
-            logging.error(f"Ошибка отправки {user_id}: {e}")
+            failed += 1
+            logging.error(f"Ошибка промо-рассылки для {user_id}: {e}")
 
-    await callback.message.answer(f"✅ Рассылка завершена.\n📨 Успешно: {success}\n🚫 Заблокировали: {blocked}")
-    await state.finish()
-    await callback.answer()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+await callback.message.answer(
+    f"✅ Рассылка завершена.\n"
+    f"📨 Успешно: {success}\n"
+    f"🚫 Заблокировали бота: {blocked}\n"
+    f"⚠️ Другие ошибки: {failed}"
+)
 
 @dp.callback_query_handler(text="cancel_promo", state=PromoStates.waiting_for_text)
 async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
