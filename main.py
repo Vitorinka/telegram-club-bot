@@ -759,6 +759,71 @@ async def give_access_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['expired_users'], state='*')
+async def expired_users_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT 
+                telegram_id,
+                expiry_date,
+                payment_failed,
+                grace_period_end,
+                reminder_sent,
+                blocked_bot,
+                EXTRACT(EPOCH FROM (NOW() - expiry_date)) / 86400 AS days_expired
+            FROM users
+            WHERE paid = TRUE
+              AND expiry_date IS NOT NULL
+              AND expiry_date < NOW()
+            ORDER BY expiry_date ASC
+            LIMIT 30
+        """)
+
+        users = cur.fetchall()
+
+        if not users:
+            await message.answer("✅ Нет пользователей с истекшей датой и paid=True.")
+            return
+
+        lines = ["🧯 Пользователи с истекшей датой, но paid=True:\n"]
+
+        for user in users:
+            telegram_id, expiry_date, payment_failed, grace_period_end, reminder_sent, blocked_bot, days_expired = user
+
+            expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M") if expiry_date else "нет даты"
+            grace_text = grace_period_end.strftime("%d.%m.%Y %H:%M") if grace_period_end else "нет"
+
+            lines.append(
+                f"ID: {telegram_id}\n"
+                f"Истекла: {expiry_text}\n"
+                f"Дней после окончания: {float(days_expired):.1f}\n"
+                f"payment_failed: {payment_failed}\n"
+                f"grace_period_end: {grace_text}\n"
+                f"reminder_sent: {reminder_sent}\n"
+                f"blocked_bot: {blocked_bot}\n"
+            )
+
+        text = "\n---\n".join(lines)
+
+        if len(text) > 4000:
+            text = text[:3900] + "\n\nСообщение обрезано. Показаны не все пользователи."
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка expired_users: {e}")
+        await message.answer(f"❌ Ошибка получения списка: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
