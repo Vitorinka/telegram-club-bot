@@ -948,6 +948,28 @@ async def user_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['admin_help'], state='*')
+async def admin_help_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    text = (
+        "🛠 Админ-команды бота\n\n"
+        "/stats — общая статистика\n"
+        "/user <telegram_id> — карточка пользователя\n"
+        "/expired_users — пользователи с истекшей датой, но paid=True\n"
+        "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
+        "/broadcast текст — текстовая рассылка всем пользователям\n"
+        "/promo_trial — промо-рассылка с фото/видео и кнопкой триала\n"
+        "/test_expiry — вручную запустить проверку подписок\n"
+        "/test_grace <telegram_id> — тестово поставить grace period на 24 часа\n"
+        "/test_backup — вручную запустить бэкап базы\n"
+        "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
+        "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
+    )
+
+    await message.answer(text)
+
 @dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
