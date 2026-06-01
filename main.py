@@ -1417,8 +1417,8 @@ async def stripe_webhook(request):
             except Exception as e:
                 logging.error(f"Не удалось отправить сообщение о неудачной оплате пользователю {user_id}: {e}")
 
-        await mark_event_processed(event_id)
-        return web.Response(status=200)
+    await mark_event_processed(event_id)
+    return web.Response(status=200)
 
 @dp.message_handler(commands=['test_backup'])
 async def test_backup(message: types.Message):
