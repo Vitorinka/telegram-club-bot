@@ -1042,14 +1042,20 @@ async def send_free_lesson_followup(user_id, cur):
         WHERE telegram_id = %s
     """, (int(user_id),))
 
-@dp.message_handler(content_types=[types.ContentType.LEFT_CHAT_MEMBER], state='*')
-async def delete_left_member_service_message(message: types.Message):
+@dp.message_handler(
+    content_types=[
+        types.ContentType.NEW_CHAT_MEMBERS,
+        types.ContentType.LEFT_CHAT_MEMBER
+    ],
+    state='*'
+)
+async def delete_join_leave_service_messages(message: types.Message):
     if str(message.chat.id) != str(GROUP_ID):
         return
 
     try:
         await message.delete()
-        logging.info(f"Удалено системное сообщение о выходе/удалении пользователя в группе {message.chat.id}")
+        logging.info(f"Удалено системное сообщение о входе/выходе пользователя в группе {message.chat.id}")
     except Exception as e:
         logging.warning(f"Не удалось удалить системное сообщение в группе {message.chat.id}: {e}")
 
