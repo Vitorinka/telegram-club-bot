@@ -135,20 +135,40 @@ async def notify_admins(text: str):
 
 # --- АВТОМАТИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК (КРОН) ---
 async def ban_user_logic(telegram_id, cur):
+    # 1. Пытаемся удалить пользователя из группы
     try:
-        # aiogram 2.x использует kick_chat_member для бана
-        await bot.kick_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
-        cur.execute("""
-            UPDATE users 
-            SET paid = FALSE, payment_failed = FALSE, grace_period_end = NULL, reminder_sent = FALSE 
-            WHERE telegram_id = %s
-        """, (telegram_id,))
-        await bot.send_message(telegram_id, 
-            "⚠️ Ваша подписка истекла. Доступ закрыт.\nВы можете оформить новую подписку в любое время.",
-            reply_markup=get_tariffs_keyboard(show_trial=False))
+        await bot.kick_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+        logging.info(f"Пользователь {telegram_id} удален из группы из-за истечения подписки.")
     except Exception as e:
-        logging.error(f"Ошибка при бане {telegram_id}: {e}")
+        logging.error(f"Не удалось удалить пользователя {telegram_id} из группы: {e}")
 
+    # 2. В любом случае закрываем доступ в базе
+    cur.execute("""
+        UPDATE users 
+        SET paid = FALSE,
+            payment_failed = FALSE,
+            grace_period_end = NULL,
+            reminder_sent = FALSE
+        WHERE telegram_id = %s
+    """, (int(telegram_id),))
+
+    # 3. Пытаемся уведомить пользователя
+    try:
+        await bot.send_message(
+            int(telegram_id),
+            "⚠️ Ваша подписка истекла. Доступ закрыт.\n"
+            "Вы можете оформить новую подписку в любое время.",
+            reply_markup=get_tariffs_keyboard(show_trial=False)
+        )
+    except BotBlocked:
+        cur.execute(
+            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+            (int(telegram_id),)
+        )
+        logging.info(f"Пользователь {telegram_id} заблокировал бота.")
+    except Exception as e:
+        logging.error(f"Не удалось отправить сообщение об окончании доступа пользователю {telegram_id}: {e}")
+        
 async def check_subscriptions_and_reminders():
     logging.info("--- Запуск ежедневной проверки подписок ---")
     conn = get_db_conn()
