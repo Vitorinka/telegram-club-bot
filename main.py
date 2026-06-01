@@ -972,22 +972,34 @@ async def unblock_user(message: types.Message):
     await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
     
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
+def get_telegram_webhook_path():
+    secret = os.getenv("WEBHOOK_SECRET")
+    if secret:
+        return f"/webhook/{secret}"
+    return "/webhook"
+
+
+def get_safe_telegram_webhook_path():
+    secret = os.getenv("WEBHOOK_SECRET")
+    if secret:
+        return "/webhook/***"
+    return "/webhook"
+
+
 async def on_startup(app):
     init_db()
     await bot.delete_webhook()
 
-    secret = os.getenv("WEBHOOK_SECRET")
     domain = os.getenv("YOUR_DOMAIN")
 
     if not domain:
         logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
     else:
-        webhook_url = f"{domain}/webhook"
-        safe_webhook_url = f"{domain}/webhook"
+        webhook_path = get_telegram_webhook_path()
+        safe_webhook_path = get_safe_telegram_webhook_path()
 
-        if secret:
-            webhook_url += f"?token={secret}"
-            safe_webhook_url += "?token=***"
+        webhook_url = f"{domain}{webhook_path}"
+        safe_webhook_url = f"{domain}{safe_webhook_path}"
 
         await bot.set_webhook(webhook_url)
         logging.info(f"Webhook установлен: {safe_webhook_url}")
@@ -996,15 +1008,19 @@ async def on_startup(app):
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
 
+
 async def on_shutdown(app):
     await bot.close()
     logging.info("Бот остановлен.")
 
+
 if __name__ == "__main__":
     from aiogram.dispatcher.webhook import get_new_configured_app
-    app = get_new_configured_app(dispatcher=dp, path='/webhook')
+
+    app = get_new_configured_app(dispatcher=dp, path=get_telegram_webhook_path())
     app.router.add_post('/stripe-payment', stripe_webhook)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
+
     port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host='0.0.0.0', port=port)
+    web.run_app(app, host='0.0.0.0', port=port)ort)
