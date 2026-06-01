@@ -231,6 +231,62 @@ async def check_subscriptions_and_reminders():
     cur.close()
     conn.close()
 
+async def check_free_lesson_followups():
+    logging.info("--- Проверка follow-up после бесплатного урока ---")
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT telegram_id
+            FROM users
+            WHERE video_sent = TRUE
+              AND video_sent_at IS NOT NULL
+              AND feedback_sent = FALSE
+              AND feedback_received = FALSE
+              AND (blocked_bot IS NOT TRUE)
+              AND paid = FALSE
+              AND video_sent_at <= NOW() - INTERVAL '24 hours'
+            ORDER BY video_sent_at ASC
+            LIMIT 50
+        """)
+
+        users = cur.fetchall()
+
+        sent = 0
+        blocked = 0
+        failed = 0
+
+        for (user_id,) in users:
+            try:
+                await send_free_lesson_followup(user_id, cur)
+                sent += 1
+            except BotBlocked:
+                blocked += 1
+                cur.execute(
+                    "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                    (int(user_id),)
+                )
+            except Exception as e:
+                failed += 1
+                logging.error(f"Ошибка follow-up после бесплатного урока для {user_id}: {e}")
+
+        conn.commit()
+
+        logging.info(
+            f"Follow-up после бесплатного урока: отправлено={sent}, "
+            f"заблокировали={blocked}, ошибки={failed}"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка check_free_lesson_followups: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 # --- БЭКАП БАЗЫ ДАННЫХ ---
 async def send_db_backup():
     filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.sql"
@@ -602,6 +658,124 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Не удалось отправить ответ: {e}")
         await state.finish()
 
+@dp.callback_query_handler(text="feedback_join", state='*')
+async def feedback_join(callback: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+
+    user_id = callback.from_user.id
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users
+            SET feedback_received = TRUE
+            WHERE telegram_id = %s
+        """, (user_id,))
+
+        cur.execute("""
+            SELECT paid, trial_used
+            FROM users
+            WHERE telegram_id = %s
+        """, (user_id,))
+
+        row = cur.fetchone()
+        conn.commit()
+
+        paid = row[0] if row else False
+        trial_used = row[1] if row else False
+        show_trial = not (paid or trial_used)
+
+        await RegistrationStates.choice.set()
+
+        await callback.message.answer(
+            "Отлично. Выберите удобный формат участия:",
+            reply_markup=get_tariffs_keyboard(show_trial=show_trial)
+        )
+
+        await callback.answer()
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка feedback_join для {user_id}: {e}")
+        await callback.answer("Не удалось открыть тарифы. Попробуйте /start.", show_alert=True)
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+@dp.callback_query_handler(text="feedback_question", state='*')
+async def feedback_question(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users
+            SET feedback_received = TRUE
+            WHERE telegram_id = %s
+        """, (user_id,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка feedback_question для {user_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+    await state.finish()
+
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(KeyboardButton("❌ Отмена"))
+
+    await callback.message.answer(
+        "💬 Напишите ваш вопрос одним сообщением.\n\n"
+        "Я передам его администратору, и вам ответят здесь, в этом чате.",
+        reply_markup=kb
+    )
+
+    await ContactState.waiting_for_message.set()
+    await callback.answer()
+
+
+@dp.callback_query_handler(text="feedback_think", state='*')
+async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+
+    user_id = callback.from_user.id
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users
+            SET feedback_received = TRUE
+            WHERE telegram_id = %s
+        """, (user_id,))
+        conn.commit()
+
+        await callback.message.answer(
+            "Хорошо, возвращайтесь, когда будет удобно.\n\n"
+            "В меню ниже можно открыть тарифы, задать вопрос или посмотреть профиль.",
+            reply_markup=get_main_keyboard()
+        )
+
+        await callback.answer()
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка feedback_think для {user_id}: {e}")
+        await callback.answer("Ошибка. Попробуйте позже.", show_alert=True)
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(text="🎁 Бесплатный урок", state='*')
 async def free_lesson_button(message: types.Message, state: FSMContext):
     await state.finish()
@@ -704,6 +878,40 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
     finally:
         cur.close()
         conn.close()
+
+def get_free_lesson_feedback_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("🌟 Хочу в клуб", callback_data="feedback_join"),
+        InlineKeyboardButton("💬 Задать вопрос", callback_data="feedback_question"),
+        InlineKeyboardButton("🤍 Пока думаю", callback_data="feedback_think")
+    )
+    return kb
+
+
+async def send_free_lesson_followup(user_id, cur):
+    text = (
+        "Как ощущения после пробной тренировки?\n\n"
+        "Удалось почувствовать больше легкости, подвижности или контакта с телом?\n\n"
+        "Если вам откликнулся такой формат, вы можете продолжить занятия в клубе: "
+        "там собраны тренировки, зарядки, дыхательные практики, рецепты и поддержка.\n\n"
+        "Выберите, что вам сейчас ближе:"
+    )
+
+    await bot.send_message(
+        int(user_id),
+        text,
+        reply_markup=get_free_lesson_feedback_keyboard()
+    )
+
+    cur.execute("""
+        UPDATE users
+        SET feedback_sent = TRUE,
+            feedback_sent_at = NOW()
+        WHERE telegram_id = %s
+    """, (int(user_id),))
+
+
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 @dp.message_handler(commands=['start'], state='*')
@@ -1388,6 +1596,7 @@ async def admin_help_command(message: types.Message):
         "/test_backup — вручную запустить бэкап базы\n"
         "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
         "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
+        "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
         "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
     )
 
@@ -1464,6 +1673,55 @@ async def expiring_users_command(message: types.Message):
     except Exception as e:
         logging.error(f"Ошибка expiring_users: {e}")
         await message.answer(f"❌ Ошибка получения списка: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+@dp.message_handler(commands=['test_followup'], state='*')
+async def test_followup_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /test_followup <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO users (telegram_id, paid)
+            VALUES (%s, FALSE)
+            ON CONFLICT (telegram_id) DO NOTHING
+        """, (target_user_id,))
+
+        await send_free_lesson_followup(target_user_id, cur)
+        conn.commit()
+
+        await message.answer(f"✅ Тестовый follow-up отправлен пользователю {target_user_id}.")
+
+    except BotBlocked:
+        cur.execute(
+            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+            (target_user_id,)
+        )
+        conn.commit()
+        await message.answer("⚠️ Пользователь заблокировал бота.")
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка test_followup для {target_user_id}: {e}")
+        await message.answer(f"❌ Ошибка отправки тестового follow-up: {e}")
 
     finally:
         cur.close()
@@ -1874,9 +2132,9 @@ async def on_startup(app):
         logging.info(f"Webhook установлен: {safe_webhook_url}")
 
     scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
+    scheduler.add_job(check_free_lesson_followups, 'interval', hours=1)
     scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
     scheduler.start()
-
 
 async def on_shutdown(app):
     await bot.close()
