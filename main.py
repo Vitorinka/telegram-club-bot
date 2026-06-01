@@ -673,23 +673,90 @@ async def cancel_subscription(callback: types.CallbackQuery):
 
 @dp.message_handler(commands=['profile'], state='*')
 async def profile(message: types.Message):
+    user_id = message.from_user.id
+
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s", (message.from_user.id,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
 
-    if not user or not user[0]:
-        await message.answer("У вас пока нет активной подписки. Нажмите /start, чтобы оформить её.")
-    else:
-        date_text = user[1].strftime("%d.%m.%Y") if user[1] else "не установлена"
-        text = f"✅ Ваша подписка активна.\n📅 Действует до: {date_text}\n\nХотите продлить доступ?"
+    try:
+        cur.execute("""
+            SELECT 
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                payment_failed,
+                grace_period_end,
+                auto_renew,
+                trial_used
+            FROM users
+            WHERE telegram_id = %s
+        """, (user_id,))
+
+        user = cur.fetchone()
+
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
-        if user[2]:
-            kb.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+
+        if not user:
+            kb.add(InlineKeyboardButton("💳 Выбрать тариф", callback_data="retry_payment"))
+            await message.answer(
+                "👤 Ваш профиль\n\n"
+                "❌ Активной подписки нет.\n\n"
+                "Вы можете выбрать тариф и оформить доступ.",
+                reply_markup=kb
+            )
+            return
+
+        paid, expiry_date, stripe_subscription_id, payment_failed, grace_period_end, auto_renew, trial_used = user
+
+        now = datetime.utcnow()
+
+        expiry_text = expiry_date.strftime("%d.%m.%Y") if expiry_date else "не установлена"
+        auto_renew_text = "включено" if auto_renew and stripe_subscription_id else "отключено"
+
+        if paid and expiry_date and expiry_date > now:
+            delta = expiry_date - now
+            status_text = "✅ Подписка активна"
+            time_text = f"осталось {delta.days} дн."
+            kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
+
+            if stripe_subscription_id and auto_renew:
+                kb.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+
+        elif paid and expiry_date and expiry_date <= now:
+            delta = now - expiry_date
+
+            if delta < timedelta(days=2):
+                status_text = "⏳ Подписка истекла, идет льготный период"
+                time_text = f"истекла {delta.days} дн. назад"
+            else:
+                status_text = "⚠️ Подписка истекла"
+                time_text = f"истекла {delta.days} дн. назад"
+
+            kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
+
+        else:
+            status_text = "❌ Активной подписки нет"
+            time_text = "нет активного доступа"
+            kb.add(InlineKeyboardButton("💳 Выбрать тариф", callback_data="retry_payment"))
+
+        text = (
+            "👤 Ваш профиль\n\n"
+            f"{status_text}\n"
+            f"📅 Действует до: {expiry_text}\n"
+            f"⏳ Срок: {time_text}\n"
+            f"🔁 Автопродление: {auto_renew_text}\n\n"
+            "Вы можете управлять доступом ниже."
+        )
+
         await message.answer(text, reply_markup=kb)
+
+    except Exception as e:
+        logging.error(f"Ошибка profile: {e}")
+        await message.answer("❌ Не удалось загрузить профиль. Попробуйте позже или напишите @re_tasha.")
+
+    finally:
+        cur.close()
+        conn.close()
 
 @dp.callback_query_handler(text="show_renew_options", state='*')
 async def show_renew_options(callback: types.CallbackQuery):
