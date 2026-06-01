@@ -763,6 +763,76 @@ async def give_access_command(message: types.Message):
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
 
+@dp.message_handler(commands=['stats'], state='*')
+async def stats_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE")
+        paid_users = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = FALSE")
+        unpaid_users = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE trial_used = TRUE")
+        trial_used = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE blocked_bot = TRUE")
+        blocked_users = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE payment_failed = TRUE")
+        payment_failed = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM users WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW()")
+        grace_active = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*) FROM users
+            WHERE paid = TRUE
+              AND expiry_date IS NOT NULL
+              AND expiry_date > NOW()
+              AND expiry_date <= NOW() + INTERVAL '2 days'
+        """)
+        expiring_soon = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*) FROM users
+            WHERE paid = TRUE
+              AND expiry_date IS NOT NULL
+              AND expiry_date < NOW()
+        """)
+        expired_but_paid = cur.fetchone()[0]
+
+        text = (
+            "📊 Статистика бота\n\n"
+            f"👥 Всего пользователей: {total_users}\n"
+            f"✅ Активных подписок: {paid_users}\n"
+            f"👀 Без активной подписки: {unpaid_users}\n"
+            f"🌟 Использовали пробную неделю: {trial_used}\n"
+            f"🚫 Заблокировали бота: {blocked_users}\n"
+            f"⚠️ Ошибка оплаты: {payment_failed}\n"
+            f"⏳ В grace period: {grace_active}\n"
+            f"📅 Заканчивается в ближайшие 48 часов: {expiring_soon}\n"
+            f"🧯 Истекли, но еще paid=True: {expired_but_paid}"
+        )
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка stats: {e}")
+        await message.answer(f"❌ Ошибка получения статистики: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['test_expiry'])
 async def test_expiry(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
