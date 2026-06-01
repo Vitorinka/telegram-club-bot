@@ -970,6 +970,82 @@ async def admin_help_command(message: types.Message):
 
     await message.answer(text)
 
+@dp.message_handler(commands=['expiring_users'], state='*')
+async def expiring_users_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT 
+                telegram_id,
+                expiry_date,
+                auto_renew,
+                reminder_sent,
+                payment_failed,
+                trial_used,
+                blocked_bot,
+                EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400 AS days_left
+            FROM users
+            WHERE paid = TRUE
+              AND expiry_date IS NOT NULL
+              AND expiry_date > NOW()
+              AND expiry_date <= NOW() + INTERVAL '2 days'
+            ORDER BY expiry_date ASC
+            LIMIT 30
+        """)
+
+        users = cur.fetchall()
+
+        if not users:
+            await message.answer("✅ Нет пользователей, у которых подписка заканчивается в ближайшие 48 часов.")
+            return
+
+        lines = ["📅 Подписка заканчивается в ближайшие 48 часов:\n"]
+
+        for user in users:
+            (
+                telegram_id,
+                expiry_date,
+                auto_renew,
+                reminder_sent,
+                payment_failed,
+                trial_used,
+                blocked_bot,
+                days_left
+            ) = user
+
+            expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M") if expiry_date else "нет даты"
+
+            lines.append(
+                f"ID: {telegram_id}\n"
+                f"Заканчивается: {expiry_text}\n"
+                f"Осталось дней: {float(days_left):.1f}\n"
+                f"auto_renew: {auto_renew}\n"
+                f"reminder_sent: {reminder_sent}\n"
+                f"payment_failed: {payment_failed}\n"
+                f"trial_used: {trial_used}\n"
+                f"blocked_bot: {blocked_bot}\n"
+            )
+
+        text = "\n---\n".join(lines)
+
+        if len(text) > 4000:
+            text = text[:3900] + "\n\nСообщение обрезано. Показаны не все пользователи."
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка expiring_users: {e}")
+        await message.answer(f"❌ Ошибка получения списка: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['help'], state='*')
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
