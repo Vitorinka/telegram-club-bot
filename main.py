@@ -360,6 +360,8 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
         f"🚫 Заблокировали бота: {blocked}\n"
         f"⚠️ Другие ошибки: {failed}"
     )
+    await state.finish()
+    await callback.answer()
 
 @dp.callback_query_handler(text="cancel_promo", state=PromoStates.waiting_for_text)
 async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
