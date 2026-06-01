@@ -472,7 +472,7 @@ def get_main_keyboard():
 async def show_menu(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer(
-        "🌟 Главное меню\n\nВыберите нужный раздел:",
+        "Главное меню\n\nВыберите нужный раздел:",
         reply_markup=get_main_keyboard()
     )
 
@@ -878,7 +878,7 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
         kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("🌟 Начать пробную неделю", callback_data="sub_trial")
+            InlineKeyboardButton("Хочу в клуб", callback_data="sub_trial")
         )
 
         await bot.send_video(
@@ -913,9 +913,9 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
 def get_free_lesson_feedback_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton("🌟 Хочу в клуб", callback_data="feedback_join"),
-        InlineKeyboardButton("💬 Задать вопрос", callback_data="feedback_question"),
-        InlineKeyboardButton("🤍 Пока думаю", callback_data="feedback_think")
+        InlineKeyboardButton("Хочу в клуб", callback_data="feedback_join"),
+        InlineKeyboardButton("Задать вопрос", callback_data="feedback_question"),
+        InlineKeyboardButton("Пока думаю", callback_data="feedback_think")
     )
     return kb
 
@@ -940,7 +940,7 @@ async def send_auto_free_lesson(user_id, cur):
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
     kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("🌟 Начать пробную неделю", callback_data="sub_trial")
+        InlineKeyboardButton("Хочу в клуб", callback_data="sub_trial")
     )
 
     await bot.send_video(
@@ -1152,8 +1152,8 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     conn.close()
     kb = get_tariffs_keyboard(show_trial=show_trial)
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
-    await message.answer(
-        "🌟 Главное меню доступно ниже.",
+    await callback.message.answer(
+        "Главное меню доступно ниже ",
         reply_markup=get_main_keyboard()
     )
     await callback.answer()
