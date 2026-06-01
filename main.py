@@ -354,12 +354,12 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
     cur.close()
     conn.close()
 
-await callback.message.answer(
-    f"✅ Рассылка завершена.\n"
-    f"📨 Успешно: {success}\n"
-    f"🚫 Заблокировали бота: {blocked}\n"
-    f"⚠️ Другие ошибки: {failed}"
-)
+    await callback.message.answer(
+        f"✅ Рассылка завершена.\n"
+        f"📨 Успешно: {success}\n"
+        f"🚫 Заблокировали бота: {blocked}\n"
+        f"⚠️ Другие ошибки: {failed}"
+    )
 
 @dp.callback_query_handler(text="cancel_promo", state=PromoStates.waiting_for_text)
 async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
