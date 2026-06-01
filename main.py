@@ -684,18 +684,24 @@ async def broadcast(message: types.Message):
         f"Заблокировали бота: {blocked}\n"
         f"Другие ошибки: {failed}"
     )
+
 @dp.message_handler(commands=['give_access'], state='*')
 async def give_access_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
+
     args = message.get_args().split()
+
     if len(args) < 1:
         await message.reply("⚠️ Использование: /give_access <user_id> [дней]")
         return
+
     target_user_id = args[0]
     days = int(args[1]) if len(args) > 1 else 30
+
     conn = get_db_conn()
     cur = conn.cursor()
+
     try:
         cur.execute("""
             INSERT INTO users (telegram_id, paid, expiry_date)
@@ -707,40 +713,48 @@ async def give_access_command(message: types.Message):
                     ELSE NOW() + INTERVAL '%s days'
                 END,
                 payment_failed = FALSE,
-                grace_period_end = NULL;
+                grace_period_end = NULL,
+                blocked_bot = FALSE;
         """, (int(target_user_id), days, days, days))
+
+        conn.commit()
+
+        try:
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(target_user_id))
+        except Exception as e:
+            if "administrator" in str(e).lower():
+                logging.warning(f"Не удалось разбанить админа {target_user_id}: {e}")
+            else:
+                logging.error(f"Ошибка разбана {target_user_id}: {e}")
+
+        link = await generate_invite_link()
+
+        try:
+            if link:
+                await bot.send_message(
+                    int(target_user_id),
+                    f"✅ Администратор предоставил вам доступ на {days} дней!\nСсылка: {link}"
+                )
+            else:
+                await bot.send_message(
+                    int(target_user_id),
+                    f"✅ Администратор предоставил вам доступ на {days} дней. Добро пожаловать!"
+                )
+
+            await message.answer(f"✅ Доступ пользователю {target_user_id} предоставлен.")
+
+        except BotBlocked:
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (int(target_user_id),)
+            )
             conn.commit()
+            await message.answer("⚠️ Доступ обновлен, но пользователь заблокировал бота.")
 
-            try:
-                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(target_user_id))
-            except Exception as e:
-                if "administrator" in str(e).lower():
-                    logging.warning(f"Не удалось разбанить админа {target_user_id}: {e}")
-                else:
-                    logging.error(f"Ошибка разбана {target_user_id}: {e}")
-
-            link = await generate_invite_link()
-
-            try:
-                if link:
-                    await bot.send_message(
-                        int(target_user_id),
-                        f"✅ Администратор предоставил вам доступ на {days} дней!\nСсылка: {link}"
-                    )
-                else:
-                    await bot.send_message(
-                        int(target_user_id),
-                        f"✅ Администратор предоставил вам доступ на {days} дней. Добро пожаловать!"
-                    )
-
-                await message.answer(f"✅ Доступ пользователю {target_user_id} предоставлен.")
-            except BotBlocked:
-                cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(target_user_id),))
-                conn.commit()
-                await message.answer("⚠️ Доступ обновлен, но пользователь заблокировал бота.")
     except Exception as e:
         conn.rollback()
         await message.answer(f"❌ Ошибка: {e}")
+
     finally:
         cur.close()
         conn.close()
