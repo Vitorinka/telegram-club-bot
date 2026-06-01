@@ -965,6 +965,7 @@ async def admin_help_command(message: types.Message):
         "/test_grace <telegram_id> — тестово поставить grace period на 24 часа\n"
         "/test_backup — вручную запустить бэкап базы\n"
         "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
+        "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
         "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
     )
 
