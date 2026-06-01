@@ -540,15 +540,21 @@ async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
     await ReplyState.waiting_for_reply.set()
 
     await callback.message.answer(
-        f"✍️ Напишите ответ для пользователя {target_user_id} одним сообщением.\n\n"
+        f"✍️ Отправьте ответ для пользователя {target_user_id} одним сообщением.\n\n"
+        f"Можно отправить текст, фото, видео, голосовое или документ.\n"
         f"Чтобы отменить, отправьте /cancel."
     )
 
     await callback.answer()
 
-@dp.message_handler(state=ReplyState.waiting_for_reply, content_types=types.ContentTypes.TEXT)
+@dp.message_handler(state=ReplyState.waiting_for_reply, content_types=types.ContentTypes.ANY)
 async def send_admin_reply(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
+        return
+
+    if message.text in ["/cancel", "❌ Отмена"]:
+        await state.finish()
+        await message.answer("Ответ отменен.")
         return
 
     data = await state.get_data()
@@ -562,9 +568,13 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(
             int(target_user_id),
-            "💬 Ответ администратора:\n\n"
-            f"{message.html_text}",
-            parse_mode="HTML"
+            "💬 Ответ администратора:"
+        )
+
+        await bot.copy_message(
+            chat_id=int(target_user_id),
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
         )
 
         await message.answer(f"✅ Ответ отправлен пользователю {target_user_id}.")
