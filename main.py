@@ -972,22 +972,21 @@ async def unblock_user(message: types.Message):
     await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
     
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
-async def on_startup(app):
-    init_db()
-    await bot.delete_webhook()
-    secret = os.getenv("WEBHOOK_SECRET")
-    domain = os.getenv("YOUR_DOMAIN")
-    if not domain:
-        logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
-    else:
-        webhook_url = f"{domain}/webhook"
-        if secret:
-            webhook_url += f"?token={secret}"
-        await bot.set_webhook(webhook_url)
-        logging.info(f"Webhook установлен: {webhook_url}")
-    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
-    scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
-    scheduler.start()
+secret = os.getenv("WEBHOOK_SECRET")
+domain = os.getenv("YOUR_DOMAIN")
+
+if not domain:
+    logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
+else:
+    webhook_url = f"{domain}/webhook"
+    safe_webhook_url = f"{domain}/webhook"
+
+    if secret:
+        webhook_url += f"?token={secret}"
+        safe_webhook_url += "?token=***"
+
+    await bot.set_webhook(webhook_url)
+    logging.info(f"Webhook установлен: {safe_webhook_url}")
 
 async def on_shutdown(app):
     await bot.close()
