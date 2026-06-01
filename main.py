@@ -1736,7 +1736,7 @@ async def admin_help_command(message: types.Message):
         "/expired_users — пользователи с истекшей датой, но paid=True\n"
         "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
-        "/promo_trial — промо-рассылка с фото/видео и кнопкой триала\n"
+        "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
         "/test_grace <telegram_id> — тестово поставить grace period на 24 часа\n"
         "/test_backup — вручную запустить бэкап базы\n"
