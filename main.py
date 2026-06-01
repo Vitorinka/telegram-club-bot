@@ -17,6 +17,13 @@ class PromoStates(StatesGroup):
     waiting_for_media = State()
     waiting_for_text = State()
 
+class ContactState(StatesGroup):
+    waiting_for_message = State()
+
+
+class ReplyState(StatesGroup):
+    waiting_for_reply = State()
+
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info("Начинаю подключение к базе данных...")
@@ -442,12 +449,148 @@ async def rules_button_handler(message: types.Message, state: FSMContext):
 @dp.message_handler(text="💬 Задать вопрос", state='*')
 async def ask_question_button(message: types.Message, state: FSMContext):
     await state.finish()
+
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(KeyboardButton("❌ Отмена"))
+
     await message.answer(
-        "💬 По всем вопросам напишите @re_tasha.\n\n"
-        "Позже здесь можно будет сделать полноценную переписку с администратором прямо внутри бота.",
-        reply_markup=get_main_keyboard()
+        "💬 Напишите ваш вопрос одним сообщением.\n\n"
+        "Я передам его администратору, и вам ответят здесь, в этом чате.",
+        reply_markup=kb
     )
 
+    await ContactState.waiting_for_message.set()
+
+@dp.message_handler(state=ContactState.waiting_for_message, content_types=types.ContentTypes.ANY)
+async def forward_question_to_admin(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.finish()
+        await message.answer(
+            "Отправка вопроса отменена.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "username не указан"
+
+    try:
+        for admin_id in ADMIN_IDS:
+            await bot.forward_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+
+            kb = InlineKeyboardMarkup(row_width=1).add(
+                InlineKeyboardButton("✍️ Ответить", callback_data=f"reply_to_{user.id}")
+            )
+
+            await bot.send_message(
+                admin_id,
+                f"📩 Новый вопрос от пользователя:\n\n"
+                f"ID: {user.id}\n"
+                f"Username: {username}\n"
+                f"Имя: {user.full_name}",
+                reply_markup=kb
+            )
+
+        conn = get_db_conn()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "UPDATE users SET feedback_received = TRUE WHERE telegram_id = %s",
+                (user.id,)
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        await message.answer(
+            "✅ Ваш вопрос отправлен администратору.\n"
+            "Ответ придет здесь, в этом чате.",
+            reply_markup=get_main_keyboard()
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки вопроса админу от {user.id}: {e}")
+        await message.answer(
+            "❌ Не удалось отправить вопрос. Попробуйте позже или напишите @re_tasha.",
+            reply_markup=get_main_keyboard()
+        )
+
+    finally:
+        await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_"), state='*')
+async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+
+    try:
+        target_user_id = int(callback.data.replace("reply_to_", ""))
+    except ValueError:
+        await callback.answer("Ошибка ID пользователя.", show_alert=True)
+        return
+
+    await state.update_data(reply_to_user=target_user_id)
+    await ReplyState.waiting_for_reply.set()
+
+    await callback.message.answer(
+        f"✍️ Напишите ответ для пользователя {target_user_id} одним сообщением.\n\n"
+        f"Чтобы отменить, отправьте /cancel."
+    )
+
+    await callback.answer()
+
+@dp.message_handler(state=ReplyState.waiting_for_reply, content_types=types.ContentTypes.TEXT)
+async def send_admin_reply(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("reply_to_user")
+
+    if not target_user_id:
+        await state.finish()
+        await message.answer("❌ Не найден пользователь для ответа.")
+        return
+
+    try:
+        await bot.send_message(
+            int(target_user_id),
+            "💬 Ответ администратора:\n\n"
+            f"{message.html_text}",
+            parse_mode="HTML"
+        )
+
+        await message.answer(f"✅ Ответ отправлен пользователю {target_user_id}.")
+        await state.finish()
+
+    except BotBlocked:
+        conn = get_db_conn()
+        cur = conn.cursor()
+
+        try:
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (int(target_user_id),)
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        await message.answer("⚠️ Пользователь заблокировал бота. Ответ не отправлен.")
+        await state.finish()
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки ответа пользователю {target_user_id}: {e}")
+        await message.answer(f"❌ Не удалось отправить ответ: {e}")
+        await state.finish()
 
 @dp.message_handler(text="🎁 Бесплатный урок", state='*')
 async def free_lesson_button(message: types.Message, state: FSMContext):
