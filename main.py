@@ -689,6 +689,10 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Не удалось отправить ответ: {e}")
         await state.finish()
 
+@dp.message_handler(commands=['ask'], state='*')
+async def ask_command(message: types.Message, state: FSMContext):
+    await ask_question_button(message, state)
+
 @dp.callback_query_handler(text="feedback_join", state='*')
 async def feedback_join(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
@@ -2293,7 +2297,7 @@ async def on_startup(app):
         types.BotCommand("start", "Запуск бота"),
         types.BotCommand("menu", "Главное меню"),
         types.BotCommand("profile", "Мой профиль и подписка"),
-        types.BotCommand("help", "Помощь и правила"),
+        types.BotCommand("ask", "Задать вопрос"),
     ])
 
     domain = os.getenv("YOUR_DOMAIN")
