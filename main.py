@@ -664,6 +664,10 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     conn.close()
     kb = get_tariffs_keyboard(show_trial=show_trial)
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
+    await message.answer(
+        "🌟 Главное меню доступно ниже.",
+        reply_markup=get_main_keyboard()
+    )
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
