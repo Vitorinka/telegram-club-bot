@@ -1728,6 +1728,7 @@ async def admin_help_command(message: types.Message):
         "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
         "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
         "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
+        "/test_auto_lesson <telegram_id> — тестово отправить бесплатный урок\n"
         "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
     )
 
@@ -2174,8 +2175,8 @@ async def stripe_webhook(request):
             try:
                 await bot.send_message(
                     int(user_id),
-                    "❌ Оплата не прошла или время сессии истекло.\n"
-                    "Вы можете выбрать тариф и попробовать снова.",
+                    "Похоже, оформление доступа не завершилось.\n\n"
+                    "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь.",
                     reply_markup=kb
                 )
             except BotBlocked:
