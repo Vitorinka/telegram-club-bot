@@ -2175,39 +2175,86 @@ async def stripe_webhook(request):
             conn.close()
 
     # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
+        # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
         sub_id = getattr(invoice, 'subscription', None)
+
         if not sub_id:
+            logging.warning(f"invoice.payment_succeeded без subscription_id: event={event_id}")
+            await notify_admins(
+                f"Оплата прошла, но в invoice нет subscription_id.\n"
+                f"event_id: {event_id}"
+            )
             await mark_event_processed(event_id)
             return web.Response(status=200)
+
+        conn = get_db_conn()
+        cur = conn.cursor()
+
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
             new_expiry = datetime.fromtimestamp(subscription.current_period_end)
-            conn = get_db_conn()
-            cur = conn.cursor()
+
             cur.execute("""
                 UPDATE users 
                 SET expiry_date = %s, 
                     paid = TRUE, 
                     payment_failed = FALSE, 
                     grace_period_end = NULL,
-                    reminder_sent = FALSE
+                    reminder_sent = FALSE,
+                    auto_renew = TRUE
                 WHERE stripe_subscription_id = %s
+                RETURNING telegram_id
             """, (new_expiry, sub_id))
-            conn.commit()
-            cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (sub_id,))
+
             row = cur.fetchone()
+            conn.commit()
+
+            if not row:
+                logging.error(
+                    f"invoice.payment_succeeded: пользователь не найден по stripe_subscription_id={sub_id}, event={event_id}"
+                )
+
+                await notify_admins(
+                    "Оплата в Stripe прошла, но пользователь в базе не найден.\n\n"
+                    f"subscription_id: {sub_id}\n"
+                    f"event_id: {event_id}\n"
+                    f"Новая дата из Stripe: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n\n"
+                    "Нужно вручную найти пользователя и выдать доступ командой /give_access."
+                )
+                return web.Response(status=200)
+
+            telegram_id = row[0]
+
+            try:
+                await bot.send_message(
+                    int(telegram_id),
+                    f"✅ Автопродление успешно! Доступ продлен до {new_expiry.strftime('%d.%m.%Y')}. Хорошего дня!"
+                )
+            except BotBlocked:
+                cur.execute(
+                    "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                    (int(telegram_id),)
+                )
+                conn.commit()
+            except Exception as e:
+                logging.error(f"Не удалось отправить сообщение об автопродлении {telegram_id}: {e}")
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Ошибка invoice.payment_succeeded: {e}")
+            await notify_admins(
+                f"Ошибка обработки успешной оплаты Stripe.\n\n"
+                f"subscription_id: {sub_id}\n"
+                f"event_id: {event_id}\n"
+                f"Ошибка: {e}"
+            )
+
+        finally:
             cur.close()
             conn.close()
-            if row:
-                try:
-                    await bot.send_message(row[0], f"✅ Автопродление успешно! Доступ продлён до {new_expiry.strftime('%d.%m.%Y')}. Хорошего дня!")
-                except BotBlocked:
-                    pass
-        except Exception as e:
-            logging.error(f"Ошибка invoice.payment_succeeded: {e}")
-
+    
     # ---------- 3. ОШИБКА ОПЛАТЫ (invoice.payment_failed) – GRACE PERIOD ----------
     elif event['type'] == 'invoice.payment_failed':
         invoice = event['data']['object']
