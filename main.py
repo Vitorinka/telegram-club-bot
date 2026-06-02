@@ -1469,6 +1469,65 @@ async def show_renew_options(callback: types.CallbackQuery):
     await callback.message.edit_text("Выберите тариф для продления доступа:", reply_markup=kb)
     await callback.answer()
 
+@dp.message_handler(commands=['send_user'], state='*')
+async def send_user_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split(maxsplit=1)
+
+    if len(args) < 2:
+        await message.reply(
+            "⚠️ Использование:\n"
+            "/send_user <telegram_id> текст сообщения\n\n"
+            "Пример:\n"
+            "/send_user 123456789 Добрый день! Ваш доступ закончился, вы можете продлить подписку через /profile."
+        )
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    text = args[1].strip()
+
+    if not text:
+        await message.reply("⚠️ Текст сообщения не может быть пустым.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        await bot.send_message(
+            target_user_id,
+            text
+        )
+
+        await message.answer(f"✅ Сообщение отправлено пользователю {target_user_id}.")
+
+    except BotBlocked:
+        cur.execute(
+            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+            (target_user_id,)
+        )
+        conn.commit()
+
+        await message.answer("⚠️ Пользователь заблокировал бота. Сообщение не отправлено.")
+
+    except Exception as e:
+        logging.error(f"Ошибка send_user для {target_user_id}: {e}")
+        await message.answer(
+            f"❌ Не удалось отправить сообщение пользователю {target_user_id}.\n\n"
+            f"Ошибка: {e}"
+        )
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['broadcast'], state='*')
 async def broadcast(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -1775,6 +1834,7 @@ async def admin_help_command(message: types.Message):
         "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
         "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
         "/test_auto_lesson <telegram_id> — тестово отправить бесплатный урок\n"
+        "/send_user <telegram_id> текст — написать конкретному пользователю\n"
         "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
     )
 
