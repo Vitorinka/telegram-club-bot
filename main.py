@@ -392,6 +392,14 @@ async def promo_get_media(message: types.Message, state: FSMContext):
 @dp.message_handler(state=PromoStates.waiting_for_text, content_types=types.ContentTypes.TEXT)
 async def promo_get_text(message: types.Message, state: FSMContext):
     text = message.html_text
+
+    if len(text) > 3900:
+        await message.reply(
+            "⚠️ Текст слишком длинный для Telegram-сообщения.\n\n"
+            "Сократите его примерно до 3900 символов и отправьте заново."
+        )
+        return
+
     data = await state.get_data()
     media_type = data['media_type']
     file_id = data['file_id']
@@ -400,12 +408,27 @@ async def promo_get_text(message: types.Message, state: FSMContext):
         InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_promo"),
         InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo")
     )
-    await state.update_data(text=text)
-    if media_type == 'photo':
-        await message.reply_photo(file_id, caption=text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>", reply_markup=kb, parse_mode="HTML")
-    else:
-        await message.reply_video(file_id, caption=text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>", reply_markup=kb, parse_mode="HTML")
 
+    await state.update_data(text=text)
+
+    try:
+        if media_type == 'photo':
+            await message.reply_photo(file_id)
+        else:
+            await message.reply_video(file_id)
+
+        await message.reply(
+            text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка предпросмотра промо-рассылки: {e}")
+        await message.reply(
+            "❌ Не удалось создать предпросмотр. Проверьте текст и попробуйте заново."
+        )
+        
 @dp.callback_query_handler(text="confirm_promo", state=PromoStates.waiting_for_text)
 async def promo_send(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
