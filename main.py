@@ -2330,10 +2330,45 @@ async def on_startup(app):
         await bot.set_webhook(webhook_url)
         logging.info(f"Webhook установлен: {safe_webhook_url}")
 
-    scheduler.add_job(check_subscriptions_and_reminders, 'cron', hour=10, minute=0)
-    scheduler.add_job(check_auto_free_lessons, 'interval', hours=1)
-    scheduler.add_job(check_free_lesson_followups, 'interval', hours=1)
-    scheduler.add_job(send_db_backup, 'cron', day_of_week='mon', hour=3, minute=0)
+    scheduler.add_job(
+        check_subscriptions_and_reminders,
+        'cron',
+        hour=10,
+        minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        check_auto_free_lessons,
+        'cron',
+        minute=15,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        check_free_lesson_followups,
+        'cron',
+        minute=30,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        send_db_backup,
+        'cron',
+        day_of_week='mon',
+        hour=3,
+        minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
     scheduler.start()
 
 async def on_shutdown(app):
