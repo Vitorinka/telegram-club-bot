@@ -393,10 +393,12 @@ async def promo_get_media(message: types.Message, state: FSMContext):
 async def promo_get_text(message: types.Message, state: FSMContext):
     text = message.html_text
 
-    if len(text) > 3900:
+    if len(text) > 1000:
         await message.reply(
-            "⚠️ Текст слишком длинный для Telegram-сообщения.\n\n"
-            "Сократите его примерно до 3900 символов и отправьте заново."
+            f"⚠️ Текст слишком длинный для промо-рассылки с фото/видео.\n\n"
+            f"Сейчас: {len(text)} символов.\n"
+            f"Максимум: 1000 символов.\n\n"
+            f"Сократите текст и отправьте его еще раз."
         )
         return
 
@@ -413,20 +415,26 @@ async def promo_get_text(message: types.Message, state: FSMContext):
 
     try:
         if media_type == 'photo':
-            await message.reply_photo(file_id)
+            await message.reply_photo(
+                file_id,
+                caption=text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
         else:
-            await message.reply_video(file_id)
-
-        await message.reply(
-            text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+            await message.reply_video(
+                file_id,
+                caption=text + "\n\n---\n<i>Предпросмотр. Отправляем?</i>",
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
 
     except Exception as e:
         logging.error(f"Ошибка предпросмотра промо-рассылки: {e}")
         await message.reply(
-            "❌ Не удалось создать предпросмотр. Проверьте текст и попробуйте заново."
+            "❌ Не удалось создать предпросмотр.\n\n"
+            "Возможно, текст все еще слишком длинный или в нем есть ошибка форматирования. "
+            "Сократите текст и попробуйте снова."
         )
         
 @dp.callback_query_handler(text="confirm_promo", state=PromoStates.waiting_for_text)
