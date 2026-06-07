@@ -145,14 +145,102 @@ async def notify_admins(text: str):
         except Exception:
             pass
 
+
+def is_undeliverable_user_error(error):
+    error_text = str(error).lower()
+    undeliverable_markers = (
+        "chat not found",
+        "chatnotfound",
+        "bot was blocked",
+        "user is deactivated",
+        "bot can't initiate conversation",
+        "forbidden",
+    )
+    return any(marker in error_text for marker in undeliverable_markers)
+
+
 # --- АВТОМАТИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК (КРОН) ---
+async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+    if not stripe_subscription_id:
+        return False
+
+    try:
+        subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
+        status = getattr(subscription, 'status', None)
+        current_period_end = getattr(subscription, 'current_period_end', None)
+
+        if status in ('active', 'trialing') and current_period_end:
+            new_expiry = datetime.utcfromtimestamp(current_period_end)
+
+            if new_expiry > datetime.utcnow():
+                cur.execute("""
+                    UPDATE users
+                    SET paid = TRUE,
+                        expiry_date = %s,
+                        payment_failed = FALSE,
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE
+                    WHERE telegram_id = %s
+                """, (new_expiry, int(telegram_id)))
+
+                logging.info(
+                    f"Пользователь {telegram_id} не удален: Stripe подписка активна до {new_expiry} UTC."
+                )
+                return True
+
+    except Exception as e:
+        logging.error(f"Не удалось перепроверить Stripe-подписку {stripe_subscription_id} для {telegram_id}: {e}")
+        await notify_admins(
+            f"Не смогла перепроверить Stripe перед удалением пользователя {telegram_id}.\n"
+            f"subscription_id: {stripe_subscription_id}\n"
+            f"Ошибка: {e}\n\n"
+            "Пользователь пока НЕ удален автоматически. Проверьте вручную."
+        )
+        return True
+
+    return False
+
 async def ban_user_logic(telegram_id, cur):
+    cur.execute("""
+        SELECT paid, expiry_date, stripe_subscription_id
+        FROM users
+        WHERE telegram_id = %s
+    """, (int(telegram_id),))
+    user = cur.fetchone()
+
+    if not user:
+        logging.warning(f"Пользователь {telegram_id} не удален: пользователь не найден в БД.")
+        return
+
+    paid, expiry_date, stripe_subscription_id = user
+    now = datetime.utcnow()
+
+    if paid and expiry_date and expiry_date > now:
+        logging.info("Пользователь не удален: доступ уже активен в БД")
+        return
+
+    if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+        return
+
     # 1. Пытаемся удалить пользователя из группы
     try:
         await bot.kick_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+        try:
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+        except Exception as e:
+            logging.error(f"Пользователь {telegram_id} удален, но не удалось снять бан: {e}")
+            await notify_admins(
+                f"Пользователь {telegram_id} удален из группы, но не удалось снять бан.\n"
+                f"Ошибка: {e}"
+            )
         logging.info(f"Пользователь {telegram_id} удален из группы из-за истечения подписки.")
     except Exception as e:
         logging.error(f"Не удалось удалить пользователя {telegram_id} из группы: {e}")
+        await notify_admins(
+            f"Не удалось удалить пользователя {telegram_id} из группы.\n"
+            f"Ошибка: {e}\n\n"
+            "Пользователь мог остаться в группе. Проверьте вручную."
+        )
 
     # 2. В любом случае закрываем доступ в базе
     cur.execute("""
@@ -186,13 +274,16 @@ async def check_subscriptions_and_reminders():
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent, trial_used
-        FROM users WHERE paid = TRUE AND (blocked_bot IS NOT TRUE)
+        SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent, trial_used, stripe_subscription_id
+        FROM users
+        WHERE paid = TRUE
+          AND expiry_date IS NOT NULL
+          AND (blocked_bot IS NOT TRUE)
     """)
     users = cur.fetchall()
     now = datetime.utcnow()
 
-    for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _) in users:
+    for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _, stripe_subscription_id) in users:
         time_left = expiry - now
 
         # ----- Истекший доступ -----
@@ -213,6 +304,8 @@ async def check_subscriptions_and_reminders():
                         logging.warning(f"Не удалось отправить сообщение пользователю {telegram_id}: {e}")
                 continue
             else:
+                if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+                    continue
                 await ban_user_logic(telegram_id, cur)
 
         # ----- Напоминание за 48 часов -----
@@ -1033,8 +1126,16 @@ async def check_auto_free_lessons():
                     (int(user_id),)
                 )
             except Exception as e:
-                failed += 1
-                logging.error(f"Ошибка автоотправки бесплатного урока для {user_id}: {e}")
+                if is_undeliverable_user_error(e):
+                    blocked += 1
+                    cur.execute(
+                        "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                        (int(user_id),)
+                    )
+                    logging.info(f"Пользователь {user_id} помечен blocked_bot после ошибки автоурока: {e}")
+                else:
+                    failed += 1
+                    logging.error(f"Ошибка автоотправки бесплатного урока для {user_id}: {e}")
 
         conn.commit()
 
@@ -1786,7 +1887,7 @@ async def user_command(message: types.Message):
         grace_text = grace_period_end.strftime("%d.%m.%Y %H:%M") if grace_period_end else "нет"
         registered_text = registered_at.strftime("%d.%m.%Y %H:%M") if registered_at else "нет"
 
-        stripe_text = "есть" if stripe_subscription_id else "нет"
+        stripe_text = stripe_subscription_id if stripe_subscription_id else "нет"
 
         text = (
             f"👤 Пользователь {telegram_id}\n\n"
@@ -1831,6 +1932,7 @@ async def admin_help_command(message: types.Message):
         "/test_grace <telegram_id> — тестово поставить grace period на 24 часа\n"
         "/test_backup — вручную запустить бэкап базы\n"
         "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
+        "/unban_user <telegram_id> — снять бан пользователя в Telegram-группе\n"
         "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
         "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
         "/test_auto_lesson <telegram_id> — тестово отправить бесплатный урок\n"
@@ -2194,7 +2296,7 @@ async def stripe_webhook(request):
 
         try:
             subscription = stripe.Subscription.retrieve(sub_id)
-            new_expiry = datetime.fromtimestamp(subscription.current_period_end)
+            new_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
 
             cur.execute("""
                 UPDATE users 
@@ -2427,6 +2529,30 @@ async def unblock_user(message: types.Message):
     cur.close()
     conn.close()
     await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
+
+@dp.message_handler(commands=['unban_user'], state='*')
+async def unban_user(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /unban_user <telegram_id>")
+        return
+
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    try:
+        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
+        await message.reply(f"✅ Бан пользователя {user_id} снят в Telegram-группе.")
+    except Exception as e:
+        logging.error(f"Ошибка /unban_user для {user_id}: {e}")
+        await message.reply(f"❌ Не удалось снять бан пользователя {user_id}: {e}")
     
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
 def get_telegram_webhook_path():
