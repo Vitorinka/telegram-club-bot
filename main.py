@@ -3069,6 +3069,7 @@ async def admin_help_command(message: types.Message):
         "/test_backup — вручную запустить бэкап базы\n"
         "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
         "/unban_user <telegram_id> — снять бан пользователя в Telegram-группе\n"
+        "/send_invite_link <telegram_id> — отправить новую ссылку входа в клуб\n"
         "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
         "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
         "/test_auto_lesson <telegram_id> — тестово отправить бесплатный урок\n"
@@ -3959,6 +3960,106 @@ async def unblock_user(message: types.Message):
     cur.close()
     conn.close()
     await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
+
+@dp.message_handler(commands=['send_invite_link'], state='*')
+async def send_invite_link_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /send_invite_link <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT paid, expiry_date, blocked_bot
+            FROM users
+            WHERE telegram_id = %s
+        """, (target_user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            await message.reply("❌ Пользователь не найден в базе.")
+            return
+
+        paid, expiry_date, blocked_bot = user
+
+        if not paid or not expiry_date or expiry_date <= datetime.utcnow():
+            await message.reply("⚠️ У пользователя нет активного доступа.")
+            return
+
+        try:
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=target_user_id)
+        except Exception as e:
+            logging.error(f"Ошибка разбана перед /send_invite_link для {target_user_id}: {e}")
+
+        invite = await bot.create_chat_invite_link(
+            chat_id=int(GROUP_ID),
+            name=f"manual_invite_{target_user_id}",
+            expire_date=datetime.utcnow() + timedelta(hours=24),
+            member_limit=1
+        )
+        invite_link = invite.invite_link
+        expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M")
+        user_text = (
+            "Здравствуйте! Мы восстановили вам доступ в клуб.\n\n"
+            f"Ваш доступ активен до {expiry_text}.\n\n"
+            "Вот новая ссылка для входа:\n"
+            f"{invite_link}\n\n"
+            "Ссылка действует 24 часа и только для одного входа."
+        )
+
+        try:
+            await bot.send_message(target_user_id, user_text)
+        except BotBlocked:
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (target_user_id,)
+            )
+            conn.commit()
+            await message.answer(
+                "⚠️ Ссылка создана, но пользователь заблокировал бота.\n\n"
+                f"telegram_id: {target_user_id}\n"
+                f"Ссылка для ручной отправки: {invite_link}"
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не удалось отправить invite link пользователю {target_user_id}: {e}")
+            await message.answer(
+                "⚠️ Ссылка создана, но не удалось отправить ее пользователю.\n\n"
+                f"telegram_id: {target_user_id}\n"
+                f"Ошибка: {e}\n"
+                f"Ссылка для ручной отправки: {invite_link}"
+            )
+            return
+
+        await log_access_event(
+            target_user_id,
+            "manual_invite_sent",
+            source="admin_command",
+            new_expiry=expiry_date,
+            notes=f"admin_id={message.from_user.id}"
+        )
+        await message.answer(f"✅ Ссылка отправлена пользователю {target_user_id}")
+
+    except Exception as e:
+        logging.error(f"Ошибка /send_invite_link для {target_user_id}: {e}")
+        await message.answer(f"❌ Ошибка отправки ссылки: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
 
 @dp.message_handler(commands=['unban_user'], state='*')
 async def unban_user(message: types.Message):
