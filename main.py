@@ -3903,6 +3903,15 @@ async def stripe_webhook(request):
                     finally:
                         cur.close()
                         conn.close()
+                except Exception as e:
+                    logging.error(f"Не удалось отправить сообщение о неудачной оплате пользователю {row[0]}: {e}")
+                    await notify_critical_delivery_failed(
+                        row[0],
+                        "invoice.payment_failed",
+                        "сообщение о неудачном списании",
+                        e,
+                        "payment_failed = TRUE; grace_period_end установлен"
+                    )
 
     # ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ ПОДПИСКУ (customer.subscription.deleted) ----------
     elif event['type'] == 'customer.subscription.deleted':
