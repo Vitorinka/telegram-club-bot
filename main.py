@@ -2219,13 +2219,50 @@ async def sync_stripe_user_command(message: types.Message):
             await message.reply(f"❌ Не удалось получить подписку из Stripe: {e}")
             return
 
-        status = getattr(subscription, 'status', None)
-        current_period_end = getattr(subscription, 'current_period_end', None)
-        customer = getattr(subscription, 'customer', None)
-        cancel_at_period_end = bool(getattr(subscription, 'cancel_at_period_end', False))
+        def sync_stripe_value(obj, *path):
+            current = obj
+            for key in path:
+                if current is None:
+                    return None
+                if isinstance(current, dict):
+                    current = current.get(key)
+                else:
+                    current = getattr(current, key, None)
+            return current
+
+        status = sync_stripe_value(subscription, 'status')
+        current_period_end = sync_stripe_value(subscription, 'current_period_end')
+        period_source = "subscription.current_period_end"
+        customer = sync_stripe_value(subscription, 'customer')
+        cancel_at_period_end = bool(sync_stripe_value(subscription, 'cancel_at_period_end'))
         customer_id = customer if isinstance(customer, str) else getattr(customer, 'id', None)
         auto_renew = not cancel_at_period_end
         period_end_text = "нет"
+
+        if not current_period_end:
+            try:
+                invoices = await asyncio.to_thread(
+                    stripe.Invoice.list,
+                    subscription=stripe_subscription_id,
+                    limit=5
+                )
+
+                invoice_data = sync_stripe_value(invoices, 'data') or []
+                for invoice in invoice_data:
+                    invoice_status = sync_stripe_value(invoice, 'status')
+                    if invoice_status != 'paid':
+                        continue
+
+                    lines_data = sync_stripe_value(invoice, 'lines', 'data') or []
+                    first_line = lines_data[0] if lines_data else None
+                    period_end = sync_stripe_value(first_line, 'period', 'end')
+
+                    if period_end:
+                        current_period_end = period_end
+                        period_source = "invoice.lines.data[0].period.end"
+                        break
+            except Exception as e:
+                logging.error(f"Не удалось получить invoices Stripe для /sync_stripe_user {target_user_id}: {e}")
 
         if current_period_end:
             period_end_dt = datetime.utcfromtimestamp(current_period_end)
@@ -2255,7 +2292,7 @@ async def sync_stripe_user_command(message: types.Message):
                 old_expiry=expiry_date,
                 new_expiry=new_expiry,
                 stripe_subscription_id=stripe_subscription_id,
-                notes=f"status={status}; auto_renew={auto_renew}; admin_id={message.from_user.id}"
+                notes=f"status={status}; auto_renew={auto_renew}; period_source={period_source}; admin_id={message.from_user.id}"
             )
 
             await message.reply(
@@ -2265,19 +2302,29 @@ async def sync_stripe_user_command(message: types.Message):
                 "paid: TRUE\n"
                 f"expiry_date: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n"
                 f"auto_renew: {auto_renew}\n"
+                f"period_source: {period_source}\n"
                 f"stripe_subscription_id: {stripe_subscription_id}\n"
                 f"stripe_customer_id: {customer_id or 'нет'}"
             )
             return
 
         if status in ('active', 'trialing') and not current_period_end:
+            cur.execute("""
+                UPDATE users
+                SET stripe_subscription_id = %s,
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                    auto_renew = %s
+                WHERE telegram_id = %s
+            """, (stripe_subscription_id, customer_id, auto_renew, target_user_id))
+            conn.commit()
+
             await message.reply(
-                "⚠️ Подписка в Stripe активна, но у нее нет current_period_end.\n\n"
+                "⚠️ Подписка активна, customer_id обновлен, но current_period_end не найден. expiry_date не меняла.\n\n"
                 f"telegram_id: {target_user_id}\n"
                 f"status: {status}\n"
+                f"auto_renew: {auto_renew}\n"
                 f"stripe_subscription_id: {stripe_subscription_id}\n"
-                f"stripe_customer_id: {customer_id or 'нет'}\n\n"
-                "БД автоматически не обновлена. Проверьте подписку вручную в Stripe."
+                f"stripe_customer_id: {customer_id or 'нет'}"
             )
             return
 
