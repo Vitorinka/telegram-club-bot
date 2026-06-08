@@ -1850,12 +1850,32 @@ async def give_access_command(message: types.Message):
 
     args = message.get_args().split()
 
-    if len(args) < 1:
-        await message.reply("⚠️ Использование: /give_access <user_id> [дней]")
+    if len(args) < 1 or len(args) > 2:
+        await message.reply("⚠️ Использование: /give_access <telegram_id> [дней]")
         return
 
-    target_user_id = args[0]
-    days = int(args[1]) if len(args) > 1 else 30
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    if len(args) == 2:
+        try:
+            days = int(args[1])
+        except ValueError:
+            await message.reply("⚠️ Количество дней должно быть числом.")
+            return
+    else:
+        days = 30
+
+    if days <= 0:
+        await message.reply("⚠️ Количество дней должно быть больше 0.")
+        return
+
+    if days > 730:
+        await message.reply("⚠️ Нельзя выдать доступ больше чем на 730 дней одной командой.")
+        return
 
     conn = get_db_conn()
     cur = conn.cursor()
@@ -1863,7 +1883,7 @@ async def give_access_command(message: types.Message):
     try:
         cur.execute(
             "SELECT expiry_date FROM users WHERE telegram_id = %s",
-            (int(target_user_id),)
+            (target_user_id,)
         )
         row = cur.fetchone()
         old_expiry = row[0] if row else None
@@ -1880,11 +1900,11 @@ async def give_access_command(message: types.Message):
                 payment_failed = FALSE,
                 grace_period_end = NULL,
                 blocked_bot = FALSE;
-        """, (int(target_user_id), days, days, days))
+        """, (target_user_id, days, days, days))
 
         cur.execute(
             "SELECT expiry_date FROM users WHERE telegram_id = %s",
-            (int(target_user_id),)
+            (target_user_id,)
         )
         row = cur.fetchone()
         new_expiry = row[0] if row else None
@@ -1901,7 +1921,7 @@ async def give_access_command(message: types.Message):
         )
 
         try:
-            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(target_user_id))
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=target_user_id)
         except Exception as e:
             if "administrator" in str(e).lower():
                 logging.warning(f"Не удалось разбанить админа {target_user_id}: {e}")
@@ -1913,12 +1933,12 @@ async def give_access_command(message: types.Message):
         try:
             if link:
                 await bot.send_message(
-                    int(target_user_id),
+                    target_user_id,
                     f"✅ Администратор предоставил вам доступ на {days} дней!\nСсылка: {link}"
                 )
             else:
                 await bot.send_message(
-                    int(target_user_id),
+                    target_user_id,
                     f"✅ Администратор предоставил вам доступ на {days} дней. Добро пожаловать!"
                 )
 
@@ -1927,7 +1947,7 @@ async def give_access_command(message: types.Message):
         except BotBlocked:
             cur.execute(
                 "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
-                (int(target_user_id),)
+                (target_user_id,)
             )
             conn.commit()
             await notify_critical_delivery_failed(
@@ -2918,6 +2938,7 @@ async def stripe_webhook(request):
             cur.execute("SELECT paid, expiry_date, first_payment_done FROM users WHERE telegram_id = %s", (int(user_id),))
             row = cur.fetchone()
             now = datetime.utcnow()
+            old_expiry = row[1] if row else None
 
             if row and row[0] and row[1] and row[1] > now:
                 new_expiry = row[1] + timedelta(days=days_to_add)
@@ -2942,6 +2963,17 @@ async def stripe_webhook(request):
                     first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
             """, (int(user_id), new_expiry, sub_id, customer_id, is_trial, needs_link))
             conn.commit()
+
+            await log_access_event(
+                user_id,
+                "stripe_checkout_completed",
+                source="stripe_webhook",
+                old_expiry=old_expiry,
+                new_expiry=new_expiry,
+                stripe_event_id=event_id,
+                stripe_subscription_id=sub_id,
+                notes=f"days={days_to_add}; customer_id={customer_id or 'нет'}"
+            )
 
             if needs_link:
                 link = await generate_invite_link()
@@ -3046,22 +3078,31 @@ async def stripe_webhook(request):
                 return web.Response(status=200)
 
             new_expiry = datetime.utcfromtimestamp(current_period_end)
+            old_expiry = None
 
             cur.execute("""
-                UPDATE users 
-                SET expiry_date = %s, 
-                    paid = TRUE, 
+                WITH target AS (
+                    SELECT telegram_id, expiry_date AS old_expiry
+                    FROM users
+                    WHERE stripe_subscription_id = %s
+                )
+                UPDATE users
+                SET expiry_date = %s,
+                    paid = TRUE,
                     stripe_subscription_id = %s,
-                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                    payment_failed = FALSE, 
+                    stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
+                    payment_failed = FALSE,
                     grace_period_end = NULL,
                     reminder_sent = FALSE,
                     auto_renew = TRUE
-                WHERE stripe_subscription_id = %s
-                RETURNING telegram_id
-            """, (new_expiry, sub_id, customer_id, sub_id))
+                FROM target
+                WHERE users.telegram_id = target.telegram_id
+                RETURNING users.telegram_id, target.old_expiry
+            """, (sub_id, new_expiry, sub_id, customer_id))
 
             row = cur.fetchone()
+            if row:
+                old_expiry = row[1]
 
             if not row:
                 metadata_telegram_id = stripe_value(subscription, 'metadata', 'telegram_id')
@@ -3076,23 +3117,36 @@ async def stripe_webhook(request):
                         )
                     else:
                         cur.execute("""
+                            WITH target AS (
+                                SELECT telegram_id, expiry_date AS old_expiry
+                                FROM users
+                                WHERE telegram_id = %s
+                            )
                             UPDATE users
                             SET expiry_date = %s,
                                 paid = TRUE,
                                 stripe_subscription_id = %s,
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                                stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
                                 payment_failed = FALSE,
                                 grace_period_end = NULL,
                                 reminder_sent = FALSE,
                                 auto_renew = TRUE
-                            WHERE telegram_id = %s
-                            RETURNING telegram_id
-                        """, (new_expiry, sub_id, customer_id, metadata_telegram_id))
+                            FROM target
+                            WHERE users.telegram_id = target.telegram_id
+                            RETURNING users.telegram_id, target.old_expiry
+                        """, (metadata_telegram_id, new_expiry, sub_id, customer_id))
 
                         row = cur.fetchone()
+                        if row:
+                            old_expiry = row[1]
 
             if not row and customer_id:
                 cur.execute("""
+                    WITH target AS (
+                        SELECT telegram_id, expiry_date AS old_expiry
+                        FROM users
+                        WHERE stripe_customer_id = %s
+                    )
                     UPDATE users
                     SET expiry_date = %s,
                         paid = TRUE,
@@ -3102,11 +3156,14 @@ async def stripe_webhook(request):
                         grace_period_end = NULL,
                         reminder_sent = FALSE,
                         auto_renew = TRUE
-                    WHERE stripe_customer_id = %s
-                    RETURNING telegram_id
-                """, (new_expiry, sub_id, customer_id, customer_id))
+                    FROM target
+                    WHERE users.telegram_id = target.telegram_id
+                    RETURNING users.telegram_id, target.old_expiry
+                """, (customer_id, new_expiry, sub_id, customer_id))
 
                 row = cur.fetchone()
+                if row:
+                    old_expiry = row[1]
 
             conn.commit()
 
@@ -3121,6 +3178,18 @@ async def stripe_webhook(request):
                 return web.Response(status=200)
 
             telegram_id = row[0]
+            invoice_id = stripe_value(invoice, 'id') or "нет"
+
+            await log_access_event(
+                telegram_id,
+                "stripe_invoice_paid",
+                source="stripe_webhook",
+                old_expiry=old_expiry,
+                new_expiry=new_expiry,
+                stripe_event_id=event_id,
+                stripe_subscription_id=sub_id,
+                notes=f"customer_id={customer_id or 'нет'}; invoice_id={invoice_id}"
+            )
 
             try:
                 await bot.send_message(
