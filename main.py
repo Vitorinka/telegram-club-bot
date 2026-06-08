@@ -389,6 +389,7 @@ async def check_subscriptions_and_reminders():
     active_in_db_skipped = 0
     not_found_total = 0
     telegram_errors = 0
+    pending_access_events = []
 
     for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _, stripe_subscription_id) in users:
         time_left = expiry - now
@@ -419,6 +420,21 @@ async def check_subscriptions_and_reminders():
                 continue
             else:
                 if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+                    cur.execute(
+                        "SELECT expiry_date FROM users WHERE telegram_id = %s",
+                        (telegram_id,)
+                    )
+                    row = cur.fetchone()
+                    refreshed_expiry = row[0] if row else None
+                    pending_access_events.append({
+                        "telegram_id": telegram_id,
+                        "event_type": "auto_stripe_protected_before_removal",
+                        "source": "auto_check",
+                        "old_expiry": expiry,
+                        "new_expiry": refreshed_expiry,
+                        "stripe_subscription_id": stripe_subscription_id,
+                        "notes": "Stripe subscription active during expired-user check"
+                    })
                     stripe_protected += 1
                     continue
 
@@ -427,10 +443,34 @@ async def check_subscriptions_and_reminders():
                 if ban_status == "active_in_db":
                     active_in_db_skipped += 1
                 elif ban_status == "stripe_protected":
+                    cur.execute(
+                        "SELECT expiry_date FROM users WHERE telegram_id = %s",
+                        (telegram_id,)
+                    )
+                    row = cur.fetchone()
+                    refreshed_expiry = row[0] if row else None
+                    pending_access_events.append({
+                        "telegram_id": telegram_id,
+                        "event_type": "auto_stripe_protected_before_removal",
+                        "source": "auto_check",
+                        "old_expiry": expiry,
+                        "new_expiry": refreshed_expiry,
+                        "stripe_subscription_id": stripe_subscription_id,
+                        "notes": "Stripe subscription protected user inside ban_user_logic"
+                    })
                     stripe_protected += 1
                 elif ban_status == "not_found":
                     not_found_total += 1
                 elif ban_status in ("removed", "kick_failed"):
+                    pending_access_events.append({
+                        "telegram_id": telegram_id,
+                        "event_type": "auto_access_closed_expired",
+                        "source": "auto_check",
+                        "old_expiry": expiry,
+                        "new_expiry": None,
+                        "stripe_subscription_id": stripe_subscription_id,
+                        "notes": f"ban_status={ban_status}"
+                    })
                     removed_total += 1
                     if ban_status == "kick_failed":
                         telegram_errors += 1
@@ -453,6 +493,9 @@ async def check_subscriptions_and_reminders():
     conn.commit()
     cur.close()
     conn.close()
+
+    for access_event in pending_access_events:
+        await log_access_event(**access_event)
 
     if (
         expired_total == 0
