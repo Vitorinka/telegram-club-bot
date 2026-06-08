@@ -2640,6 +2640,138 @@ async def recent_access_events_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['find_by_stripe'], state='*')
+async def find_by_stripe_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /find_by_stripe <sub_... | cus_... | evt_...>")
+        return
+
+    query_id = args[0].strip()
+
+    def fmt_dt(value):
+        return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                telegram_id,
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                stripe_customer_id,
+                auto_renew,
+                payment_failed,
+                grace_period_end,
+                blocked_bot
+            FROM users
+            WHERE stripe_subscription_id = %s
+               OR stripe_customer_id = %s
+            LIMIT 10
+        """, (query_id, query_id))
+
+        users = cur.fetchall()
+
+        cur.execute("""
+            SELECT
+                created_at,
+                telegram_id,
+                event_type,
+                source,
+                old_expiry,
+                new_expiry,
+                stripe_event_id,
+                stripe_subscription_id,
+                notes
+            FROM access_events
+            WHERE stripe_event_id = %s
+               OR stripe_subscription_id = %s
+            ORDER BY created_at DESC
+            LIMIT 10
+        """, (query_id, query_id))
+
+        events = cur.fetchall()
+
+        if not users and not events:
+            await message.answer(f"Ничего не найдено по Stripe ID:\n{query_id}")
+            return
+
+        lines = [f"🔎 Найдено по Stripe ID: {query_id}\n"]
+
+        if users:
+            lines.append("Users:")
+            for (
+                telegram_id,
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                stripe_customer_id,
+                auto_renew,
+                payment_failed,
+                grace_period_end,
+                blocked_bot
+            ) in users:
+                lines.extend([
+                    f"telegram_id: {telegram_id}",
+                    f"paid: {paid}",
+                    f"expiry_date: {fmt_dt(expiry_date)}",
+                    f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                    f"stripe_customer_id: {stripe_customer_id or 'нет'}",
+                    f"auto_renew: {auto_renew}",
+                    f"payment_failed: {payment_failed}",
+                    f"grace_period_end: {fmt_dt(grace_period_end)}",
+                    f"blocked_bot: {blocked_bot}",
+                    ""
+                ])
+
+        if events:
+            lines.append("Access events:")
+            for (
+                created_at,
+                telegram_id,
+                event_type,
+                source,
+                old_expiry,
+                new_expiry,
+                stripe_event_id,
+                stripe_subscription_id,
+                notes
+            ) in events:
+                lines.extend([
+                    f"Дата: {fmt_dt(created_at)}",
+                    f"telegram_id: {telegram_id}",
+                    f"event_type: {event_type}",
+                    f"source: {source or 'нет'}",
+                    f"old_expiry: {fmt_dt(old_expiry)}",
+                    f"new_expiry: {fmt_dt(new_expiry)}",
+                    f"stripe_event_id: {stripe_event_id or 'нет'}",
+                    f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                    f"notes: {notes or 'нет'}",
+                    ""
+                ])
+
+        text = "\n".join(lines).strip()
+
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка find_by_stripe_command для {query_id}: {e}")
+        await message.answer(f"❌ Ошибка поиска по Stripe ID: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['bot_health'], state='*')
 async def bot_health_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2760,6 +2892,7 @@ async def admin_help_command(message: types.Message):
         "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
         "/access_history <telegram_id> — история действий по доступу\n"
         "/recent_access_events — последние события по доступу\n"
+        "/find_by_stripe <id> — найти пользователя по Stripe ID\n"
         "/bot_health — диагностика бота и базы\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
