@@ -3419,6 +3419,14 @@ async def stripe_webhook(request):
             subscription = stripe.Subscription.retrieve(sub_id)
             customer_id = customer_id or stripe_object_id(stripe_value(subscription, 'customer'))
             current_period_end = stripe_value(subscription, 'current_period_end')
+            period_source = "subscription.current_period_end"
+
+            if not current_period_end:
+                lines_data = stripe_value(invoice, 'lines', 'data') or []
+                first_line = lines_data[0] if lines_data else None
+                current_period_end = stripe_value(first_line, 'period', 'end')
+                if current_period_end:
+                    period_source = "invoice.lines.data[0].period.end"
 
             if not current_period_end:
                 invoice_id = stripe_value(invoice, 'id') or "нет"
@@ -3448,7 +3456,10 @@ async def stripe_webhook(request):
                     WHERE stripe_subscription_id = %s
                 )
                 UPDATE users
-                SET expiry_date = %s,
+                SET expiry_date = CASE
+                        WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                        ELSE %s
+                    END,
                     paid = TRUE,
                     stripe_subscription_id = %s,
                     stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
@@ -3459,7 +3470,7 @@ async def stripe_webhook(request):
                 FROM target
                 WHERE users.telegram_id = target.telegram_id
                 RETURNING users.telegram_id, target.old_expiry
-            """, (sub_id, new_expiry, sub_id, customer_id))
+            """, (sub_id, new_expiry, new_expiry, sub_id, customer_id))
 
             row = cur.fetchone()
             if row:
@@ -3484,7 +3495,10 @@ async def stripe_webhook(request):
                                 WHERE telegram_id = %s
                             )
                             UPDATE users
-                            SET expiry_date = %s,
+                            SET expiry_date = CASE
+                                    WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                                    ELSE %s
+                                END,
                                 paid = TRUE,
                                 stripe_subscription_id = %s,
                                 stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
@@ -3495,7 +3509,7 @@ async def stripe_webhook(request):
                             FROM target
                             WHERE users.telegram_id = target.telegram_id
                             RETURNING users.telegram_id, target.old_expiry
-                        """, (metadata_telegram_id, new_expiry, sub_id, customer_id))
+                        """, (metadata_telegram_id, new_expiry, new_expiry, sub_id, customer_id))
 
                         row = cur.fetchone()
                         if row:
@@ -3509,7 +3523,10 @@ async def stripe_webhook(request):
                         WHERE stripe_customer_id = %s
                     )
                     UPDATE users
-                    SET expiry_date = %s,
+                    SET expiry_date = CASE
+                            WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                            ELSE %s
+                        END,
                         paid = TRUE,
                         stripe_subscription_id = %s,
                         stripe_customer_id = %s,
@@ -3520,7 +3537,7 @@ async def stripe_webhook(request):
                     FROM target
                     WHERE users.telegram_id = target.telegram_id
                     RETURNING users.telegram_id, target.old_expiry
-                """, (customer_id, new_expiry, sub_id, customer_id))
+                """, (customer_id, new_expiry, new_expiry, sub_id, customer_id))
 
                 row = cur.fetchone()
                 if row:
@@ -3541,6 +3558,14 @@ async def stripe_webhook(request):
             telegram_id = row[0]
             invoice_id = stripe_value(invoice, 'id') or "нет"
 
+            if old_expiry and old_expiry >= new_expiry:
+                logging.info(
+                    f"invoice.payment_succeeded: срок уже актуален, пропускаю повторное уведомление. "
+                    f"telegram_id={telegram_id}, old_expiry={old_expiry}, new_expiry={new_expiry}, event={event_id}"
+                )
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
             await log_access_event(
                 telegram_id,
                 "stripe_invoice_paid",
@@ -3549,7 +3574,7 @@ async def stripe_webhook(request):
                 new_expiry=new_expiry,
                 stripe_event_id=event_id,
                 stripe_subscription_id=sub_id,
-                notes=f"customer_id={customer_id or 'нет'}; invoice_id={invoice_id}"
+                notes=f"customer_id={customer_id or 'нет'}; invoice_id={invoice_id}; period_source={period_source}"
             )
 
             try:
