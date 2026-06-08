@@ -2093,8 +2093,8 @@ async def give_access_command(message: types.Message):
         old_expiry = row[0] if row else None
 
         cur.execute("""
-            INSERT INTO users (telegram_id, paid, expiry_date)
-            VALUES (%s, TRUE, NOW() + INTERVAL '%s days')
+            INSERT INTO users (telegram_id, paid, expiry_date, auto_renew)
+            VALUES (%s, TRUE, NOW() + INTERVAL '%s days', FALSE)
             ON CONFLICT (telegram_id) DO UPDATE 
             SET paid = TRUE, 
                 expiry_date = CASE 
@@ -2103,7 +2103,11 @@ async def give_access_command(message: types.Message):
                 END,
                 payment_failed = FALSE,
                 grace_period_end = NULL,
-                blocked_bot = FALSE;
+                blocked_bot = FALSE,
+                auto_renew = CASE
+                    WHEN users.stripe_subscription_id IS NULL THEN FALSE
+                    ELSE users.auto_renew
+                END;
         """, (target_user_id, days, days, days))
 
         cur.execute(
@@ -2234,16 +2238,21 @@ async def set_expiry_command(message: types.Message):
                 payment_failed,
                 grace_period_end,
                 reminder_sent,
-                blocked_bot
+                blocked_bot,
+                auto_renew
             )
-            VALUES (%s, TRUE, %s, FALSE, NULL, FALSE, FALSE)
+            VALUES (%s, TRUE, %s, FALSE, NULL, FALSE, FALSE, FALSE)
             ON CONFLICT (telegram_id) DO UPDATE
             SET paid = TRUE,
                 expiry_date = EXCLUDED.expiry_date,
                 payment_failed = FALSE,
                 grace_period_end = NULL,
                 reminder_sent = FALSE,
-                blocked_bot = FALSE
+                blocked_bot = FALSE,
+                auto_renew = CASE
+                    WHEN users.stripe_subscription_id IS NULL THEN FALSE
+                    ELSE users.auto_renew
+                END
         """, (target_user_id, expiry_date))
 
         conn.commit()
@@ -3502,6 +3511,7 @@ async def stripe_webhook(request):
             return web.Response(status=200)
 
         is_trial = (days_to_add == 7)
+        has_subscription = bool(sub_id)
         conn = get_db_conn()
         cur = conn.cursor()
         try:
@@ -3519,7 +3529,7 @@ async def stripe_webhook(request):
             needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
             cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
-                VALUES (%s, TRUE, %s, %s, %s, TRUE, %s, FALSE, NULL, FALSE)
+                VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, FALSE)
                 ON CONFLICT (telegram_id) DO UPDATE SET
                     paid = TRUE,
                     expiry_date = EXCLUDED.expiry_date,
@@ -3528,10 +3538,10 @@ async def stripe_webhook(request):
                     trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
                     payment_failed = FALSE,
                     grace_period_end = NULL,
-                    auto_renew = TRUE,
+                    auto_renew = EXCLUDED.auto_renew,
                     reminder_sent = FALSE,
                     first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-            """, (int(user_id), new_expiry, sub_id, customer_id, is_trial, needs_link))
+            """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
             conn.commit()
 
             await log_access_event(
@@ -3581,6 +3591,13 @@ async def stripe_webhook(request):
         except Exception as e:
             conn.rollback()
             logging.error(f"Ошибка checkout: {e}")
+            await notify_admins(
+                f"Ошибка обработки checkout.session.completed.\n\n"
+                f"user_id: {user_id}\n"
+                f"event_id: {event_id}\n"
+                f"Ошибка: {e}"
+            )
+            return web.Response(status=500)
         finally:
             cur.close()
             conn.close()
@@ -3823,6 +3840,7 @@ async def stripe_webhook(request):
                 f"event_id: {event_id}\n"
                 f"Ошибка: {e}"
             )
+            return web.Response(status=500)
 
         finally:
             cur.close()
@@ -3831,7 +3849,29 @@ async def stripe_webhook(request):
     # ---------- 3. ОШИБКА ОПЛАТЫ (invoice.payment_failed) – GRACE PERIOD ----------
     elif event['type'] == 'invoice.payment_failed':
         invoice = event['data']['object']
-        sub_id = getattr(invoice, 'subscription', None)
+        sub_id = stripe_object_id(stripe_value(invoice, 'subscription'))
+        sub_id = sub_id or stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription'))
+        lines_data = stripe_value(invoice, 'lines', 'data') or []
+        first_line = lines_data[0] if lines_data else None
+        sub_id = sub_id or stripe_object_id(stripe_value(first_line, 'subscription'))
+
+        if not sub_id:
+            invoice_id = stripe_value(invoice, 'id') or "нет"
+            customer_id = stripe_object_id(stripe_value(invoice, 'customer')) or "нет"
+            logging.error(
+                f"invoice.payment_failed: не найден subscription_id. "
+                f"invoice_id={invoice_id}, customer_id={customer_id}, event={event_id}"
+            )
+            await notify_admins(
+                "Stripe прислал ошибку оплаты, но subscription_id не найден.\n\n"
+                f"event_id: {event_id}\n"
+                f"invoice_id: {invoice_id}\n"
+                f"customer_id: {customer_id}\n\n"
+                "payment_failed в БД не обновлен. Проверьте вручную."
+            )
+            await mark_event_processed(event_id)
+            return web.Response(status=200)
+
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
@@ -3852,7 +3892,17 @@ async def stripe_webhook(request):
                         "⚠️ Не удалось списать оплату за подписку. У вас есть 24 часа, чтобы пополнить карту или связаться с администратором.\n"
                         "После устранения проблемы доступ восстановится автоматически.")
                 except BotBlocked:
-                    pass
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(
+                            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                            (int(row[0]),)
+                        )
+                        conn.commit()
+                    finally:
+                        cur.close()
+                        conn.close()
 
     # ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ ПОДПИСКУ (customer.subscription.deleted) ----------
     elif event['type'] == 'customer.subscription.deleted':
