@@ -66,6 +66,7 @@ def init_db():
             paid BOOLEAN DEFAULT FALSE,
             expiry_date TIMESTAMP,
             stripe_subscription_id TEXT,
+            stripe_customer_id TEXT,
             reminder_sent BOOLEAN DEFAULT FALSE,
             payment_failed BOOLEAN DEFAULT FALSE,
             grace_period_end TIMESTAMP,
@@ -83,6 +84,7 @@ def init_db():
         );
     """)
     # Добавляем недостающие колонки (для старых БД)
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;")
@@ -1372,15 +1374,24 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
 
     try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{'price': price_id, 'quantity': 1}],
-            mode=mode,
-            success_url='https://t.me/Natalia_SoulFit_bot',
-            cancel_url='https://t.me/Natalia_SoulFit_bot',
-            client_reference_id=str(user_id),
-            metadata={'days': str(days)}
-        )
+        session_params = {
+            'payment_method_types': ['card'],
+            'line_items': [{'price': price_id, 'quantity': 1}],
+            'mode': mode,
+            'success_url': 'https://t.me/Natalia_SoulFit_bot',
+            'cancel_url': 'https://t.me/Natalia_SoulFit_bot',
+            'client_reference_id': str(user_id),
+            'metadata': {'days': str(days), 'telegram_id': str(user_id)}
+        }
+
+        if mode == 'subscription':
+            session_params['subscription_data'] = {
+                'metadata': {
+                    'telegram_id': str(user_id)
+                }
+            }
+
+        session = stripe.checkout.Session.create(**session_params)
         new_kb = InlineKeyboardMarkup(row_width=1).add(
             InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
@@ -2193,6 +2204,109 @@ async def stripe_webhook(request):
     if await is_event_processed(event_id):
         return web.Response(status=200)
 
+    def stripe_value(obj, *path):
+        current = obj
+        for key in path:
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
+
+    def stripe_object_id(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        return stripe_value(value, 'id')
+
+    def safe_stripe_repr(value):
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                key: safe_stripe_repr(val)
+                for key, val in value.items()
+                if key not in ('payment_method_details', 'card', 'source')
+            }
+        return str(value)
+
+    def invoice_subscription_field_states(invoice):
+        lines_data = stripe_value(invoice, 'lines', 'data') or []
+        first_line = lines_data[0] if lines_data else None
+        return {
+            'invoice.subscription': stripe_object_id(stripe_value(invoice, 'subscription')),
+            'invoice.parent.subscription_details.subscription': stripe_object_id(
+                stripe_value(invoice, 'parent', 'subscription_details', 'subscription')
+            ),
+            'invoice.lines.data[0].subscription': stripe_object_id(stripe_value(first_line, 'subscription')),
+        }
+
+    def empty_subscription_fields_text(invoice):
+        fields = invoice_subscription_field_states(invoice)
+        empty_fields = [name for name, value in fields.items() if not value]
+        return ", ".join(empty_fields) if empty_fields else "нет"
+
+    def log_invoice_debug(invoice, subscription_id=None):
+        lines_data = stripe_value(invoice, 'lines', 'data') or []
+        first_line = lines_data[0] if lines_data else None
+        debug_payload = {
+            'event_id': event_id,
+            'invoice_id': stripe_value(invoice, 'id'),
+            'billing_reason': stripe_value(invoice, 'billing_reason'),
+            'status': stripe_value(invoice, 'status'),
+            'amount_paid': stripe_value(invoice, 'amount_paid'),
+            'currency': stripe_value(invoice, 'currency'),
+            'customer': stripe_object_id(stripe_value(invoice, 'customer')),
+            'customer_email': stripe_value(invoice, 'customer_email'),
+            'subscription': stripe_object_id(stripe_value(invoice, 'subscription')),
+            'parent_subscription': stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription')),
+            'resolved_subscription_id': subscription_id,
+            'payment_intent': stripe_object_id(stripe_value(invoice, 'payment_intent')),
+            'hosted_invoice_url': stripe_value(invoice, 'hosted_invoice_url'),
+            'metadata': safe_stripe_repr(stripe_value(invoice, 'metadata')),
+            'lines_count': len(lines_data),
+            'first_line': {
+                'id': stripe_value(first_line, 'id'),
+                'price_id': stripe_object_id(stripe_value(first_line, 'price')),
+                'subscription': stripe_object_id(stripe_value(first_line, 'subscription')),
+                'period_start': stripe_value(first_line, 'period', 'start'),
+                'period_end': stripe_value(first_line, 'period', 'end'),
+            } if first_line else None,
+        }
+        logging.info(f"STRIPE INVOICE DEBUG: {debug_payload}")
+
+    async def notify_unlinked_invoice(invoice, subscription_id=None):
+        invoice_id = stripe_value(invoice, 'id') or "нет"
+        billing_reason = stripe_value(invoice, 'billing_reason') or "нет"
+        customer = stripe_value(invoice, 'customer')
+        customer_id = stripe_object_id(customer) or "нет"
+        customer_email = (
+            stripe_value(invoice, 'customer_email')
+            or stripe_value(customer, 'email')
+            or "нет"
+        )
+        amount_paid = stripe_value(invoice, 'amount_paid')
+        hosted_invoice_url = stripe_value(invoice, 'hosted_invoice_url') or "нет"
+
+        await notify_admins(
+            "Stripe прислал успешную оплату, но пользователя в БД не удалось надежно определить.\n\n"
+            f"invoice_id: {invoice_id}\n"
+            f"event_id: {event_id}\n"
+            f"subscription_id: {subscription_id or 'нет'}\n"
+            f"billing_reason: {billing_reason}\n"
+            f"customer_id: {customer_id}\n"
+            f"customer_email: {customer_email}\n"
+            f"amount_paid: {amount_paid if amount_paid is not None else 'нет'}\n"
+            f"hosted_invoice_url: {hosted_invoice_url}\n\n"
+            f"Пустые subscription-поля: {empty_subscription_fields_text(invoice)}\n\n"
+            "Доступ автоматически НЕ выдан. Проверьте оплату вручную."
+        )
+
     # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
@@ -2201,7 +2315,8 @@ async def stripe_webhook(request):
             await mark_event_processed(event_id)
             return web.Response(status=200)
 
-        sub_id = getattr(session, 'subscription', None)
+        sub_id = stripe_object_id(stripe_value(session, 'subscription'))
+        customer_id = stripe_object_id(stripe_value(session, 'customer'))
         days_to_add = 0
         metadata_raw = getattr(session, 'metadata', None)
         if metadata_raw is not None:
@@ -2236,19 +2351,20 @@ async def stripe_webhook(request):
             # Нужна ли ссылка? Да, если нет активной подписки (paid=False или expiry_date < now)
             needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
             cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
-                VALUES (%s, TRUE, %s, %s, TRUE, %s, FALSE, NULL, FALSE)
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
+                VALUES (%s, TRUE, %s, %s, %s, TRUE, %s, FALSE, NULL, FALSE)
                 ON CONFLICT (telegram_id) DO UPDATE SET
                     paid = TRUE,
                     expiry_date = EXCLUDED.expiry_date,
                     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+                    stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
                     trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
                     payment_failed = FALSE,
                     grace_period_end = NULL,
                     auto_renew = TRUE,
                     reminder_sent = FALSE,
                     first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-            """, (int(user_id), new_expiry, sub_id, is_trial, needs_link))
+            """, (int(user_id), new_expiry, sub_id, customer_id, is_trial, needs_link))
             conn.commit()
 
             if needs_link:
@@ -2280,51 +2396,137 @@ async def stripe_webhook(request):
         # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
-        sub_id = getattr(invoice, 'subscription', None)
+        sub_id = stripe_object_id(stripe_value(invoice, 'subscription'))
+        sub_id = sub_id or stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription'))
+        lines_data = stripe_value(invoice, 'lines', 'data') or []
+        first_line = lines_data[0] if lines_data else None
+        sub_id = sub_id or stripe_object_id(stripe_value(first_line, 'subscription'))
+        customer_id = stripe_object_id(stripe_value(invoice, 'customer'))
+        subscription = None
 
         if not sub_id:
-            logging.warning(f"invoice.payment_succeeded без subscription_id: event={event_id}")
-            await notify_admins(
-                f"Оплата прошла, но в invoice нет subscription_id.\n"
-                f"event_id: {event_id}"
-            )
-            await mark_event_processed(event_id)
-            return web.Response(status=200)
+            try:
+                invoice = stripe.Invoice.retrieve(
+                    stripe_value(invoice, 'id'),
+                    expand=['subscription', 'customer', 'parent.subscription_details.subscription']
+                )
+                sub_id = stripe_object_id(stripe_value(invoice, 'subscription'))
+                sub_id = sub_id or stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription'))
+                lines_data = stripe_value(invoice, 'lines', 'data') or []
+                first_line = lines_data[0] if lines_data else None
+                sub_id = sub_id or stripe_object_id(stripe_value(first_line, 'subscription'))
+                customer_id = stripe_object_id(stripe_value(invoice, 'customer'))
+            except Exception as e:
+                logging.error(f"Не удалось повторно получить invoice {stripe_value(invoice, 'id')}: {e}")
+
+        log_invoice_debug(invoice, subscription_id=sub_id)
 
         conn = get_db_conn()
         cur = conn.cursor()
 
         try:
+            if not sub_id:
+                logging.error(f"invoice.payment_succeeded: не найден subscription_id, event={event_id}")
+                await notify_unlinked_invoice(invoice)
+                conn.commit()
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
             subscription = stripe.Subscription.retrieve(sub_id)
-            new_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+            customer_id = customer_id or stripe_object_id(stripe_value(subscription, 'customer'))
+            current_period_end = stripe_value(subscription, 'current_period_end')
+
+            if not current_period_end:
+                invoice_id = stripe_value(invoice, 'id') or "нет"
+                logging.error(
+                    f"invoice.payment_succeeded: у subscription нет current_period_end. "
+                    f"subscription_id={sub_id}, customer_id={customer_id}, invoice_id={invoice_id}, event={event_id}"
+                )
+                await notify_admins(
+                    "Stripe прислал успешную оплату, но у подписки нет current_period_end.\n\n"
+                    f"event_id: {event_id}\n"
+                    f"subscription_id: {sub_id}\n"
+                    f"customer_id: {customer_id or 'нет'}\n"
+                    f"invoice_id: {invoice_id}\n\n"
+                    "Webhook не упал, но доступ автоматически не обновлен. Проверьте подписку вручную."
+                )
+                conn.commit()
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
+            new_expiry = datetime.utcfromtimestamp(current_period_end)
 
             cur.execute("""
                 UPDATE users 
                 SET expiry_date = %s, 
                     paid = TRUE, 
+                    stripe_subscription_id = %s,
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
                     payment_failed = FALSE, 
                     grace_period_end = NULL,
                     reminder_sent = FALSE,
                     auto_renew = TRUE
                 WHERE stripe_subscription_id = %s
                 RETURNING telegram_id
-            """, (new_expiry, sub_id))
+            """, (new_expiry, sub_id, customer_id, sub_id))
 
             row = cur.fetchone()
+
+            if not row:
+                metadata_telegram_id = stripe_value(subscription, 'metadata', 'telegram_id')
+
+                if metadata_telegram_id:
+                    try:
+                        metadata_telegram_id = int(metadata_telegram_id)
+                    except (TypeError, ValueError):
+                        logging.error(
+                            f"invoice.payment_succeeded: некорректный metadata.telegram_id={metadata_telegram_id}, "
+                            f"subscription_id={sub_id}, event={event_id}"
+                        )
+                    else:
+                        cur.execute("""
+                            UPDATE users
+                            SET expiry_date = %s,
+                                paid = TRUE,
+                                stripe_subscription_id = %s,
+                                stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                                payment_failed = FALSE,
+                                grace_period_end = NULL,
+                                reminder_sent = FALSE,
+                                auto_renew = TRUE
+                            WHERE telegram_id = %s
+                            RETURNING telegram_id
+                        """, (new_expiry, sub_id, customer_id, metadata_telegram_id))
+
+                        row = cur.fetchone()
+
+            if not row and customer_id:
+                cur.execute("""
+                    UPDATE users
+                    SET expiry_date = %s,
+                        paid = TRUE,
+                        stripe_subscription_id = %s,
+                        stripe_customer_id = %s,
+                        payment_failed = FALSE,
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE,
+                        auto_renew = TRUE
+                    WHERE stripe_customer_id = %s
+                    RETURNING telegram_id
+                """, (new_expiry, sub_id, customer_id, customer_id))
+
+                row = cur.fetchone()
+
             conn.commit()
 
             if not row:
                 logging.error(
-                    f"invoice.payment_succeeded: пользователь не найден по stripe_subscription_id={sub_id}, event={event_id}"
+                    f"invoice.payment_succeeded: пользователь не найден. "
+                    f"subscription_id={sub_id}, customer_id={customer_id}, event={event_id}"
                 )
 
-                await notify_admins(
-                    "Оплата в Stripe прошла, но пользователь в базе не найден.\n\n"
-                    f"subscription_id: {sub_id}\n"
-                    f"event_id: {event_id}\n"
-                    f"Новая дата из Stripe: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n\n"
-                    "Нужно вручную найти пользователя и выдать доступ командой /give_access."
-                )
+                await notify_unlinked_invoice(invoice, subscription_id=sub_id)
+                await mark_event_processed(event_id)
                 return web.Response(status=200)
 
             telegram_id = row[0]
@@ -2403,8 +2605,8 @@ async def stripe_webhook(request):
     # ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ (customer.subscription.updated) ----------
     elif event['type'] == 'customer.subscription.updated':
         sub = event['data']['object']
-        sub_id = getattr(sub, 'id', None)
-        cancel_at_period_end = getattr(sub, 'cancel_at_period_end', False)
+        sub_id = stripe_object_id(stripe_value(sub, 'id'))
+        cancel_at_period_end = bool(stripe_value(sub, 'cancel_at_period_end'))
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
