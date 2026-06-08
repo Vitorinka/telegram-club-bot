@@ -405,6 +405,11 @@ async def check_subscriptions_and_reminders():
             if -time_left.total_seconds() < 2 * 86400:
                 grace_total += 1
 
+                if auto_renew and stripe_subscription_id:
+                    if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+                        stripe_protected += 1
+                        continue
+
                 if not reminder_sent:
                     try:
                         await bot.send_message(telegram_id,
@@ -477,7 +482,11 @@ async def check_subscriptions_and_reminders():
 
         # ----- Напоминание за 48 часов -----
         elif timedelta(0) < time_left < timedelta(days=2):
-            if not reminder_sent and auto_renew:
+            if auto_renew and stripe_subscription_id:
+                logging.info(
+                    f"Пользователь {telegram_id}: напоминание за 48 часов пропущено, потому что включено auto_renew."
+                )
+            elif not reminder_sent and not auto_renew:
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
                 try:
                     await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
