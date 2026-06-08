@@ -1532,13 +1532,125 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     # Получаем данные пользователя из БД
     conn = get_db_conn()
     cur = conn.cursor()
-    cur.execute("SELECT trial_used, paid FROM users WHERE telegram_id = %s", (user_id,))
+    cur.execute("""
+        SELECT
+            trial_used,
+            paid,
+            expiry_date,
+            auto_renew,
+            stripe_subscription_id,
+            payment_failed
+        FROM users
+        WHERE telegram_id = %s
+    """, (user_id,))
     row = cur.fetchone()
-    cur.close()
-    conn.close()
 
     trial_used = row[0] if row else False
     paid = row[1] if row else False
+    expiry_date = row[2] if row else None
+    auto_renew = row[3] if row else False
+    stripe_subscription_id = row[4] if row else None
+    payment_failed = row[5] if row else False
+
+    if paid and expiry_date and expiry_date > datetime.utcnow() and not payment_failed:
+        logging.info(
+            f"Checkout заблокирован: у пользователя {user_id} уже есть активный доступ/подписка."
+        )
+        cur.close()
+        conn.close()
+        await callback.message.answer(
+            f"✅ У вас уже есть активный доступ до {expiry_date.strftime('%d.%m.%Y %H:%M')}.\n"
+            "Повторная оплата не нужна."
+        )
+        await state.finish()
+        return
+
+    if auto_renew and stripe_subscription_id:
+        try:
+            subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
+            status = getattr(subscription, 'status', None)
+            current_period_end = getattr(subscription, 'current_period_end', None)
+            customer = getattr(subscription, 'customer', None)
+            customer_id = customer if isinstance(customer, str) else getattr(customer, 'id', None)
+            period_source = "subscription.current_period_end"
+
+            if status in ('active', 'trialing') and not current_period_end:
+                invoices = await asyncio.to_thread(
+                    stripe.Invoice.list,
+                    subscription=stripe_subscription_id,
+                    limit=5
+                )
+                invoice_data = getattr(invoices, 'data', None) or []
+
+                for invoice in invoice_data:
+                    invoice_status = getattr(invoice, 'status', None)
+                    if invoice_status != 'paid':
+                        continue
+
+                    lines = getattr(invoice, 'lines', None)
+                    lines_data = getattr(lines, 'data', None) or []
+                    first_line = lines_data[0] if lines_data else None
+                    period = getattr(first_line, 'period', None)
+                    period_end = getattr(period, 'end', None)
+
+                    if period_end:
+                        current_period_end = period_end
+                        period_source = "invoice.lines.data[0].period.end"
+                        break
+
+            if status in ('active', 'trialing') and current_period_end:
+                new_expiry = datetime.utcfromtimestamp(current_period_end)
+                if new_expiry > datetime.utcnow():
+                    cur.execute("""
+                        UPDATE users
+                        SET paid = TRUE,
+                            expiry_date = %s,
+                            payment_failed = FALSE,
+                            grace_period_end = NULL,
+                            reminder_sent = FALSE,
+                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                        WHERE telegram_id = %s
+                    """, (new_expiry, customer_id, user_id))
+                    conn.commit()
+                    logging.info(
+                        f"Checkout заблокирован: у пользователя {user_id} уже есть активная Stripe-подписка. "
+                        f"period_source={period_source}"
+                    )
+                    cur.close()
+                    conn.close()
+                    await callback.message.answer(
+                        f"✅ У вас уже есть активная подписка до {new_expiry.strftime('%d.%m.%Y %H:%M')}.\n"
+                        "Повторная оплата не нужна."
+                    )
+                    await state.finish()
+                    return
+
+            if status in ('active', 'trialing') and not current_period_end:
+                cur.execute("""
+                    UPDATE users
+                    SET stripe_subscription_id = %s,
+                        stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                        auto_renew = TRUE
+                    WHERE telegram_id = %s
+                """, (stripe_subscription_id, customer_id, user_id))
+                conn.commit()
+                logging.warning(
+                    f"Checkout заблокирован: Stripe subscription active/trialing, но period_end не найден. "
+                    f"user_id={user_id}, stripe_subscription_id={stripe_subscription_id}, customer_id={customer_id}"
+                )
+                cur.close()
+                conn.close()
+                await callback.message.answer(
+                    "✅ У вас уже есть активная подписка.\n"
+                    "Повторная оплата не нужна. Если доступ не обновился, напишите администратору."
+                )
+                await state.finish()
+                return
+        except Exception as e:
+            logging.error(f"Не удалось проверить Stripe перед Checkout для пользователя {user_id}: {e}")
+
+    cur.close()
+    conn.close()
 
     # Если нажата кнопка пробной недели
     if sub_type == "sub_trial":
@@ -1709,7 +1821,7 @@ async def profile(message: types.Message):
 
     try:
         cur.execute("""
-            SELECT 
+            SELECT
                 paid,
                 expiry_date,
                 stripe_subscription_id,
@@ -2356,7 +2468,7 @@ async def expired_users_command(message: types.Message):
 
     try:
         cur.execute("""
-            SELECT 
+            SELECT
                 telegram_id,
                 expiry_date,
                 payment_failed,
@@ -2433,7 +2545,7 @@ async def user_command(message: types.Message):
 
     try:
         cur.execute("""
-            SELECT 
+            SELECT
                 telegram_id,
                 paid,
                 expiry_date,
