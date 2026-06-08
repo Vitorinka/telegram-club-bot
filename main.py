@@ -2403,8 +2403,8 @@ async def stripe_webhook(request):
     # ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ (customer.subscription.updated) ----------
     elif event['type'] == 'customer.subscription.updated':
         sub = event['data']['object']
-        sub_id = sub.get('id')
-        cancel_at_period_end = sub.get('cancel_at_period_end', False)
+        sub_id = getattr(sub, 'id', None)
+        cancel_at_period_end = getattr(sub, 'cancel_at_period_end', False)
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
