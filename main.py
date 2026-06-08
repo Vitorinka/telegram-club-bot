@@ -212,19 +212,20 @@ async def ban_user_logic(telegram_id, cur):
 
     if not user:
         logging.warning(f"Пользователь {telegram_id} не удален: пользователь не найден в БД.")
-        return
+        return "not_found"
 
     paid, expiry_date, stripe_subscription_id = user
     now = datetime.utcnow()
 
     if paid and expiry_date and expiry_date > now:
         logging.info("Пользователь не удален: доступ уже активен в БД")
-        return
+        return "active_in_db"
 
     if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
-        return
+        return "stripe_protected"
 
     # 1. Пытаемся удалить пользователя из группы
+    status = "removed"
     try:
         await bot.kick_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
         try:
@@ -243,6 +244,7 @@ async def ban_user_logic(telegram_id, cur):
             f"Ошибка: {e}\n\n"
             "Пользователь мог остаться в группе. Проверьте вручную."
         )
+        status = "kick_failed"
 
     # 2. В любом случае закрываем доступ в базе
     cur.execute("""
@@ -270,6 +272,8 @@ async def ban_user_logic(telegram_id, cur):
         logging.info(f"Пользователь {telegram_id} заблокировал бота.")
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение об окончании доступа пользователю {telegram_id}: {e}")
+
+    return status
         
 async def check_subscriptions_and_reminders():
     logging.info("--- Запуск ежедневной проверки подписок ---")
@@ -284,17 +288,31 @@ async def check_subscriptions_and_reminders():
     """)
     users = cur.fetchall()
     now = datetime.utcnow()
+    checked_total = len(users)
+    expired_total = 0
+    grace_total = 0
+    reminders_sent = 0
+    reminder_errors = 0
+    stripe_protected = 0
+    removed_total = 0
+    active_in_db_skipped = 0
+    not_found_total = 0
+    telegram_errors = 0
 
     for (telegram_id, expiry, payment_failed, grace_end, auto_renew, reminder_sent, _, stripe_subscription_id) in users:
         time_left = expiry - now
 
         # ----- Истекший доступ -----
         if time_left.total_seconds() < 0:
+            expired_total += 1
+
             if payment_failed and grace_end and now < grace_end:
                 continue
 
             # Общий льготный период 2 дня
             if -time_left.total_seconds() < 2 * 86400:
+                grace_total += 1
+
                 if not reminder_sent:
                     try:
                         await bot.send_message(telegram_id,
@@ -302,13 +320,29 @@ async def check_subscriptions_and_reminders():
                             "Пожалуйста, продлите подписку как можно скорее.",
                             reply_markup=get_tariffs_keyboard(show_trial=False))
                         cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                        reminders_sent += 1
                     except Exception as e:
+                        reminder_errors += 1
+                        telegram_errors += 1
                         logging.warning(f"Не удалось отправить сообщение пользователю {telegram_id}: {e}")
                 continue
             else:
                 if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+                    stripe_protected += 1
                     continue
-                await ban_user_logic(telegram_id, cur)
+
+                ban_status = await ban_user_logic(telegram_id, cur)
+
+                if ban_status == "active_in_db":
+                    active_in_db_skipped += 1
+                elif ban_status == "stripe_protected":
+                    stripe_protected += 1
+                elif ban_status == "not_found":
+                    not_found_total += 1
+                elif ban_status in ("removed", "kick_failed"):
+                    removed_total += 1
+                    if ban_status == "kick_failed":
+                        telegram_errors += 1
 
         # ----- Напоминание за 48 часов -----
         elif timedelta(0) < time_left < timedelta(days=2):
@@ -317,7 +351,10 @@ async def check_subscriptions_and_reminders():
                 try:
                     await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
                     cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                    reminders_sent += 1
                 except Exception as e:
+                    reminder_errors += 1
+                    telegram_errors += 1
                     logging.warning(f"Не удалось отправить напоминание пользователю {telegram_id}: {e}")
                     if "ChatNotFound" in str(e) or "bot was blocked" in str(e):
                         cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (telegram_id,))
@@ -325,6 +362,38 @@ async def check_subscriptions_and_reminders():
     conn.commit()
     cur.close()
     conn.close()
+
+    if (
+        expired_total == 0
+        and grace_total == 0
+        and reminders_sent == 0
+        and reminder_errors == 0
+        and stripe_protected == 0
+        and removed_total == 0
+        and active_in_db_skipped == 0
+        and not_found_total == 0
+        and telegram_errors == 0
+    ):
+        report_text = f"✅ Проверка подписок завершена. Проверено: {checked_total}, удалено: 0, ошибок: 0."
+    else:
+        report_text = (
+            "📊 Проверка подписок завершена\n\n"
+            f"Проверено пользователей: {checked_total}\n"
+            f"Просроченных найдено: {expired_total}\n"
+            f"В льготном периоде: {grace_total}\n"
+            f"Напоминаний отправлено: {reminders_sent}\n"
+            f"Ошибок напоминаний: {reminder_errors}\n"
+            f"Защищены через Stripe/ошибку Stripe: {stripe_protected}\n"
+            f"Удалены/закрыт доступ: {removed_total}\n"
+            f"Пропущены, доступ уже активен в БД: {active_in_db_skipped}\n"
+            f"Не найдены в БД перед удалением: {not_found_total}\n"
+            f"Ошибки Telegram: {telegram_errors}"
+        )
+
+    try:
+        await notify_admins(report_text)
+    except Exception as e:
+        logging.error(f"Не удалось отправить отчет проверки подписок: {e}")
 
 async def check_free_lesson_followups():
     logging.info("--- Проверка follow-up после бесплатного урока ---")
