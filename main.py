@@ -1986,6 +1986,136 @@ async def set_expiry_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['sync_stripe_user'], state='*')
+async def sync_stripe_user_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /sync_stripe_user <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ Использование: /sync_stripe_user <telegram_id>")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                stripe_customer_id,
+                payment_failed,
+                grace_period_end,
+                blocked_bot
+            FROM users
+            WHERE telegram_id = %s
+        """, (target_user_id,))
+
+        user = cur.fetchone()
+
+        if not user:
+            await message.reply("❌ Пользователь не найден в базе.")
+            return
+
+        (
+            paid,
+            expiry_date,
+            stripe_subscription_id,
+            stripe_customer_id,
+            payment_failed,
+            grace_period_end,
+            blocked_bot
+        ) = user
+
+        if not stripe_subscription_id:
+            await message.reply("⚠️ У пользователя нет stripe_subscription_id. Синхронизация со Stripe невозможна.")
+            return
+
+        try:
+            subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
+        except Exception as e:
+            await message.reply(f"❌ Не удалось получить подписку из Stripe: {e}")
+            return
+
+        status = getattr(subscription, 'status', None)
+        current_period_end = getattr(subscription, 'current_period_end', None)
+        customer = getattr(subscription, 'customer', None)
+        cancel_at_period_end = bool(getattr(subscription, 'cancel_at_period_end', False))
+        customer_id = customer if isinstance(customer, str) else getattr(customer, 'id', None)
+        auto_renew = not cancel_at_period_end
+        period_end_text = "нет"
+
+        if current_period_end:
+            period_end_dt = datetime.utcfromtimestamp(current_period_end)
+            period_end_text = period_end_dt.strftime("%d.%m.%Y %H:%M")
+
+        if status in ('active', 'trialing') and current_period_end:
+            new_expiry = datetime.utcfromtimestamp(current_period_end)
+
+            cur.execute("""
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                    payment_failed = FALSE,
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE,
+                    auto_renew = %s
+                WHERE telegram_id = %s
+            """, (new_expiry, customer_id, auto_renew, target_user_id))
+
+            conn.commit()
+
+            await message.reply(
+                "✅ Stripe-синхронизация выполнена\n\n"
+                f"telegram_id: {target_user_id}\n"
+                f"status: {status}\n"
+                "paid: TRUE\n"
+                f"expiry_date: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n"
+                f"auto_renew: {auto_renew}\n"
+                f"stripe_subscription_id: {stripe_subscription_id}\n"
+                f"stripe_customer_id: {customer_id or 'нет'}"
+            )
+            return
+
+        if status in ('active', 'trialing') and not current_period_end:
+            await message.reply(
+                "⚠️ Подписка в Stripe активна, но у нее нет current_period_end.\n\n"
+                f"telegram_id: {target_user_id}\n"
+                f"status: {status}\n"
+                f"stripe_subscription_id: {stripe_subscription_id}\n"
+                f"stripe_customer_id: {customer_id or 'нет'}\n\n"
+                "БД автоматически не обновлена. Проверьте подписку вручную в Stripe."
+            )
+            return
+
+        await message.reply(
+            "⚠️ Подписка в Stripe не активна\n\n"
+            f"telegram_id: {target_user_id}\n"
+            f"status: {status}\n"
+            f"current_period_end: {period_end_text}\n"
+            f"cancel_at_period_end: {cancel_at_period_end}\n\n"
+            "БД автоматически не обновлена до paid=True."
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка /sync_stripe_user для {args[0]}: {e}")
+        await message.reply(f"❌ Ошибка: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['expired_users'], state='*')
 async def expired_users_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2167,6 +2297,7 @@ async def admin_help_command(message: types.Message):
         "/expired_users — пользователи с истекшей датой, но paid=True\n"
         "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
         "/set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm] — установить точную дату окончания доступа\n"
+        "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
