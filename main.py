@@ -2565,6 +2565,81 @@ async def access_history_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['recent_access_events'], state='*')
+async def recent_access_events_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                created_at,
+                telegram_id,
+                event_type,
+                source,
+                old_expiry,
+                new_expiry,
+                stripe_event_id,
+                stripe_subscription_id,
+                notes
+            FROM access_events
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+
+        events = cur.fetchall()
+
+        if not events:
+            await message.answer("История действий по доступу пока пустая.")
+            return
+
+        def fmt_dt(value):
+            return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
+
+        lines = ["🧾 Последние события по доступу\n"]
+
+        for (
+            created_at,
+            telegram_id,
+            event_type,
+            source,
+            old_expiry,
+            new_expiry,
+            stripe_event_id,
+            stripe_subscription_id,
+            notes
+        ) in events:
+            lines.extend([
+                f"Дата: {fmt_dt(created_at)}",
+                f"telegram_id: {telegram_id}",
+                f"event_type: {event_type}",
+                f"source: {source or 'нет'}",
+                f"old_expiry: {fmt_dt(old_expiry)}",
+                f"new_expiry: {fmt_dt(new_expiry)}",
+                f"stripe_event_id: {stripe_event_id or 'нет'}",
+                f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                f"notes: {notes or 'нет'}",
+                ""
+            ])
+
+        text = "\n".join(lines).strip()
+
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка recent_access_events_command: {e}")
+        await message.answer(f"❌ Ошибка получения последних событий доступа: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['admin_help'], state='*')
 async def admin_help_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2579,6 +2654,7 @@ async def admin_help_command(message: types.Message):
         "/set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm] — установить точную дату окончания доступа\n"
         "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
         "/access_history <telegram_id> — история действий по доступу\n"
+        "/recent_access_events — последние события по доступу\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
