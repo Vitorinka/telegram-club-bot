@@ -3618,4 +3618,139 @@ async def test_backup(message: types.Message):
     await message.answer("✅ Бэкап завершён. Проверьте личные сообщения от бота (файл должен прийти админам).")
 
 @dp.message_handler(commands=['unblock_user'], state='*')
-async def unblock_u
+async def unblock_user(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.get_args().split()
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /unblock_user <telegram_id>")
+        return
+    user_id = int(args[0])
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET blocked_bot = FALSE WHERE telegram_id = %s", (user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
+
+@dp.message_handler(commands=['unban_user'], state='*')
+async def unban_user(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /unban_user <telegram_id>")
+        return
+
+    try:
+        user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    try:
+        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
+        await message.reply(f"✅ Бан пользователя {user_id} снят в Telegram-группе.")
+    except Exception as e:
+        logging.error(f"Ошибка /unban_user для {user_id}: {e}")
+        await message.reply(f"❌ Не удалось снять бан пользователя {user_id}: {e}")
+    
+# --- ЗАПУСК И ВЕБХУК TELEGRAM ---
+def get_telegram_webhook_path():
+    secret = os.getenv("WEBHOOK_SECRET")
+    if secret:
+        return f"/webhook/{secret}"
+    return "/webhook"
+
+
+def get_safe_telegram_webhook_path():
+    secret = os.getenv("WEBHOOK_SECRET")
+    if secret:
+        return "/webhook/***"
+    return "/webhook"
+
+
+async def on_startup(app):
+    init_db()
+    await bot.delete_webhook()
+    
+    await bot.set_my_commands([
+        types.BotCommand("start", "Запуск бота"),
+        types.BotCommand("menu", "Главное меню"),
+        types.BotCommand("profile", "Мой профиль и подписка"),
+        types.BotCommand("ask", "Задать вопрос"),
+    ])
+
+    domain = os.getenv("YOUR_DOMAIN")
+
+    if not domain:
+        logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
+    else:
+        webhook_path = get_telegram_webhook_path()
+        safe_webhook_path = get_safe_telegram_webhook_path()
+
+        webhook_url = f"{domain}{webhook_path}"
+        safe_webhook_url = f"{domain}{safe_webhook_path}"
+
+        await bot.set_webhook(webhook_url)
+        logging.info(f"Webhook установлен: {safe_webhook_url}")
+
+    scheduler.add_job(
+        check_subscriptions_and_reminders,
+        'cron',
+        hour=10,
+        minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        check_auto_free_lessons,
+        'cron',
+        minute=15,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        check_free_lesson_followups,
+        'cron',
+        minute=30,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        send_db_backup,
+        'cron',
+        day_of_week='mon',
+        hour=3,
+        minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.start()
+
+async def on_shutdown(app):
+    await bot.close()
+    logging.info("Бот остановлен.")
+
+
+if __name__ == "__main__":
+    from aiogram.dispatcher.webhook import get_new_configured_app
+
+    app = get_new_configured_app(dispatcher=dp, path=get_telegram_webhook_path())
+    app.router.add_post('/stripe-payment', stripe_webhook)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    port = int(os.environ.get("PORT", 8080))
+    web.run_app(app, host='0.0.0.0', port=port, access_log=None)
