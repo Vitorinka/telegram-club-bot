@@ -148,6 +148,21 @@ async def notify_admins(text: str):
             pass
 
 
+async def notify_critical_delivery_failed(telegram_id, event_type, action, error, db_state_note=""):
+    text = (
+        "Не удалось отправить критическое сообщение пользователю.\n\n"
+        f"telegram_id: {telegram_id}\n"
+        f"событие: {event_type}\n"
+        f"действие: {action}\n"
+        f"ошибка: {error}"
+    )
+
+    if db_state_note:
+        text += f"\n{db_state_note}"
+
+    await notify_admins(text)
+
+
 def is_undeliverable_user_error(error):
     error_text = str(error).lower()
     undeliverable_markers = (
@@ -270,8 +285,22 @@ async def ban_user_logic(telegram_id, cur):
             (int(telegram_id),)
         )
         logging.info(f"Пользователь {telegram_id} заблокировал бота.")
+        await notify_critical_delivery_failed(
+            telegram_id,
+            "subscription_expired",
+            "сообщение об окончании подписки",
+            "BotBlocked",
+            "paid = FALSE; доступ закрыт в БД"
+        )
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение об окончании доступа пользователю {telegram_id}: {e}")
+        await notify_critical_delivery_failed(
+            telegram_id,
+            "subscription_expired",
+            "сообщение об окончании подписки",
+            e,
+            "paid = FALSE; доступ закрыт в БД"
+        )
 
     return status
         
@@ -1816,10 +1845,141 @@ async def give_access_command(message: types.Message):
                 (int(target_user_id),)
             )
             conn.commit()
+            await notify_critical_delivery_failed(
+                target_user_id,
+                "give_access",
+                "сообщение о вручную выданном доступе",
+                "BotBlocked",
+                f"Доступ выдан на {days} дней; blocked_bot = TRUE"
+            )
             await message.answer("⚠️ Доступ обновлен, но пользователь заблокировал бота.")
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение после /give_access пользователю {target_user_id}: {e}")
+            await notify_critical_delivery_failed(
+                target_user_id,
+                "give_access",
+                "сообщение о вручную выданном доступе",
+                e,
+                f"Доступ выдан на {days} дней"
+            )
+            await message.answer(
+                f"⚠️ Доступ выдан, но не удалось отправить сообщение пользователю {target_user_id}.\n\n"
+                f"Ошибка: {e}"
+            )
 
     except Exception as e:
         conn.rollback()
+        await message.answer(f"❌ Ошибка: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+@dp.message_handler(commands=['set_expiry'], state='*')
+async def set_expiry_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) not in (2, 3):
+        await message.reply("⚠️ Использование: /set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm]")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ Использование: /set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm]")
+        return
+
+    date_text = args[1]
+    time_text = args[2] if len(args) == 3 else "23:59"
+
+    try:
+        expiry_date = datetime.strptime(f"{date_text} {time_text}", "%d.%m.%Y %H:%M")
+    except ValueError:
+        await message.reply("⚠️ Неверный формат даты. Пример: /set_expiry 901812366 06.07.2026 23:59")
+        return
+
+    if expiry_date <= datetime.utcnow():
+        await message.reply("⚠️ Дата окончания должна быть в будущем.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M")
+
+    try:
+        cur.execute("""
+            INSERT INTO users (
+                telegram_id,
+                paid,
+                expiry_date,
+                payment_failed,
+                grace_period_end,
+                reminder_sent,
+                blocked_bot
+            )
+            VALUES (%s, TRUE, %s, FALSE, NULL, FALSE, FALSE)
+            ON CONFLICT (telegram_id) DO UPDATE
+            SET paid = TRUE,
+                expiry_date = EXCLUDED.expiry_date,
+                payment_failed = FALSE,
+                grace_period_end = NULL,
+                reminder_sent = FALSE,
+                blocked_bot = FALSE
+        """, (target_user_id, expiry_date))
+
+        conn.commit()
+
+        try:
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=target_user_id)
+        except Exception as e:
+            logging.error(f"Ошибка разбана после /set_expiry для {target_user_id}: {e}")
+
+        link = await generate_invite_link()
+        user_text = f"✅ Администратор обновил ваш доступ до {expiry_text}."
+
+        if link:
+            user_text += f"\nСсылка для входа в клуб: {link}"
+
+        try:
+            await bot.send_message(target_user_id, user_text)
+        except BotBlocked:
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (target_user_id,)
+            )
+            conn.commit()
+            await notify_critical_delivery_failed(
+                target_user_id,
+                "set_expiry",
+                "сообщение об обновлении точной даты доступа",
+                "BotBlocked",
+                f"expiry_date = {expiry_text}; blocked_bot = TRUE"
+            )
+            await message.answer("⚠️ Дата обновлена, но пользователь заблокировал бота.")
+            return
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение после /set_expiry пользователю {target_user_id}: {e}")
+            await notify_critical_delivery_failed(
+                target_user_id,
+                "set_expiry",
+                "сообщение об обновлении точной даты доступа",
+                e,
+                f"expiry_date = {expiry_text}"
+            )
+            await message.answer(
+                f"⚠️ Дата обновлена, но не удалось отправить сообщение пользователю {target_user_id}.\n\n"
+                f"Ошибка: {e}"
+            )
+            return
+
+        await message.answer(f"✅ Доступ пользователя {target_user_id} установлен до {expiry_text}.")
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Ошибка /set_expiry для {args[0]}: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
     finally:
@@ -2006,6 +2166,7 @@ async def admin_help_command(message: types.Message):
         "/user <telegram_id> — карточка пользователя\n"
         "/expired_users — пользователи с истекшей датой, но paid=True\n"
         "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
+        "/set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm] — установить точную дату окончания доступа\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
@@ -2446,7 +2607,22 @@ async def stripe_webhook(request):
             except BotBlocked:
                 cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
                 conn.commit()
-                pass  # не беспокоим админа
+                await notify_critical_delivery_failed(
+                    user_id,
+                    "checkout.session.completed",
+                    "сообщение об успешной оплате/продлении",
+                    "BotBlocked",
+                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить сообщение после checkout пользователю {user_id}: {e}")
+                await notify_critical_delivery_failed(
+                    user_id,
+                    "checkout.session.completed",
+                    "сообщение об успешной оплате/продлении",
+                    e,
+                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}"
+                )
             try:
                 await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
             except Exception as e:
@@ -2611,8 +2787,22 @@ async def stripe_webhook(request):
                     (int(telegram_id),)
                 )
                 conn.commit()
+                await notify_critical_delivery_failed(
+                    telegram_id,
+                    "invoice.payment_succeeded",
+                    "сообщение об успешном автопродлении",
+                    "BotBlocked",
+                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
+                )
             except Exception as e:
                 logging.error(f"Не удалось отправить сообщение об автопродлении {telegram_id}: {e}")
+                await notify_critical_delivery_failed(
+                    telegram_id,
+                    "invoice.payment_succeeded",
+                    "сообщение об успешном автопродлении",
+                    e,
+                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}"
+                )
 
         except Exception as e:
             conn.rollback()
