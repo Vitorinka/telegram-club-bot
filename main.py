@@ -2640,6 +2640,111 @@ async def recent_access_events_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['bot_health'], state='*')
+async def bot_health_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    def fmt_dt(value):
+        return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
+
+    env_names = [
+        "BOT_TOKEN",
+        "DATABASE_URL",
+        "GROUP_ID",
+        "ADMIN_IDS",
+        "STRIPE_API_KEY",
+        "STRIPE_WEBHOOK_SECRET"
+    ]
+    env_lines = [f"{name}: {'OK' if os.getenv(name) else 'MISSING'}" for name in env_names]
+
+    db_status = "OK"
+    user_stats = {
+        "total": "нет",
+        "paid": "нет",
+        "active": "нет",
+        "expired_paid": "нет",
+        "payment_failed": "нет",
+        "grace": "нет",
+        "blocked": "нет"
+    }
+    access_stats = {
+        "total": "нет",
+        "last_24h": "нет",
+        "last_event": "нет"
+    }
+    conn = None
+    cur = None
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+
+        cur.execute("SELECT COUNT(*) FROM users;")
+        user_stats["total"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE;")
+        user_stats["paid"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW();")
+        user_stats["active"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date < NOW();")
+        user_stats["expired_paid"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE payment_failed = TRUE;")
+        user_stats["payment_failed"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW();")
+        user_stats["grace"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM users WHERE blocked_bot = TRUE;")
+        user_stats["blocked"] = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM access_events;")
+        access_stats["total"] = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM access_events WHERE created_at >= NOW() - INTERVAL '24 hours';")
+        access_stats["last_24h"] = cur.fetchone()[0]
+        cur.execute("""
+            SELECT created_at, event_type, telegram_id
+            FROM access_events
+            ORDER BY created_at DESC
+            LIMIT 1
+        """)
+        last_event = cur.fetchone()
+        if last_event:
+            access_stats["last_event"] = (
+                f"{fmt_dt(last_event[0])}, {last_event[1]}, telegram_id: {last_event[2]}"
+            )
+    except Exception as e:
+        db_status = f"ERROR: {e}"
+        logging.error(f"Ошибка bot_health_command: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+    text = (
+        "🩺 Bot health\n\n"
+        f"UTC now: {datetime.utcnow().strftime('%d.%m.%Y %H:%M')}\n\n"
+        "ENV:\n"
+        f"{chr(10).join(env_lines)}\n\n"
+        f"DB: {db_status}\n\n"
+        "Users:\n"
+        f"Всего пользователей: {user_stats['total']}\n"
+        f"paid=True: {user_stats['paid']}\n"
+        f"Активных по expiry_date: {user_stats['active']}\n"
+        f"Истекли, но paid=True: {user_stats['expired_paid']}\n"
+        f"payment_failed=True: {user_stats['payment_failed']}\n"
+        f"В grace period: {user_stats['grace']}\n"
+        f"Заблокировали бота: {user_stats['blocked']}\n\n"
+        "Access events:\n"
+        f"Всего: {access_stats['total']}\n"
+        f"За 24ч: {access_stats['last_24h']}\n"
+        f"Последнее событие: {access_stats['last_event']}"
+    )
+
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+
+    await message.answer(text)
+
 @dp.message_handler(commands=['admin_help'], state='*')
 async def admin_help_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2655,6 +2760,7 @@ async def admin_help_command(message: types.Message):
         "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
         "/access_history <telegram_id> — история действий по доступу\n"
         "/recent_access_events — последние события по доступу\n"
+        "/bot_health — диагностика бота и базы\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
@@ -3512,139 +3618,4 @@ async def test_backup(message: types.Message):
     await message.answer("✅ Бэкап завершён. Проверьте личные сообщения от бота (файл должен прийти админам).")
 
 @dp.message_handler(commands=['unblock_user'], state='*')
-async def unblock_user(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    args = message.get_args().split()
-    if len(args) != 1:
-        await message.reply("⚠️ Использование: /unblock_user <telegram_id>")
-        return
-    user_id = int(args[0])
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET blocked_bot = FALSE WHERE telegram_id = %s", (user_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
-    await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
-
-@dp.message_handler(commands=['unban_user'], state='*')
-async def unban_user(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    args = message.get_args().split()
-
-    if len(args) != 1:
-        await message.reply("⚠️ Использование: /unban_user <telegram_id>")
-        return
-
-    try:
-        user_id = int(args[0])
-    except ValueError:
-        await message.reply("⚠️ telegram_id должен быть числом.")
-        return
-
-    try:
-        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=user_id)
-        await message.reply(f"✅ Бан пользователя {user_id} снят в Telegram-группе.")
-    except Exception as e:
-        logging.error(f"Ошибка /unban_user для {user_id}: {e}")
-        await message.reply(f"❌ Не удалось снять бан пользователя {user_id}: {e}")
-    
-# --- ЗАПУСК И ВЕБХУК TELEGRAM ---
-def get_telegram_webhook_path():
-    secret = os.getenv("WEBHOOK_SECRET")
-    if secret:
-        return f"/webhook/{secret}"
-    return "/webhook"
-
-
-def get_safe_telegram_webhook_path():
-    secret = os.getenv("WEBHOOK_SECRET")
-    if secret:
-        return "/webhook/***"
-    return "/webhook"
-
-
-async def on_startup(app):
-    init_db()
-    await bot.delete_webhook()
-    
-    await bot.set_my_commands([
-        types.BotCommand("start", "Запуск бота"),
-        types.BotCommand("menu", "Главное меню"),
-        types.BotCommand("profile", "Мой профиль и подписка"),
-        types.BotCommand("ask", "Задать вопрос"),
-    ])
-
-    domain = os.getenv("YOUR_DOMAIN")
-
-    if not domain:
-        logging.error("YOUR_DOMAIN не задан! Вебхук Telegram не установлен.")
-    else:
-        webhook_path = get_telegram_webhook_path()
-        safe_webhook_path = get_safe_telegram_webhook_path()
-
-        webhook_url = f"{domain}{webhook_path}"
-        safe_webhook_url = f"{domain}{safe_webhook_path}"
-
-        await bot.set_webhook(webhook_url)
-        logging.info(f"Webhook установлен: {safe_webhook_url}")
-
-    scheduler.add_job(
-        check_subscriptions_and_reminders,
-        'cron',
-        hour=10,
-        minute=0,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1
-    )
-
-    scheduler.add_job(
-        check_auto_free_lessons,
-        'cron',
-        minute=15,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1
-    )
-
-    scheduler.add_job(
-        check_free_lesson_followups,
-        'cron',
-        minute=30,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1
-    )
-
-    scheduler.add_job(
-        send_db_backup,
-        'cron',
-        day_of_week='mon',
-        hour=3,
-        minute=0,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1
-    )
-
-    scheduler.start()
-
-async def on_shutdown(app):
-    await bot.close()
-    logging.info("Бот остановлен.")
-
-
-if __name__ == "__main__":
-    from aiogram.dispatcher.webhook import get_new_configured_app
-
-    app = get_new_configured_app(dispatcher=dp, path=get_telegram_webhook_path())
-    app.router.add_post('/stripe-payment', stripe_webhook)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    port = int(os.environ.get("PORT", 8080))
-    web.run_app(app, host='0.0.0.0', port=port, access_log=None)
+async def unblock_u
