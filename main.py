@@ -248,6 +248,44 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
         status = getattr(subscription, 'status', None)
         current_period_end = getattr(subscription, 'current_period_end', None)
 
+        if status in ('active', 'trialing') and not current_period_end:
+            invoices = await asyncio.to_thread(
+                stripe.Invoice.list,
+                subscription=stripe_subscription_id,
+                limit=5
+            )
+            invoice_data = getattr(invoices, 'data', None) or []
+
+            for invoice in invoice_data:
+                invoice_status = getattr(invoice, 'status', None)
+                if invoice_status != 'paid':
+                    continue
+
+                lines = getattr(invoice, 'lines', None)
+                lines_data = getattr(lines, 'data', None) or []
+                first_line = lines_data[0] if lines_data else None
+                period = getattr(first_line, 'period', None)
+                period_end = getattr(period, 'end', None)
+
+                if period_end:
+                    current_period_end = period_end
+                    break
+
+        if status in ('active', 'trialing') and not current_period_end:
+            logging.warning(
+                f"Stripe subscription active/trialing, но period_end не найден. "
+                f"telegram_id={telegram_id}, stripe_subscription_id={stripe_subscription_id}"
+            )
+            cur.execute("""
+                UPDATE users
+                SET payment_failed = FALSE,
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE,
+                    auto_renew = TRUE
+                WHERE telegram_id = %s
+            """, (int(telegram_id),))
+            return True
+
         if status in ('active', 'trialing') and current_period_end:
             new_expiry = datetime.utcfromtimestamp(current_period_end)
 
@@ -258,7 +296,8 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                         expiry_date = %s,
                         payment_failed = FALSE,
                         grace_period_end = NULL,
-                        reminder_sent = FALSE
+                        reminder_sent = FALSE,
+                        auto_renew = TRUE
                     WHERE telegram_id = %s
                 """, (new_expiry, int(telegram_id)))
 
@@ -1858,10 +1897,11 @@ async def profile(message: types.Message):
             delta = expiry_date - now
             status_text = "✅ Подписка активна"
             time_text = f"осталось {delta.days} дн."
-            kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
 
             if stripe_subscription_id and auto_renew:
                 kb.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+            else:
+                kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
 
         elif paid and expiry_date and expiry_date <= now:
             delta = now - expiry_date
