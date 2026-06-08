@@ -2465,6 +2465,7 @@ async def access_history_command(message: types.Message):
                 source,
                 old_expiry,
                 new_expiry,
+                stripe_event_id,
                 stripe_subscription_id,
                 notes
             FROM access_events
@@ -2490,6 +2491,7 @@ async def access_history_command(message: types.Message):
             source,
             old_expiry,
             new_expiry,
+            stripe_event_id,
             stripe_subscription_id,
             notes
         ) in events:
@@ -2499,6 +2501,7 @@ async def access_history_command(message: types.Message):
                 f"source: {source or 'нет'}",
                 f"old_expiry: {fmt_dt(old_expiry)}",
                 f"new_expiry: {fmt_dt(new_expiry)}",
+                f"stripe_event_id: {stripe_event_id or 'нет'}",
                 f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
                 f"notes: {notes or 'нет'}",
                 ""
