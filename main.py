@@ -83,6 +83,21 @@ def init_db():
             processed_at TIMESTAMP DEFAULT NOW()
         );
     """)
+    # История ручных действий и синхронизаций по доступу
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS access_events (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            old_expiry TIMESTAMP,
+            new_expiry TIMESTAMP,
+            stripe_event_id TEXT,
+            stripe_subscription_id TEXT,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
     # Добавляем недостающие колонки (для старых БД)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
@@ -119,6 +134,53 @@ async def mark_event_processed(event_id):
     conn.commit()
     cur.close()
     conn.close()
+
+async def log_access_event(
+    telegram_id,
+    event_type,
+    source=None,
+    old_expiry=None,
+    new_expiry=None,
+    stripe_event_id=None,
+    stripe_subscription_id=None,
+    notes=None
+):
+    conn = None
+    cur = None
+
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO access_events (
+                telegram_id,
+                event_type,
+                source,
+                old_expiry,
+                new_expiry,
+                stripe_event_id,
+                stripe_subscription_id,
+                notes
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            int(telegram_id),
+            event_type,
+            source,
+            old_expiry,
+            new_expiry,
+            stripe_event_id,
+            stripe_subscription_id,
+            notes
+        ))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Не удалось записать access_event для {telegram_id}: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def generate_invite_link():
@@ -1799,6 +1861,13 @@ async def give_access_command(message: types.Message):
     cur = conn.cursor()
 
     try:
+        cur.execute(
+            "SELECT expiry_date FROM users WHERE telegram_id = %s",
+            (int(target_user_id),)
+        )
+        row = cur.fetchone()
+        old_expiry = row[0] if row else None
+
         cur.execute("""
             INSERT INTO users (telegram_id, paid, expiry_date)
             VALUES (%s, TRUE, NOW() + INTERVAL '%s days')
@@ -1813,7 +1882,23 @@ async def give_access_command(message: types.Message):
                 blocked_bot = FALSE;
         """, (int(target_user_id), days, days, days))
 
+        cur.execute(
+            "SELECT expiry_date FROM users WHERE telegram_id = %s",
+            (int(target_user_id),)
+        )
+        row = cur.fetchone()
+        new_expiry = row[0] if row else None
+
         conn.commit()
+
+        await log_access_event(
+            target_user_id,
+            "manual_give_access",
+            source="admin_command",
+            old_expiry=old_expiry,
+            new_expiry=new_expiry,
+            notes=f"days={days}; admin_id={message.from_user.id}"
+        )
 
         try:
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(target_user_id))
@@ -1910,6 +1995,13 @@ async def set_expiry_command(message: types.Message):
     expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M")
 
     try:
+        cur.execute(
+            "SELECT expiry_date FROM users WHERE telegram_id = %s",
+            (target_user_id,)
+        )
+        row = cur.fetchone()
+        old_expiry = row[0] if row else None
+
         cur.execute("""
             INSERT INTO users (
                 telegram_id,
@@ -1931,6 +2023,15 @@ async def set_expiry_command(message: types.Message):
         """, (target_user_id, expiry_date))
 
         conn.commit()
+
+        await log_access_event(
+            target_user_id,
+            "manual_set_expiry",
+            source="admin_command",
+            old_expiry=old_expiry,
+            new_expiry=expiry_date,
+            notes=f"admin_id={message.from_user.id}"
+        )
 
         try:
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=target_user_id)
@@ -2074,6 +2175,16 @@ async def sync_stripe_user_command(message: types.Message):
             """, (new_expiry, customer_id, auto_renew, target_user_id))
 
             conn.commit()
+
+            await log_access_event(
+                target_user_id,
+                "manual_stripe_sync",
+                source="admin_command",
+                old_expiry=expiry_date,
+                new_expiry=new_expiry,
+                stripe_subscription_id=stripe_subscription_id,
+                notes=f"status={status}; auto_renew={auto_renew}; admin_id={message.from_user.id}"
+            )
 
             await message.reply(
                 "✅ Stripe-синхронизация выполнена\n\n"
@@ -2306,6 +2417,88 @@ async def user_command(message: types.Message):
         cur.close()
         conn.close()
 
+@dp.message_handler(commands=['access_history'], state='*')
+async def access_history_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /access_history <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ Использование: /access_history <telegram_id>")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                created_at,
+                event_type,
+                source,
+                old_expiry,
+                new_expiry,
+                stripe_subscription_id,
+                notes
+            FROM access_events
+            WHERE telegram_id = %s
+            ORDER BY created_at DESC
+            LIMIT 15
+        """, (target_user_id,))
+
+        events = cur.fetchall()
+
+        if not events:
+            await message.answer(f"История доступа для пользователя {target_user_id} пока пустая.")
+            return
+
+        def fmt_dt(value):
+            return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
+
+        lines = [f"🧾 История доступа пользователя {target_user_id}\n"]
+
+        for (
+            created_at,
+            event_type,
+            source,
+            old_expiry,
+            new_expiry,
+            stripe_subscription_id,
+            notes
+        ) in events:
+            lines.extend([
+                f"Дата: {fmt_dt(created_at)}",
+                f"event_type: {event_type}",
+                f"source: {source or 'нет'}",
+                f"old_expiry: {fmt_dt(old_expiry)}",
+                f"new_expiry: {fmt_dt(new_expiry)}",
+                f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                f"notes: {notes or 'нет'}",
+                ""
+            ])
+
+        text = "\n".join(lines).strip()
+
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+
+        await message.answer(text)
+
+    except Exception as e:
+        logging.error(f"Ошибка access_history_command для {args[0]}: {e}")
+        await message.answer(f"❌ Ошибка получения истории доступа: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
 @dp.message_handler(commands=['admin_help'], state='*')
 async def admin_help_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -2319,6 +2512,7 @@ async def admin_help_command(message: types.Message):
         "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
         "/set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm] — установить точную дату окончания доступа\n"
         "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
+        "/access_history <telegram_id> — история действий по доступу\n"
         "/broadcast текст — текстовая рассылка всем пользователям\n"
         "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
         "/test_expiry — вручную запустить проверку подписок\n"
