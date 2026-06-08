@@ -2208,14 +2208,20 @@ async def user_command(message: types.Message):
                 paid,
                 expiry_date,
                 stripe_subscription_id,
-                reminder_sent,
-                payment_failed,
-                grace_period_end,
+                stripe_customer_id,
                 auto_renew,
                 trial_used,
                 first_payment_done,
+                reminder_sent,
+                payment_failed,
+                grace_period_end,
+                blocked_bot,
                 registered_at,
-                blocked_bot
+                video_sent,
+                video_sent_at,
+                feedback_sent,
+                feedback_sent_at,
+                feedback_received
             FROM users
             WHERE telegram_id = %s
         """, (target_user_id,))
@@ -2231,14 +2237,20 @@ async def user_command(message: types.Message):
             paid,
             expiry_date,
             stripe_subscription_id,
-            reminder_sent,
-            payment_failed,
-            grace_period_end,
+            stripe_customer_id,
             auto_renew,
             trial_used,
             first_payment_done,
+            reminder_sent,
+            payment_failed,
+            grace_period_end,
+            blocked_bot,
             registered_at,
-            blocked_bot
+            video_sent,
+            video_sent_at,
+            feedback_sent,
+            feedback_sent_at,
+            feedback_received
         ) = user
 
         now = datetime.utcnow()
@@ -2246,33 +2258,42 @@ async def user_command(message: types.Message):
         if expiry_date:
             delta = expiry_date - now
             if delta.total_seconds() >= 0:
-                access_text = f"осталось {delta.days} дн."
+                access_text = f"активен, осталось {delta.days} дн."
             else:
-                access_text = f"истекла {abs(delta.days)} дн. назад"
-            expiry_text = expiry_date.strftime("%d.%m.%Y %H:%M")
+                access_text = f"истек, {abs(delta.days)} дн. назад"
         else:
-            access_text = "дата не установлена"
-            expiry_text = "нет"
+            access_text = "нет даты"
 
-        grace_text = grace_period_end.strftime("%d.%m.%Y %H:%M") if grace_period_end else "нет"
-        registered_text = registered_at.strftime("%d.%m.%Y %H:%M") if registered_at else "нет"
+        def fmt_dt(value):
+            return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
 
         stripe_text = stripe_subscription_id if stripe_subscription_id else "нет"
+        stripe_customer_text = stripe_customer_id if stripe_customer_id else "нет"
 
         text = (
             f"👤 Пользователь {telegram_id}\n\n"
+            "Доступ:\n"
             f"paid: {paid}\n"
-            f"expiry_date: {expiry_text}\n"
+            f"expiry_date: {fmt_dt(expiry_date)}\n"
             f"статус срока: {access_text}\n"
+            f"auto_renew: {auto_renew}\n\n"
+            "Stripe:\n"
             f"stripe_subscription_id: {stripe_text}\n"
-            f"auto_renew: {auto_renew}\n"
+            f"stripe_customer_id: {stripe_customer_text}\n\n"
+            "Состояния:\n"
             f"trial_used: {trial_used}\n"
             f"first_payment_done: {first_payment_done}\n"
             f"reminder_sent: {reminder_sent}\n"
             f"payment_failed: {payment_failed}\n"
-            f"grace_period_end: {grace_text}\n"
-            f"blocked_bot: {blocked_bot}\n"
-            f"registered_at: {registered_text}"
+            f"grace_period_end: {fmt_dt(grace_period_end)}\n"
+            f"blocked_bot: {blocked_bot}\n\n"
+            "Воронка:\n"
+            f"registered_at: {fmt_dt(registered_at)}\n"
+            f"video_sent: {video_sent}\n"
+            f"video_sent_at: {fmt_dt(video_sent_at)}\n"
+            f"feedback_sent: {feedback_sent}\n"
+            f"feedback_sent_at: {fmt_dt(feedback_sent_at)}\n"
+            f"feedback_received: {feedback_received}"
         )
 
         await message.answer(text)
