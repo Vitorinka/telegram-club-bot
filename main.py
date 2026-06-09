@@ -202,6 +202,11 @@ def get_tariffs_keyboard(show_trial=True):
     )
     return kb
 
+def get_cancel_subscription_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
+    return kb
+
 async def notify_admins(text: str):
     for admin_id in ADMIN_IDS:
         try:
@@ -1754,7 +1759,16 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 }
             }
 
+        logging.info(
+            f"Создаю Checkout Session: user_id={user_id}, sub_type={sub_type}, "
+            f"mode={mode}, paid={paid}, expiry_date={expiry_date}, "
+            f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
+        )
         session = stripe.checkout.Session.create(**session_params)
+        logging.info(
+            f"Checkout Session создана: user_id={user_id}, session_id={session.id}, "
+            f"sub_type={sub_type}, mode={mode}"
+        )
         new_kb = InlineKeyboardMarkup(row_width=1).add(
             InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
             InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
@@ -3560,8 +3574,16 @@ async def stripe_webhook(request):
                 msg = f"✅ Оплата прошла успешно! Доступ до {new_expiry.strftime('%d.%m.%Y')}.\nСсылка для вступления: {link}\n\nДобро пожаловать!"
             else:
                 msg = f"✅ Ваша подписка продлена до {new_expiry.strftime('%d.%m.%Y')}. Спасибо! ❤️"
+            reply_markup = get_cancel_subscription_keyboard() if has_subscription else None
+
+            if has_subscription:
+                msg += (
+                    "\n\nОплата будет списываться автоматически до момента, пока вы не отмените подписку.\n\n"
+                    "Вы можете отменить автопродление в любой момент по кнопке ниже или через /profile."
+                )
+
             try:
-                await bot.send_message(int(user_id), msg)
+                await bot.send_message(int(user_id), msg, reply_markup=reply_markup)
             except BotBlocked:
                 cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
                 conn.commit()
@@ -3806,7 +3828,9 @@ async def stripe_webhook(request):
             try:
                 await bot.send_message(
                     int(telegram_id),
-                    f"✅ Автопродление успешно! Доступ продлен до {new_expiry.strftime('%d.%m.%Y')}. Хорошего дня!"
+                    f"✅ Автопродление успешно! Доступ продлен до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
+                    "Оплата будет списываться автоматически до момента, пока вы не отмените подписку.",
+                    reply_markup=get_cancel_subscription_keyboard()
                 )
             except BotBlocked:
                 cur.execute(
