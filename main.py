@@ -244,8 +244,26 @@ def is_undeliverable_user_error(error):
 
 
 # --- АВТОМАТИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК (КРОН) ---
-async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+def has_valid_stripe_subscription_id(stripe_subscription_id):
     if not stripe_subscription_id:
+        return False
+
+    subscription_id = str(stripe_subscription_id).strip()
+    if not subscription_id:
+        return False
+
+    if subscription_id.lower() in ("none", "null", "нет"):
+        return False
+
+    return subscription_id.startswith("sub_")
+
+
+async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+    if not has_valid_stripe_subscription_id(stripe_subscription_id):
+        logging.info(
+            f"NO_STRIPE_SUBSCRIPTION_ID — proceed to removal. telegram_id={telegram_id}, "
+            f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
+        )
         return False
 
     try:
@@ -289,7 +307,7 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                     auto_renew = TRUE
                 WHERE telegram_id = %s
             """, (int(telegram_id),))
-            return True
+            return "STRIPE_ACTIVE"
 
         if status in ('active', 'trialing') and current_period_end:
             new_expiry = datetime.utcfromtimestamp(current_period_end)
@@ -309,7 +327,7 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                 logging.info(
                     f"Пользователь {telegram_id} не удален: Stripe подписка активна до {new_expiry} UTC."
                 )
-                return True
+                return "STRIPE_ACTIVE"
 
     except Exception as e:
         logging.error(f"Не удалось перепроверить Stripe-подписку {stripe_subscription_id} для {telegram_id}: {e}")
@@ -319,7 +337,7 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
             f"Ошибка: {e}\n\n"
             "Пользователь пока НЕ удален автоматически. Проверьте вручную."
         )
-        return True
+        return "STRIPE_CHECK_FAILED"
 
     return False
 
@@ -342,8 +360,9 @@ async def ban_user_logic(telegram_id, cur):
         logging.info("Пользователь не удален: доступ уже активен в БД")
         return "active_in_db"
 
-    if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
-        return "stripe_protected"
+    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+    if stripe_guard_status:
+        return stripe_guard_status
 
     # 1. Пытаемся удалить пользователя из группы
     status = "removed"
@@ -554,14 +573,15 @@ async def check_subscriptions_and_reminders():
                 grace_user_details.append(grace_user)
                 log_report_user("GRACE_USER", grace_user)
 
-                if auto_renew and stripe_subscription_id:
-                    if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+                if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
+                    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+                    if stripe_guard_status:
                         protected_user = build_report_user(
                             telegram_id,
                             expiry,
                             stripe_subscription_id,
                             stripe_customer_id,
-                            "Stripe subscription active or Stripe check failed during grace period"
+                            f"{stripe_guard_status} during grace period"
                         )
                         protected_user_details.append(protected_user)
                         log_report_user("PROTECTED_USER", protected_user)
@@ -629,40 +649,50 @@ async def check_subscriptions_and_reminders():
             )
             continue
 
-        if await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
-            cur.execute(
-                "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
-                (telegram_id,)
+        removal_reason = "NO_STRIPE_SUBSCRIPTION_ID — proceed to removal"
+
+        if has_valid_stripe_subscription_id(stripe_subscription_id):
+            removal_reason = "STRIPE_INACTIVE_OR_EXPIRED — proceed to removal"
+            stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+            if stripe_guard_status:
+                cur.execute(
+                    "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
+                    (telegram_id,)
+                )
+                row = cur.fetchone()
+                refreshed_expiry = row[0] if row else None
+                refreshed_customer_id = row[1] if row else stripe_customer_id
+                protected_user = build_report_user(
+                    telegram_id,
+                    refreshed_expiry or expiry,
+                    stripe_subscription_id,
+                    refreshed_customer_id,
+                    stripe_guard_status
+                )
+                protected_user_details.append(protected_user)
+                log_report_user("PROTECTED_USER", protected_user)
+                pending_access_events.append({
+                    "telegram_id": telegram_id,
+                    "event_type": "auto_stripe_protected_before_removal",
+                    "source": "auto_check",
+                    "old_expiry": expiry,
+                    "new_expiry": refreshed_expiry,
+                    "stripe_subscription_id": stripe_subscription_id,
+                    "notes": stripe_guard_status
+                })
+                stripe_protected += 1
+                continue
+        else:
+            logging.info(
+                f"NO_STRIPE_SUBSCRIPTION_ID — proceed to removal. telegram_id={telegram_id}, "
+                f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
             )
-            row = cur.fetchone()
-            refreshed_expiry = row[0] if row else None
-            refreshed_customer_id = row[1] if row else stripe_customer_id
-            protected_user = build_report_user(
-                telegram_id,
-                refreshed_expiry or expiry,
-                stripe_subscription_id,
-                refreshed_customer_id,
-                "Stripe subscription active or Stripe check failed before removal"
-            )
-            protected_user_details.append(protected_user)
-            log_report_user("PROTECTED_USER", protected_user)
-            pending_access_events.append({
-                "telegram_id": telegram_id,
-                "event_type": "auto_stripe_protected_before_removal",
-                "source": "auto_check",
-                "old_expiry": expiry,
-                "new_expiry": refreshed_expiry,
-                "stripe_subscription_id": stripe_subscription_id,
-                "notes": "Stripe subscription active during expired-user check"
-            })
-            stripe_protected += 1
-            continue
 
         ban_status = await ban_user_logic(telegram_id, cur)
 
         if ban_status == "active_in_db":
             active_in_db_skipped += 1
-        elif ban_status == "stripe_protected":
+        elif ban_status in ("STRIPE_ACTIVE", "STRIPE_CHECK_FAILED"):
             cur.execute(
                 "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
                 (telegram_id,)
@@ -675,7 +705,7 @@ async def check_subscriptions_and_reminders():
                 refreshed_expiry or expiry,
                 stripe_subscription_id,
                 refreshed_customer_id,
-                "Stripe subscription protected user inside ban_user_logic"
+                f"{ban_status} inside ban_user_logic"
             )
             protected_user_details.append(protected_user)
             log_report_user("PROTECTED_USER", protected_user)
@@ -686,7 +716,7 @@ async def check_subscriptions_and_reminders():
                 "old_expiry": expiry,
                 "new_expiry": refreshed_expiry,
                 "stripe_subscription_id": stripe_subscription_id,
-                "notes": "Stripe subscription protected user inside ban_user_logic"
+                "notes": f"{ban_status} inside ban_user_logic"
             })
             stripe_protected += 1
         elif ban_status == "not_found":
@@ -697,7 +727,7 @@ async def check_subscriptions_and_reminders():
                 expiry,
                 stripe_subscription_id,
                 stripe_customer_id,
-                f"ban_status={ban_status}"
+                f"{removal_reason}; ban_status={ban_status}"
             )
             deleted_user_details.append(deleted_user)
             log_report_user("DELETED_USER", deleted_user)
@@ -708,7 +738,7 @@ async def check_subscriptions_and_reminders():
                 "old_expiry": expiry,
                 "new_expiry": None,
                 "stripe_subscription_id": stripe_subscription_id,
-                "notes": f"ban_status={ban_status}"
+                "notes": f"{removal_reason}; ban_status={ban_status}"
             })
             removed_total += 1
             if ban_status == "kick_failed":
