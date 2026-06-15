@@ -3315,39 +3315,183 @@ async def bot_health_command(message: types.Message):
 
     await message.answer(text)
 
+ADMIN_MENU_SECTIONS = {
+    "stats": {
+        "button": "📊 Статистика",
+        "title": "📊 Статистика",
+        "danger": False,
+        "commands": [
+            "/stats — статистика клуба",
+            "/bot_health — диагностика бота",
+            "/expiring_users — подписки, истекающие за 48 часов",
+            "/expired_users — просроченные подписки",
+        ],
+    },
+    "users": {
+        "button": "👤 Пользователи",
+        "title": "👤 Пользователи",
+        "danger": False,
+        "commands": [
+            "/user <telegram_id> — карточка пользователя",
+            "/find_by_stripe <stripe_id> — поиск по Stripe ID",
+            "/access_history <telegram_id> — история доступа пользователя",
+            "/recent_access_events — последние события доступа",
+            "/send_user <telegram_id> <text> — личное сообщение пользователю",
+        ],
+    },
+    "access": {
+        "button": "🔐 Доступ",
+        "title": "🔐 Доступ",
+        "danger": True,
+        "commands": [
+            "/give_access <telegram_id> <days> — выдать или продлить доступ",
+            "/set_expiry <telegram_id> <YYYY-MM-DD> — установить точную дату доступа",
+            "/sync_stripe_user <telegram_id> — синхронизировать Stripe",
+            "/send_invite_link <telegram_id> — отправить invite link",
+            "/unban_user <telegram_id> — снять бан в группе",
+            "/unblock_user <telegram_id> — снять blocked_bot",
+        ],
+    },
+    "broadcasts": {
+        "button": "📣 Рассылки",
+        "title": "📣 Рассылки",
+        "danger": True,
+        "commands": [
+            "/broadcast <text> — массовая текстовая рассылка",
+            "/promo_trial — промо-рассылка с trial-кнопкой",
+        ],
+    },
+    "checks": {
+        "button": "🧪 Проверки",
+        "title": "🧪 Проверки",
+        "danger": True,
+        "commands": [
+            "/test_expiry — ручная проверка подписок",
+            "/test_grace <telegram_id> — тест grace period",
+            "/test_followup <telegram_id> — тест follow-up",
+            "/test_auto_lesson <telegram_id> — тест бесплатного урока",
+        ],
+    },
+    "logs": {
+        "button": "🧾 Логи",
+        "title": "🧾 Логи",
+        "danger": False,
+        "commands": [
+            "/access_history <telegram_id>",
+            "/recent_access_events",
+            "/find_by_stripe <stripe_id>",
+        ],
+    },
+    "tech": {
+        "button": "🛠 Тех. функции",
+        "title": "🛠 Тех. функции",
+        "danger": True,
+        "commands": [
+            "/test_backup — backup",
+            "Отправь боту фото или видео от имени админа — бот ответит file_id",
+            "/admin_help — список всех команд",
+        ],
+    },
+}
+
+
+def get_admin_menu_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    for section_key, section in ADMIN_MENU_SECTIONS.items():
+        kb.add(InlineKeyboardButton(section["button"], callback_data=f"admin_menu:{section_key}"))
+    return kb
+
+
+def get_admin_back_keyboard():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("⬅️ Назад в админ-меню", callback_data="admin_menu:back"))
+    return kb
+
+
+def get_admin_menu_text():
+    return (
+        "🛠 Админ-меню\n\n"
+        "Выбери раздел, чтобы посмотреть доступные команды и формат использования.\n"
+        "Кнопки ниже ничего не запускают — только показывают справку."
+    )
+
+
+def get_admin_section_text(section_key):
+    section = ADMIN_MENU_SECTIONS.get(section_key)
+    if not section:
+        return get_admin_menu_text()
+
+    lines = [
+        section["title"],
+        "",
+        *section["commands"],
+    ]
+
+    if section["danger"]:
+        lines.extend([
+            "",
+            "⚠️ Команда может изменить доступ, отправить сообщения, синхронизировать Stripe или удалить пользователя. Используй только после проверки данных.",
+        ])
+
+    return "\n".join(lines)
+
+
+def get_admin_help_text():
+    lines = [
+        "🛠 Админ-команды бота",
+        "",
+        "Открой удобное меню: /admin",
+        "",
+    ]
+
+    for section_key in ("stats", "users", "access", "broadcasts", "checks", "logs", "tech"):
+        section = ADMIN_MENU_SECTIONS[section_key]
+        lines.extend([
+            section["title"],
+            *section["commands"],
+            "",
+        ])
+
+    lines.append("⚠️ Команды с доступом, рассылками, Stripe и проверками используй только после проверки данных.")
+    return "\n".join(lines)
+
+
+@dp.message_handler(commands=['admin'], state='*')
+async def admin_menu_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Недостаточно прав.")
+        return
+
+    await message.answer(get_admin_menu_text(), reply_markup=get_admin_menu_keyboard())
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("admin_menu:"), state='*')
+async def admin_menu_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Недостаточно прав.", show_alert=True)
+        return
+
+    section_key = callback.data.split(":", 1)[1]
+
+    if section_key == "back":
+        await callback.message.edit_text(get_admin_menu_text(), reply_markup=get_admin_menu_keyboard())
+        await callback.answer()
+        return
+
+    if section_key not in ADMIN_MENU_SECTIONS:
+        await callback.answer("Раздел не найден.", show_alert=True)
+        return
+
+    await callback.message.edit_text(get_admin_section_text(section_key), reply_markup=get_admin_back_keyboard())
+    await callback.answer()
+
+
 @dp.message_handler(commands=['admin_help'], state='*')
 async def admin_help_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    text = (
-        "🛠 Админ-команды бота\n\n"
-        "/stats — общая статистика\n"
-        "/user <telegram_id> — карточка пользователя\n"
-        "/expired_users — пользователи с истекшей датой, но paid=True\n"
-        "/give_access <telegram_id> [дней] — выдать доступ вручную\n"
-        "/set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm] — установить точную дату окончания доступа\n"
-        "/sync_stripe_user <telegram_id> — вручную синхронизировать пользователя со Stripe\n"
-        "/access_history <telegram_id> — история действий по доступу\n"
-        "/recent_access_events — последние события по доступу\n"
-        "/find_by_stripe <id> — найти пользователя по Stripe ID\n"
-        "/bot_health — диагностика бота и базы\n"
-        "/broadcast текст — текстовая рассылка всем пользователям\n"
-        "/promo_trial — промо-рассылка с фото/видео и кнопкой триала для тех кого еще нет в клубе\n"
-        "/test_expiry — вручную запустить проверку подписок\n"
-        "/test_grace <telegram_id> — тестово поставить grace period на 24 часа\n"
-        "/test_backup — вручную запустить бэкап базы\n"
-        "/unblock_user <telegram_id> — снять blocked_bot в базе\n\n"
-        "/unban_user <telegram_id> — снять бан пользователя в Telegram-группе\n"
-        "/send_invite_link <telegram_id> — отправить новую ссылку входа в клуб\n"
-        "/expiring_users — пользователи, у которых подписка заканчивается в ближайшие 48 часов\n"
-        "/test_followup <telegram_id> — тестово отправить follow-up после бесплатного урока\n"
-        "/test_auto_lesson <telegram_id> — тестово отправить бесплатный урок\n"
-        "/send_user <telegram_id> текст — написать конкретному пользователю\n"
-        "⚠️ Важно: команды с доступом и рассылками используй аккуратно."
-    )
-
-    await message.answer(text)
+    await message.answer(get_admin_help_text())
 
 @dp.message_handler(commands=['expiring_users'], state='*')
 async def expiring_users_command(message: types.Message):
