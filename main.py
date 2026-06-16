@@ -304,7 +304,8 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                 SET payment_failed = FALSE,
                     grace_period_end = NULL,
                     reminder_sent = FALSE,
-                    auto_renew = TRUE
+                    auto_renew = TRUE,
+                    blocked_bot = FALSE
                 WHERE telegram_id = %s
             """, (int(telegram_id),))
             return "STRIPE_ACTIVE"
@@ -320,7 +321,8 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                         payment_failed = FALSE,
                         grace_period_end = NULL,
                         reminder_sent = FALSE,
-                        auto_renew = TRUE
+                        auto_renew = TRUE,
+                        blocked_bot = FALSE
                     WHERE telegram_id = %s
                 """, (new_expiry, int(telegram_id)))
 
@@ -409,16 +411,24 @@ async def ban_user_logic(telegram_id, cur):
             "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
             (int(telegram_id),)
         )
-        logging.info(f"Пользователь {telegram_id} заблокировал бота.")
-        await notify_critical_delivery_failed(
-            telegram_id,
-            "subscription_expired",
-            "сообщение об окончании подписки",
-            "BotBlocked",
-            "paid = FALSE; доступ закрыт в БД"
+        logging.info(
+            f"Пользователь {telegram_id} заблокировал бота: сообщение об окончании доступа "
+            "не отправлено, но доступ уже закрыт в БД."
         )
+        return status
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение об окончании доступа пользователю {telegram_id}: {e}")
+        if is_undeliverable_user_error(e):
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (int(telegram_id),)
+            )
+            logging.info(
+                f"Пользователь {telegram_id}: сообщение об окончании доступа недоставляемо, "
+                "но доступ уже закрыт в БД."
+            )
+            return status
+
         await notify_critical_delivery_failed(
             telegram_id,
             "subscription_expired",
@@ -453,7 +463,8 @@ async def check_subscriptions_and_reminders():
     cur.execute("""
         SELECT telegram_id, expiry_date, payment_failed, grace_period_end, auto_renew, reminder_sent, trial_used, stripe_subscription_id, stripe_customer_id
         FROM users
-        WHERE expiry_date IS NOT NULL
+        WHERE paid = TRUE
+          AND expiry_date IS NOT NULL
           AND expiry_date < NOW()
           AND (
               (grace_period_end IS NOT NULL AND grace_period_end < NOW())
@@ -1859,7 +1870,8 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                             payment_failed = FALSE,
                             grace_period_end = NULL,
                             reminder_sent = FALSE,
-                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                            stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                            blocked_bot = FALSE
                         WHERE telegram_id = %s
                     """, (new_expiry, customer_id, user_id))
                     conn.commit()
@@ -1881,7 +1893,11 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     UPDATE users
                     SET stripe_subscription_id = %s,
                         stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                        auto_renew = TRUE
+                        auto_renew = TRUE,
+                        payment_failed = FALSE,
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE,
+                        blocked_bot = FALSE
                     WHERE telegram_id = %s
                 """, (stripe_subscription_id, customer_id, user_id))
                 conn.commit()
@@ -2661,7 +2677,8 @@ async def sync_stripe_user_command(message: types.Message):
                     payment_failed = FALSE,
                     grace_period_end = NULL,
                     reminder_sent = FALSE,
-                    auto_renew = %s
+                    auto_renew = %s,
+                    blocked_bot = FALSE
                 WHERE telegram_id = %s
             """, (new_expiry, customer_id, auto_renew, target_user_id))
 
@@ -2695,7 +2712,11 @@ async def sync_stripe_user_command(message: types.Message):
                 UPDATE users
                 SET stripe_subscription_id = %s,
                     stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                    auto_renew = %s
+                    auto_renew = %s,
+                    payment_failed = FALSE,
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE,
+                    blocked_bot = FALSE
                 WHERE telegram_id = %s
             """, (stripe_subscription_id, customer_id, auto_renew, target_user_id))
             conn.commit()
@@ -3893,20 +3914,21 @@ async def stripe_webhook(request):
             # Нужна ли ссылка? Да, если нет активной подписки (paid=False или expiry_date < now)
             needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
             cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done)
-                VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, FALSE)
-                ON CONFLICT (telegram_id) DO UPDATE SET
-                    paid = TRUE,
-                    expiry_date = EXCLUDED.expiry_date,
-                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
-                    stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
-                    trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
-                    payment_failed = FALSE,
-                    grace_period_end = NULL,
-                    auto_renew = EXCLUDED.auto_renew,
-                    reminder_sent = FALSE,
-                    first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-            """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
+            INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, grace_period_end, first_payment_done, blocked_bot)
+            VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, FALSE, FALSE)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                paid = TRUE,
+                expiry_date = EXCLUDED.expiry_date,
+                stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+                stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
+                trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
+                payment_failed = FALSE,
+                grace_period_end = NULL,
+                auto_renew = EXCLUDED.auto_renew,
+                reminder_sent = FALSE,
+                blocked_bot = FALSE,
+                first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
+        """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
             conn.commit()
 
             await log_access_event(
@@ -4065,7 +4087,8 @@ async def stripe_webhook(request):
                     payment_failed = FALSE,
                     grace_period_end = NULL,
                     reminder_sent = FALSE,
-                    auto_renew = TRUE
+                    auto_renew = TRUE,
+                    blocked_bot = FALSE
                 FROM target
                 WHERE users.telegram_id = target.telegram_id
                 RETURNING users.telegram_id, target.old_expiry
@@ -4104,7 +4127,8 @@ async def stripe_webhook(request):
                                 payment_failed = FALSE,
                                 grace_period_end = NULL,
                                 reminder_sent = FALSE,
-                                auto_renew = TRUE
+                                auto_renew = TRUE,
+                                blocked_bot = FALSE
                             FROM target
                             WHERE users.telegram_id = target.telegram_id
                             RETURNING users.telegram_id, target.old_expiry
@@ -4132,7 +4156,8 @@ async def stripe_webhook(request):
                         payment_failed = FALSE,
                         grace_period_end = NULL,
                         reminder_sent = FALSE,
-                        auto_renew = TRUE
+                        auto_renew = TRUE,
+                        blocked_bot = FALSE
                     FROM target
                     WHERE users.telegram_id = target.telegram_id
                     RETURNING users.telegram_id, target.old_expiry
