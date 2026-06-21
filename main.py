@@ -44,6 +44,16 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 
+CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
+checkout_session_cache = {}
+checkout_session_cache_lock = asyncio.Lock()
+
+CHECKOUT_OPEN_INSTRUCTION = (
+    "💳 Нажмите кнопку ниже, чтобы перейти к оплате.\n\n"
+    "Если страница оплаты сбрасывается или не дает ввести данные, откройте ссылку "
+    "во внешнем браузере Safari/Chrome через меню ⋯."
+)
+
 # --- СОСТОЯНИЯ FSM ---
 class RegistrationStates(StatesGroup):
     intro = State()
@@ -206,6 +216,65 @@ def get_cancel_subscription_keyboard():
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
     return kb
+
+
+def get_reusable_checkout_session(cache_key):
+    now_timestamp = datetime.utcnow().timestamp()
+    expired_cache_keys = []
+
+    for existing_key, existing_session in checkout_session_cache.items():
+        cache_age = now_timestamp - existing_session["cached_at"]
+        stripe_expires_at = existing_session.get("expires_at")
+        if cache_age >= CHECKOUT_SESSION_COOLDOWN_SECONDS or (
+            stripe_expires_at and stripe_expires_at <= now_timestamp
+        ):
+            expired_cache_keys.append(existing_key)
+
+    for expired_key in expired_cache_keys:
+        checkout_session_cache.pop(expired_key, None)
+
+    cached_session = checkout_session_cache.get(cache_key)
+    if not cached_session:
+        return None
+
+    cache_age = now_timestamp - cached_session["cached_at"]
+    stripe_expires_at = cached_session.get("expires_at")
+
+    if cache_age >= CHECKOUT_SESSION_COOLDOWN_SECONDS:
+        checkout_session_cache.pop(cache_key, None)
+        return None
+
+    if stripe_expires_at and stripe_expires_at <= now_timestamp:
+        checkout_session_cache.pop(cache_key, None)
+        return None
+
+    return cached_session
+
+
+def clear_cached_checkout_sessions_for_user(user_id):
+    user_id = int(user_id)
+    cache_keys = [key for key in checkout_session_cache if key[0] == user_id]
+    for cache_key in cache_keys:
+        checkout_session_cache.pop(cache_key, None)
+
+    if cache_keys:
+        logging.info(f"Checkout Session cache cleared: user_id={user_id}, entries={len(cache_keys)}")
+
+
+async def send_checkout_open_instruction(callback, checkout_url, user_id, session_id, sub_type, mode, reused=False):
+    payment_keyboard = InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("💳 Перейти к оплате", url=checkout_url),
+        InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
+    )
+    await callback.message.answer(CHECKOUT_OPEN_INSTRUCTION, reply_markup=payment_keyboard)
+    logging.info(
+        f"Payment button sent: user_id={user_id}, session_id={session_id}, "
+        f"sub_type={sub_type}, mode={mode}, checkout_url_present={bool(checkout_url)}, reused={reused}"
+    )
+    logging.info(
+        f"Checkout opened instruction sent: user_id={user_id}, session_id={session_id}, "
+        f"sub_type={sub_type}, reused={reused}"
+    )
 
 async def notify_admins(text: str):
     for admin_id in ADMIN_IDS:
@@ -1982,25 +2051,57 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 }
             }
 
-        logging.info(
-            f"Создаю Checkout Session: user_id={user_id}, sub_type={sub_type}, "
-            f"mode={mode}, paid={paid}, expiry_date={expiry_date}, "
-            f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
-        )
-        session = stripe.checkout.Session.create(**session_params)
-        logging.info(
-            f"Checkout Session создана: user_id={user_id}, session_id={session.id}, "
-            f"sub_type={sub_type}, mode={mode}"
-        )
-        new_kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("💳 Перейти к оплате", url=session.url),
-            InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
-        )
-        # Меняем клавиатуру исходного сообщения (безопасно)
-        await callback.message.edit_reply_markup(reply_markup=new_kb)
-        logging.info(
-            f"Payment button sent: user_id={user_id}, session_id={session.id}, "
-            f"sub_type={sub_type}, mode={mode}, checkout_url_present={bool(session.url)}"
+        cache_key = (int(user_id), sub_type)
+        reused = False
+
+        async with checkout_session_cache_lock:
+            cached_session = get_reusable_checkout_session(cache_key)
+
+            if cached_session:
+                reused = True
+                session_id = cached_session["session_id"]
+                checkout_url = cached_session["checkout_url"]
+                cache_age = int(datetime.utcnow().timestamp() - cached_session["cached_at"])
+                logging.info(
+                    f"New Checkout Session blocked by cooldown: user_id={user_id}, "
+                    f"sub_type={sub_type}, existing_session_id={session_id}, cache_age_seconds={cache_age}"
+                )
+                logging.info(
+                    f"Reusing existing Checkout Session: user_id={user_id}, session_id={session_id}, "
+                    f"sub_type={sub_type}, mode={mode}"
+                )
+            else:
+                logging.info(
+                    f"Создаю Checkout Session: user_id={user_id}, sub_type={sub_type}, "
+                    f"mode={mode}, paid={paid}, expiry_date={expiry_date}, "
+                    f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
+                )
+                session = stripe.checkout.Session.create(**session_params)
+                session_id = session.id
+                checkout_url = session.url
+
+                if not checkout_url:
+                    raise ValueError(f"Stripe Checkout Session {session_id} не содержит url")
+
+                checkout_session_cache[cache_key] = {
+                    "session_id": session_id,
+                    "checkout_url": checkout_url,
+                    "cached_at": datetime.utcnow().timestamp(),
+                    "expires_at": getattr(session, 'expires_at', None),
+                }
+                logging.info(
+                    f"Checkout Session создана: user_id={user_id}, session_id={session_id}, "
+                    f"sub_type={sub_type}, mode={mode}"
+                )
+
+        await send_checkout_open_instruction(
+            callback,
+            checkout_url,
+            user_id,
+            session_id,
+            sub_type,
+            mode,
+            reused=reused
         )
         await state.finish()
     except Exception as e:
@@ -3962,6 +4063,7 @@ async def stripe_webhook(request):
                 first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
             """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
             conn.commit()
+            clear_cached_checkout_sessions_for_user(user_id)
             logging.info(
                 f"User access activated: source=checkout.session.completed, event_id={event_id}, "
                 f"user_id={user_id}, paid=True, expiry_date={new_expiry}, "
@@ -4407,6 +4509,7 @@ async def stripe_webhook(request):
         user_id = getattr(session, 'client_reference_id', None)
 
         if user_id:
+            clear_cached_checkout_sessions_for_user(user_id)
             kb = InlineKeyboardMarkup(row_width=1).add(
                 InlineKeyboardButton("🔁 Выбрать тариф заново", callback_data="retry_payment")
             )
