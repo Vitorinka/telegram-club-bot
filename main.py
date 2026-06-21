@@ -53,8 +53,10 @@ checkout_session_cache_lock = asyncio.Lock()
 
 CHECKOUT_OPEN_INSTRUCTION = (
     "💳 Нажмите кнопку ниже, чтобы перейти к оплате.\n\n"
-    "Если страница оплаты сбрасывается или не дает ввести данные, откройте ссылку "
-    "во внешнем браузере Safari/Chrome через меню ⋯."
+    "Если страница оплаты открылась внутри Telegram и сбрасывается, это может быть связано "
+    "со встроенным браузером Telegram.\n\n"
+    "Попробуйте открыть оплату во внешнем браузере Safari или Chrome: нажмите ⋯ в окне оплаты "
+    "и выберите «Открыть в браузере»."
 )
 
 # --- СОСТОЯНИЯ FSM ---
@@ -314,14 +316,15 @@ async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, s
     attempt_time_text = datetime.utcfromtimestamp(attempt_timestamp).strftime("%d.%m.%Y %H:%M:%S UTC")
 
     await notify_admins(
-        "Повторная попытка открыть Stripe Checkout.\n\n"
-        f"telegram_id: {user_id}\n"
-        f"username: {username_text}\n"
-        f"имя: {name_text}\n"
-        f"тариф: {sub_type}\n"
-        f"попыток за 5 минут: {attempt_count}\n"
-        f"последняя session_id: {session_id}\n"
-        f"время последней попытки: {attempt_time_text}\n\n"
+        "Возможная проблема с оплатой\n\n"
+        "Пользователь несколько раз открыл оплату, но успешной оплаты пока нет.\n\n"
+        f"Telegram ID: {user_id}\n"
+        f"Username: {username_text}\n"
+        f"Имя: {name_text}\n"
+        f"Тариф: {sub_type}\n"
+        f"Попыток за последние 5 минут: {attempt_count}\n"
+        f"Последняя session_id: {session_id}\n"
+        f"Время последней попытки: {attempt_time_text}\n\n"
         "Возможная причина: Stripe Checkout сбрасывается во встроенном браузере Telegram. "
         "Пользователю отправлена инструкция открыть оплату во внешнем браузере."
     )
