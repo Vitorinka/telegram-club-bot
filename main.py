@@ -1998,9 +1998,16 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         )
         # Меняем клавиатуру исходного сообщения (безопасно)
         await callback.message.edit_reply_markup(reply_markup=new_kb)
+        logging.info(
+            f"Payment button sent: user_id={user_id}, session_id={session.id}, "
+            f"sub_type={sub_type}, mode={mode}, checkout_url_present={bool(session.url)}"
+        )
         await state.finish()
     except Exception as e:
-        logging.error(f"Stripe ошибка: {e}")
+        logging.exception(
+            f"Ошибка создания или отправки Stripe Checkout: user_id={user_id}, "
+            f"sub_type={sub_type}, mode={mode}: {e}"
+        )
         await callback.answer(
             "Техническая ошибка. Попробуйте позже или напишите @re_tasha",
             show_alert=True
@@ -3753,16 +3760,30 @@ async def test_grace(message: types.Message):
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+    logging.info(
+        f"Stripe webhook received: path={request.path}, payload_bytes={len(payload)}, "
+        f"signature_present={bool(sig_header)}, webhook_secret_configured={bool(webhook_secret)}"
+    )
+
+    if not webhook_secret:
+        logging.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET не задан.")
+        return web.Response(status=500)
+
     try:
         event = stripe.Webhook.construct_event(
-            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+            payload, sig_header, webhook_secret
         )
     except Exception as e:
-        logging.error(f"Ошибка подписи вебхука: {e}")
+        logging.exception(f"Ошибка проверки подписи Stripe webhook: {e}")
         return web.Response(status=400)
 
     event_id = event['id']
+    event_type = event['type']
+    logging.info(f"Stripe webhook event: event_id={event_id}, event.type={event_type}")
+
     if await is_event_processed(event_id):
+        logging.info(f"Stripe webhook event already processed: event_id={event_id}, event.type={event_type}")
         return web.Response(status=200)
 
     def stripe_value(obj, *path):
@@ -3872,7 +3893,18 @@ async def stripe_webhook(request):
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         user_id = getattr(session, 'client_reference_id', None)
+        logging.info(
+            "Stripe checkout.session.completed data: "
+            f"event_id={event_id}, session_id={stripe_value(session, 'id')}, "
+            f"user_id={user_id}, metadata_telegram_id={stripe_value(session, 'metadata', 'telegram_id')}, "
+            f"metadata_days={stripe_value(session, 'metadata', 'days')}, "
+            f"mode={stripe_value(session, 'mode')}, payment_status={stripe_value(session, 'payment_status')}"
+        )
         if not user_id:
+            logging.error(
+                f"checkout.session.completed пропущен: client_reference_id отсутствует, "
+                f"event_id={event_id}, session_id={stripe_value(session, 'id')}"
+            )
             await mark_event_processed(event_id)
             return web.Response(status=200)
 
@@ -3928,8 +3960,13 @@ async def stripe_webhook(request):
                 reminder_sent = FALSE,
                 blocked_bot = FALSE,
                 first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-        """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
+            """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
             conn.commit()
+            logging.info(
+                f"User access activated: source=checkout.session.completed, event_id={event_id}, "
+                f"user_id={user_id}, paid=True, expiry_date={new_expiry}, "
+                f"stripe_subscription_id={sub_id or 'нет'}, blocked_bot=False"
+            )
 
             await log_access_event(
                 user_id,
@@ -3985,7 +4022,10 @@ async def stripe_webhook(request):
                     logging.error(f"Ошибка разбана {user_id}: {e}")
         except Exception as e:
             conn.rollback()
-            logging.error(f"Ошибка checkout: {e}")
+            logging.exception(
+                f"Ошибка обработки checkout.session.completed: event_id={event_id}, "
+                f"user_id={user_id}, session_id={stripe_value(session, 'id')}: {e}"
+            )
             await notify_admins(
                 f"Ошибка обработки checkout.session.completed.\n\n"
                 f"user_id: {user_id}\n"
@@ -4001,6 +4041,12 @@ async def stripe_webhook(request):
         # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
     elif event['type'] == 'invoice.payment_succeeded':
         invoice = event['data']['object']
+        logging.info(
+            "Stripe invoice.payment_succeeded data: "
+            f"event_id={event_id}, invoice_id={stripe_value(invoice, 'id')}, "
+            f"customer_id={stripe_object_id(stripe_value(invoice, 'customer'))}, "
+            f"metadata_telegram_id={stripe_value(invoice, 'metadata', 'telegram_id')}"
+        )
         sub_id = stripe_object_id(stripe_value(invoice, 'subscription'))
         sub_id = sub_id or stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription'))
         lines_data = stripe_value(invoice, 'lines', 'data') or []
@@ -4181,6 +4227,11 @@ async def stripe_webhook(request):
 
             telegram_id = row[0]
             invoice_id = stripe_value(invoice, 'id') or "нет"
+            logging.info(
+                f"User access activated: source=invoice.payment_succeeded, event_id={event_id}, "
+                f"invoice_id={invoice_id}, user_id={telegram_id}, paid=True, "
+                f"expiry_date={new_expiry}, stripe_subscription_id={sub_id}, blocked_bot=False"
+            )
 
             if old_expiry and old_expiry >= new_expiry:
                 logging.info(
@@ -4233,7 +4284,10 @@ async def stripe_webhook(request):
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"Ошибка invoice.payment_succeeded: {e}")
+            logging.exception(
+                f"Ошибка invoice.payment_succeeded: event_id={event_id}, "
+                f"subscription_id={sub_id}, customer_id={customer_id}: {e}"
+            )
             await notify_admins(
                 f"Ошибка обработки успешной оплаты Stripe.\n\n"
                 f"subscription_id: {sub_id}\n"
