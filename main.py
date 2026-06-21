@@ -45,7 +45,10 @@ dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 
 CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
+CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
+CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 checkout_session_cache = {}
+checkout_retry_state = {}
 checkout_session_cache_lock = asyncio.Lock()
 
 CHECKOUT_OPEN_INSTRUCTION = (
@@ -261,18 +264,103 @@ def clear_cached_checkout_sessions_for_user(user_id):
         logging.info(f"Checkout Session cache cleared: user_id={user_id}, entries={len(cache_keys)}")
 
 
+def register_checkout_attempt(telegram_user, sub_type):
+    user_id = int(telegram_user.id)
+    now_timestamp = datetime.utcnow().timestamp()
+    retry_state = checkout_retry_state.setdefault(
+        user_id,
+        {"attempts": [], "last_admin_alert_at": None}
+    )
+    retry_state["attempts"] = [
+        attempt
+        for attempt in retry_state["attempts"]
+        if now_timestamp - attempt["timestamp"] < CHECKOUT_RETRY_WINDOW_SECONDS
+    ]
+    retry_state["attempts"].append({"timestamp": now_timestamp, "sub_type": sub_type})
+    retry_state["username"] = telegram_user.username
+    retry_state["first_name"] = telegram_user.first_name
+    retry_state["last_name"] = telegram_user.last_name
+
+    attempt_count = len(retry_state["attempts"])
+    if attempt_count >= 2:
+        logging.warning(
+            f"Checkout retry detected: user_id={user_id}, sub_type={sub_type}, "
+            f"attempts_in_window={attempt_count}, window_seconds={CHECKOUT_RETRY_WINDOW_SECONDS}"
+        )
+
+    return attempt_count, now_timestamp
+
+
+async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, session_id, attempt_timestamp):
+    retry_state = checkout_retry_state.get(int(user_id))
+    if not retry_state or attempt_count < 2:
+        return
+
+    if not ADMIN_IDS:
+        logging.warning(
+            f"Checkout retry admin alert skipped: ADMIN_IDS не настроен, user_id={user_id}, "
+            f"sub_type={sub_type}, attempts={attempt_count}"
+        )
+        return
+
+    last_admin_alert_at = retry_state.get("last_admin_alert_at")
+    if last_admin_alert_at and attempt_timestamp - last_admin_alert_at < CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS:
+        return
+
+    username = retry_state.get("username")
+    username_text = f"@{username}" if username else "нет"
+    name_parts = [retry_state.get("first_name"), retry_state.get("last_name")]
+    name_text = " ".join(part for part in name_parts if part) or "нет"
+    attempt_time_text = datetime.utcfromtimestamp(attempt_timestamp).strftime("%d.%m.%Y %H:%M:%S UTC")
+
+    await notify_admins(
+        "Повторная попытка открыть Stripe Checkout.\n\n"
+        f"telegram_id: {user_id}\n"
+        f"username: {username_text}\n"
+        f"имя: {name_text}\n"
+        f"тариф: {sub_type}\n"
+        f"попыток за 5 минут: {attempt_count}\n"
+        f"последняя session_id: {session_id}\n"
+        f"время последней попытки: {attempt_time_text}\n\n"
+        "Возможная причина: Stripe Checkout сбрасывается во встроенном браузере Telegram. "
+        "Пользователю отправлена инструкция открыть оплату во внешнем браузере."
+    )
+    retry_state["last_admin_alert_at"] = attempt_timestamp
+    logging.info(
+        f"Admin checkout issue alert sent: user_id={user_id}, sub_type={sub_type}, "
+        f"attempts={attempt_count}, session_id={session_id}"
+    )
+
+
+def reset_checkout_retry_state_after_success(user_id, source):
+    user_id = int(user_id)
+    clear_cached_checkout_sessions_for_user(user_id)
+    checkout_retry_state.pop(user_id, None)
+    logging.info(
+        f"Checkout retry state reset after successful payment: user_id={user_id}, source={source}"
+    )
+
+
 async def send_checkout_open_instruction(callback, checkout_url, user_id, session_id, sub_type, mode, reused=False):
     payment_keyboard = InlineKeyboardMarkup(row_width=1).add(
         InlineKeyboardButton("💳 Перейти к оплате", url=checkout_url),
         InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
     )
-    await callback.message.answer(CHECKOUT_OPEN_INSTRUCTION, reply_markup=payment_keyboard)
+    instruction_text = (
+        f"{CHECKOUT_OPEN_INSTRUCTION}\n\n"
+        f"Ссылка для оплаты:\n{checkout_url}"
+    )
+    await callback.message.answer(instruction_text, reply_markup=payment_keyboard)
     logging.info(
         f"Payment button sent: user_id={user_id}, session_id={session_id}, "
         f"sub_type={sub_type}, mode={mode}, checkout_url_present={bool(checkout_url)}, reused={reused}"
     )
     logging.info(
         f"Checkout opened instruction sent: user_id={user_id}, session_id={session_id}, "
+        f"sub_type={sub_type}, reused={reused}"
+    )
+    logging.info(
+        f"Checkout external browser instruction sent: user_id={user_id}, session_id={session_id}, "
         f"sub_type={sub_type}, reused={reused}"
     )
 
@@ -2049,9 +2137,10 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 'metadata': {
                     'telegram_id': str(user_id)
                 }
-            }
+        }
 
         cache_key = (int(user_id), sub_type)
+        attempt_count, attempt_timestamp = register_checkout_attempt(callback.from_user, sub_type)
         reused = False
 
         async with checkout_session_cache_lock:
@@ -2102,6 +2191,13 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             sub_type,
             mode,
             reused=reused
+        )
+        await notify_admins_about_checkout_retry(
+            user_id,
+            sub_type,
+            attempt_count,
+            session_id,
+            attempt_timestamp
         )
         await state.finish()
     except Exception as e:
@@ -4063,7 +4159,11 @@ async def stripe_webhook(request):
                 first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
             """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
             conn.commit()
-            clear_cached_checkout_sessions_for_user(user_id)
+            logging.info(
+                f"Checkout Session marked completed: user_id={user_id}, "
+                f"session_id={stripe_value(session, 'id')}, event_id={event_id}"
+            )
+            reset_checkout_retry_state_after_success(user_id, "checkout.session.completed")
             logging.info(
                 f"User access activated: source=checkout.session.completed, event_id={event_id}, "
                 f"user_id={user_id}, paid=True, expiry_date={new_expiry}, "
@@ -4329,6 +4429,7 @@ async def stripe_webhook(request):
 
             telegram_id = row[0]
             invoice_id = stripe_value(invoice, 'id') or "нет"
+            reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
             logging.info(
                 f"User access activated: source=invoice.payment_succeeded, event_id={event_id}, "
                 f"invoice_id={invoice_id}, user_id={telegram_id}, paid=True, "
