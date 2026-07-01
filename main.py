@@ -578,7 +578,7 @@ async def ban_user_logic(telegram_id, cur):
 
     if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
         logging.warning(
-            "USER_REMOVE_SKIPPED_SAFETY_CHECK: telegram_id=%s, reason=%s, paid=%s, "
+            "USER_REMOVE_STRIPE_RECHECK_REQUIRED: telegram_id=%s, reason=%s, paid=%s, "
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "auto_renew_with_stripe_subscription_needs_recheck", paid, expiry_date,
             grace_period_end, auto_renew, stripe_subscription_id
@@ -4842,6 +4842,32 @@ async def stripe_webhook(request):
                 RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
             """, (PAYMENT_RETRY_GRACE_HOURS, None if customer_id == "нет" else customer_id, sub_id))
             row = cur.fetchone()
+            if not row and customer_id != "нет":
+                cur.execute("""
+                    UPDATE users
+                    SET payment_failed = TRUE,
+                        payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                        grace_period_end = GREATEST(
+                            COALESCE(grace_period_end, NOW()),
+                            NOW() + (%s * INTERVAL '1 hour')
+                        ),
+                        stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
+                        stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                    WHERE stripe_customer_id = %s
+                    RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
+                """, (PAYMENT_RETRY_GRACE_HOURS, sub_id, customer_id, customer_id))
+                row = cur.fetchone()
+                if row:
+                    logging.warning(
+                        "PAYMENT_FAILED_USER_MATCHED_BY_CUSTOMER_ID: telegram_id=%s, customer_id=%s, "
+                        "email=%s, subscription_id=%s, invoice_id=%s, event.type=%s",
+                        row[0],
+                        customer_id,
+                        customer_email,
+                        sub_id,
+                        invoice_id,
+                        event_type,
+                    )
             conn.commit()
             cur.close()
             conn.close()
@@ -4948,6 +4974,8 @@ async def stripe_webhook(request):
         cancel_at_period_end = bool(stripe_value(sub, 'cancel_at_period_end'))
         status = stripe_value(sub, 'status')
         customer_id = stripe_object_id(stripe_value(sub, 'customer'))
+        current_period_end = stripe_value(sub, 'current_period_end')
+        subscription_expiry = datetime.utcfromtimestamp(current_period_end) if current_period_end else None
         if sub_id:
             conn = get_db_conn()
             cur = conn.cursor()
@@ -4980,6 +5008,40 @@ async def stripe_webhook(request):
                     row[2] if row else None,
                     row[3] if row else None,
                     row[4] if row else None,
+                )
+            elif status in ("active", "trialing"):
+                cur.execute("""
+                    UPDATE users
+                    SET paid = TRUE,
+                        expiry_date = CASE
+                            WHEN %s IS NOT NULL THEN %s
+                            ELSE expiry_date
+                        END,
+                        payment_failed = FALSE,
+                        payment_failed_at = NULL,
+                        last_payment_succeeded_at = COALESCE(last_payment_succeeded_at, NOW()),
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE,
+                        auto_renew = %s,
+                        stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                    WHERE stripe_subscription_id = %s
+                    RETURNING telegram_id, paid, expiry_date
+                """, (subscription_expiry, subscription_expiry, not cancel_at_period_end, customer_id, sub_id))
+                row = cur.fetchone()
+                logging.info(
+                    "SUBSCRIPTION_ACTIVE_STATE_RESTORED: event_id=%s, event.type=%s, telegram_id=%s, "
+                    "customer_id=%s, subscription_id=%s, status=%s, cancel_at_period_end=%s, "
+                    "paid=%s, expiry_date=%s, current_period_end=%s",
+                    event_id,
+                    event_type,
+                    row[0] if row else None,
+                    customer_id,
+                    sub_id,
+                    status,
+                    cancel_at_period_end,
+                    row[1] if row else None,
+                    row[2] if row else None,
+                    current_period_end,
                 )
             else:
                 cur.execute("""
