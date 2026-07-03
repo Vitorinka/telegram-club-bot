@@ -116,6 +116,43 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         );
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_links (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            customer_email TEXT,
+            status TEXT,
+            current_period_end TIMESTAMP,
+            is_active BOOLEAN DEFAULT FALSE,
+            source TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (telegram_id, stripe_customer_id, stripe_subscription_id)
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS unlinked_stripe_events (
+            id SERIAL PRIMARY KEY,
+            event_id TEXT UNIQUE,
+            event_type TEXT,
+            invoice_id TEXT,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            customer_email TEXT,
+            amount_paid BIGINT,
+            currency TEXT,
+            billing_reason TEXT,
+            period_end TIMESTAMP,
+            raw_summary TEXT,
+            resolved BOOLEAN DEFAULT FALSE,
+            resolved_by BIGINT,
+            resolved_telegram_id BIGINT,
+            resolved_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
     # Добавляем недостающие колонки (для старых БД)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
@@ -132,6 +169,16 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent_at TIMESTAMP;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_received BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS customer_email TEXT;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS status TEXT;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMP;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS source TEXT;")
+    cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();")
+    cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_by BIGINT;")
+    cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_telegram_id BIGINT;")
+    cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;")
     conn.commit()
     cur.close()
     conn.close()
@@ -201,6 +248,190 @@ async def log_access_event(
             cur.close()
         if conn:
             conn.close()
+
+def get_obj_value(obj, *path):
+    current = obj
+    for key in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def get_stripe_object_id(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return get_obj_value(value, "id")
+
+
+def stripe_period_to_datetime(period_end):
+    return datetime.utcfromtimestamp(period_end) if period_end else None
+
+
+def upsert_stripe_link(
+    cur,
+    telegram_id,
+    stripe_customer_id=None,
+    stripe_subscription_id=None,
+    customer_email=None,
+    status=None,
+    current_period_end=None,
+    is_active=False,
+    source=None,
+):
+    if not telegram_id or (not stripe_customer_id and not stripe_subscription_id):
+        return
+
+    current_period_end_dt = (
+        current_period_end
+        if isinstance(current_period_end, datetime)
+        else stripe_period_to_datetime(current_period_end)
+    )
+    cur.execute("""
+        INSERT INTO stripe_links (
+            telegram_id,
+            stripe_customer_id,
+            stripe_subscription_id,
+            customer_email,
+            status,
+            current_period_end,
+            is_active,
+            source,
+            updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (telegram_id, stripe_customer_id, stripe_subscription_id) DO UPDATE SET
+            customer_email = COALESCE(EXCLUDED.customer_email, stripe_links.customer_email),
+            status = COALESCE(EXCLUDED.status, stripe_links.status),
+            current_period_end = COALESCE(EXCLUDED.current_period_end, stripe_links.current_period_end),
+            is_active = EXCLUDED.is_active,
+            source = COALESCE(EXCLUDED.source, stripe_links.source),
+            updated_at = NOW()
+    """, (
+        int(telegram_id),
+        stripe_customer_id,
+        stripe_subscription_id,
+        customer_email,
+        status,
+        current_period_end_dt,
+        bool(is_active),
+        source,
+    ))
+
+
+def find_telegram_id_for_stripe(cur, metadata_telegram_id=None, stripe_subscription_id=None, stripe_customer_id=None):
+    if metadata_telegram_id:
+        try:
+            metadata_telegram_id = int(metadata_telegram_id)
+        except (TypeError, ValueError):
+            metadata_telegram_id = None
+
+        if metadata_telegram_id:
+            cur.execute("SELECT telegram_id FROM users WHERE telegram_id = %s", (metadata_telegram_id,))
+            row = cur.fetchone()
+            if row:
+                return row[0], "metadata.telegram_id"
+
+    if stripe_subscription_id:
+        cur.execute("SELECT telegram_id FROM users WHERE stripe_subscription_id = %s", (stripe_subscription_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], "users.stripe_subscription_id"
+
+    if stripe_customer_id:
+        cur.execute("SELECT telegram_id FROM users WHERE stripe_customer_id = %s", (stripe_customer_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], "users.stripe_customer_id"
+
+    if stripe_subscription_id:
+        cur.execute("""
+            SELECT telegram_id
+            FROM stripe_links
+            WHERE stripe_subscription_id = %s
+            ORDER BY is_active DESC, updated_at DESC
+            LIMIT 1
+        """, (stripe_subscription_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], "stripe_links.stripe_subscription_id"
+
+    if stripe_customer_id:
+        cur.execute("""
+            SELECT telegram_id
+            FROM stripe_links
+            WHERE stripe_customer_id = %s
+            ORDER BY is_active DESC, updated_at DESC
+            LIMIT 1
+        """, (stripe_customer_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], "stripe_links.stripe_customer_id"
+
+    return None, None
+
+
+def save_unlinked_stripe_event(
+    cur,
+    event_id,
+    event_type,
+    invoice_id=None,
+    stripe_customer_id=None,
+    stripe_subscription_id=None,
+    customer_email=None,
+    amount_paid=None,
+    currency=None,
+    billing_reason=None,
+    period_end=None,
+    raw_summary=None,
+):
+    period_end_dt = period_end if isinstance(period_end, datetime) else stripe_period_to_datetime(period_end)
+    cur.execute("""
+        INSERT INTO unlinked_stripe_events (
+            event_id,
+            event_type,
+            invoice_id,
+            stripe_customer_id,
+            stripe_subscription_id,
+            customer_email,
+            amount_paid,
+            currency,
+            billing_reason,
+            period_end,
+            raw_summary,
+            resolved
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+        ON CONFLICT (event_id) DO UPDATE SET
+            event_type = EXCLUDED.event_type,
+            invoice_id = COALESCE(EXCLUDED.invoice_id, unlinked_stripe_events.invoice_id),
+            stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, unlinked_stripe_events.stripe_customer_id),
+            stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, unlinked_stripe_events.stripe_subscription_id),
+            customer_email = COALESCE(EXCLUDED.customer_email, unlinked_stripe_events.customer_email),
+            amount_paid = COALESCE(EXCLUDED.amount_paid, unlinked_stripe_events.amount_paid),
+            currency = COALESCE(EXCLUDED.currency, unlinked_stripe_events.currency),
+            billing_reason = COALESCE(EXCLUDED.billing_reason, unlinked_stripe_events.billing_reason),
+            period_end = COALESCE(EXCLUDED.period_end, unlinked_stripe_events.period_end),
+            raw_summary = COALESCE(EXCLUDED.raw_summary, unlinked_stripe_events.raw_summary)
+    """, (
+        event_id,
+        event_type,
+        invoice_id,
+        stripe_customer_id,
+        stripe_subscription_id,
+        customer_email,
+        amount_paid,
+        currency,
+        billing_reason,
+        period_end_dt,
+        raw_summary,
+    ))
+
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def generate_invite_link():
@@ -522,6 +753,126 @@ def has_valid_stripe_subscription_id(stripe_subscription_id):
         return False
 
     return subscription_id.startswith("sub_")
+
+
+async def get_open_invoice_url_for_subscription(stripe_subscription_id):
+    try:
+        invoices = await asyncio.to_thread(
+            stripe.Invoice.list,
+            subscription=stripe_subscription_id,
+            status="open",
+            limit=5
+        )
+        invoice_data = getattr(invoices, "data", None) or []
+        for invoice in invoice_data:
+            hosted_invoice_url = getattr(invoice, "hosted_invoice_url", None)
+            if hosted_invoice_url:
+                return hosted_invoice_url, getattr(invoice, "id", None)
+    except Exception as e:
+        logging.error(
+            "OPEN_INVOICE_LOOKUP_FAILED: stripe_subscription_id=%s, error=%s",
+            stripe_subscription_id,
+            str(e),
+            exc_info=True,
+        )
+
+    return None, None
+
+
+async def create_billing_portal_url(stripe_customer_id):
+    if not stripe_customer_id:
+        return None
+
+    try:
+        portal = await asyncio.to_thread(
+            stripe.billing_portal.Session.create,
+            customer=stripe_customer_id,
+            return_url="https://t.me/Natalia_SoulFit_bot"
+        )
+        return getattr(portal, "url", None)
+    except Exception as e:
+        logging.error(
+            "BILLING_PORTAL_CREATE_FAILED: stripe_customer_id=%s, error=%s",
+            stripe_customer_id,
+            str(e),
+            exc_info=True,
+        )
+        return None
+
+
+async def send_existing_subscription_action(callback, user_id, stripe_subscription_id, stripe_customer_id, status, current_period_end=None):
+    invoice_url, invoice_id = await get_open_invoice_url_for_subscription(stripe_subscription_id)
+    if invoice_url:
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("💳 Оплатить открытый счёт", url=invoice_url)
+        )
+        await callback.message.answer(
+            "У вас уже есть подписка Stripe, поэтому новую подписку я не создаю.\n\n"
+            "Stripe ждёт оплату открытого счёта. Нажмите кнопку ниже, чтобы оплатить его.",
+            reply_markup=kb
+        )
+        logging.warning(
+            "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
+            "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s, invoice_id=%s",
+            user_id,
+            stripe_subscription_id,
+            stripe_customer_id,
+            status,
+            "open_invoice_url_sent",
+            invoice_id,
+        )
+        return True
+
+    portal_url = await create_billing_portal_url(stripe_customer_id)
+    if portal_url:
+        kb = InlineKeyboardMarkup(row_width=1).add(
+            InlineKeyboardButton("💳 Управлять оплатой", url=portal_url)
+        )
+        expiry_text = (
+            datetime.utcfromtimestamp(current_period_end).strftime("%d.%m.%Y %H:%M")
+            if current_period_end else "не определён"
+        )
+        await callback.message.answer(
+            "У вас уже есть подписка Stripe, поэтому новую подписку я не создаю.\n\n"
+            f"Статус подписки: {status or 'неизвестен'}.\n"
+            f"Текущий период до: {expiry_text}.\n\n"
+            "Через кнопку ниже можно оплатить счёт, сменить карту или управлять подпиской.",
+            reply_markup=kb
+        )
+        logging.warning(
+            "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
+            "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
+            user_id,
+            stripe_subscription_id,
+            stripe_customer_id,
+            status,
+            "billing_portal_sent",
+        )
+        return True
+
+    await callback.message.answer(
+        "У вас уже есть подписка Stripe, поэтому новую подписку я не создаю.\n\n"
+        "Но мне не удалось сформировать ссылку для оплаты или смены карты. "
+        "Пожалуйста, напишите администратору."
+    )
+    await notify_admins(
+        "Checkout заблокирован, потому что у пользователя уже есть Stripe subscription, "
+        "но не удалось создать invoice/billing portal ссылку.\n\n"
+        f"telegram_id: {user_id}\n"
+        f"stripe_customer_id: {stripe_customer_id or 'нет'}\n"
+        f"stripe_subscription_id: {stripe_subscription_id or 'нет'}\n"
+        f"status: {status or 'нет'}"
+    )
+    logging.warning(
+        "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
+        "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
+        user_id,
+        stripe_subscription_id,
+        stripe_customer_id,
+        status,
+        "manual_admin_review_required",
+    )
+    return True
 
 
 async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
@@ -2308,7 +2659,8 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             expiry_date,
             auto_renew,
             stripe_subscription_id,
-            payment_failed
+            payment_failed,
+            stripe_customer_id
         FROM users
         WHERE telegram_id = %s
     """, (user_id,))
@@ -2320,6 +2672,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     auto_renew = row[3] if row else False
     stripe_subscription_id = row[4] if row else None
     payment_failed = row[5] if row else False
+    stripe_customer_id = row[6] if row else None
 
     if paid and expiry_date and expiry_date > datetime.utcnow() and not payment_failed:
         logging.info(
@@ -2334,14 +2687,42 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         await state.finish()
         return
 
-    if auto_renew and stripe_subscription_id:
+    mode = 'payment' if sub_type == "sub_trial" else 'subscription'
+
+    if mode == 'subscription' and stripe_subscription_id:
         try:
             subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
             status = getattr(subscription, 'status', None)
             current_period_end = getattr(subscription, 'current_period_end', None)
             customer = getattr(subscription, 'customer', None)
             customer_id = customer if isinstance(customer, str) else getattr(customer, 'id', None)
+            customer_id = customer_id or stripe_customer_id
             period_source = "subscription.current_period_end"
+
+            if status in ('past_due', 'unpaid', 'incomplete'):
+                upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    status=status,
+                    current_period_end=current_period_end,
+                    is_active=False,
+                    source="checkout_existing_subscription_guard",
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+                await send_existing_subscription_action(
+                    callback,
+                    user_id,
+                    stripe_subscription_id,
+                    customer_id,
+                    status,
+                    current_period_end=current_period_end
+                )
+                await state.finish()
+                return
 
             if status in ('active', 'trialing') and not current_period_end:
                 invoices = await asyncio.to_thread(
@@ -2383,10 +2764,29 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                             blocked_bot = FALSE
                         WHERE telegram_id = %s
                     """, (new_expiry, customer_id, user_id))
+                    upsert_stripe_link(
+                        cur,
+                        user_id,
+                        stripe_customer_id=customer_id,
+                        stripe_subscription_id=stripe_subscription_id,
+                        status=status,
+                        current_period_end=current_period_end,
+                        is_active=True,
+                        source="checkout_existing_subscription_guard",
+                    )
                     conn.commit()
                     logging.info(
                         f"Checkout заблокирован: у пользователя {user_id} уже есть активная Stripe-подписка. "
                         f"period_source={period_source}"
+                    )
+                    logging.warning(
+                        "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
+                        "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
+                        user_id,
+                        stripe_subscription_id,
+                        customer_id,
+                        status,
+                        "active_subscription_no_checkout",
                     )
                     cur.close()
                     conn.close()
@@ -2411,16 +2811,60 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                         blocked_bot = FALSE
                     WHERE telegram_id = %s
                 """, (stripe_subscription_id, customer_id, user_id))
+                upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    status=status,
+                    current_period_end=current_period_end,
+                    is_active=True,
+                    source="checkout_existing_subscription_guard",
+                )
                 conn.commit()
                 logging.warning(
                     f"Checkout заблокирован: Stripe subscription active/trialing, но period_end не найден. "
                     f"user_id={user_id}, stripe_subscription_id={stripe_subscription_id}, customer_id={customer_id}"
+                )
+                logging.warning(
+                    "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
+                    "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
+                    user_id,
+                    stripe_subscription_id,
+                    customer_id,
+                    status,
+                    "active_subscription_period_unknown_no_checkout",
                 )
                 cur.close()
                 conn.close()
                 await callback.message.answer(
                     "✅ У вас уже есть активная подписка.\n"
                     "Повторная оплата не нужна. Если доступ не обновился, напишите администратору."
+                )
+                await state.finish()
+                return
+
+            if status not in (None, 'canceled', 'incomplete_expired'):
+                upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    status=status,
+                    current_period_end=current_period_end,
+                    is_active=False,
+                    source="checkout_existing_subscription_guard",
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+                await send_existing_subscription_action(
+                    callback,
+                    user_id,
+                    stripe_subscription_id,
+                    customer_id,
+                    status,
+                    current_period_end=current_period_end
                 )
                 await state.finish()
                 return
@@ -2472,8 +2916,6 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     if not price_id:
         await callback.answer("Ошибка конфигурации тарифа.", show_alert=True)
         return
-
-    mode = 'payment' if sub_type == "sub_trial" else 'subscription'
 
     try:
         session_params = {
@@ -3934,6 +4376,8 @@ ADMIN_MENU_SECTIONS = {
             "/give_access <telegram_id> <days> — выдать или продлить доступ",
             "/set_expiry <telegram_id> <YYYY-MM-DD> — установить точную дату доступа",
             "/sync_stripe_user <telegram_id> — синхронизировать Stripe",
+            "/unlinked_stripe — показать Stripe оплаты без пользователя",
+            "/stripe_links <telegram_id> — показать Stripe связи пользователя",
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id> — связать Stripe с пользователем",
             "/send_invite_link <telegram_id> — отправить invite link",
             "/unban_user <telegram_id> — снять бан в группе",
@@ -4533,6 +4977,17 @@ async def stripe_webhook(request):
                 blocked_bot = FALSE,
                 first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
             """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
+            upsert_stripe_link(
+                cur,
+                user_id,
+                stripe_customer_id=customer_id,
+                stripe_subscription_id=sub_id,
+                customer_email=customer_email,
+                status="checkout_completed",
+                current_period_end=new_expiry,
+                is_active=True,
+                source="checkout.session.completed",
+            )
             conn.commit()
             logging.info(
                 f"Checkout Session marked completed: user_id={user_id}, "
@@ -4660,6 +5115,21 @@ async def stripe_webhook(request):
         try:
             if not sub_id:
                 logging.error(f"invoice.payment_succeeded: не найден subscription_id, event={event_id}")
+                lines_data = stripe_value(invoice, 'lines', 'data') or []
+                first_line = lines_data[0] if lines_data else None
+                save_unlinked_stripe_event(
+                    cur,
+                    event_id,
+                    event_type,
+                    invoice_id=stripe_value(invoice, 'id'),
+                    stripe_customer_id=customer_id,
+                    customer_email=stripe_value(invoice, 'customer_email') or stripe_value(stripe_value(invoice, 'customer'), 'email'),
+                    amount_paid=stripe_value(invoice, 'amount_paid'),
+                    currency=stripe_value(invoice, 'currency'),
+                    billing_reason=stripe_value(invoice, 'billing_reason'),
+                    period_end=stripe_value(first_line, 'period', 'end'),
+                    raw_summary="invoice.payment_succeeded without subscription_id",
+                )
                 await notify_unlinked_invoice(invoice)
                 conn.commit()
                 await mark_event_processed(event_id)
@@ -4697,81 +5167,86 @@ async def stripe_webhook(request):
 
             new_expiry = datetime.utcfromtimestamp(current_period_end)
             old_expiry = None
-
-            cur.execute("""
-                WITH target AS (
-                    SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
-                    FROM users
-                    WHERE stripe_subscription_id = %s
-                )
-                UPDATE users
-                SET expiry_date = CASE
-                        WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                        ELSE %s
-                    END,
-                    paid = TRUE,
-                    stripe_subscription_id = %s,
-                    stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
-                    payment_failed = FALSE,
-                    payment_failed_at = NULL,
-                    last_payment_succeeded_at = NOW(),
-                    grace_period_end = NULL,
-                    reminder_sent = FALSE,
-                    auto_renew = TRUE,
-                    blocked_bot = FALSE
-                FROM target
-                WHERE users.telegram_id = target.telegram_id
-                RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
-            """, (sub_id, new_expiry, new_expiry, sub_id, customer_id))
-
-            row = cur.fetchone()
+            row = None
             was_payment_failed = False
-            if row:
-                old_expiry = row[1]
-                was_payment_failed = row[2]
+            metadata_telegram_id = (
+                stripe_value(invoice, 'metadata', 'telegram_id')
+                or stripe_value(subscription, 'metadata', 'telegram_id')
+            )
+
+            if metadata_telegram_id:
+                try:
+                    metadata_telegram_id = int(metadata_telegram_id)
+                except (TypeError, ValueError):
+                    logging.error(
+                        f"invoice.payment_succeeded: некорректный metadata.telegram_id={metadata_telegram_id}, "
+                        f"subscription_id={sub_id}, event={event_id}"
+                    )
+                    metadata_telegram_id = None
+
+            if metadata_telegram_id:
+                cur.execute("""
+                    WITH target AS (
+                        SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                        FROM users
+                        WHERE telegram_id = %s
+                    )
+                    UPDATE users
+                    SET expiry_date = CASE
+                            WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                            ELSE %s
+                        END,
+                        paid = TRUE,
+                        stripe_subscription_id = %s,
+                        stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
+                        payment_failed = FALSE,
+                        payment_failed_at = NULL,
+                        last_payment_succeeded_at = NOW(),
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE,
+                        auto_renew = TRUE,
+                        blocked_bot = FALSE
+                    FROM target
+                    WHERE users.telegram_id = target.telegram_id
+                    RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                """, (metadata_telegram_id, new_expiry, new_expiry, sub_id, customer_id))
+
+                row = cur.fetchone()
+                if row:
+                    old_expiry = row[1]
+                    was_payment_failed = row[2]
 
             if not row:
-                metadata_telegram_id = stripe_value(subscription, 'metadata', 'telegram_id')
+                cur.execute("""
+                    WITH target AS (
+                        SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                        FROM users
+                        WHERE stripe_subscription_id = %s
+                    )
+                    UPDATE users
+                    SET expiry_date = CASE
+                            WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                            ELSE %s
+                        END,
+                        paid = TRUE,
+                        stripe_subscription_id = %s,
+                        stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
+                        payment_failed = FALSE,
+                        payment_failed_at = NULL,
+                        last_payment_succeeded_at = NOW(),
+                        grace_period_end = NULL,
+                        reminder_sent = FALSE,
+                        auto_renew = TRUE,
+                        blocked_bot = FALSE
+                    FROM target
+                    WHERE users.telegram_id = target.telegram_id
+                    RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                """, (sub_id, new_expiry, new_expiry, sub_id, customer_id))
 
-                if metadata_telegram_id:
-                    try:
-                        metadata_telegram_id = int(metadata_telegram_id)
-                    except (TypeError, ValueError):
-                        logging.error(
-                            f"invoice.payment_succeeded: некорректный metadata.telegram_id={metadata_telegram_id}, "
-                            f"subscription_id={sub_id}, event={event_id}"
-                        )
-                    else:
-                        cur.execute("""
-                            WITH target AS (
-                                SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
-                                FROM users
-                                WHERE telegram_id = %s
-                            )
-                            UPDATE users
-                            SET expiry_date = CASE
-                                    WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                                    ELSE %s
-                                END,
-                                paid = TRUE,
-                                stripe_subscription_id = %s,
-                                stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
-                                payment_failed = FALSE,
-                                payment_failed_at = NULL,
-                                last_payment_succeeded_at = NOW(),
-                                grace_period_end = NULL,
-                                reminder_sent = FALSE,
-                                auto_renew = TRUE,
-                                blocked_bot = FALSE
-                            FROM target
-                            WHERE users.telegram_id = target.telegram_id
-                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
-                        """, (metadata_telegram_id, new_expiry, new_expiry, sub_id, customer_id))
-
-                        row = cur.fetchone()
-                        if row:
-                            old_expiry = row[1]
-                            was_payment_failed = row[2]
+                row = cur.fetchone()
+                if row:
+                    old_expiry = row[1]
+                    was_payment_failed = row[2]
 
             if not row and customer_id:
                 cur.execute("""
@@ -4805,9 +5280,72 @@ async def stripe_webhook(request):
                     old_expiry = row[1]
                     was_payment_failed = row[2]
 
-            conn.commit()
+            if not row:
+                linked_telegram_id, link_source = find_telegram_id_for_stripe(
+                    cur,
+                    stripe_subscription_id=sub_id,
+                    stripe_customer_id=customer_id,
+                )
+                if linked_telegram_id:
+                    cur.execute("""
+                        WITH target AS (
+                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                            FROM users
+                            WHERE telegram_id = %s
+                        )
+                        UPDATE users
+                        SET expiry_date = CASE
+                                WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                                ELSE %s
+                            END,
+                            paid = TRUE,
+                            stripe_subscription_id = %s,
+                            stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
+                            payment_failed = FALSE,
+                            payment_failed_at = NULL,
+                            last_payment_succeeded_at = NOW(),
+                            grace_period_end = NULL,
+                            reminder_sent = FALSE,
+                            auto_renew = TRUE,
+                            blocked_bot = FALSE
+                        FROM target
+                        WHERE users.telegram_id = target.telegram_id
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                    """, (linked_telegram_id, new_expiry, new_expiry, sub_id, customer_id))
+                    row = cur.fetchone()
+                    if row:
+                        old_expiry = row[1]
+                        was_payment_failed = row[2]
+                        logging.info(
+                            "STRIPE_USER_RESOLVED_VIA_LINK: event_id=%s, event.type=%s, telegram_id=%s, "
+                            "source=%s, customer_id=%s, subscription_id=%s",
+                            event_id,
+                            event_type,
+                            row[0],
+                            link_source,
+                            customer_id,
+                            sub_id,
+                        )
 
             if not row:
+                lines_data = stripe_value(invoice, 'lines', 'data') or []
+                first_line = lines_data[0] if lines_data else None
+                period_end = current_period_end or stripe_value(first_line, 'period', 'end')
+                save_unlinked_stripe_event(
+                    cur,
+                    event_id,
+                    event_type,
+                    invoice_id=stripe_value(invoice, 'id'),
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                    customer_email=stripe_value(invoice, 'customer_email') or stripe_value(stripe_value(invoice, 'customer'), 'email'),
+                    amount_paid=stripe_value(invoice, 'amount_paid'),
+                    currency=stripe_value(invoice, 'currency'),
+                    billing_reason=stripe_value(invoice, 'billing_reason'),
+                    period_end=period_end,
+                    raw_summary=f"subscription_id={sub_id}; customer_id={customer_id}; period_source={period_source}",
+                )
+                conn.commit()
                 logging.error(
                     f"invoice.payment_succeeded: пользователь не найден. "
                     f"subscription_id={sub_id}, customer_id={customer_id}, event={event_id}"
@@ -4818,8 +5356,21 @@ async def stripe_webhook(request):
                 return web.Response(status=200)
 
             telegram_id = row[0]
-            invoice_id = stripe_value(invoice, 'id') or "нет"
             customer_email = stripe_value(invoice, 'customer_email') or stripe_value(stripe_value(invoice, 'customer'), 'email')
+            upsert_stripe_link(
+                cur,
+                telegram_id,
+                stripe_customer_id=customer_id,
+                stripe_subscription_id=sub_id,
+                customer_email=customer_email,
+                status=get_obj_value(subscription, 'status'),
+                current_period_end=current_period_end,
+                is_active=True,
+                source="invoice.payment_succeeded",
+            )
+            conn.commit()
+
+            invoice_id = stripe_value(invoice, 'id') or "нет"
             billing_reason = stripe_value(invoice, 'billing_reason')
             invoice_status = stripe_value(invoice, 'status')
             reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
@@ -5159,6 +5710,17 @@ async def stripe_webhook(request):
                     row[3] if row else None,
                     row[4] if row else None,
                 )
+                if row:
+                    upsert_stripe_link(
+                        cur,
+                        row[0],
+                        stripe_customer_id=customer_id,
+                        stripe_subscription_id=sub_id,
+                        status=status,
+                        current_period_end=current_period_end,
+                        is_active=False,
+                        source="customer.subscription.updated",
+                    )
             elif status in ("active", "trialing"):
                 cur.execute("""
                     UPDATE users
@@ -5179,6 +5741,16 @@ async def stripe_webhook(request):
                 """, (subscription_expiry, subscription_expiry, not cancel_at_period_end, customer_id, sub_id))
                 row = cur.fetchone()
                 if row:
+                    upsert_stripe_link(
+                        cur,
+                        row[0],
+                        stripe_customer_id=customer_id,
+                        stripe_subscription_id=sub_id,
+                        status=status,
+                        current_period_end=current_period_end,
+                        is_active=True,
+                        source="customer.subscription.updated",
+                    )
                     logging.info(
                         "SUBSCRIPTION_ACTIVE_STATE_RESTORED: event_id=%s, event.type=%s, telegram_id=%s, "
                         "customer_id=%s, subscription_id=%s, status=%s, cancel_at_period_end=%s, "
@@ -5238,6 +5810,17 @@ async def stripe_webhook(request):
                     row[1] if row else None,
                     row[2] if row else None,
                 )
+                if row:
+                    upsert_stripe_link(
+                        cur,
+                        row[0],
+                        stripe_customer_id=customer_id,
+                        stripe_subscription_id=sub_id,
+                        status=status,
+                        current_period_end=current_period_end,
+                        is_active=status in ("active", "trialing"),
+                        source="customer.subscription.updated",
+                    )
             conn.commit()
             cur.close()
             conn.close()
@@ -5457,6 +6040,156 @@ async def send_invite_link_command(message: types.Message):
         conn.close()
 
 
+@dp.message_handler(commands=['unlinked_stripe'], state='*')
+async def unlinked_stripe_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                event_id,
+                event_type,
+                invoice_id,
+                stripe_customer_id,
+                stripe_subscription_id,
+                customer_email,
+                amount_paid,
+                currency,
+                billing_reason,
+                period_end,
+                created_at
+            FROM unlinked_stripe_events
+            WHERE resolved IS NOT TRUE
+            ORDER BY created_at DESC
+            LIMIT 10
+        """)
+        rows = cur.fetchall()
+
+        if not rows:
+            await message.reply("✅ Нерешённых unlinked Stripe events нет.")
+            return
+
+        lines = ["⚠️ Нерешённые Stripe оплаты без пользователя:"]
+        for index, row in enumerate(rows, 1):
+            (
+                event_id,
+                event_type,
+                invoice_id,
+                customer_id,
+                subscription_id,
+                customer_email,
+                amount_paid,
+                currency,
+                billing_reason,
+                period_end,
+                created_at,
+            ) = row
+            lines.extend([
+                "",
+                f"{index}) event_id: {event_id}",
+                f"event_type: {event_type or 'нет'}",
+                f"invoice_id: {invoice_id or 'нет'}",
+                f"customer: {customer_id or 'нет'}",
+                f"subscription: {subscription_id or 'нет'}",
+                f"email: {customer_email or 'нет'}",
+                f"amount: {amount_paid if amount_paid is not None else 'нет'} {currency or ''}".strip(),
+                f"billing_reason: {billing_reason or 'нет'}",
+                f"period_end: {period_end or 'нет'}",
+                f"created_at: {created_at}",
+                "Связать: /link_stripe_user <telegram_id> "
+                f"{customer_id or '<customer_id>'} {subscription_id or '<subscription_id>'}",
+            ])
+
+        await message.reply("\n".join(lines))
+    except Exception as e:
+        logging.error("UNLINKED_STRIPE_COMMAND_FAILED: error=%s", str(e), exc_info=True)
+        await message.reply(f"❌ Ошибка /unlinked_stripe: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+@dp.message_handler(commands=['stripe_links'], state='*')
+async def stripe_links_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /stripe_links <telegram_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            SELECT
+                stripe_customer_id,
+                stripe_subscription_id,
+                customer_email,
+                status,
+                current_period_end,
+                is_active,
+                source,
+                created_at,
+                updated_at
+            FROM stripe_links
+            WHERE telegram_id = %s
+            ORDER BY updated_at DESC
+            LIMIT 20
+        """, (target_user_id,))
+        rows = cur.fetchall()
+
+        if not rows:
+            await message.reply(f"Связей Stripe для telegram_id={target_user_id} пока нет.")
+            return
+
+        lines = [f"Stripe связи для telegram_id={target_user_id}:"]
+        for index, row in enumerate(rows, 1):
+            (
+                customer_id,
+                subscription_id,
+                customer_email,
+                status,
+                current_period_end,
+                is_active,
+                source,
+                created_at,
+                updated_at,
+            ) = row
+            lines.extend([
+                "",
+                f"{index}) customer_id: {customer_id or 'нет'}",
+                f"subscription_id: {subscription_id or 'нет'}",
+                f"email: {customer_email or 'нет'}",
+                f"status: {status or 'нет'}",
+                f"current_period_end: {current_period_end or 'нет'}",
+                f"is_active: {is_active}",
+                f"source: {source or 'нет'}",
+                f"created_at: {created_at}",
+                f"updated_at: {updated_at}",
+            ])
+
+        await message.reply("\n".join(lines))
+    except Exception as e:
+        logging.error("STRIPE_LINKS_COMMAND_FAILED: telegram_id=%s, error=%s", target_user_id, str(e), exc_info=True)
+        await message.reply(f"❌ Ошибка /stripe_links: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+
 @dp.message_handler(commands=['link_stripe_user'], state='*')
 async def link_stripe_user_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5553,6 +6286,29 @@ async def link_stripe_user_command(message: types.Message):
                     auto_renew = %s
                 WHERE telegram_id = %s
             """, (customer_id, subscription_id, not cancel_at_period_end, target_user_id))
+
+        upsert_stripe_link(
+            cur,
+            target_user_id,
+            stripe_customer_id=customer_id,
+            stripe_subscription_id=subscription_id,
+            status=status,
+            current_period_end=current_period_end,
+            is_active=access_active,
+            source="manual_link_stripe_user",
+        )
+        cur.execute("""
+            UPDATE unlinked_stripe_events
+            SET resolved = TRUE,
+                resolved_by = %s,
+                resolved_telegram_id = %s,
+                resolved_at = NOW()
+            WHERE resolved IS NOT TRUE
+              AND (
+                  stripe_customer_id = %s
+                  OR stripe_subscription_id = %s
+              )
+        """, (message.from_user.id, target_user_id, customer_id, subscription_id))
 
         conn.commit()
 
