@@ -395,6 +395,107 @@ async def notify_critical_delivery_failed(telegram_id, event_type, action, error
     await notify_admins(text)
 
 
+async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, stripe_event_id=None, stripe_subscription_id=None):
+    try:
+        try:
+            await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+        except Exception as e:
+            if "administrator" in str(e).lower():
+                logging.warning(f"Не удалось разбанить админа {telegram_id}: {e}")
+            else:
+                logging.warning(
+                    "ACCESS_REJOIN_UNBAN_FAILED_AFTER_PAYMENT: telegram_id=%s, source=%s, "
+                    "stripe_event_id=%s, stripe_subscription_id=%s, error=%s",
+                    telegram_id,
+                    source,
+                    stripe_event_id,
+                    stripe_subscription_id,
+                    str(e),
+                    exc_info=True,
+                )
+
+        invite_link = await generate_invite_link()
+        if not invite_link:
+            raise RuntimeError("invite_link_not_created")
+
+        expiry_text = expiry_date.strftime("%d.%m.%Y") if expiry_date else "активен"
+        await bot.send_message(
+            int(telegram_id),
+            "✅ Оплата прошла успешно, доступ восстановлен.\n\n"
+            f"Ваш доступ активен до {expiry_text}.\n\n"
+            "Вот новая ссылка для входа в клуб:\n"
+            f"{invite_link}"
+        )
+        logging.info(
+            "ACCESS_REJOIN_INVITE_SENT_AFTER_PAYMENT: telegram_id=%s, source=%s, "
+            "stripe_event_id=%s, stripe_subscription_id=%s, expiry_date=%s",
+            telegram_id,
+            source,
+            stripe_event_id,
+            stripe_subscription_id,
+            expiry_date,
+        )
+        await log_access_event(
+            telegram_id,
+            "rejoin_invite_sent_after_payment",
+            source=source,
+            new_expiry=expiry_date,
+            stripe_event_id=stripe_event_id,
+            stripe_subscription_id=stripe_subscription_id,
+            notes="invite link sent after payment"
+        )
+        return True
+    except BotBlocked as e:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
+                (int(telegram_id),)
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        logging.error(
+            "ACCESS_REJOIN_INVITE_FAILED_AFTER_PAYMENT: telegram_id=%s, source=%s, "
+            "stripe_event_id=%s, stripe_subscription_id=%s, error=%s",
+            telegram_id,
+            source,
+            stripe_event_id,
+            stripe_subscription_id,
+            "BotBlocked",
+            exc_info=True,
+        )
+        await notify_admins(
+            "Оплата прошла, но не удалось отправить пользователю ссылку для входа.\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"source: {source}\n"
+            f"subscription_id: {stripe_subscription_id or 'нет'}\n"
+            f"ошибка: BotBlocked"
+        )
+        return False
+    except Exception as e:
+        logging.error(
+            "ACCESS_REJOIN_INVITE_FAILED_AFTER_PAYMENT: telegram_id=%s, source=%s, "
+            "stripe_event_id=%s, stripe_subscription_id=%s, error=%s",
+            telegram_id,
+            source,
+            stripe_event_id,
+            stripe_subscription_id,
+            str(e),
+            exc_info=True,
+        )
+        await notify_admins(
+            "Оплата прошла, но не удалось отправить пользователю ссылку для входа.\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"source: {source}\n"
+            f"subscription_id: {stripe_subscription_id or 'нет'}\n"
+            f"ошибка: {e}"
+        )
+        return False
+
+
 def is_undeliverable_user_error(error):
     error_text = str(error).lower()
     undeliverable_markers = (
@@ -575,6 +676,32 @@ async def ban_user_logic(telegram_id, cur):
             telegram_id, "grace_period_active", paid, expiry_date, grace_period_end, auto_renew, stripe_subscription_id
         )
         return "grace_active"
+
+    if auto_renew and not has_valid_stripe_subscription_id(stripe_subscription_id):
+        logging.warning(
+            "UNLINKED_STRIPE_NEEDS_MANUAL_REVIEW: telegram_id=%s, paid=%s, expiry_date=%s, "
+            "grace=%s, auto_renew=%s, stripe_customer_id=%s, stripe_subscription_id=%s, reason=%s",
+            telegram_id,
+            paid,
+            expiry_date,
+            grace_period_end,
+            auto_renew,
+            stripe_customer_id,
+            stripe_subscription_id,
+            "auto_renew_without_valid_subscription_id",
+        )
+        await notify_admins(
+            "Пользователь НЕ удален: включен auto_renew, но Stripe-связка неполная.\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"paid: {paid}\n"
+            f"expiry_date: {expiry_date}\n"
+            f"grace_period_end: {grace_period_end or 'нет'}\n"
+            f"stripe_customer_id: {stripe_customer_id or 'нет'}\n"
+            f"stripe_subscription_id: {stripe_subscription_id or 'нет'}\n\n"
+            "Нужно вручную проверить Stripe и связать пользователя командой "
+            "/link_stripe_user <telegram_id> <customer_id> <subscription_id>."
+        )
+        return "STRIPE_UNLINKED_REVIEW"
 
     if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
         logging.warning(
@@ -1003,7 +1130,7 @@ async def check_subscriptions_and_reminders():
 
         if ban_status == "active_in_db":
             active_in_db_skipped += 1
-        elif ban_status in ("STRIPE_ACTIVE", "STRIPE_CHECK_FAILED"):
+        elif ban_status in ("STRIPE_ACTIVE", "STRIPE_CHECK_FAILED", "STRIPE_UNLINKED_REVIEW"):
             cur.execute(
                 "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
                 (telegram_id,)
@@ -3807,6 +3934,7 @@ ADMIN_MENU_SECTIONS = {
             "/give_access <telegram_id> <days> — выдать или продлить доступ",
             "/set_expiry <telegram_id> <YYYY-MM-DD> — установить точную дату доступа",
             "/sync_stripe_user <telegram_id> — синхронизировать Stripe",
+            "/link_stripe_user <telegram_id> <customer_id> <subscription_id> — связать Stripe с пользователем",
             "/send_invite_link <telegram_id> — отправить invite link",
             "/unban_user <telegram_id> — снять бан в группе",
             "/unblock_user <telegram_id> — снять blocked_bot",
@@ -4295,7 +4423,7 @@ async def stripe_webhook(request):
         }
         logging.info(f"STRIPE INVOICE DEBUG: {debug_payload}")
 
-    async def notify_unlinked_invoice(invoice, subscription_id=None):
+    async def notify_unlinked_invoice(invoice, subscription_id=None, period_end_override=None):
         invoice_id = stripe_value(invoice, 'id') or "нет"
         billing_reason = stripe_value(invoice, 'billing_reason') or "нет"
         customer = stripe_value(invoice, 'customer')
@@ -4306,10 +4434,14 @@ async def stripe_webhook(request):
             or "нет"
         )
         amount_paid = stripe_value(invoice, 'amount_paid')
+        lines_data = stripe_value(invoice, 'lines', 'data') or []
+        first_line = lines_data[0] if lines_data else None
+        period_end = period_end_override or stripe_value(first_line, 'period', 'end')
         hosted_invoice_url = stripe_value(invoice, 'hosted_invoice_url') or "нет"
 
         await notify_admins(
-            "Stripe прислал успешную оплату, но пользователя в БД не удалось надежно определить.\n\n"
+            "Оплата Stripe прошла, но пользователь не найден в БД. Нужно вручную связать "
+            "Stripe customer/subscription с Telegram ID.\n\n"
             f"invoice_id: {invoice_id}\n"
             f"event_id: {event_id}\n"
             f"subscription_id: {subscription_id or 'нет'}\n"
@@ -4317,9 +4449,11 @@ async def stripe_webhook(request):
             f"customer_id: {customer_id}\n"
             f"customer_email: {customer_email}\n"
             f"amount_paid: {amount_paid if amount_paid is not None else 'нет'}\n"
+            f"period_end: {period_end or 'нет'}\n"
             f"hosted_invoice_url: {hosted_invoice_url}\n\n"
             f"Пустые subscription-поля: {empty_subscription_fields_text(invoice)}\n\n"
-            "Доступ автоматически НЕ выдан. Проверьте оплату вручную."
+            "Доступ автоматически НЕ выдан. Используйте команду:\n"
+            "/link_stripe_user <telegram_id> <customer_id> <subscription_id>"
         )
 
     # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
@@ -4430,46 +4564,44 @@ async def stripe_webhook(request):
             )
 
             if needs_link:
-                link = await generate_invite_link()
-                msg = f"✅ Оплата прошла успешно! Доступ до {new_expiry.strftime('%d.%m.%Y')}.\nСсылка для вступления: {link}\n\nДобро пожаловать!"
+                await send_rejoin_invite_after_payment(
+                    user_id,
+                    new_expiry,
+                    "checkout.session.completed",
+                    stripe_event_id=event_id,
+                    stripe_subscription_id=sub_id,
+                )
             else:
                 msg = f"✅ Ваша подписка продлена до {new_expiry.strftime('%d.%m.%Y')}. Спасибо! ❤️"
-            reply_markup = get_cancel_subscription_keyboard() if has_subscription else None
+                reply_markup = get_cancel_subscription_keyboard() if has_subscription else None
 
-            if has_subscription:
-                msg += (
-                    "\n\nОплата будет списываться автоматически до момента, пока вы не отмените подписку.\n\n"
-                    "Вы можете отменить автопродление в любой момент по кнопке ниже или через /profile."
-                )
+                if has_subscription:
+                    msg += (
+                        "\n\nОплата будет списываться автоматически до момента, пока вы не отмените подписку.\n\n"
+                        "Вы можете отменить автопродление в любой момент по кнопке ниже или через /profile."
+                    )
 
-            try:
-                await bot.send_message(int(user_id), msg, reply_markup=reply_markup)
-            except BotBlocked:
-                cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
-                conn.commit()
-                await notify_critical_delivery_failed(
-                    user_id,
-                    "checkout.session.completed",
-                    "сообщение об успешной оплате/продлении",
-                    "BotBlocked",
-                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
-                )
-            except Exception as e:
-                logging.error(f"Не удалось отправить сообщение после checkout пользователю {user_id}: {e}")
-                await notify_critical_delivery_failed(
-                    user_id,
-                    "checkout.session.completed",
-                    "сообщение об успешной оплате/продлении",
-                    e,
-                    f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}"
-                )
-            try:
-                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(user_id))
-            except Exception as e:
-                if "administrator" in str(e).lower():
-                    logging.warning(f"Не удалось разбанить админа {user_id}: {e}")
-                else:
-                    logging.error(f"Ошибка разбана {user_id}: {e}")
+                try:
+                    await bot.send_message(int(user_id), msg, reply_markup=reply_markup)
+                except BotBlocked:
+                    cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
+                    conn.commit()
+                    await notify_critical_delivery_failed(
+                        user_id,
+                        "checkout.session.completed",
+                        "сообщение об успешной оплате/продлении",
+                        "BotBlocked",
+                        f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
+                    )
+                except Exception as e:
+                    logging.error(f"Не удалось отправить сообщение после checkout пользователю {user_id}: {e}")
+                    await notify_critical_delivery_failed(
+                        user_id,
+                        "checkout.session.completed",
+                        "сообщение об успешной оплате/продлении",
+                        e,
+                        f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}"
+                    )
         except Exception as e:
             conn.rollback()
             logging.exception(
@@ -4681,7 +4813,7 @@ async def stripe_webhook(request):
                     f"subscription_id={sub_id}, customer_id={customer_id}, event={event_id}"
                 )
 
-                await notify_unlinked_invoice(invoice, subscription_id=sub_id)
+                await notify_unlinked_invoice(invoice, subscription_id=sub_id, period_end_override=current_period_end)
                 await mark_event_processed(event_id)
                 return web.Response(status=200)
 
@@ -4737,12 +4869,30 @@ async def stripe_webhook(request):
                 notes=f"customer_id={customer_id or 'нет'}; invoice_id={invoice_id}; period_source={period_source}"
             )
 
+            needs_rejoin_invite = (old_expiry is None) or (old_expiry < datetime.utcnow())
+            if needs_rejoin_invite:
+                await send_rejoin_invite_after_payment(
+                    telegram_id,
+                    new_expiry,
+                    "invoice.payment_succeeded",
+                    stripe_event_id=event_id,
+                    stripe_subscription_id=sub_id,
+                )
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
             try:
                 await bot.send_message(
                     int(telegram_id),
                     f"✅ Автопродление успешно! Доступ продлен до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
                     "Оплата будет списываться автоматически до момента, пока вы не отмените подписку.",
                     reply_markup=get_cancel_subscription_keyboard()
+                )
+                logging.info(
+                    "AUTO_RENEW_NOTICE_SENT: telegram_id=%s, invoice_id=%s, new_expiry=%s",
+                    telegram_id,
+                    invoice_id,
+                    new_expiry,
                 )
             except BotBlocked:
                 cur.execute(
@@ -5028,21 +5178,43 @@ async def stripe_webhook(request):
                     RETURNING telegram_id, paid, expiry_date
                 """, (subscription_expiry, subscription_expiry, not cancel_at_period_end, customer_id, sub_id))
                 row = cur.fetchone()
-                logging.info(
-                    "SUBSCRIPTION_ACTIVE_STATE_RESTORED: event_id=%s, event.type=%s, telegram_id=%s, "
-                    "customer_id=%s, subscription_id=%s, status=%s, cancel_at_period_end=%s, "
-                    "paid=%s, expiry_date=%s, current_period_end=%s",
-                    event_id,
-                    event_type,
-                    row[0] if row else None,
-                    customer_id,
-                    sub_id,
-                    status,
-                    cancel_at_period_end,
-                    row[1] if row else None,
-                    row[2] if row else None,
-                    current_period_end,
-                )
+                if row:
+                    logging.info(
+                        "SUBSCRIPTION_ACTIVE_STATE_RESTORED: event_id=%s, event.type=%s, telegram_id=%s, "
+                        "customer_id=%s, subscription_id=%s, status=%s, cancel_at_period_end=%s, "
+                        "paid=%s, expiry_date=%s, current_period_end=%s",
+                        event_id,
+                        event_type,
+                        row[0],
+                        customer_id,
+                        sub_id,
+                        status,
+                        cancel_at_period_end,
+                        row[1],
+                        row[2],
+                        current_period_end,
+                    )
+                else:
+                    logging.warning(
+                        "SUBSCRIPTION_ACTIVE_STATE_UNLINKED: event_id=%s, event.type=%s, "
+                        "customer_id=%s, subscription_id=%s, status=%s, current_period_end=%s",
+                        event_id,
+                        event_type,
+                        customer_id,
+                        sub_id,
+                        status,
+                        current_period_end,
+                    )
+                    await notify_admins(
+                        "Stripe subscription active/trialing, но пользователь не найден в БД.\n\n"
+                        f"event_id: {event_id}\n"
+                        f"customer_id: {customer_id or 'нет'}\n"
+                        f"subscription_id: {sub_id or 'нет'}\n"
+                        f"status: {status or 'нет'}\n"
+                        f"current_period_end: {current_period_end or 'нет'}\n\n"
+                        "Нужно вручную связать Stripe с Telegram ID:\n"
+                        "/link_stripe_user <telegram_id> <customer_id> <subscription_id>"
+                    )
             else:
                 cur.execute("""
                     UPDATE users
@@ -5283,6 +5455,164 @@ async def send_invite_link_command(message: types.Message):
     finally:
         cur.close()
         conn.close()
+
+
+@dp.message_handler(commands=['link_stripe_user'], state='*')
+async def link_stripe_user_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    args = message.get_args().split()
+    if len(args) != 3:
+        await message.reply("⚠️ Использование: /link_stripe_user <telegram_id> <customer_id> <subscription_id>")
+        return
+
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    customer_id = args[1].strip()
+    subscription_id = args[2].strip()
+
+    if not customer_id.startswith("cus_") or not subscription_id.startswith("sub_"):
+        await message.reply("⚠️ customer_id должен начинаться с cus_, subscription_id должен начинаться с sub_.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    old_expiry = None
+    new_expiry = None
+    access_active = False
+    status = None
+
+    try:
+        cur.execute("SELECT expiry_date FROM users WHERE telegram_id = %s", (target_user_id,))
+        row = cur.fetchone()
+        if not row:
+            await message.reply("❌ Пользователь не найден в базе.")
+            return
+
+        old_expiry = row[0]
+
+        try:
+            subscription = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
+        except Exception as e:
+            logging.error(
+                "LINK_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s, customer_id=%s, "
+                "subscription_id=%s, error=%s",
+                target_user_id,
+                customer_id,
+                subscription_id,
+                str(e),
+                exc_info=True,
+            )
+            await message.reply(f"❌ Не удалось получить Stripe subscription: {e}")
+            return
+
+        status = getattr(subscription, "status", None)
+        current_period_end = getattr(subscription, "current_period_end", None)
+        cancel_at_period_end = bool(getattr(subscription, "cancel_at_period_end", False))
+        stripe_customer_id = getattr(subscription, "customer", None)
+        stripe_customer_id = stripe_customer_id if isinstance(stripe_customer_id, str) else customer_id
+
+        if stripe_customer_id and stripe_customer_id != customer_id:
+            logging.warning(
+                "LINK_STRIPE_USER_CUSTOMER_MISMATCH: telegram_id=%s, provided_customer_id=%s, "
+                "subscription_customer_id=%s, subscription_id=%s",
+                target_user_id,
+                customer_id,
+                stripe_customer_id,
+                subscription_id,
+            )
+
+        if status in ("active", "trialing") and current_period_end:
+            new_expiry = datetime.utcfromtimestamp(current_period_end)
+            cur.execute("""
+                UPDATE users
+                SET stripe_customer_id = %s,
+                    stripe_subscription_id = %s,
+                    paid = TRUE,
+                    expiry_date = %s,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    last_payment_succeeded_at = NOW(),
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE,
+                    auto_renew = TRUE,
+                    blocked_bot = FALSE
+                WHERE telegram_id = %s
+            """, (customer_id, subscription_id, new_expiry, target_user_id))
+            access_active = True
+        else:
+            cur.execute("""
+                UPDATE users
+                SET stripe_customer_id = %s,
+                    stripe_subscription_id = %s,
+                    auto_renew = %s
+                WHERE telegram_id = %s
+            """, (customer_id, subscription_id, not cancel_at_period_end, target_user_id))
+
+        conn.commit()
+
+        await log_access_event(
+            target_user_id,
+            "manual_link_stripe_user",
+            source="admin_command",
+            old_expiry=old_expiry,
+            new_expiry=new_expiry,
+            stripe_subscription_id=subscription_id,
+            notes=(
+                f"admin_id={message.from_user.id}; customer_id={customer_id}; "
+                f"status={status}; current_period_end={current_period_end}"
+            )
+        )
+
+        invite_sent = False
+        if access_active:
+            invite_sent = await send_rejoin_invite_after_payment(
+                target_user_id,
+                new_expiry,
+                "manual_link_stripe_user",
+                stripe_subscription_id=subscription_id,
+            )
+
+        logging.info(
+            "LINK_STRIPE_USER_COMPLETED: telegram_id=%s, customer_id=%s, subscription_id=%s, "
+            "status=%s, expiry_date=%s, invite_sent=%s",
+            target_user_id,
+            customer_id,
+            subscription_id,
+            status,
+            new_expiry,
+            invite_sent,
+        )
+        await message.reply(
+            "✅ Stripe пользователь связан.\n\n"
+            f"telegram_id: {target_user_id}\n"
+            f"customer_id: {customer_id}\n"
+            f"subscription_id: {subscription_id}\n"
+            f"status: {status or 'нет'}\n"
+            f"expiry_date: {new_expiry or 'не обновлена'}\n"
+            f"invite_sent: {invite_sent}"
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logging.error(
+            "LINK_STRIPE_USER_FAILED: telegram_id=%s, customer_id=%s, subscription_id=%s, error=%s",
+            target_user_id,
+            customer_id,
+            subscription_id,
+            str(e),
+            exc_info=True,
+        )
+        await message.reply(f"❌ Ошибка /link_stripe_user: {e}")
+    finally:
+        cur.close()
+        conn.close()
+
 
 @dp.message_handler(commands=['unban_user'], state='*')
 async def unban_user(message: types.Message):
