@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 from stripe_invoice_rules import (
     has_future_trial,
+    is_paid_out_of_band_invoice,
     is_zero_subscription_update_invoice,
     should_ignore_payment_failed_for_active_trial,
     successful_invoice_action,
@@ -23,6 +24,22 @@ class StripeInvoiceRulesTest(unittest.TestCase):
                 subscription_status="active",
                 trial_end=None,
                 now=self.now,
+                invoice={
+                    "amount_due": 3900,
+                    "payments": {
+                        "data": [
+                            {
+                                "status": "paid",
+                                "amount_paid": 3900,
+                                "payment": {
+                                    "type": "payment_intent",
+                                    "payment_intent": "pi_123",
+                                },
+                            }
+                        ]
+                    },
+                },
+                amount_due=3900,
             ),
             "process_payment",
         )
@@ -87,6 +104,22 @@ class StripeInvoiceRulesTest(unittest.TestCase):
                 subscription_status="active",
                 trial_end=self.past_trial_end,
                 now=self.now,
+                invoice={
+                    "amount_due": 3900,
+                    "payments": {
+                        "data": [
+                            {
+                                "status": "paid",
+                                "amount_paid": 3900,
+                                "payment": {
+                                    "type": "payment_intent",
+                                    "payment_intent": "pi_after_trial",
+                                },
+                            }
+                        ]
+                    },
+                },
+                amount_due=3900,
             ),
             "process_payment",
         )
@@ -98,6 +131,8 @@ class StripeInvoiceRulesTest(unittest.TestCase):
             subscription_status="active",
             trial_end=None,
             now=self.now,
+            invoice={"payments": {"data": []}},
+            amount_due=3900,
         )
         second = successful_invoice_action(
             amount_paid=3900,
@@ -105,6 +140,8 @@ class StripeInvoiceRulesTest(unittest.TestCase):
             subscription_status="active",
             trial_end=None,
             now=self.now,
+            invoice={"payments": {"data": []}},
+            amount_due=3900,
         )
         self.assertEqual(first, second)
 
@@ -123,7 +160,79 @@ class StripeInvoiceRulesTest(unittest.TestCase):
     def test_has_future_trial_requires_trialing_status(self):
         self.assertFalse(has_future_trial("active", self.future_trial_end, now=self.now))
 
+    def test_old_api_paid_out_of_band_invoice_is_not_recurring_payment(self):
+        invoice = {
+            "status": "paid",
+            "amount_due": 5000,
+            "amount_paid": 5000,
+            "payment_intent": None,
+            "paid_out_of_band": True,
+        }
+        self.assertTrue(is_paid_out_of_band_invoice(invoice, 5000, 5000))
+        self.assertEqual(
+            successful_invoice_action(
+                amount_paid=5000,
+                billing_reason="subscription_cycle",
+                subscription_status="active",
+                trial_end=None,
+                now=self.now,
+                invoice=invoice,
+                amount_due=5000,
+            ),
+            "process_out_of_band",
+        )
+
+    def test_new_api_payment_record_invoice_is_not_recurring_payment(self):
+        invoice = {
+            "status": "paid",
+            "amount_due": 5000,
+            "amount_paid": 5000,
+            "payments": {
+                "data": [
+                    {
+                        "status": "paid",
+                        "amount_paid": 5000,
+                        "payment": {
+                            "type": "payment_record",
+                            "payment_record": "inpayrec_123",
+                        },
+                    }
+                ]
+            },
+        }
+        self.assertEqual(
+            successful_invoice_action(
+                amount_paid=5000,
+                billing_reason="subscription_cycle",
+                subscription_status="active",
+                trial_end=None,
+                now=self.now,
+                invoice=invoice,
+                amount_due=5000,
+            ),
+            "process_out_of_band",
+        )
+
+    def test_customer_balance_without_out_of_band_marker_is_not_forced_to_out_of_band(self):
+        invoice = {
+            "status": "paid",
+            "amount_due": 5000,
+            "amount_paid": 5000,
+            "payment_intent": None,
+            "payments": {
+                "data": [
+                    {
+                        "status": "paid",
+                        "amount_paid": 5000,
+                        "payment": {
+                            "type": "customer_balance",
+                        },
+                    }
+                ]
+            },
+        }
+        self.assertFalse(is_paid_out_of_band_invoice(invoice, 5000, 5000))
+
 
 if __name__ == "__main__":
     unittest.main()
-
