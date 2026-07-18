@@ -5149,11 +5149,55 @@ async def stripe_webhook(request):
             amount_paid = stripe_value(invoice, 'amount_paid')
             amount_due = stripe_value(invoice, 'amount_due')
             invoice_status = stripe_value(invoice, 'status')
+
+            if amount_paid and not stripe_value(invoice, 'payments', 'data'):
+                try:
+                    invoice = stripe.Invoice.retrieve(
+                        invoice_id,
+                        expand=['payments']
+                    )
+                    customer_id = customer_id or stripe_object_id(stripe_value(invoice, 'customer'))
+                    amount_paid = stripe_value(invoice, 'amount_paid')
+                    amount_due = stripe_value(invoice, 'amount_due')
+                    invoice_status = stripe_value(invoice, 'status')
+                    billing_reason = stripe_value(invoice, 'billing_reason')
+                    logging.info(
+                        "Stripe invoice.payment_succeeded payments expanded: event_id=%s, "
+                        "invoice_id=%s, payments_count=%s, payment_intent=%s, paid_out_of_band=%s",
+                        event_id,
+                        invoice_id,
+                        len(stripe_value(invoice, 'payments', 'data') or []),
+                        stripe_object_id(stripe_value(invoice, 'payment_intent')),
+                        stripe_value(invoice, 'paid_out_of_band'),
+                    )
+                except Exception as e:
+                    logging.exception(
+                        "Не удалось получить invoice payments для классификации оплаты. "
+                        "event_id=%s, invoice_id=%s, subscription_id=%s, error=%s",
+                        event_id,
+                        invoice_id,
+                        sub_id,
+                        e,
+                    )
+                    await notify_admins(
+                        "Stripe прислал успешный invoice, но бот не смог проверить payment records.\n\n"
+                        f"event_id: {event_id}\n"
+                        f"invoice_id: {invoice_id}\n"
+                        f"subscription_id: {sub_id}\n"
+                        f"customer_id: {customer_id or 'нет'}\n"
+                        f"Ошибка: {e}\n\n"
+                        "Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся."
+                    )
+                    conn.rollback()
+                    return web.Response(status=500)
+
             invoice_action = successful_invoice_action(
                 amount_paid,
                 billing_reason,
                 subscription_status,
                 trial_end,
+                invoice=invoice,
+                amount_due=amount_due,
             )
 
             if invoice_action == "ignore_zero":
@@ -5552,22 +5596,40 @@ async def stripe_webhook(request):
             conn.commit()
 
             reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
-            logging.info(
-                "REAL_RECURRING_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
-                "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
-                "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
-                event_id,
-                event_type,
-                invoice_id,
-                telegram_id,
-                sub_id,
-                customer_id,
-                billing_reason,
-                amount_paid,
-                amount_due,
-                invoice_status,
-                new_expiry,
-            )
+            if invoice_action == "process_out_of_band":
+                logging.info(
+                    "MANUAL_OUT_OF_BAND_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
+                    "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
+                    "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                    event_id,
+                    event_type,
+                    invoice_id,
+                    telegram_id,
+                    sub_id,
+                    customer_id,
+                    billing_reason,
+                    amount_paid,
+                    amount_due,
+                    invoice_status,
+                    new_expiry,
+                )
+            else:
+                logging.info(
+                    "REAL_RECURRING_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
+                    "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
+                    "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                    event_id,
+                    event_type,
+                    invoice_id,
+                    telegram_id,
+                    sub_id,
+                    customer_id,
+                    billing_reason,
+                    amount_paid,
+                    amount_due,
+                    invoice_status,
+                    new_expiry,
+                )
             logging.info(
                 "User access activated: source=invoice.payment_succeeded, event_id=%s, "
                 "event.type=%s, invoice_id=%s, user_id=%s, customer_id=%s, customer_email=%s, "
@@ -5599,6 +5661,18 @@ async def stripe_webhook(request):
                 logging.info(
                     f"invoice.payment_succeeded: срок уже актуален, пропускаю повторное уведомление. "
                     f"telegram_id={telegram_id}, old_expiry={old_expiry}, new_expiry={new_expiry}, event={event_id}"
+                )
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
+            if invoice_action == "process_out_of_band":
+                logging.info(
+                    "AUTO_RENEW_NOTICE_SKIPPED_OUT_OF_BAND: telegram_id=%s, invoice_id=%s, "
+                    "event_id=%s, new_expiry=%s",
+                    telegram_id,
+                    invoice_id,
+                    event_id,
+                    new_expiry,
                 )
                 await mark_event_processed(event_id)
                 return web.Response(status=200)
