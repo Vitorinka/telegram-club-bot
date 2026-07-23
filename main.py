@@ -1,10 +1,11 @@
 import os
 import logging
 import asyncio
+import io
 import stripe
 import psycopg2
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -28,6 +29,20 @@ from stripe_invoice_rules import (
     should_ignore_payment_failed_for_active_trial,
     subscription_update_period,
     successful_invoice_action,
+)
+from weekly_report import (
+    MOSCOW_TZ,
+    build_payments_csv,
+    build_weekly_report_text,
+    claim_weekly_report_run_record,
+    classify_manual_link_payment_kind,
+    get_current_week_bounds,
+    get_last_completed_week_bounds,
+    parse_admin_ids,
+    report_key as weekly_report_key,
+    should_create_manual_link_payment_event,
+    tariff_code_from_invoice,
+    to_utc_naive,
 )
 class PromoStates(StatesGroup):
     waiting_for_media = State()
@@ -169,6 +184,62 @@ def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         );
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_events (
+            id BIGSERIAL PRIMARY KEY,
+            stripe_event_id TEXT UNIQUE NOT NULL,
+            event_type TEXT NOT NULL,
+            telegram_id BIGINT,
+            invoice_id TEXT,
+            checkout_session_id TEXT,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            payment_status TEXT NOT NULL,
+            payment_kind TEXT,
+            billing_reason TEXT,
+            tariff_code TEXT,
+            amount_paid BIGINT DEFAULT 0,
+            amount_due BIGINT DEFAULT 0,
+            currency TEXT,
+            period_start TIMESTAMP,
+            period_end TIMESTAMP,
+            recovered_after_failure BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS payment_events_created_at_idx
+        ON payment_events (created_at);
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS payment_events_telegram_id_idx
+        ON payment_events (telegram_id);
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS payment_events_status_kind_idx
+        ON payment_events (payment_status, payment_kind);
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_report_runs (
+            report_key TEXT PRIMARY KEY,
+            period_start TIMESTAMP NOT NULL,
+            period_end TIMESTAMP NOT NULL,
+            status TEXT NOT NULL,
+            sent_admin_ids TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            completed_at TIMESTAMP,
+            error_text TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value_text TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
     # Добавляем недостающие колонки (для старых БД)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
@@ -185,6 +256,10 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent_at TIMESTAMP;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_received BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_updated_at TIMESTAMP;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS customer_email TEXT;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS status TEXT;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMP;")
@@ -195,6 +270,12 @@ def init_db():
     cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_by BIGINT;")
     cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_telegram_id BIGINT;")
     cur.execute("ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;")
+    cur.execute("ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();")
+    cur.execute("""
+        INSERT INTO system_settings (key, value_text)
+        VALUES ('payment_history_started_at', NOW()::TEXT)
+        ON CONFLICT (key) DO NOTHING;
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -322,6 +403,135 @@ def safe_log_url(value):
 
 def stripe_period_to_datetime(period_end):
     return datetime.utcfromtimestamp(period_end) if period_end else None
+
+
+def update_telegram_user_profile(cur, telegram_user):
+    if not telegram_user:
+        return
+    telegram_id = getattr(telegram_user, "id", None)
+    if not telegram_id:
+        return
+    cur.execute("""
+        INSERT INTO users (telegram_id, paid, username, first_name, last_name, profile_updated_at)
+        VALUES (%s, FALSE, %s, %s, %s, NOW())
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            username = EXCLUDED.username,
+            first_name = EXCLUDED.first_name,
+            last_name = EXCLUDED.last_name,
+            profile_updated_at = NOW()
+    """, (
+        int(telegram_id),
+        getattr(telegram_user, "username", None),
+        getattr(telegram_user, "first_name", None),
+        getattr(telegram_user, "last_name", None),
+    ))
+
+
+def save_telegram_user_profile(telegram_user):
+    conn = None
+    cur = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        update_telegram_user_profile(cur, telegram_user)
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logging.warning(
+            "Не удалось обновить профиль Telegram user_id=%s: %s",
+            getattr(telegram_user, "id", None),
+            e,
+        )
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+def invoice_line_period_datetimes(invoice):
+    lines_data = get_obj_value(invoice, "lines", "data") or []
+    first_line = lines_data[0] if lines_data else None
+    period_start = stripe_period_to_datetime(get_obj_value(first_line, "period", "start"))
+    period_end = stripe_period_to_datetime(get_obj_value(first_line, "period", "end"))
+    return period_start, period_end
+
+
+def normalize_payment_kind(payment_kind):
+    if payment_kind == "subscription_adjustment":
+        return "adjustment"
+    if payment_kind in ("trial", "initial_subscription", "recurring", "adjustment", "out_of_band"):
+        return payment_kind
+    return "unknown"
+
+
+def insert_payment_event(
+    cur,
+    stripe_event_id,
+    event_type,
+    payment_status,
+    telegram_id=None,
+    invoice_id=None,
+    checkout_session_id=None,
+    stripe_customer_id=None,
+    stripe_subscription_id=None,
+    payment_kind=None,
+    billing_reason=None,
+    tariff_code=None,
+    amount_paid=0,
+    amount_due=0,
+    currency=None,
+    period_start=None,
+    period_end=None,
+    recovered_after_failure=False,
+    created_at=None,
+):
+    payment_status = payment_status if payment_status in ("succeeded", "failed") else "failed"
+    payment_kind = normalize_payment_kind(payment_kind)
+    cur.execute("""
+        INSERT INTO payment_events (
+            stripe_event_id,
+            event_type,
+            telegram_id,
+            invoice_id,
+            checkout_session_id,
+            stripe_customer_id,
+            stripe_subscription_id,
+            payment_status,
+            payment_kind,
+            billing_reason,
+            tariff_code,
+            amount_paid,
+            amount_due,
+            currency,
+            period_start,
+            period_end,
+            recovered_after_failure,
+            created_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()))
+        ON CONFLICT (stripe_event_id) DO NOTHING
+    """, (
+        stripe_event_id,
+        event_type,
+        int(telegram_id) if telegram_id is not None else None,
+        invoice_id,
+        checkout_session_id,
+        stripe_customer_id,
+        stripe_subscription_id,
+        payment_status,
+        payment_kind,
+        billing_reason,
+        tariff_code or "unknown",
+        int(amount_paid or 0),
+        int(amount_due or 0),
+        currency,
+        period_start,
+        period_end,
+        bool(recovered_after_failure),
+        created_at,
+    ))
 
 
 def upsert_stripe_link(
@@ -482,6 +692,130 @@ def save_unlinked_stripe_event(
         period_end_dt,
         raw_summary,
     ))
+
+
+def fetch_unlinked_events_for_manual_link(customer_id, subscription_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                event_id,
+                event_type,
+                invoice_id,
+                stripe_customer_id,
+                stripe_subscription_id,
+                amount_paid,
+                currency,
+                billing_reason,
+                period_end,
+                created_at
+            FROM unlinked_stripe_events
+            WHERE resolved IS NOT TRUE
+              AND event_type = 'invoice.payment_succeeded'
+              AND (
+                  stripe_customer_id = %s
+                  OR stripe_subscription_id = %s
+              )
+            ORDER BY created_at ASC
+        """, (customer_id, subscription_id))
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def prepare_manual_link_payment_events(customer_id, subscription_id):
+    rows = fetch_unlinked_events_for_manual_link(customer_id, subscription_id)
+    prepared = []
+    for row in rows:
+        (
+            event_id,
+            event_type,
+            invoice_id,
+            row_customer_id,
+            row_subscription_id,
+            amount_paid,
+            currency,
+            billing_reason,
+            period_end,
+            created_at,
+        ) = row
+        amount_due = 0
+        period_start = None
+        tariff_code = "unknown"
+        invoice_action = None
+        try:
+            if invoice_id:
+                invoice = await asyncio.to_thread(stripe.Invoice.retrieve, invoice_id)
+                amount_paid = get_obj_value(invoice, "amount_paid") if get_obj_value(invoice, "amount_paid") is not None else amount_paid
+                amount_due = get_obj_value(invoice, "amount_due") or 0
+                currency = get_obj_value(invoice, "currency") or currency
+                billing_reason = get_obj_value(invoice, "billing_reason") or billing_reason
+                period_start, invoice_period_end = invoice_line_period_datetimes(invoice)
+                period_end = invoice_period_end or period_end
+                tariff_code = tariff_code_from_invoice(invoice)
+                invoice_action = successful_invoice_action(
+                    amount_paid,
+                    billing_reason,
+                    None,
+                    None,
+                    invoice=invoice,
+                    amount_due=amount_due,
+                )
+        except Exception as e:
+            logging.warning(
+                "MANUAL_LINK_PAYMENT_EVENT_INVOICE_RETRIEVE_FAILED: event_id=%s, invoice_id=%s, error=%s",
+                safe_log_id(event_id),
+                safe_log_id(invoice_id),
+                e,
+            )
+        prepared.append({
+            "event_id": event_id,
+            "event_type": event_type,
+            "invoice_id": invoice_id,
+            "stripe_customer_id": row_customer_id or customer_id,
+            "stripe_subscription_id": row_subscription_id or subscription_id,
+            "payment_kind": classify_manual_link_payment_kind(billing_reason, invoice_action),
+            "billing_reason": billing_reason,
+            "tariff_code": tariff_code,
+            "amount_paid": amount_paid,
+            "amount_due": amount_due,
+            "currency": currency,
+            "period_start": period_start,
+            "period_end": period_end,
+            "created_at": created_at,
+            "create_payment_event": should_create_manual_link_payment_event(amount_paid),
+        })
+    return prepared
+
+
+def backfill_payment_events_for_manual_link(cur, telegram_id, prepared_events):
+    inserted = 0
+    for event in prepared_events:
+        if not event["create_payment_event"]:
+            continue
+        insert_payment_event(
+            cur,
+            event["event_id"],
+            event["event_type"],
+            "succeeded",
+            telegram_id=telegram_id,
+            invoice_id=event["invoice_id"],
+            stripe_customer_id=event["stripe_customer_id"],
+            stripe_subscription_id=event["stripe_subscription_id"],
+            payment_kind=event["payment_kind"],
+            billing_reason=event["billing_reason"],
+            tariff_code=event["tariff_code"],
+            amount_paid=event["amount_paid"],
+            amount_due=event["amount_due"],
+            currency=event["currency"],
+            period_start=event["period_start"],
+            period_end=event["period_end"],
+            created_at=event["created_at"],
+        )
+        inserted += cur.rowcount
+    return inserted
 
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -703,6 +1037,481 @@ async def get_group_member_status_for_payment(telegram_id, source, stripe_event_
             exc_info=True,
         )
         return None, True
+
+
+def _fetch_single_count(cur, query, params=()):
+    cur.execute(query, params)
+    return cur.fetchone()[0]
+
+
+def _fetch_revenue_by_currency(cur, period_start_utc, period_end_utc):
+    cur.execute("""
+        SELECT UPPER(COALESCE(currency, '')), COALESCE(SUM(amount_paid), 0)
+        FROM payment_events
+        WHERE payment_status = 'succeeded'
+          AND created_at >= %s
+          AND created_at < %s
+        GROUP BY UPPER(COALESCE(currency, ''))
+    """, (period_start_utc, period_end_utc))
+    return {currency: int(amount or 0) for currency, amount in cur.fetchall() if currency}
+
+
+def _fetch_tariff_counts(cur, period_start_utc, period_end_utc):
+    cur.execute("""
+        SELECT COALESCE(tariff_code, 'unknown'), COUNT(*)
+        FROM payment_events
+        WHERE payment_status = 'succeeded'
+          AND created_at >= %s
+          AND created_at < %s
+        GROUP BY COALESCE(tariff_code, 'unknown')
+    """, (period_start_utc, period_end_utc))
+    return {tariff_code: int(count) for tariff_code, count in cur.fetchall()}
+
+
+def _fetch_payment_buyers(cur, period_start_utc, period_end_utc):
+    cur.execute("""
+        SELECT
+            pe.created_at,
+            pe.telegram_id,
+            u.username,
+            u.first_name,
+            u.last_name,
+            pe.tariff_code,
+            pe.payment_kind,
+            pe.amount_paid,
+            pe.currency,
+            pe.billing_reason,
+            pe.recovered_after_failure
+        FROM payment_events pe
+        LEFT JOIN users u ON u.telegram_id = pe.telegram_id
+        WHERE pe.payment_status = 'succeeded'
+          AND pe.telegram_id IS NOT NULL
+          AND pe.created_at >= %s
+          AND pe.created_at < %s
+        ORDER BY pe.created_at ASC, pe.id ASC
+    """, (period_start_utc, period_end_utc))
+    return [
+        {
+            "paid_at": row[0],
+            "telegram_id": row[1],
+            "username": row[2],
+            "first_name": row[3],
+            "last_name": row[4],
+            "tariff_code": row[5] or "unknown",
+            "payment_kind": row[6] or "unknown",
+            "amount_paid": row[7] or 0,
+            "currency": row[8],
+            "billing_reason": row[9],
+            "recovered_after_failure": row[10],
+        }
+        for row in cur.fetchall()
+    ]
+
+
+def _fetch_weekly_metrics(cur, period_start_utc, period_end_utc):
+    metrics = {
+        "new_registrations": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE registered_at >= %s AND registered_at < %s",
+            (period_start_utc, period_end_utc),
+        ),
+        "free_lessons": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE video_sent_at >= %s AND video_sent_at < %s",
+            (period_start_utc, period_end_utc),
+        ),
+        "group_joins": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE event_type = 'group_member_joined'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "group_leaves": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE event_type = 'group_member_left'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "active_paid_now": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW()",
+        ),
+        "total_users_now": _fetch_single_count(cur, "SELECT COUNT(*) FROM users"),
+        "blocked_bot_now": _fetch_single_count(cur, "SELECT COUNT(*) FROM users WHERE blocked_bot = TRUE"),
+        "initial_purchases": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND payment_kind = 'initial_subscription'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "recurring_payments": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND payment_kind = 'recurring'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "trial_payments": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND payment_kind = 'trial'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "adjustment_payments": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND payment_kind IN ('adjustment', 'out_of_band', 'unknown')
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "successful_payments": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "unique_payers": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(DISTINCT telegram_id) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND telegram_id IS NOT NULL
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "failed_payments": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'failed'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "recovered_after_failure": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM payment_events
+            WHERE payment_status = 'succeeded'
+              AND recovered_after_failure = TRUE
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "auto_renew_disabled": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE event_type = 'subscription_auto_renew_disabled'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "access_closed": _fetch_single_count(
+            cur,
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE event_type = 'auto_access_closed_expired'
+              AND created_at >= %s
+              AND created_at < %s
+            """,
+            (period_start_utc, period_end_utc),
+        ),
+        "grace_period_now": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW()",
+        ),
+        "payment_failed_now": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE payment_failed = TRUE",
+        ),
+        "unlinked_stripe_events": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM unlinked_stripe_events WHERE resolved = FALSE",
+        ),
+        "expired_paid_now": _fetch_single_count(
+            cur,
+            "SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date < NOW()",
+        ),
+    }
+    metrics["revenue_by_currency"] = _fetch_revenue_by_currency(cur, period_start_utc, period_end_utc)
+    metrics["tariff_counts"] = _fetch_tariff_counts(cur, period_start_utc, period_end_utc)
+    return metrics
+
+
+def _fetch_payment_history_started_at(cur):
+    cur.execute("SELECT value_text FROM system_settings WHERE key = 'payment_history_started_at'")
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return datetime.fromisoformat(str(row[0]).split("+")[0])
+    except ValueError:
+        return None
+
+
+def _weekly_report_keyboard(key):
+    return InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("📄 Скачать CSV покупок", callback_data=f"weekly_csv:{key}"),
+        InlineKeyboardButton("🔄 Обновить отчёт", callback_data=f"weekly_refresh:{key}"),
+    )
+
+
+async def hydrate_missing_buyer_profiles(payments, concurrency=3):
+    missing_ids = [
+        int(payment["telegram_id"])
+        for payment in payments
+        if payment.get("telegram_id")
+        and not payment.get("username")
+        and not payment.get("first_name")
+        and not payment.get("last_name")
+    ]
+    seen = set()
+    missing_ids = [telegram_id for telegram_id in missing_ids if not (telegram_id in seen or seen.add(telegram_id))]
+    if not missing_ids:
+        return payments
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def fetch_profile(telegram_id):
+        async with semaphore:
+            try:
+                chat = await bot.get_chat(telegram_id)
+                save_telegram_user_profile(chat)
+                return telegram_id, chat
+            except Exception as e:
+                logging.warning("WEEKLY_REPORT_PROFILE_FETCH_FAILED: telegram_id=%s, error=%s", telegram_id, e)
+                return telegram_id, None
+
+    results = await asyncio.gather(*(fetch_profile(telegram_id) for telegram_id in missing_ids))
+    profiles = {telegram_id: profile for telegram_id, profile in results if profile}
+
+    for payment in payments:
+        profile = profiles.get(payment.get("telegram_id"))
+        if profile:
+            payment["username"] = getattr(profile, "username", None)
+            payment["first_name"] = getattr(profile, "first_name", None)
+            payment["last_name"] = getattr(profile, "last_name", None)
+    return payments
+
+
+async def build_weekly_admin_report(period_start, period_end):
+    period_start_utc = to_utc_naive(period_start)
+    period_end_utc = to_utc_naive(period_end)
+    comparison_start = period_start - timedelta(days=7)
+    comparison_end = period_start
+    comparison_start_utc = to_utc_naive(comparison_start)
+    comparison_end_utc = to_utc_naive(comparison_end)
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        metrics = _fetch_weekly_metrics(cur, period_start_utc, period_end_utc)
+        comparison = _fetch_weekly_metrics(cur, comparison_start_utc, comparison_end_utc)
+        buyers = _fetch_payment_buyers(cur, period_start_utc, period_end_utc)
+        history_started_at = _fetch_payment_history_started_at(cur)
+    finally:
+        cur.close()
+        conn.close()
+
+    buyers = await hydrate_missing_buyer_profiles(buyers)
+    history_note = None
+    if history_started_at and history_started_at > period_start_utc:
+        history_started_moscow = history_started_at.replace(tzinfo=timezone.utc).astimezone(MOSCOW_TZ)
+        history_note = (
+            "История платежей собирается с "
+            f"{history_started_moscow.strftime('%d.%m.%Y')}. "
+            "Оплаты до этой даты в выручку не включены."
+        )
+    text = build_weekly_report_text(
+        period_start,
+        period_end,
+        metrics,
+        comparison=comparison,
+        buyers=buyers,
+        history_note=history_note,
+    )
+    return text, buyers
+
+
+def claim_weekly_report_run(cur, key, period_start, period_end):
+    return claim_weekly_report_run_record(
+        cur,
+        key,
+        to_utc_naive(period_start),
+        to_utc_naive(period_end),
+        datetime.utcnow(),
+        lease_minutes=30,
+    )
+
+
+def complete_weekly_report_run(cur, key, sent_admin_ids):
+    cur.execute("""
+        UPDATE weekly_report_runs
+        SET status = 'completed',
+            sent_admin_ids = %s,
+            updated_at = NOW(),
+            completed_at = NOW(),
+            error_text = NULL
+        WHERE report_key = %s
+    """, (",".join(str(admin_id) for admin_id in sent_admin_ids), key))
+
+
+def fail_weekly_report_run(cur, key, error_text):
+    cur.execute("""
+        UPDATE weekly_report_runs
+        SET status = 'failed',
+            updated_at = NOW(),
+            completed_at = NOW(),
+            error_text = %s
+        WHERE report_key = %s
+    """, (str(error_text)[:500], key))
+
+
+def save_weekly_report_sent_admin(cur, key, sent_admin_ids):
+    cur.execute("""
+        UPDATE weekly_report_runs
+        SET sent_admin_ids = %s,
+            updated_at = NOW()
+        WHERE report_key = %s
+    """, (",".join(str(admin_id) for admin_id in sent_admin_ids), key))
+
+
+async def send_weekly_admin_report():
+    period_start, period_end = get_last_completed_week_bounds()
+    key = weekly_report_key(period_start)
+    if not ADMIN_IDS:
+        logging.warning("WEEKLY_ADMIN_REPORT_SKIPPED: ADMIN_IDS не настроен")
+        return {"status": "failed", "report_key": None, "sent_admin_ids": [], "errors": ["ADMIN_IDS not configured"]}
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    claim_result = {"status": "already_processing", "sent_admin_ids": []}
+    try:
+        claim_result = claim_weekly_report_run(cur, key, period_start, period_end)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    if claim_result["status"] != "claimed":
+        logging.info(
+            "WEEKLY_ADMIN_REPORT_DUPLICATE_SKIPPED: report_key=%s, status=%s",
+            key,
+            claim_result["status"],
+        )
+        return {
+            "status": claim_result["status"],
+            "report_key": key,
+            "sent_admin_ids": claim_result.get("sent_admin_ids", []),
+            "errors": [],
+        }
+
+    sent_admin_ids = list(claim_result.get("sent_admin_ids", []))
+    errors = []
+    try:
+        text, _ = await build_weekly_admin_report(period_start, period_end)
+        keyboard = _weekly_report_keyboard(key)
+        for admin_id in ADMIN_IDS:
+            if admin_id in sent_admin_ids:
+                continue
+            try:
+                await bot.send_message(admin_id, text, reply_markup=keyboard)
+                sent_admin_ids.append(admin_id)
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    save_weekly_report_sent_admin(cur, key, sent_admin_ids)
+                    conn.commit()
+                finally:
+                    cur.close()
+                    conn.close()
+            except Exception as e:
+                logging.error("WEEKLY_ADMIN_REPORT_SEND_FAILED: admin_id=%s, report_key=%s, error=%s", admin_id, key, e)
+                errors.append(f"{admin_id}: {e}")
+    except Exception as e:
+        logging.exception("WEEKLY_ADMIN_REPORT_BUILD_FAILED: report_key=%s, error=%s", key, e)
+        errors.append(str(e))
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        if sent_admin_ids:
+            complete_weekly_report_run(cur, key, sent_admin_ids)
+        else:
+            fail_weekly_report_run(cur, key, "; ".join(errors) or "unknown error")
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    status = "failed"
+    if sent_admin_ids and errors:
+        status = "partial"
+    elif sent_admin_ids:
+        status = "completed"
+    return {
+        "status": status,
+        "report_key": key,
+        "sent_admin_ids": sent_admin_ids,
+        "errors": errors,
+    }
+
+
+async def send_weekly_report_to_admin(message, period_start, period_end, with_actions=True):
+    text, _ = await build_weekly_admin_report(period_start, period_end)
+    key = weekly_report_key(period_start)
+    keyboard = _weekly_report_keyboard(key) if with_actions else None
+    await message.answer(text, reply_markup=keyboard)
+
+
+async def send_weekly_csv(callback, period_start, period_end):
+    _, buyers = await build_weekly_admin_report(period_start, period_end)
+    csv_bytes = build_payments_csv(buyers)
+    start_label = period_start.date().isoformat()
+    csv_end = period_end - timedelta(days=1) if period_end.time() == datetime.min.time() and period_end > period_start else period_end
+    end_label = csv_end.date().isoformat()
+    file_obj = io.BytesIO(csv_bytes)
+    file_obj.name = f"weekly_payments_{start_label}_{end_label}.csv"
+    await bot.send_document(
+        callback.from_user.id,
+        types.InputFile(file_obj, filename=file_obj.name),
+        caption=f"CSV покупок за {start_label} — {end_label}",
+    )
 
 
 async def payment_needs_rejoin_invite(telegram_id, old_expiry, source, stripe_event_id=None):
@@ -2553,18 +3362,31 @@ async def delete_join_leave_service_messages(message: types.Message):
     event_datetime = getattr(message, "date", None)
     event_type = "unknown_service_message"
     event_user = None
+    service_event_users = []
 
     if getattr(message, "new_chat_members", None):
         event_type = "user_joined"
-        event_user = message.new_chat_members[0] if message.new_chat_members else None
+        service_event_users = list(message.new_chat_members or [])
+        event_user = service_event_users[0] if service_event_users else None
     elif getattr(message, "left_chat_member", None):
         event_type = "user_left"
         event_user = message.left_chat_member
+        service_event_users = [event_user] if event_user else []
 
     user_id = getattr(event_user, "id", None)
     username = getattr(event_user, "username", None)
     full_name = getattr(event_user, "full_name", None)
     service_message_deleted = False
+    for service_user in service_event_users:
+        service_user_id = getattr(service_user, "id", None)
+        if not service_user_id or getattr(service_user, "is_bot", False):
+            continue
+        save_telegram_user_profile(service_user)
+        await log_access_event(
+            service_user_id,
+            "group_member_joined" if event_type == "user_joined" else "group_member_left",
+            source="telegram_group",
+        )
 
     logging.info(
         "GROUP_SERVICE_MESSAGE: chat_id=%s, chat_title=%s, message_id=%s, event_type=%s, "
@@ -2627,6 +3449,7 @@ async def delete_join_leave_service_messages(message: types.Message):
 async def start(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
+    save_telegram_user_profile(message.from_user)
 
     # Добавляем пользователя в БД (если его ещё нет)
     conn = get_db_conn()
@@ -2745,6 +3568,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer("⏳ Проверяем...")
     sub_type = callback.data
     user_id = callback.from_user.id
+    save_telegram_user_profile(callback.from_user)
 
     # Получаем данные пользователя из БД
     conn = get_db_conn()
@@ -4448,6 +5272,9 @@ ADMIN_MENU_SECTIONS = {
         "danger": False,
         "commands": [
             "/stats — статистика клуба",
+            "/weekly_report — отчёт за прошлую неделю",
+            "/weekly_report_current — отчёт за текущую неделю",
+            "/weekly_report_send — тестовая отправка weekly report всем админам",
             "/bot_health — диагностика бота",
             "/expiring_users — подписки, истекающие за 48 часов",
             "/expired_users — просроченные подписки",
@@ -4820,6 +5647,98 @@ async def stats_command(message: types.Message):
     finally:
         cur.close()
         conn.close()
+
+
+@dp.message_handler(commands=['weekly_report'], state='*')
+async def weekly_report_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    period_start, period_end = get_last_completed_week_bounds()
+    await send_weekly_report_to_admin(message, period_start, period_end)
+
+
+@dp.message_handler(commands=['weekly_report_current'], state='*')
+async def weekly_report_current_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    period_start, period_end = get_current_week_bounds()
+    await send_weekly_report_to_admin(message, period_start, period_end, with_actions=False)
+
+
+@dp.message_handler(commands=['weekly_report_send'], state='*')
+async def weekly_report_send_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    period_start, _ = get_last_completed_week_bounds()
+    key = weekly_report_key(period_start)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT status, sent_admin_ids FROM weekly_report_runs WHERE report_key = %s", (key,))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if row and row[0] == "completed":
+        await message.answer(
+            f"⚠️ Отчёт за {key} уже был автоматически отправлен администраторам: {row[1] or 'нет данных'}."
+        )
+        return
+    await message.answer(f"Запускаю тестовую автоматическую отправку отчёта за {key}.")
+    result = await send_weekly_admin_report()
+    status_text = {
+        "completed": "✅ Отчёт отправлен всем доступным администраторам.",
+        "partial": "⚠️ Отчёт отправлен частично.",
+        "failed": "❌ Отчёт не удалось отправить ни одному администратору.",
+        "duplicate_completed": "⚠️ Отчёт уже был отправлен ранее.",
+        "already_processing": "⏳ Отчёт уже формируется другим запуском.",
+    }.get(result["status"], result["status"])
+    await message.answer(
+        f"{status_text}\n"
+        f"report_key: {result.get('report_key') or key}\n"
+        f"sent_admin_ids: {', '.join(str(admin_id) for admin_id in result.get('sent_admin_ids', [])) or 'нет'}"
+    )
+
+
+def weekly_period_from_key(key):
+    period_start = datetime.fromisoformat(key).replace(tzinfo=MOSCOW_TZ)
+    return period_start, period_start + timedelta(days=7)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("weekly_csv:"), state='*')
+async def weekly_csv_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    try:
+        period_start, period_end = weekly_period_from_key(key)
+    except Exception:
+        await callback.answer("Некорректный период.", show_alert=True)
+        return
+    await callback.answer("Готовлю CSV...")
+    await send_weekly_csv(callback, period_start, period_end)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("weekly_refresh:"), state='*')
+async def weekly_refresh_callback(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Недоступно.", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    try:
+        period_start, period_end = weekly_period_from_key(key)
+    except Exception:
+        await callback.answer("Некорректный период.", show_alert=True)
+        return
+    text, _ = await build_weekly_admin_report(period_start, period_end)
+    try:
+        await callback.message.edit_text(text, reply_markup=_weekly_report_keyboard(key))
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+    await callback.answer("Обновлено.")
+
 
 @dp.message_handler(commands=['test_expiry'])
 async def test_expiry(message: types.Message):
@@ -5253,6 +6172,23 @@ async def stripe_webhook(request):
                     current_period_end=new_expiry,
                     is_active=True,
                     source="checkout.session.completed",
+                )
+                insert_payment_event(
+                    cur,
+                    event_id,
+                    event_type,
+                    "succeeded",
+                    telegram_id=user_id,
+                    checkout_session_id=stripe_value(session, 'id'),
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                    payment_kind="trial" if is_trial and not has_subscription else "unknown",
+                    tariff_code="sub_trial" if is_trial and not has_subscription else "unknown",
+                    amount_paid=stripe_value(session, 'amount_total'),
+                    amount_due=stripe_value(session, 'amount_total'),
+                    currency=stripe_value(session, 'currency'),
+                    period_start=now,
+                    period_end=new_expiry,
                 )
                 conn.commit()
                 logging.info(
@@ -5887,6 +6823,7 @@ async def stripe_webhook(request):
 
                 telegram_id = row[0]
                 customer_email = stripe_value(invoice, 'customer_email') or stripe_value(stripe_value(invoice, 'customer'), 'email')
+                period_start, period_end = invoice_line_period_datetimes(invoice)
                 upsert_stripe_link(
                     cur,
                     telegram_id,
@@ -5897,6 +6834,25 @@ async def stripe_webhook(request):
                     current_period_end=current_period_end,
                     is_active=True,
                     source="invoice.payment_succeeded",
+                )
+                insert_payment_event(
+                    cur,
+                    event_id,
+                    event_type,
+                    "succeeded",
+                    telegram_id=telegram_id,
+                    invoice_id=invoice_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                    payment_kind=payment_kind,
+                    billing_reason=billing_reason,
+                    tariff_code=tariff_code_from_invoice(invoice),
+                    amount_paid=amount_paid,
+                    amount_due=amount_due,
+                    currency=stripe_value(invoice, 'currency'),
+                    period_start=period_start,
+                    period_end=period_end or new_expiry,
+                    recovered_after_failure=was_payment_failed,
                 )
                 conn.commit()
 
@@ -6374,6 +7330,27 @@ async def stripe_webhook(request):
                             safe_log_id(invoice_id),
                             event_type,
                         )
+                if row:
+                    failed_period_start, failed_period_end = invoice_line_period_datetimes(invoice)
+                    failed_kind = invoice_payment_kind(billing_reason, "process_payment")
+                    insert_payment_event(
+                        cur,
+                        event_id,
+                        event_type,
+                        "failed",
+                        telegram_id=row[0],
+                        invoice_id=invoice_id,
+                        stripe_customer_id=customer_id_for_db,
+                        stripe_subscription_id=sub_id,
+                        payment_kind=failed_kind,
+                        billing_reason=billing_reason,
+                        tariff_code=tariff_code_from_invoice(invoice),
+                        amount_paid=stripe_value(invoice, 'amount_paid'),
+                        amount_due=stripe_value(invoice, 'amount_due'),
+                        currency=stripe_value(invoice, 'currency'),
+                        period_start=failed_period_start,
+                        period_end=failed_period_end,
+                    )
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -6487,6 +7464,14 @@ async def stripe_webhook(request):
             if sub_id:
                 conn = get_db_conn()
                 cur = conn.cursor()
+                old_auto_renew = None
+                cur.execute(
+                    "SELECT auto_renew FROM users WHERE stripe_subscription_id = %s",
+                    (sub_id,)
+                )
+                old_auto_row = cur.fetchone()
+                if old_auto_row:
+                    old_auto_renew = old_auto_row[0]
                 if status in ("past_due", "unpaid"):
                     cur.execute("""
                         UPDATE users
@@ -6667,6 +7652,25 @@ async def stripe_webhook(request):
                             is_active=status in ("active", "trialing"),
                             source="customer.subscription.updated",
                         )
+                if row and old_auto_renew is True and cancel_at_period_end:
+                    cur.execute("""
+                        INSERT INTO access_events (
+                            telegram_id,
+                            event_type,
+                            source,
+                            stripe_event_id,
+                            stripe_subscription_id,
+                            notes
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (
+                        row[0],
+                        "subscription_auto_renew_disabled",
+                        "customer.subscription.updated",
+                        event_id,
+                        sub_id,
+                        f"status={status}; cancel_at_period_end=True",
+                    ))
                 conn.commit()
                 cur.close()
                 conn.close()
@@ -7068,6 +8072,23 @@ async def link_stripe_user_command(message: types.Message):
         await message.reply("⚠️ customer_id должен начинаться с cus_, subscription_id должен начинаться с sub_.")
         return
 
+    try:
+        subscription = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
+    except Exception as e:
+        logging.error(
+            "LINK_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s, customer_id=%s, "
+            "subscription_id=%s, error=%s",
+            target_user_id,
+            customer_id,
+            subscription_id,
+            str(e),
+            exc_info=True,
+        )
+        await message.reply(f"❌ Не удалось получить Stripe subscription: {e}")
+        return
+
+    prepared_payment_events = await prepare_manual_link_payment_events(customer_id, subscription_id)
+
     conn = get_db_conn()
     cur = conn.cursor()
     old_expiry = None
@@ -7083,21 +8104,6 @@ async def link_stripe_user_command(message: types.Message):
             return
 
         old_expiry = row[0]
-
-        try:
-            subscription = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
-        except Exception as e:
-            logging.error(
-                "LINK_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s, customer_id=%s, "
-                "subscription_id=%s, error=%s",
-                target_user_id,
-                customer_id,
-                subscription_id,
-                str(e),
-                exc_info=True,
-            )
-            await message.reply(f"❌ Не удалось получить Stripe subscription: {e}")
-            return
 
         status = getattr(subscription, "status", None)
         current_period_end = getattr(subscription, "current_period_end", None)
@@ -7152,6 +8158,11 @@ async def link_stripe_user_command(message: types.Message):
             is_active=access_active,
             source="manual_link_stripe_user",
         )
+        backfilled_payment_events = backfill_payment_events_for_manual_link(
+            cur,
+            target_user_id,
+            prepared_payment_events,
+        )
         cur.execute("""
             UPDATE unlinked_stripe_events
             SET resolved = TRUE,
@@ -7176,7 +8187,8 @@ async def link_stripe_user_command(message: types.Message):
             stripe_subscription_id=subscription_id,
             notes=(
                 f"admin_id={message.from_user.id}; customer_id={customer_id}; "
-                f"status={status}; current_period_end={current_period_end}"
+                f"status={status}; current_period_end={current_period_end}; "
+                f"backfilled_payment_events={backfilled_payment_events}"
             )
         )
 
@@ -7191,13 +8203,14 @@ async def link_stripe_user_command(message: types.Message):
 
         logging.info(
             "LINK_STRIPE_USER_COMPLETED: telegram_id=%s, customer_id=%s, subscription_id=%s, "
-            "status=%s, expiry_date=%s, invite_sent=%s",
+            "status=%s, expiry_date=%s, invite_sent=%s, backfilled_payment_events=%s",
             target_user_id,
             customer_id,
             subscription_id,
             status,
             new_expiry,
             invite_sent,
+            backfilled_payment_events,
         )
         await message.reply(
             "✅ Stripe пользователь связан.\n\n"
@@ -7206,7 +8219,8 @@ async def link_stripe_user_command(message: types.Message):
             f"subscription_id: {subscription_id}\n"
             f"status: {status or 'нет'}\n"
             f"expiry_date: {new_expiry or 'не обновлена'}\n"
-            f"invite_sent: {invite_sent}"
+            f"invite_sent: {invite_sent}\n"
+            f"payment_events_added: {backfilled_payment_events}"
         )
 
     except Exception as e:
@@ -7324,6 +8338,18 @@ async def on_startup(app):
         hour=3,
         minute=0,
         misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        send_weekly_admin_report,
+        'cron',
+        day_of_week='mon',
+        hour=10,
+        minute=0,
+        timezone=MOSCOW_TZ,
+        misfire_grace_time=3600,
         coalesce=True,
         max_instances=1
     )
