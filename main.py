@@ -95,6 +95,7 @@ from weekly_report import (
 from stripe_webhook_safety import (
     construct_verified_stripe_event,
     stripe_signature_error_class,
+    stripe_value,
     stripe_webhook_diagnostics,
 )
 class PromoStates(StatesGroup):
@@ -6434,14 +6435,14 @@ async def stripe_webhook(request):
         logging.exception("Stripe webhook construct_event failed: error=%s diagnostics=%s", e, diagnostics)
         return web.Response(status=400, text="Stripe webhook verification error")
 
-    event_id = event['id']
-    event_type = event['type']
+    event_id = stripe_value(event, "id")
+    event_type = stripe_value(event, "type")
     logging.info(f"Stripe webhook event: event_id={safe_log_id(event_id)}, event.type={event_type}")
 
-    event_created = event.get("created")
+    event_created = stripe_value(event, "created")
     event_created_at = datetime.utcfromtimestamp(int(event_created)) if event_created else None
-    event_object = event.get("data", {}).get("object", {}) if isinstance(event, dict) else {}
-    object_id = event_object.get("id") if isinstance(event_object, dict) else getattr(event_object, "id", None)
+    event_object = stripe_value(event, "data", "object")
+    object_id = stripe_value(event_object, "id")
     claim_result = await claim_event_processing(
         event_id,
         event_created_at=event_created_at,
@@ -6458,17 +6459,6 @@ async def stripe_webhook(request):
         return web.Response(status=200)
 
     try:
-
-        def stripe_value(obj, *path):
-            current = obj
-            for key in path:
-                if current is None:
-                    return None
-                if isinstance(current, dict):
-                    current = current.get(key)
-                else:
-                    current = getattr(current, key, None)
-            return current
 
         def stripe_object_id(value):
             if value is None:

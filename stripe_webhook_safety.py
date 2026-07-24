@@ -53,6 +53,18 @@ def railway_diagnostics(env=None):
     return {key: env.get(key) for key in RAILWAY_DIAGNOSTIC_ENV_KEYS if env.get(key)}
 
 
+def stripe_value(obj, *path):
+    current = obj
+    for key in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
 def stripe_webhook_diagnostics(request, payload, sig_header, webhook_secret, env=None):
     headers = getattr(request, "headers", {}) or {}
     return {

@@ -458,7 +458,8 @@ class StripeInvoiceRulesTest(unittest.TestCase):
     def test_webhook_outer_exception_releases_claim(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
-        self.assertIn("try:\n\n        def stripe_value", source)
+        self.assertIn("from stripe_webhook_safety import", source)
+        self.assertNotIn("        def stripe_value", source)
         self.assertIn("except Exception as e:\n        await release_event_processing(event_id)", source)
         self.assertNotIn("claim_released", source)
         self.assertIn("await release_event_processing(event_id)", source)

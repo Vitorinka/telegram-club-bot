@@ -8,6 +8,7 @@ from stripe_webhook_safety import (
     construct_verified_stripe_event,
     stripe_signature_error_class,
     stripe_signature_timestamp,
+    stripe_value,
     stripe_webhook_diagnostics,
     webhook_secret_diagnostics,
 )
@@ -30,6 +31,11 @@ class FakeRequest:
     path = "/stripe-payment"
     host = "club.example"
     headers = {"Content-Type": "application/json"}
+
+
+class FakeStripeObject:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class StripeWebhookSafetyTests(unittest.TestCase):
@@ -78,6 +84,47 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         self.assertEqual(diagnostics["RAILWAY_ENVIRONMENT"], "production")
         self.assertEqual(diagnostics["RAILWAY_SERVICE_NAME"], "bot")
         self.assertNotIn(SECRET_PREFIX + "diag", str(diagnostics))
+
+    def test_stripe_value_reads_stripe_object_without_get(self):
+        event = FakeStripeObject(
+            id="evt_object",
+            created=123,
+            data=FakeStripeObject(object=FakeStripeObject(id="sub_object")),
+        )
+
+        self.assertFalse(hasattr(event, "get"))
+        self.assertEqual(stripe_value(event, "created"), 123)
+        event_object = stripe_value(event, "data", "object")
+        self.assertEqual(stripe_value(event_object, "id"), "sub_object")
+
+    def test_stripe_value_keeps_dict_compatibility(self):
+        event = {
+            "id": "evt_dict",
+            "created": 456,
+            "data": {"object": {"id": "sub_dict"}},
+        }
+
+        self.assertEqual(stripe_value(event, "created"), 456)
+        event_object = stripe_value(event, "data", "object")
+        self.assertEqual(stripe_value(event_object, "id"), "sub_dict")
+
+    def test_webhook_claim_extraction_does_not_use_get(self):
+        event = FakeStripeObject(
+            id="evt_no_get",
+            type="customer.subscription.updated",
+            created=789,
+            data=FakeStripeObject(object=FakeStripeObject(id="sub_no_get")),
+        )
+
+        try:
+            event_created = stripe_value(event, "created")
+            event_object = stripe_value(event, "data", "object")
+            object_id = stripe_value(event_object, "id")
+        except AttributeError as exc:
+            self.fail(f"StripeObject-style event access raised AttributeError: {exc}")
+
+        self.assertEqual(event_created, 789)
+        self.assertEqual(object_id, "sub_no_get")
 
 
 if __name__ == "__main__":
