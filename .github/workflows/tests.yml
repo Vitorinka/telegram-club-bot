@@ -24,4 +24,4 @@ jobs:
         run: PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest discover -s tests -v
       - name: Secret scan
         run: |
-          ! grep -RInE --exclude='*.patch' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
+          ! grep -RInE --exclude='*.patch' --exclude='tests.yml' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
