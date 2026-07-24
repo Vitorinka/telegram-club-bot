@@ -109,6 +109,11 @@ from weekly_report import (
     tariff_code_from_invoice,
     to_utc_naive,
 )
+from stripe_webhook_safety import (
+    construct_verified_stripe_event,
+    stripe_signature_error_class,
+    stripe_webhook_diagnostics,
+)
 class PromoStates(StatesGroup):
     waiting_for_media = State()
     waiting_for_text = State()
@@ -128,6 +133,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_ID = os.getenv("GROUP_ID")
 ADMIN_IDS = [int(id.strip()) for id in os.getenv("ADMIN_IDS", "").split(",") if id.strip()]
 stripe.api_key = os.getenv("STRIPE_API_KEY")
+SUCCESSFUL_INVOICE_EVENT_TYPES = ("invoice.payment_succeeded", "invoice.paid")
 
 REQUIRED_ENV_VARS = (
     "BOT_TOKEN",
@@ -1412,6 +1418,106 @@ async def notify_admins(text: str, alert_key=None, severity="WARNING"):
             cur.close()
             conn.close()
     return {"delivered": delivered, "failed": failed}
+
+
+def format_minor_amount_for_admin(amount, currency):
+    if amount is None:
+        return "нет"
+    try:
+        value = int(amount)
+    except (TypeError, ValueError):
+        return f"{amount} {(currency or '').upper()}".strip()
+    return f"{value / 100:.2f} {(currency or '').upper()}".strip()
+
+
+def admin_payment_user_label(telegram_id, first_name=None, username=None):
+    if first_name and username:
+        return f"{first_name} (@{username}, {telegram_id})"
+    if username:
+        return f"@{username} ({telegram_id})"
+    if first_name:
+        return f"{first_name} ({telegram_id})"
+    return str(telegram_id)
+
+
+async def notify_admins_idempotent(notification_type, text, stripe_event_id):
+    key = notification_key(notification_type, 0, stripe_event_id)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        claim = claim_notification(
+            cur,
+            key,
+            0,
+            notification_type,
+            stripe_event_id=stripe_event_id,
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    if claim not in ("claimed", "retry_claimed"):
+        logging.info(
+            "ADMIN_NOTIFICATION_SKIPPED: type=%s, stripe_event_id=%s, claim=%s",
+            notification_type,
+            safe_log_id(stripe_event_id),
+            claim,
+        )
+        return {"status": claim}
+
+    try:
+        result = await notify_admins(text)
+    except Exception as e:
+        fail_conn = get_db_conn()
+        fail_cur = fail_conn.cursor()
+        try:
+            mark_notification_failed(fail_cur, key, e)
+            fail_conn.commit()
+        finally:
+            fail_cur.close()
+            fail_conn.close()
+        raise
+
+    done_conn = get_db_conn()
+    done_cur = done_conn.cursor()
+    try:
+        mark_notification_sent(done_cur, key)
+        done_conn.commit()
+    finally:
+        done_cur.close()
+        done_conn.close()
+    return {"status": "sent", "result": result}
+
+
+async def notify_admins_payment_success_once(
+    *,
+    event_id,
+    event_type,
+    telegram_id,
+    payment_type,
+    tariff_code,
+    amount,
+    currency,
+    new_expiry,
+    first_name=None,
+    username=None,
+):
+    text = (
+        "Stripe payment processed successfully.\n\n"
+        f"type: {payment_type}\n"
+        f"event_type: {event_type}\n"
+        f"event_id: {event_id}\n"
+        f"user: {admin_payment_user_label(telegram_id, first_name, username)}\n"
+        f"tariff: {tariff_code or 'unknown'}\n"
+        f"amount: {format_minor_amount_for_admin(amount, currency)}\n"
+        f"new_expiry: {new_expiry.strftime('%d.%m.%Y %H:%M') if new_expiry else 'нет'}"
+    )
+    return await notify_admins_idempotent(
+        "stripe_payment_success_admin",
+        text,
+        event_id,
+    )
 
 
 async def notify_critical_delivery_failed(telegram_id, event_type, action, error, db_state_note=""):
@@ -6751,22 +6857,40 @@ async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
     webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-    logging.info(
-        f"Stripe webhook received: path={request.path}, payload_bytes={len(payload)}, "
-        f"signature_present={bool(sig_header)}, webhook_secret_configured={bool(webhook_secret)}"
+    diagnostics = stripe_webhook_diagnostics(
+        request,
+        payload,
+        sig_header,
+        webhook_secret,
+        os.environ,
     )
+    logging.info("Stripe webhook received: diagnostics=%s", diagnostics)
 
     if not webhook_secret:
-        logging.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET не задан.")
+        logging.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET не задан. diagnostics=%s", diagnostics)
         return web.Response(status=500)
+    if not sig_header:
+        logging.warning("Stripe webhook rejected: Stripe-Signature header missing. diagnostics=%s", diagnostics)
+        return web.Response(status=400, text="Missing Stripe-Signature")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, webhook_secret
+        event = construct_verified_stripe_event(payload, sig_header, webhook_secret)
+    except stripe_signature_error_class() as e:
+        logging.warning(
+            "Stripe webhook signature verification failed: error=%s diagnostics=%s",
+            str(e),
+            diagnostics,
         )
+        return web.Response(status=400, text="Invalid Stripe signature")
+    except LookupError as e:
+        logging.warning("Stripe webhook rejected: %s diagnostics=%s", e, diagnostics)
+        return web.Response(status=400, text="Missing Stripe-Signature")
+    except ValueError as e:
+        logging.error("Stripe webhook rejected: %s diagnostics=%s", e, diagnostics)
+        return web.Response(status=500, text="Stripe webhook secret missing")
     except Exception as e:
-        logging.exception(f"Ошибка проверки подписи Stripe webhook: {e}")
-        return web.Response(status=400)
+        logging.exception("Stripe webhook construct_event failed: error=%s diagnostics=%s", e, diagnostics)
+        return web.Response(status=400, text="Stripe webhook verification error")
 
     event_id = event['id']
     event_type = event['type']
@@ -7111,10 +7235,15 @@ async def stripe_webhook(request):
             conn = get_db_conn()
             cur = conn.cursor()
             try:
-                cur.execute("SELECT paid, expiry_date, first_payment_done FROM users WHERE telegram_id = %s", (int(user_id),))
+                cur.execute(
+                    "SELECT paid, expiry_date, first_payment_done, first_name, username FROM users WHERE telegram_id = %s",
+                    (int(user_id),),
+                )
                 row = cur.fetchone()
                 now = datetime.utcnow()
                 old_expiry = row[1] if row else None
+                first_name = row[3] if row else None
+                username = row[4] if row else None
 
                 if row and row[0] and row[1] and row[1] > now:
                     new_expiry = row[1] + timedelta(days=days_to_add)
@@ -7207,6 +7336,18 @@ async def stripe_webhook(request):
                     period_end=new_expiry,
                 )
                 conn.commit()
+                await notify_admins_payment_success_once(
+                    event_id=event_id,
+                    event_type=event_type,
+                    telegram_id=user_id,
+                    payment_type="первая оплата" if not row or not row[2] else "новая оплата",
+                    tariff_code="sub_trial" if is_trial and not has_subscription else "unknown",
+                    amount=stripe_value(session, 'amount_total'),
+                    currency=stripe_value(session, 'currency'),
+                    new_expiry=new_expiry,
+                    first_name=first_name,
+                    username=username,
+                )
                 logging.info(
                     f"Checkout Session marked completed: user_id={user_id}, "
                     f"session_id={safe_log_id(stripe_value(session, 'id'))}, event_id={safe_log_id(event_id)}"
@@ -7304,9 +7445,9 @@ async def stripe_webhook(request):
                 cur.close()
                 conn.close()
 
-        # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
-            # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
-        elif event['type'] == 'invoice.payment_succeeded':
+        # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded / invoice.paid) ----------
+            # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded / invoice.paid) ----------
+        elif event['type'] in SUCCESSFUL_INVOICE_EVENT_TYPES:
             invoice = event['data']['object']
             logging.info(
                 "Stripe invoice.payment_succeeded data: "
@@ -7644,7 +7785,7 @@ async def stripe_webhook(request):
                 if metadata_telegram_id:
                     cur.execute("""
                         WITH target AS (
-                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed, first_name, username
                             FROM users
                             WHERE telegram_id = %s
                         )
@@ -7670,7 +7811,7 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, target.first_name, target.username
                     """, (
                         metadata_telegram_id,
                         new_expiry,
@@ -7690,7 +7831,7 @@ async def stripe_webhook(request):
                 if not row:
                     cur.execute("""
                         WITH target AS (
-                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed, first_name, username
                             FROM users
                             WHERE stripe_subscription_id = %s
                         )
@@ -7717,7 +7858,7 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, target.first_name, target.username
                     """, (
                         sub_id,
                         new_expiry,
@@ -7737,7 +7878,7 @@ async def stripe_webhook(request):
                 if not row and customer_id:
                     cur.execute("""
                         WITH target AS (
-                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed, first_name, username
                             FROM users
                             WHERE stripe_customer_id = %s
                         )
@@ -7764,7 +7905,7 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, target.first_name, target.username
                     """, (
                         customer_id,
                         new_expiry,
@@ -7790,7 +7931,7 @@ async def stripe_webhook(request):
                     if linked_telegram_id:
                         cur.execute("""
                             WITH target AS (
-                                SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                                SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed, first_name, username
                                 FROM users
                                 WHERE telegram_id = %s
                             )
@@ -7817,7 +7958,7 @@ async def stripe_webhook(request):
                                 first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                             FROM target
                             WHERE users.telegram_id = target.telegram_id
-                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, target.first_name, target.username
                         """, (
                             linked_telegram_id,
                             new_expiry,
@@ -7906,6 +8047,18 @@ async def stripe_webhook(request):
                     recovered_after_failure=was_payment_failed,
                 )
                 conn.commit()
+                await notify_admins_payment_success_once(
+                    event_id=event_id,
+                    event_type=event_type,
+                    telegram_id=telegram_id,
+                    payment_type="первая оплата" if payment_kind == "initial_subscription" else "продление" if payment_kind == "recurring" else payment_kind,
+                    tariff_code=tariff_code_from_invoice(invoice),
+                    amount=amount_paid,
+                    currency=stripe_value(invoice, 'currency'),
+                    new_expiry=new_expiry,
+                    first_name=row[3] if len(row) > 3 else None,
+                    username=row[4] if len(row) > 4 else None,
+                )
 
                 reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
                 if payment_kind == "out_of_band":
