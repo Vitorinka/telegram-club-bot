@@ -92,6 +92,11 @@ from weekly_report import (
     tariff_code_from_invoice,
     to_utc_naive,
 )
+from stripe_webhook_safety import (
+    construct_verified_stripe_event,
+    stripe_signature_error_class,
+    stripe_webhook_diagnostics,
+)
 class PromoStates(StatesGroup):
     waiting_for_media = State()
     waiting_for_text = State()
@@ -6394,22 +6399,40 @@ async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
     webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-    logging.info(
-        f"Stripe webhook received: path={request.path}, payload_bytes={len(payload)}, "
-        f"signature_present={bool(sig_header)}, webhook_secret_configured={bool(webhook_secret)}"
+    diagnostics = stripe_webhook_diagnostics(
+        request,
+        payload,
+        sig_header,
+        webhook_secret,
+        os.environ,
     )
+    logging.info("Stripe webhook diagnostics: %s", diagnostics)
 
     if not webhook_secret:
-        logging.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET не задан.")
-        return web.Response(status=500)
+        logging.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET не задан. diagnostics=%s", diagnostics)
+        return web.Response(status=500, text="Stripe webhook secret missing")
+    if not sig_header:
+        logging.warning("Stripe webhook rejected: Stripe-Signature header missing. diagnostics=%s", diagnostics)
+        return web.Response(status=400, text="Missing Stripe-Signature")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, webhook_secret
+        event = construct_verified_stripe_event(payload, sig_header, webhook_secret)
+    except stripe_signature_error_class() as e:
+        logging.warning(
+            "Stripe webhook signature verification failed: error=%s diagnostics=%s",
+            str(e),
+            diagnostics,
         )
+        return web.Response(status=400, text="Invalid Stripe signature")
+    except LookupError as e:
+        logging.warning("Stripe webhook rejected: %s diagnostics=%s", e, diagnostics)
+        return web.Response(status=400, text="Missing Stripe-Signature")
+    except ValueError as e:
+        logging.error("Stripe webhook rejected: %s diagnostics=%s", e, diagnostics)
+        return web.Response(status=500, text="Stripe webhook secret missing")
     except Exception as e:
-        logging.exception(f"Ошибка проверки подписи Stripe webhook: {e}")
-        return web.Response(status=400)
+        logging.exception("Stripe webhook construct_event failed: error=%s diagnostics=%s", e, diagnostics)
+        return web.Response(status=400, text="Stripe webhook verification error")
 
     event_id = event['id']
     event_type = event['type']

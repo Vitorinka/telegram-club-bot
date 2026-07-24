@@ -19,9 +19,10 @@ jobs:
           PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
           main.py stripe_invoice_rules.py weekly_report.py checkout_safety.py
           admin_security.py scheduled_jobs.py group_access.py
-          tests/test_stripe_invoice_rules.py tests/test_weekly_report.py
+          stripe_webhook_safety.py tests/test_stripe_invoice_rules.py
+          tests/test_weekly_report.py tests/test_stripe_webhook_safety.py
       - name: Unit tests
         run: PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest discover -s tests -v
       - name: Secret scan
         run: |
-          ! grep -RInE --exclude='*.patch' --exclude='tests.yml' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
+          ! grep -RInE --binary-files=without-match --exclude='*.patch' --exclude='tests.yml' --exclude-dir='.git' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
