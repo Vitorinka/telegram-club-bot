@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: >
+          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
+          main.py stripe_invoice_rules.py weekly_report.py checkout_safety.py
+          admin_security.py scheduled_jobs.py group_access.py
+          tests/test_stripe_invoice_rules.py tests/test_weekly_report.py
+      - name: Unit tests
+        run: PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest discover -s tests -v
+      - name: Secret scan
+        run: |
+          ! grep -RInE --exclude='*.patch' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
