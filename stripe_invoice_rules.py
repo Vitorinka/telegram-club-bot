@@ -182,31 +182,50 @@ def should_send_rejoin_invite(previous_expiry, now, telegram_member_status=None,
     return access_was_inactive
 
 
-def claim_stripe_event(cur, event_id, lease_seconds=600, event_created_at=None, event_type=None, object_id=None):
+def claim_stripe_event(
+    cur,
+    event_id,
+    lease_seconds=600,
+    event_created_at=None,
+    event_type=None,
+    object_id=None,
+    max_attempts=5,
+):
     """Atomically claim a Stripe event before side effects."""
     cur.execute(
         """
-        INSERT INTO stripe_events (event_id, processed, processed_at, event_created_at, event_type, object_id)
-        VALUES (%s, FALSE, NOW(), %s, %s, %s)
+        INSERT INTO stripe_events (event_id, processed, processed_at, event_created_at, event_type, object_id, attempt_count)
+        VALUES (%s, FALSE, NOW(), %s, %s, %s, 1)
         ON CONFLICT (event_id) DO UPDATE SET
             processed = FALSE,
             processed_at = NOW(),
+            attempt_count = COALESCE(stripe_events.attempt_count, 0) + 1,
+            last_error = NULL,
             event_created_at = COALESCE(EXCLUDED.event_created_at, stripe_events.event_created_at),
             event_type = COALESCE(EXCLUDED.event_type, stripe_events.event_type),
             object_id = COALESCE(EXCLUDED.object_id, stripe_events.object_id)
         WHERE stripe_events.processed IS NOT TRUE
+          AND COALESCE(stripe_events.dead_letter, FALSE) IS NOT TRUE
+          AND COALESCE(stripe_events.attempt_count, 0) < %s
           AND stripe_events.processed_at < NOW() - (%s * INTERVAL '1 second')
         RETURNING event_id
         """,
-        (event_id, event_created_at, event_type, object_id, lease_seconds),
+        (event_id, event_created_at, event_type, object_id, max_attempts, lease_seconds),
     )
     if cur.fetchone():
         return "claimed"
 
-    cur.execute("SELECT processed FROM stripe_events WHERE event_id = %s", (event_id,))
+    cur.execute("SELECT processed, dead_letter, attempt_count FROM stripe_events WHERE event_id = %s", (event_id,))
     row = cur.fetchone()
-    if row and row[0]:
+    processed = bool(row[0]) if row and len(row) > 0 else False
+    dead_letter = bool(row[1]) if row and len(row) > 1 else False
+    attempt_count = row[2] if row and len(row) > 2 else None
+    if dead_letter:
+        return "dead_letter"
+    if processed:
         return "duplicate_processed"
+    if attempt_count is not None and attempt_count >= max_attempts:
+        return "max_attempts_exceeded"
     return "duplicate_processing"
 
 
@@ -227,6 +246,27 @@ def release_stripe_event_claim(cur, event_id):
     cur.execute(
         "DELETE FROM stripe_events WHERE event_id = %s AND processed IS NOT TRUE",
         (event_id,),
+    )
+
+
+def mark_stripe_event_failed(cur, event_id, error_text, max_attempts=5):
+    cur.execute(
+        """
+        UPDATE stripe_events
+        SET processed = FALSE,
+            last_error = LEFT(%s, 1000),
+            dead_letter = CASE
+                WHEN COALESCE(attempt_count, 0) >= %s THEN TRUE
+                ELSE dead_letter
+            END,
+            dead_letter_at = CASE
+                WHEN COALESCE(attempt_count, 0) >= %s THEN NOW()
+                ELSE dead_letter_at
+            END,
+            processed_at = NOW()
+        WHERE event_id = %s
+        """,
+        (str(error_text), max_attempts, max_attempts, event_id),
     )
 
 

@@ -22,6 +22,7 @@ from stripe_invoice_rules import (
     invoice_payment_kind,
     is_zero_subscription_update_invoice,
     mark_stripe_event_processed,
+    mark_stripe_event_failed,
     redact_email,
     redact_identifier,
     redact_url,
@@ -57,9 +58,25 @@ from checkout_safety import (
     mark_checkout_terminal,
     mask_secret_text,
     parse_moscow_expiry,
+    should_block_paid_checkout_for_manual_review,
     should_apply_negative_event,
     stripe_identity_conflict_queries,
+    stripe_identity_normalization_queries,
     subscription_status_action,
+)
+from access_removal import (
+    claim_access_removal,
+    count_unconfirmed_removals_query,
+    ensure_access_removal_schema,
+    mark_access_removal_failed,
+    mark_access_removal_removed,
+)
+from notification_outbox import (
+    claim_notification,
+    ensure_notification_outbox_schema,
+    mark_notification_failed,
+    mark_notification_sent,
+    notification_key,
 )
 from group_access import (
     group_join_decision,
@@ -153,6 +170,10 @@ CHECKOUT_OPEN_INSTRUCTION = (
     "Попробуйте открыть оплату во внешнем браузере Safari или Chrome: нажмите ⋯ в окне оплаты "
     "и выберите «Открыть в браузере»."
 )
+
+
+def is_production_environment():
+    return os.getenv("ENVIRONMENT", "").strip().lower() == "production"
 
 # --- СОСТОЯНИЯ FSM ---
 class RegistrationStates(StatesGroup):
@@ -415,6 +436,22 @@ def init_db():
             updated_at TIMESTAMP DEFAULT NOW()
         );
     """)
+    ensure_access_removal_schema(cur)
+    ensure_notification_outbox_schema(cur)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stripe_manual_review_events (
+            event_id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            object_id TEXT,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            telegram_id BIGINT,
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
     # Добавляем недостающие колонки (для старых БД)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;")
@@ -442,6 +479,10 @@ def init_db():
     cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS event_created_at TIMESTAMP;")
     cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS event_type TEXT;")
     cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS object_id TEXT;")
+    cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER DEFAULT 0;")
+    cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS last_error TEXT;")
+    cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS dead_letter BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS dead_letter_at TIMESTAMP;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS customer_email TEXT;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS status TEXT;")
     cur.execute("ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMP;")
@@ -458,6 +499,15 @@ def init_db():
         VALUES ('payment_history_started_at', NOW()::TEXT)
         ON CONFLICT (key) DO NOTHING;
     """)
+    for normalization_type, query in stripe_identity_normalization_queries():
+        cur.execute(query)
+        normalized_count = max(cur.rowcount, 0)
+        if normalized_count:
+            logging.warning(
+                "STRIPE_ID_PLACEHOLDERS_NORMALIZED: type=%s count=%s",
+                normalization_type,
+                normalized_count,
+            )
     identity_conflicts = []
     for conflict_type, query in stripe_identity_conflict_queries():
         cur.execute(query)
@@ -541,6 +591,59 @@ async def release_event_processing(event_id):
     finally:
         cur.close()
         conn.close()
+
+
+async def mark_event_failed(event_id, error):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        mark_stripe_event_failed(cur, event_id, error)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def send_idempotent_user_message(telegram_id, notification_type, text, stripe_event_id=None, reply_markup=None):
+    key = notification_key(notification_type, telegram_id, stripe_event_id)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        claim = claim_notification(cur, key, telegram_id, notification_type, stripe_event_id=stripe_event_id)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    if claim != "claimed":
+        logging.info(
+            "NOTIFICATION_SKIPPED_IDEMPOTENT: telegram_id=%s, type=%s, stripe_event_id=%s, claim=%s",
+            telegram_id,
+            notification_type,
+            safe_log_id(stripe_event_id),
+            claim,
+        )
+        return claim
+    try:
+        await bot.send_message(int(telegram_id), text, reply_markup=reply_markup)
+    except Exception as exc:
+        fail_conn = get_db_conn()
+        fail_cur = fail_conn.cursor()
+        try:
+            mark_notification_failed(fail_cur, key, exc)
+            fail_conn.commit()
+        finally:
+            fail_cur.close()
+            fail_conn.close()
+        raise
+    sent_conn = get_db_conn()
+    sent_cur = sent_conn.cursor()
+    try:
+        mark_notification_sent(sent_cur, key)
+        sent_conn.commit()
+    finally:
+        sent_cur.close()
+        sent_conn.close()
+    return "sent"
 
 async def log_access_event(
     telegram_id,
@@ -912,6 +1015,47 @@ def save_unlinked_stripe_event(
         period_end_dt,
         raw_summary,
     ))
+
+
+def save_stripe_manual_review_event(
+    cur,
+    event_id,
+    event_type,
+    obj=None,
+    reason="manual_review_required",
+    telegram_id=None,
+    stripe_customer_id=None,
+    stripe_subscription_id=None,
+):
+    stripe_customer_id = stripe_customer_id or get_stripe_object_id(get_obj_value(obj, "customer"))
+    stripe_subscription_id = stripe_subscription_id or get_stripe_object_id(get_obj_value(obj, "subscription"))
+    object_id = get_stripe_object_id(get_obj_value(obj, "id"))
+    cur.execute(
+        """
+        INSERT INTO stripe_manual_review_events (
+            event_id, event_type, object_id, stripe_customer_id,
+            stripe_subscription_id, telegram_id, reason, status, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', NOW())
+        ON CONFLICT (event_id) DO UPDATE SET
+            event_type = EXCLUDED.event_type,
+            object_id = COALESCE(EXCLUDED.object_id, stripe_manual_review_events.object_id),
+            stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, stripe_manual_review_events.stripe_customer_id),
+            stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, stripe_manual_review_events.stripe_subscription_id),
+            telegram_id = COALESCE(EXCLUDED.telegram_id, stripe_manual_review_events.telegram_id),
+            reason = EXCLUDED.reason,
+            updated_at = NOW()
+        """,
+        (
+            event_id,
+            event_type,
+            object_id,
+            stripe_customer_id,
+            stripe_subscription_id,
+            int(telegram_id) if telegram_id else None,
+            reason,
+        ),
+    )
 
 
 def fetch_unlinked_events_for_manual_link(customer_id, subscription_id):
@@ -2273,6 +2417,27 @@ async def ban_user_logic(telegram_id, cur):
         )
         return "telegram_status_error"
 
+    claim_conn = get_db_conn()
+    claim_cur = claim_conn.cursor()
+    try:
+        removal_claim = claim_access_removal(
+            claim_cur,
+            telegram_id,
+            source="subscription_expired",
+            reason=reason,
+        )
+        claim_conn.commit()
+    finally:
+        claim_cur.close()
+        claim_conn.close()
+
+    if removal_claim["status"].startswith("duplicate_removed"):
+        logging.info("USER_REMOVE_ALREADY_FINALIZED: telegram_id=%s, claim=%s", telegram_id, removal_claim)
+        return "removed"
+    if removal_claim["status"] != "claimed":
+        logging.info("USER_REMOVE_SKIPPED_BY_REMOVAL_JOB: telegram_id=%s, claim=%s", telegram_id, removal_claim)
+        return removal_claim["status"]
+
     # 1. Пытаемся удалить пользователя из группы
     status = "removed"
     logging.warning(
@@ -2325,20 +2490,47 @@ async def ban_user_logic(telegram_id, cur):
         await notify_admins(
             f"Не удалось удалить пользователя {telegram_id} из группы.\n"
             f"Ошибка: {e}\n\n"
-            "Пользователь мог остаться в группе. Проверьте вручную."
+            "Пользователь мог остаться в группе. Случай помечен для ручной проверки."
         )
-        status = "kick_failed"
+        fail_conn = get_db_conn()
+        fail_cur = fail_conn.cursor()
+        try:
+            mark_access_removal_failed(fail_cur, removal_claim["job_key"], e, manual_review=True)
+            fail_conn.commit()
+        finally:
+            fail_cur.close()
+            fail_conn.close()
+        return "kick_failed"
 
-    # 2. В любом случае закрываем доступ в базе
-    cur.execute("""
-        UPDATE users
-        SET paid = FALSE,
-            payment_failed = FALSE,
-            payment_failed_at = NULL,
-            grace_period_end = NULL,
-            reminder_sent = FALSE
-        WHERE telegram_id = %s
-    """, (int(telegram_id),))
+    # 2. Закрываем коммерческий доступ только после подтверждённого Telegram removal.
+    final_conn = get_db_conn()
+    final_cur = final_conn.cursor()
+    try:
+        final_cur.execute("""
+            UPDATE users
+            SET paid = FALSE,
+                payment_failed = FALSE,
+                payment_failed_at = NULL,
+                grace_period_end = NULL,
+                reminder_sent = FALSE
+            WHERE telegram_id = %s
+        """, (int(telegram_id),))
+        mark_access_removal_removed(final_cur, removal_claim["job_key"])
+        final_conn.commit()
+    except Exception as e:
+        final_conn.rollback()
+        recovery_conn = get_db_conn()
+        recovery_cur = recovery_conn.cursor()
+        try:
+            mark_access_removal_failed(recovery_cur, removal_claim["job_key"], e, manual_review=False)
+            recovery_conn.commit()
+        finally:
+            recovery_cur.close()
+            recovery_conn.close()
+        raise
+    finally:
+        final_cur.close()
+        final_conn.close()
 
     # 3. Пытаемся уведомить пользователя
     try:
@@ -2720,7 +2912,7 @@ async def check_subscriptions_and_reminders():
             log_report_user("GRACE_USER", grace_user)
         elif ban_status == "not_found":
             not_found_total += 1
-        elif ban_status in ("removed", "kick_failed"):
+        elif ban_status == "removed":
             deleted_user = build_report_user(
                 telegram_id,
                 expiry,
@@ -2740,9 +2932,26 @@ async def check_subscriptions_and_reminders():
                 "notes": f"{removal_reason}; ban_status={ban_status}"
             })
             removed_total += 1
-            if ban_status == "kick_failed":
-                telegram_errors += 1
-                logging.error(f"DELETED_USER: не получилось удалить из группы telegram_id={telegram_id}")
+        elif ban_status == "kick_failed":
+            telegram_errors += 1
+            protected_user = build_report_user(
+                telegram_id,
+                expiry,
+                stripe_subscription_id,
+                stripe_customer_id,
+                "telegram_removal_failed_manual_review"
+            )
+            protected_user_details.append(protected_user)
+            log_report_user("REMOVAL_MANUAL_REVIEW", protected_user)
+            pending_access_events.append({
+                "telegram_id": telegram_id,
+                "event_type": "telegram_removal_failed_manual_review",
+                "source": "auto_check",
+                "old_expiry": expiry,
+                "new_expiry": None,
+                "stripe_subscription_id": stripe_subscription_id,
+                "notes": "Telegram removal failed; physical group access not confirmed closed"
+            })
 
     conn.commit()
     cur.close()
@@ -4080,6 +4289,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             stripe_subscription_id,
             payment_failed,
             stripe_customer_id,
+            first_payment_done,
             EXISTS (
                 SELECT 1
                 FROM trial_redemptions tr
@@ -4097,7 +4307,8 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     stripe_subscription_id = row[4] if row else None
     payment_failed = row[5] if row else False
     stripe_customer_id = row[6] if row else None
-    trial_redeemed = row[7] if row else False
+    first_payment_done = row[7] if row else False
+    trial_redeemed = row[8] if row else False
 
     if paid and expiry_date and expiry_date > datetime.utcnow() and not payment_failed:
         logging.info(
@@ -4113,6 +4324,46 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         return
 
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
+
+    manual_review_decision = should_block_paid_checkout_for_manual_review(
+        cur,
+        user_id,
+        mode,
+        stripe_customer_id=stripe_customer_id,
+        stripe_subscription_id=stripe_subscription_id,
+        first_payment_done=first_payment_done,
+        paid=paid,
+        expiry_date=expiry_date,
+    )
+    if manual_review_decision["block"]:
+        reasons = ",".join(manual_review_decision["reasons"])
+        cur.execute(
+            """
+            INSERT INTO access_events (
+                telegram_id, event_type, source, old_expiry, notes
+            )
+            VALUES (%s, 'checkout_manual_review_missing_stripe_ids', 'process_payment', %s, %s)
+            """,
+            (int(user_id), expiry_date, f"reasons={reasons}; sub_type={sub_type}"),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        await notify_admins(
+            "Платный Checkout заблокирован: у пользователя есть признаки прошлой платёжной истории, "
+            "но локальные Stripe IDs отсутствуют.\n\n"
+            f"telegram_id: {user_id}\n"
+            f"tariff: {sub_type}\n"
+            f"reasons: {reasons}\n\n"
+            "Новый Stripe subscription Checkout НЕ создан. Проверьте Stripe Dashboard и используйте "
+            "/link_stripe_user при необходимости."
+        )
+        await callback.message.answer(
+            "Не могу безопасно создать новую подписку автоматически: ваш доступ требует проверки.\n"
+            "Администратор получил диагностическое сообщение и поможет восстановить оплату."
+        )
+        await state.finish()
+        return
 
     if mode == 'subscription' and stripe_customer_id:
         try:
@@ -4855,6 +5106,29 @@ async def send_user_command(message: types.Message):
 
     if not text:
         await message.reply("⚠️ Текст сообщения не может быть пустым.")
+        return
+
+    if is_production_environment():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "dangerous_admin_command",
+                {"command": "send_user", "telegram_id": target_user_id, "text": text},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await send_admin_action_confirmation(
+            message,
+            action_id,
+            "Подтвердите отправку личного сообщения пользователю.\n\n"
+            f"telegram_id: {target_user_id}\n"
+            f"preview: {text[:300]}",
+        )
         return
 
     conn = get_db_conn()
@@ -5742,6 +6016,7 @@ async def bot_health_command(message: types.Message):
     pg_dump_status = "OK" if shutil.which("pg_dump") else "MISSING"
     conflict_count = "нет"
     stale_processing_events = "нет"
+    dead_letter_events = "нет"
     user_stats = {
         "total": "нет",
         "paid": "нет",
@@ -5803,6 +6078,8 @@ async def bot_health_command(message: types.Message):
               AND processed_at < NOW() - INTERVAL '10 minutes'
         """)
         stale_processing_events = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM stripe_events WHERE dead_letter IS TRUE")
+        dead_letter_events = cur.fetchone()[0]
     except Exception as e:
         db_status = f"ERROR: {e}"
         logging.error(f"Ошибка bot_health_command: {e}")
@@ -5841,6 +6118,7 @@ async def bot_health_command(message: types.Message):
         f"pg_dump: {pg_dump_status}\n"
         f"Stripe identity conflicts: {conflict_count}\n"
         f"Stale processing Stripe events: {stale_processing_events}\n"
+        f"Dead-letter Stripe events: {dead_letter_events}\n"
         f"Scheduler jobs: {len(scheduler.get_jobs())}\n"
         f"Owner: {OWNER_ID}\n\n"
         "Users:\n"
@@ -6198,6 +6476,9 @@ async def stats_command(message: types.Message):
         cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE")
         paid_users = cur.fetchone()[0]
 
+        cur.execute("SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW()")
+        active_by_expiry = cur.fetchone()[0]
+
         cur.execute("SELECT COUNT(*) FROM users WHERE paid = FALSE")
         unpaid_users = cur.fetchone()[0]
 
@@ -6230,17 +6511,51 @@ async def stats_command(message: types.Message):
         """)
         expired_but_paid = cur.fetchone()[0]
 
+        cur.execute("""
+            SELECT COUNT(*) FROM users
+            WHERE auto_renew = TRUE
+              AND (
+                  stripe_subscription_id IS NULL
+                  OR BTRIM(stripe_subscription_id) = ''
+                  OR LOWER(BTRIM(stripe_subscription_id)) IN ('null', 'none', 'нет')
+              )
+        """)
+        auto_renew_missing_subscription = cur.fetchone()[0]
+
+        cur.execute(count_unconfirmed_removals_query())
+        unconfirmed_removals = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM unlinked_stripe_events WHERE resolved IS NOT TRUE")
+        unlinked_stripe_events = cur.fetchone()[0]
+
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM stripe_events
+            WHERE processed IS NOT TRUE
+              AND processed_at < NOW() - INTERVAL '10 minutes'
+        """)
+        stale_stripe_events = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM stripe_identity_conflicts WHERE resolved IS NOT TRUE")
+        stripe_identity_conflicts = cur.fetchone()[0]
+
         text = (
             "📊 Статистика бота\n\n"
             f"👥 Всего пользователей: {total_users}\n"
-            f"✅ Активных подписок: {paid_users}\n"
+            f"paid=TRUE: {paid_users}\n"
+            f"✅ Активных по expiry_date > NOW(): {active_by_expiry}\n"
             f"👀 Без активной подписки: {unpaid_users}\n"
             f"🌟 Использовали пробную неделю: {trial_used}\n"
             f"🚫 Заблокировали бота: {blocked_users}\n"
             f"⚠️ Ошибка оплаты: {payment_failed}\n"
             f"⏳ В grace period: {grace_active}\n"
             f"📅 Заканчивается в ближайшие 48 часов: {expiring_soon}\n"
-            f"🧯 Истекли, но еще paid=True: {expired_but_paid}"
+            f"🧯 Истекли, но еще paid=True: {expired_but_paid}\n"
+            f"🔁 auto_renew=TRUE без stripe_subscription_id: {auto_renew_missing_subscription}\n"
+            f"🚪 Неподтверждённые Telegram removal: {unconfirmed_removals}\n"
+            f"⚠️ Unlinked Stripe events: {unlinked_stripe_events}\n"
+            f"⏱ Stale Stripe events: {stale_stripe_events}\n"
+            f"🧩 Stripe identity conflicts: {stripe_identity_conflicts}"
         )
 
         await message.answer(text)
@@ -6354,6 +6669,26 @@ async def weekly_refresh_callback(callback: types.CallbackQuery):
 @admin_private_only(ADMIN_IDS)
 async def test_expiry(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
+        if is_production_environment():
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                action_id = make_action_request(
+                    cur,
+                    message.from_user.id,
+                    "dangerous_admin_command",
+                    {"command": "test_expiry"},
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            await send_admin_action_confirmation(
+                message,
+                action_id,
+                "Подтвердите production-запуск полной проверки подписок. Команда может отправить сообщения и закрыть доступ просроченным пользователям.",
+            )
+            return
         await message.answer("Запускаю проверку подписок...")
         await check_subscriptions_and_reminders()
         await message.answer("Проверка завершена.")
@@ -6370,6 +6705,28 @@ async def test_grace(message: types.Message):
         await message.reply("Использование: /test_grace <user_id>")
         return
     user_id = args[0]
+    if is_production_environment():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "dangerous_admin_command",
+                {"command": "test_grace", "telegram_id": int(user_id)},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await send_admin_action_confirmation(
+            message,
+            action_id,
+            "Подтвердите production-изменение grace/payment_failed.\n\n"
+            f"telegram_id: {user_id}\n"
+            "Будет установлен payment_failed=TRUE и grace_period_end на 24 часа.",
+        )
+        return
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -6903,7 +7260,13 @@ async def stripe_webhook(request):
                         )
 
                     try:
-                        await bot.send_message(int(user_id), msg, reply_markup=reply_markup)
+                        await send_idempotent_user_message(
+                            user_id,
+                            "checkout_payment_success",
+                            msg,
+                            stripe_event_id=event_id,
+                            reply_markup=reply_markup,
+                        )
                     except BotBlocked:
                         cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
                         conn.commit()
@@ -7717,10 +8080,12 @@ async def stripe_webhook(request):
                             "Спасибо! ❤️"
                         )
                         notice_marker = "SUBSCRIPTION_PAYMENT_NOTICE_SENT"
-                    await bot.send_message(
-                        int(telegram_id),
+                    await send_idempotent_user_message(
+                        telegram_id,
+                        f"stripe_{payment_kind}_success",
                         message_text,
-                        reply_markup=get_cancel_subscription_keyboard()
+                        stripe_event_id=event_id,
+                        reply_markup=get_cancel_subscription_keyboard(),
                     )
                     logging.info(
                         "%s: telegram_id=%s, invoice_id=%s, new_expiry=%s",
@@ -8519,6 +8884,49 @@ async def stripe_webhook(request):
                 cur.close()
                 conn.close()
 
+        # ---------- 4.2. REFUND / DISPUTE / CHARGEBACK / PAYMENT INTENT FAILURE ----------
+        elif event['type'] in (
+            'charge.refunded',
+            'refund.created',
+            'charge.dispute.created',
+            'charge.dispute.closed',
+            'payment_intent.payment_failed',
+        ):
+            obj = event['data']['object']
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                customer_id = stripe_object_id(stripe_value(obj, 'customer'))
+                subscription_id = stripe_object_id(stripe_value(obj, 'subscription'))
+                telegram_id = None
+                if customer_id or subscription_id:
+                    telegram_id, _ = find_telegram_id_for_stripe(
+                        cur,
+                        stripe_subscription_id=subscription_id,
+                        stripe_customer_id=customer_id,
+                    )
+                save_stripe_manual_review_event(
+                    cur,
+                    event_id,
+                    event_type,
+                    obj=obj,
+                    reason="stripe_refund_dispute_or_payment_failure_requires_manual_review",
+                    telegram_id=telegram_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=subscription_id,
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            await notify_admins(
+                "Stripe событие требует ручной проверки. Автоматическое удаление доступа не выполнялось.\n\n"
+                f"event_id: {event_id}\n"
+                f"event_type: {event_type}\n"
+                f"object_id: {object_id or 'нет'}\n"
+                f"telegram_id: {telegram_id or 'не найден'}"
+            )
+
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session = event['data']['object']
@@ -8570,6 +8978,7 @@ async def stripe_webhook(request):
         return web.Response(status=200)
     except Exception as e:
         await release_event_processing(event_id)
+        await mark_event_failed(event_id, e)
         logging.exception(
             "STRIPE_WEBHOOK_UNHANDLED_EXCEPTION: event_id=%s, event.type=%s, error=%s",
             safe_log_id(event_id),
@@ -8637,6 +9046,26 @@ async def test_backup(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         await message.answer("Нет прав.")
         return
+    if is_production_environment():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "dangerous_admin_command",
+                {"command": "test_backup"},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await send_admin_action_confirmation(
+            message,
+            action_id,
+            "Подтвердите production-запуск backup. Команда создаст дамп и может отправить файл администраторам.",
+        )
+        return
     await message.answer("🔄 Запускаю бэкап...")
     await send_db_backup()
     await message.answer("✅ Бэкап завершён. Проверьте личные сообщения от бота (файл должен прийти админам).")
@@ -8651,6 +9080,26 @@ async def unblock_user(message: types.Message):
         await message.reply("⚠️ Использование: /unblock_user <telegram_id>")
         return
     user_id = int(args[0])
+    if is_production_environment():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "dangerous_admin_command",
+                {"command": "unblock_user", "telegram_id": user_id},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await send_admin_action_confirmation(
+            message,
+            action_id,
+            f"Подтвердите снятие blocked_bot для telegram_id={user_id}.",
+        )
+        return
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("UPDATE users SET blocked_bot = FALSE WHERE telegram_id = %s", (user_id,))
@@ -8929,7 +9378,54 @@ async def execute_confirmed_admin_action(action_type, payload):
         return await execute_confirmed_resolve_checkout(payload)
     if action_type == "revoke_invite_links":
         return await execute_confirmed_revoke_invite_links(payload)
+    if action_type == "dangerous_admin_command":
+        return await execute_confirmed_dangerous_admin_command(payload)
     raise ValueError(f"Unsupported admin action: {action_type}")
+
+
+async def execute_confirmed_dangerous_admin_command(payload):
+    command = payload.get("command")
+    if command == "test_grace":
+        telegram_id = int(payload["telegram_id"])
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                    grace_period_end = NOW() + INTERVAL '1 day'
+                WHERE telegram_id = %s
+            """, (telegram_id,))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await bot.send_message(telegram_id, "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
+        return {"status": "completed", "command": command, "telegram_id": telegram_id}
+    if command == "test_expiry":
+        result = await check_subscriptions_and_reminders()
+        return {"status": "completed", "command": command, "result": result}
+    if command == "test_backup":
+        await send_db_backup()
+        return {"status": "completed", "command": command}
+    if command == "send_user":
+        await bot.send_message(int(payload["telegram_id"]), payload["text"])
+        return {"status": "completed", "command": command, "telegram_id": int(payload["telegram_id"])}
+    if command == "unblock_user":
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("UPDATE users SET blocked_bot = FALSE WHERE telegram_id = %s", (int(payload["telegram_id"]),))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        return {"status": "completed", "command": command, "telegram_id": int(payload["telegram_id"])}
+    if command == "unban_user":
+        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(payload["telegram_id"]))
+        return {"status": "completed", "command": command, "telegram_id": int(payload["telegram_id"])}
+    raise ValueError(f"Unsupported dangerous command: {command}")
 
 
 async def execute_confirmed_broadcast(payload):
@@ -9810,6 +10306,27 @@ async def unban_user(message: types.Message):
         user_id = int(args[0])
     except ValueError:
         await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+
+    if is_production_environment():
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "dangerous_admin_command",
+                {"command": "unban_user", "telegram_id": user_id},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        await send_admin_action_confirmation(
+            message,
+            action_id,
+            f"Подтвердите Telegram unban в группе для telegram_id={user_id}.",
+        )
         return
 
     try:

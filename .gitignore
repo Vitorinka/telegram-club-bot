@@ -5,6 +5,8 @@ outputs/
 *.zip
 *.patch
 *.sql
+!migrations/*.sql
 *.sql.enc
 .env
 backup_*
+.DS_Store

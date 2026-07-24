@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   unittest:
     runs-on: ubuntu-latest
@@ -14,14 +17,16 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Verify dependency graph
+        run: python3 -m pip check
       - name: Compile
         run: >
-          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
+          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m compileall -q
           main.py stripe_invoice_rules.py weekly_report.py checkout_safety.py
-          admin_security.py scheduled_jobs.py group_access.py
-          tests/test_stripe_invoice_rules.py tests/test_weekly_report.py
+          admin_security.py scheduled_jobs.py group_access.py access_removal.py
+          notification_outbox.py tests
       - name: Unit tests
         run: PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest discover -s tests -v
       - name: Secret scan
         run: |
-          ! grep -RInE --exclude='*.patch' --exclude='tests.yml' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
+          ! grep -RInE --binary-files=without-match --exclude='*.patch' --exclude='tests.yml' --exclude-dir='.git' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .

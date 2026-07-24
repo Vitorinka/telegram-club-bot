@@ -179,6 +179,89 @@ def claim_trial_redemption(cur, telegram_id, stripe_event_id, checkout_session_i
     return cur.fetchone() is not None
 
 
+PLACEHOLDER_STRIPE_ID_LITERALS = ("null", "none", "нет")
+
+
+def normalize_stripe_identifier(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in PLACEHOLDER_STRIPE_ID_LITERALS:
+        return None
+    return text
+
+
+def stripe_identity_normalization_queries():
+    """Normalize known placeholder Stripe IDs before duplicate auditing."""
+    return [
+        (
+            "users_subscription",
+            """
+            UPDATE users
+            SET stripe_subscription_id = NULL,
+                auto_renew = FALSE
+            WHERE stripe_subscription_id IS NOT NULL
+              AND (
+                  BTRIM(stripe_subscription_id) = ''
+                  OR LOWER(BTRIM(stripe_subscription_id)) IN ('null', 'none', 'нет')
+              )
+            """,
+        ),
+        (
+            "users_customer",
+            """
+            UPDATE users
+            SET stripe_customer_id = NULL
+            WHERE stripe_customer_id IS NOT NULL
+              AND (
+                  BTRIM(stripe_customer_id) = ''
+                  OR LOWER(BTRIM(stripe_customer_id)) IN ('null', 'none', 'нет')
+              )
+            """,
+        ),
+        (
+            "stripe_links_subscription",
+            """
+            UPDATE stripe_links
+            SET stripe_subscription_id = NULL
+            WHERE stripe_subscription_id IS NOT NULL
+              AND (
+                  BTRIM(stripe_subscription_id) = ''
+                  OR LOWER(BTRIM(stripe_subscription_id)) IN ('null', 'none', 'нет')
+              )
+            """,
+        ),
+        (
+            "stripe_links_customer",
+            """
+            UPDATE stripe_links
+            SET stripe_customer_id = NULL
+            WHERE stripe_customer_id IS NOT NULL
+              AND (
+                  BTRIM(stripe_customer_id) = ''
+                  OR LOWER(BTRIM(stripe_customer_id)) IN ('null', 'none', 'нет')
+              )
+            """,
+        ),
+        (
+            "placeholder_conflicts",
+            """
+            UPDATE stripe_identity_conflicts
+            SET resolved = TRUE,
+                updated_at = NOW()
+            WHERE resolved IS NOT TRUE
+              AND (
+                  stripe_id IS NULL
+                  OR BTRIM(stripe_id) = ''
+                  OR LOWER(BTRIM(stripe_id)) IN ('null', 'none', 'нет')
+              )
+            """,
+        ),
+    ]
+
+
 def stripe_identity_conflict_queries():
     return [
         (
@@ -187,6 +270,8 @@ def stripe_identity_conflict_queries():
             SELECT stripe_subscription_id, array_agg(telegram_id ORDER BY telegram_id), count(*)
             FROM users
             WHERE stripe_subscription_id IS NOT NULL
+              AND BTRIM(stripe_subscription_id) <> ''
+              AND LOWER(BTRIM(stripe_subscription_id)) NOT IN ('null', 'none', 'нет')
             GROUP BY stripe_subscription_id
             HAVING count(*) > 1
             """,
@@ -197,6 +282,8 @@ def stripe_identity_conflict_queries():
             SELECT stripe_customer_id, array_agg(telegram_id ORDER BY telegram_id), count(*)
             FROM users
             WHERE stripe_customer_id IS NOT NULL
+              AND BTRIM(stripe_customer_id) <> ''
+              AND LOWER(BTRIM(stripe_customer_id)) NOT IN ('null', 'none', 'нет')
             GROUP BY stripe_customer_id
             HAVING count(*) > 1
             """,
@@ -207,6 +294,8 @@ def stripe_identity_conflict_queries():
             SELECT stripe_subscription_id, array_agg(DISTINCT telegram_id ORDER BY telegram_id), count(DISTINCT telegram_id)
             FROM stripe_links
             WHERE stripe_subscription_id IS NOT NULL
+              AND BTRIM(stripe_subscription_id) <> ''
+              AND LOWER(BTRIM(stripe_subscription_id)) NOT IN ('null', 'none', 'нет')
             GROUP BY stripe_subscription_id
             HAVING count(DISTINCT telegram_id) > 1
             """,
@@ -217,6 +306,8 @@ def stripe_identity_conflict_queries():
             SELECT stripe_customer_id, array_agg(DISTINCT telegram_id ORDER BY telegram_id), count(DISTINCT telegram_id)
             FROM stripe_links
             WHERE stripe_customer_id IS NOT NULL
+              AND BTRIM(stripe_customer_id) <> ''
+              AND LOWER(BTRIM(stripe_customer_id)) NOT IN ('null', 'none', 'нет')
             GROUP BY stripe_customer_id
             HAVING count(DISTINCT telegram_id) > 1
             """,
@@ -228,6 +319,66 @@ def should_apply_negative_event(event_created_at, last_success_created_at):
     if not event_created_at or not last_success_created_at:
         return True
     return event_created_at > last_success_created_at
+
+
+def paid_checkout_manual_review_indicators(cur, telegram_id):
+    cur.execute(
+        """
+        SELECT
+            EXISTS (
+                SELECT 1 FROM payment_events
+                WHERE telegram_id = %s
+                  AND payment_status = 'succeeded'
+            ),
+            EXISTS (
+                SELECT 1 FROM stripe_links
+                WHERE telegram_id = %s
+                  AND (
+                      stripe_customer_id IS NOT NULL
+                      OR stripe_subscription_id IS NOT NULL
+                  )
+            ),
+            EXISTS (
+                SELECT 1 FROM checkout_sessions
+                WHERE telegram_id = %s
+                  AND mode = 'subscription'
+                  AND status = 'completed'
+            ),
+            EXISTS (
+                SELECT 1 FROM stripe_identity_conflicts
+                WHERE resolved IS NOT TRUE
+                  AND telegram_ids LIKE %s
+            )
+        """,
+        (int(telegram_id), int(telegram_id), int(telegram_id), f"%{int(telegram_id)}%"),
+    )
+    row = cur.fetchone() or (False, False, False, False)
+    keys = ("successful_payment_events", "stripe_links", "completed_subscription_checkout", "stripe_identity_conflict")
+    return {key: bool(value) for key, value in zip(keys, row)}
+
+
+def should_block_paid_checkout_for_manual_review(
+    cur,
+    telegram_id,
+    mode,
+    stripe_customer_id=None,
+    stripe_subscription_id=None,
+    first_payment_done=False,
+    paid=False,
+    expiry_date=None,
+):
+    if mode != "subscription":
+        return {"block": False, "reasons": []}
+    if normalize_stripe_identifier(stripe_customer_id) or normalize_stripe_identifier(stripe_subscription_id):
+        return {"block": False, "reasons": []}
+
+    indicators = paid_checkout_manual_review_indicators(cur, telegram_id)
+    reasons = [key for key, value in indicators.items() if value]
+    if first_payment_done:
+        reasons.append("first_payment_done")
+    if paid or expiry_date is not None:
+        reasons.append("previous_access_record")
+    return {"block": bool(reasons), "reasons": sorted(set(reasons))}
 
 
 def live_subscription_is_paid(status, latest_invoice_status=None):
