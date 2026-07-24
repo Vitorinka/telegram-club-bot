@@ -447,7 +447,7 @@ class StripeInvoiceRulesTest(unittest.TestCase):
     def test_subscription_updated_active_does_not_set_paid_true(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
-        start = source.index("elif event['type'] == 'customer.subscription.updated'")
+        start = source.index("elif event_type == 'customer.subscription.updated'")
         end = source.index("# ---------- 5. СЕССИЯ ОПЛАТЫ", start)
         block = source[start:end]
         active_start = block.index('elif status in ("active", "trialing")')

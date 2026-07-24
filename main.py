@@ -6563,8 +6563,8 @@ async def stripe_webhook(request):
             )
 
         # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
-        if event['type'] == 'checkout.session.completed':
-            session = event['data']['object']
+        if event_type == 'checkout.session.completed':
+            session = event_object
             user_id = getattr(session, 'client_reference_id', None)
             metadata_obj = stripe_value(session, 'metadata') or {}
             metadata_keys = list(metadata_obj.keys()) if isinstance(metadata_obj, dict) else []
@@ -6956,8 +6956,8 @@ async def stripe_webhook(request):
 
         # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
             # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
-        elif event['type'] == 'invoice.payment_succeeded':
-            invoice = event['data']['object']
+        elif event_type == 'invoice.payment_succeeded':
+            invoice = event_object
             logging.info(
                 "Stripe invoice.payment_succeeded data: "
                 f"event_id={safe_log_id(event_id)}, invoice_id={safe_log_id(stripe_value(invoice, 'id'))}, "
@@ -7795,8 +7795,8 @@ async def stripe_webhook(request):
                 conn.close()
 
         # ---------- 3. ОШИБКА ОПЛАТЫ (invoice.payment_failed) – GRACE PERIOD ----------
-        elif event['type'] == 'invoice.payment_failed':
-            invoice = event['data']['object']
+        elif event_type == 'invoice.payment_failed':
+            invoice = event_object
             sub_id = stripe_object_id(stripe_value(invoice, 'subscription'))
             sub_id = sub_id or stripe_object_id(stripe_value(invoice, 'parent', 'subscription_details', 'subscription'))
             lines_data = stripe_value(invoice, 'lines', 'data') or []
@@ -8164,8 +8164,8 @@ async def stripe_webhook(request):
                     )
 
         # ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ ПОДПИСКУ (customer.subscription.deleted) ----------
-        elif event['type'] == 'customer.subscription.deleted':
-            sub = event['data']['object']
+        elif event_type == 'customer.subscription.deleted':
+            sub = event_object
             sub_id = stripe_object_id(stripe_value(sub, 'id'))
             customer_id = stripe_object_id(stripe_value(sub, 'customer'))
             status = stripe_value(sub, 'status')
@@ -8202,8 +8202,8 @@ async def stripe_webhook(request):
                 )
 
         # ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ (customer.subscription.updated) ----------
-        elif event['type'] == 'customer.subscription.updated':
-            sub = event['data']['object']
+        elif event_type == 'customer.subscription.updated':
+            sub = event_object
             sub_id = stripe_object_id(stripe_value(sub, 'id'))
             cancel_at_period_end = bool(stripe_value(sub, 'cancel_at_period_end'))
             status = stripe_value(sub, 'status')
@@ -8533,8 +8533,8 @@ async def stripe_webhook(request):
                 conn.close()
 
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
-        elif event['type'] in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
-            session = event['data']['object']
+        elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
+            session = event_object
             user_id = getattr(session, 'client_reference_id', None)
             session_id = stripe_value(session, 'id')
             conn = get_db_conn()
@@ -8543,8 +8543,8 @@ async def stripe_webhook(request):
                 mark_checkout_terminal(
                     cur,
                     session_id,
-                    "expired" if event['type'] == 'checkout.session.expired' else "failed",
-                    error_text=event['type'],
+                    "expired" if event_type == 'checkout.session.expired' else "failed",
+                    error_text=event_type,
                 )
                 conn.commit()
             finally:

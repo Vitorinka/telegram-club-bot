@@ -3,6 +3,7 @@ import hmac
 import json
 import time
 import unittest
+from pathlib import Path
 
 from stripe_webhook_safety import (
     construct_verified_stripe_event,
@@ -15,6 +16,14 @@ from stripe_webhook_safety import (
 
 
 SECRET_PREFIX = "wh" + "sec_"
+WEBHOOK_EVENT_TYPES = (
+    "checkout.session.completed",
+    "invoice.payment_succeeded",
+    "invoice.payment_failed",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
+    "checkout.session.expired",
+)
 
 
 def signed_header(payload, secret, timestamp=None):
@@ -36,6 +45,14 @@ class FakeRequest:
 class FakeStripeObject:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+
+class NoItemEvent:
+    def __init__(self, event_type, event_object):
+        self.id = "evt_no_item"
+        self.type = event_type
+        self.created = 123
+        self.data = FakeStripeObject(object=event_object)
 
 
 class StripeWebhookSafetyTests(unittest.TestCase):
@@ -125,6 +142,50 @@ class StripeWebhookSafetyTests(unittest.TestCase):
 
         self.assertEqual(event_created, 789)
         self.assertEqual(object_id, "sub_no_get")
+
+    def test_dispatch_uses_normalized_event_fields_without_item_access(self):
+        for event_type in WEBHOOK_EVENT_TYPES:
+            with self.subTest(event_type=event_type):
+                event_object = FakeStripeObject(id="obj_no_item")
+                event = NoItemEvent(event_type, event_object)
+
+                self.assertFalse(hasattr(event, "get"))
+                self.assertFalse(hasattr(event, "__getitem__"))
+
+                normalized_type = stripe_value(event, "type")
+                normalized_object = stripe_value(event, "data", "object")
+
+                if normalized_type == "checkout.session.completed":
+                    dispatched_object = normalized_object
+                elif normalized_type == "invoice.payment_succeeded":
+                    dispatched_object = normalized_object
+                elif normalized_type == "invoice.payment_failed":
+                    dispatched_object = normalized_object
+                elif normalized_type == "customer.subscription.deleted":
+                    dispatched_object = normalized_object
+                elif normalized_type == "customer.subscription.updated":
+                    dispatched_object = normalized_object
+                elif normalized_type in ("checkout.session.expired", "checkout.session.async_payment_failed"):
+                    dispatched_object = normalized_object
+                else:
+                    dispatched_object = None
+
+                self.assertIs(dispatched_object, event_object)
+
+    def test_stripe_webhook_has_no_raw_event_dispatch_indexing(self):
+        main_py = Path(__file__).resolve().parents[1] / "main.py"
+        source = main_py.read_text()
+        start = source.index("async def stripe_webhook(request):")
+        end = source.index("@dp.message_handler(commands=['test_auto_lesson']", start)
+        webhook_source = source[start:end]
+
+        for forbidden in (
+            'event["type"]',
+            "event['type']",
+            'event["data"]["object"]',
+            "event['data']['object']",
+        ):
+            self.assertNotIn(forbidden, webhook_source)
 
 
 if __name__ == "__main__":

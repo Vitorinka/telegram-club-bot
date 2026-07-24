@@ -487,7 +487,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertTrue(should_live_check_stale_negative_subscription_update(older, newer))
 
     def test_subscription_updated_sql_tracks_last_state_and_live_check(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("elif event['type'] == 'customer.subscription.updated'"):MAIN_SOURCE.index("# ---------- 5. СЕССИЯ ОПЛАТЫ")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("elif event_type == 'customer.subscription.updated'"):MAIN_SOURCE.index("# ---------- 5. СЕССИЯ ОПЛАТЫ")]
         self.assertIn("last_subscription_state_event_created_at", source)
         self.assertIn("last_successful_invoice_created_at", source)
         self.assertIn("SUBSCRIPTION_UPDATED_NEGATIVE_STALE_IGNORED", source)

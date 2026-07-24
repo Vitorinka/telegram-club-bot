@@ -250,7 +250,7 @@ class WeeklyReportTest(unittest.TestCase):
         link_only_start = source.index('if checkout_action == "link_only":')
         link_only_end = source.index("days_to_add = 0", link_only_start)
         self.assertNotIn("insert_payment_event(", source[link_only_start:link_only_end])
-        self.assertIn('"failed"', source[source.index("elif event['type'] == 'invoice.payment_failed'"):])
+        self.assertIn('"failed"', source[source.index("elif event_type == 'invoice.payment_failed'"):])
         self.assertIn("backfill_payment_events_for_manual_link", source)
         self.assertIn("created_at=event[\"created_at\"]", source)
         self.assertIn("resolved = TRUE", source)
