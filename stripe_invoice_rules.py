@@ -113,6 +113,18 @@ def should_ignore_payment_failed_for_active_trial(subscription_status, trial_end
     return has_future_trial(subscription_status, trial_end, now=now)
 
 
+def should_apply_subscription_state_update(event_created_at, last_state_event_created_at):
+    if event_created_at is None or last_state_event_created_at is None:
+        return True
+    return event_created_at >= last_state_event_created_at
+
+
+def should_live_check_stale_negative_subscription_update(event_created_at, last_successful_invoice_created_at):
+    if event_created_at is None or last_successful_invoice_created_at is None:
+        return False
+    return event_created_at <= last_successful_invoice_created_at
+
+
 def checkout_completion_action(mode, subscription_id=None):
     """Subscription Checkout only links Stripe IDs; invoice confirms access."""
     if mode == "subscription":
@@ -170,20 +182,23 @@ def should_send_rejoin_invite(previous_expiry, now, telegram_member_status=None,
     return access_was_inactive
 
 
-def claim_stripe_event(cur, event_id, lease_seconds=600):
+def claim_stripe_event(cur, event_id, lease_seconds=600, event_created_at=None, event_type=None, object_id=None):
     """Atomically claim a Stripe event before side effects."""
     cur.execute(
         """
-        INSERT INTO stripe_events (event_id, processed, processed_at)
-        VALUES (%s, FALSE, NOW())
+        INSERT INTO stripe_events (event_id, processed, processed_at, event_created_at, event_type, object_id)
+        VALUES (%s, FALSE, NOW(), %s, %s, %s)
         ON CONFLICT (event_id) DO UPDATE SET
             processed = FALSE,
-            processed_at = NOW()
+            processed_at = NOW(),
+            event_created_at = COALESCE(EXCLUDED.event_created_at, stripe_events.event_created_at),
+            event_type = COALESCE(EXCLUDED.event_type, stripe_events.event_type),
+            object_id = COALESCE(EXCLUDED.object_id, stripe_events.object_id)
         WHERE stripe_events.processed IS NOT TRUE
           AND stripe_events.processed_at < NOW() - (%s * INTERVAL '1 second')
         RETURNING event_id
         """,
-        (event_id, lease_seconds),
+        (event_id, event_created_at, event_type, object_id, lease_seconds),
     )
     if cur.fetchone():
         return "claimed"
