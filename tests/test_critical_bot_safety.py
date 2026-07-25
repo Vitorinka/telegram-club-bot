@@ -35,7 +35,13 @@ from group_access import (
     mark_bot_invite_link_revoked,
     save_bot_invite_link,
 )
-from scheduled_jobs import claim_message_delivery, claim_scheduled_job, process_claimed_delivery
+from scheduled_jobs import (
+    claim_message_delivery,
+    claim_pending_message_deliveries,
+    claim_scheduled_job,
+    enqueue_message_delivery,
+    process_claimed_delivery,
+)
 from stripe_invoice_rules import (
     should_apply_subscription_state_update,
     should_live_check_stale_negative_subscription_update,
@@ -236,6 +242,47 @@ class CriticalBotSafetyTests(unittest.TestCase):
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("message_delivery_events", sql)
         self.assertIn("lease_until < %s", sql)
+
+    def test_message_delivery_outbox_enqueue_is_idempotent(self):
+        cur = FakeCursor(fetches=[("stripe:evt_1:payment_success_notice",)])
+        created = enqueue_message_delivery(
+            cur,
+            "stripe:evt_1:payment_success_notice",
+            1,
+            "stripe_payment_success",
+            {"text": "ok"},
+        )
+        self.assertTrue(created)
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", sql)
+        self.assertIn("WHERE message_delivery_events.status <> 'sent'", sql)
+        self.assertIn("payload_json", sql)
+
+    def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
+        cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None)]])
+        rows = claim_pending_message_deliveries(cur, limit=5)
+        self.assertEqual(rows[0][0], "stripe:evt_1:payment_success_notice")
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("status IN ('pending', 'failed')", sql)
+        self.assertIn("RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link", sql)
+
+    def test_stripe_delivery_worker_uses_existing_outbox_and_saved_invite_links(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_pending_message_deliveries"):MAIN_SOURCE.index("async def scheduled_process_message_deliveries")]
+        self.assertIn("claim_pending_message_deliveries", source)
+        self.assertIn("save_delivery_invite_link", source)
+        self.assertIn("mark_delivery_sent", source)
+        self.assertIn("mark_delivery_failed", source)
+        self.assertIn("BotBlocked", source)
+        self.assertIn("blocked_bot = TRUE", source)
+
+    def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
+        self.assertIn("async def scheduled_process_message_deliveries", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def scheduled_process_message_deliveries"):MAIN_SOURCE.index("async def on_startup")]
+        self.assertIn("run_scheduled_with_lock", source)
+        self.assertIn('"process_message_deliveries"', source)
+        startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
+        self.assertIn("scheduled_process_message_deliveries", startup)
 
     def test_stale_negative_event_decisions(self):
         success = datetime(2026, 7, 23, 12, 0)

@@ -71,12 +71,15 @@ from group_access import (
 from scheduled_jobs import (
     OWNER_ID,
     claim_message_delivery,
+    claim_pending_message_deliveries,
     claim_scheduled_job,
     complete_scheduled_job,
+    enqueue_message_delivery,
     fail_scheduled_job,
     mark_delivery_failed,
     mark_delivery_sent,
     process_claimed_delivery,
+    save_delivery_invite_link,
 )
 from weekly_report import (
     MOSCOW_TZ,
@@ -398,9 +401,15 @@ def init_db():
             claimed_at TIMESTAMP,
             lease_until TIMESTAMP,
             sent_at TIMESTAMP,
+            next_attempt_at TIMESTAMP,
+            payload_json TEXT,
+            invite_link TEXT,
             last_error TEXT
         );
     """)
+    cur.execute("ALTER TABLE message_delivery_events ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMP;")
+    cur.execute("ALTER TABLE message_delivery_events ADD COLUMN IF NOT EXISTS payload_json TEXT;")
+    cur.execute("ALTER TABLE message_delivery_events ADD COLUMN IF NOT EXISTS invite_link TEXT;")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS subscription_removal_events (
             telegram_id BIGINT PRIMARY KEY,
@@ -10202,6 +10211,119 @@ async def scheduled_send_db_backup():
     )
 
 
+async def process_pending_message_deliveries(limit=25):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        deliveries = claim_pending_message_deliveries(cur, limit=limit)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    sent = 0
+    failed = 0
+    blocked = 0
+
+    for delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link in deliveries:
+        payload = json.loads(payload_json or "{}")
+        try:
+            if delivery_type == "stripe_rejoin_invite":
+                link = invite_link
+                if not link:
+                    options = invite_link_options("stripe_rejoin", telegram_id)
+                    invite = await bot.create_chat_invite_link(chat_id=int(GROUP_ID), **options)
+                    link = invite.invite_link
+                    link_conn = get_db_conn()
+                    link_cur = link_conn.cursor()
+                    try:
+                        save_delivery_invite_link(link_cur, delivery_key, link)
+                        save_bot_invite_link(
+                            link_cur,
+                            link,
+                            "stripe_rejoin",
+                            telegram_id,
+                            options.get("expire_date"),
+                        )
+                        link_conn.commit()
+                    finally:
+                        link_cur.close()
+                        link_conn.close()
+                text = payload.get("text") or (
+                    "✅ Оплата прошла успешно. Доступ восстановлен.\n\n"
+                    f"Ссылка для входа в группу: {link}"
+                )
+                if "{invite_link}" in text:
+                    text = text.replace("{invite_link}", link)
+                await bot.send_message(int(telegram_id), text)
+            else:
+                text = payload.get("text")
+                if not text:
+                    raise ValueError(f"delivery text missing for {delivery_type}")
+                await bot.send_message(int(telegram_id), text)
+
+            sent_conn = get_db_conn()
+            sent_cur = sent_conn.cursor()
+            try:
+                mark_delivery_sent(sent_cur, delivery_key)
+                sent_conn.commit()
+            finally:
+                sent_cur.close()
+                sent_conn.close()
+            sent += 1
+        except BotBlocked as e:
+            block_conn = get_db_conn()
+            block_cur = block_conn.cursor()
+            try:
+                block_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+                mark_delivery_failed(block_cur, delivery_key, e, permanently_failed=True)
+                block_conn.commit()
+            finally:
+                block_cur.close()
+                block_conn.close()
+            blocked += 1
+        except Exception as e:
+            fail_conn = get_db_conn()
+            fail_cur = fail_conn.cursor()
+            try:
+                permanently_failed = attempt_count >= 10
+                mark_delivery_failed(
+                    fail_cur,
+                    delivery_key,
+                    e,
+                    retry_delay_minutes=min(60, max(5, int(attempt_count) * 5)),
+                    permanently_failed=permanently_failed,
+                )
+                fail_conn.commit()
+            finally:
+                fail_cur.close()
+                fail_conn.close()
+            failed += 1
+
+    if failed or blocked:
+        await notify_admins(
+            "Message delivery outbox processed with failures.\n\n"
+            f"sent: {sent}\n"
+            f"failed/retry: {failed}\n"
+            f"blocked/permanent: {blocked}",
+            alert_key="message_delivery_outbox_failed",
+            severity="CRITICAL" if blocked else "WARNING",
+        )
+    return {"sent": sent, "failed": failed, "blocked": blocked}
+
+
+async def scheduled_process_message_deliveries():
+    return await run_scheduled_with_lock(
+        "process_message_deliveries",
+        datetime.utcnow().strftime("%Y-%m-%dT%H"),
+        process_pending_message_deliveries,
+        lease_minutes=20,
+    )
+
+
 async def on_startup(app):
     init_db()
 
@@ -10265,6 +10387,15 @@ async def on_startup(app):
         day_of_week='mon',
         hour=3,
         minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_process_message_deliveries,
+        'cron',
+        minute='*/5',
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1
