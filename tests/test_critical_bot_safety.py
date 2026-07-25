@@ -321,6 +321,23 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ):
             self.assertIn(name, MAIN_SOURCE)
 
+    def test_db_pool_uses_timeouts_and_threaded_pool(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("class PooledDbConnection"):MAIN_SOURCE.index("def init_db")]
+        self.assertIn("ThreadedConnectionPool", source)
+        self.assertIn("connect_timeout=DB_CONNECT_TIMEOUT_SECONDS", source)
+        self.assertIn("statement_timeout", source)
+        self.assertIn("putconn(self._raw_conn)", source)
+        self.assertIn("putconn(self._raw_conn, close=True)", source)
+        self.assertIn("DB_POOL_CONNECTION_ERRORS", source)
+
+    def test_db_pool_health_and_shutdown_are_exposed(self):
+        self.assertIn("def db_pool_health", MAIN_SOURCE)
+        self.assertIn("pool_available", MAIN_SOURCE)
+        self.assertIn("pool_used", MAIN_SOURCE)
+        self.assertIn("connection_errors", MAIN_SOURCE)
+        self.assertIn("close_db_pool()", MAIN_SOURCE[MAIN_SOURCE.index("async def on_shutdown"):])
+        self.assertIn("app.router.add_get('/health', health)", MAIN_SOURCE)
+
     def test_backup_config_decision(self):
         self.assertEqual(backup_decision({})["telegram_enabled"], False)
         self.assertFalse(backup_decision({"BACKUP_TELEGRAM_ENABLED": "true"})["allowed"])

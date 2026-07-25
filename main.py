@@ -6,6 +6,7 @@ import json
 import shutil
 import stripe
 import psycopg2
+from psycopg2 import pool as psycopg2_pool
 import subprocess
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types
@@ -154,6 +155,12 @@ CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
 CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 PAYMENT_RETRY_GRACE_HOURS = int(os.getenv("PAYMENT_RETRY_GRACE_HOURS", "48"))
+DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
+DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
+DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "5"))
+DB_POOL = None
+DB_POOL_CONNECTION_ERRORS = 0
 checkout_session_cache = {}
 checkout_retry_state = {}
 checkout_session_cache_lock = asyncio.Lock()
@@ -174,8 +181,77 @@ class RegistrationStates(StatesGroup):
     choice = State()
 
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
+class PooledDbConnection:
+    def __init__(self, raw_conn, pool):
+        self._raw_conn = raw_conn
+        self._pool = pool
+        self._closed = False
+
+    def cursor(self, *args, **kwargs):
+        return self._raw_conn.cursor(*args, **kwargs)
+
+    def commit(self):
+        return self._raw_conn.commit()
+
+    def rollback(self):
+        return self._raw_conn.rollback()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.putconn(self._raw_conn)
+
+    def close_broken(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.putconn(self._raw_conn, close=True)
+
+    def __getattr__(self, name):
+        return getattr(self._raw_conn, name)
+
+
+def get_db_pool():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = psycopg2_pool.ThreadedConnectionPool(
+            DB_POOL_MIN_CONN,
+            DB_POOL_MAX_CONN,
+            DATABASE_URL,
+            sslmode='require',
+            connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+        )
+    return DB_POOL
+
+
 def get_db_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    global DB_POOL_CONNECTION_ERRORS
+    try:
+        return PooledDbConnection(get_db_pool().getconn(), get_db_pool())
+    except Exception:
+        DB_POOL_CONNECTION_ERRORS += 1
+        raise
+
+
+def close_db_pool():
+    global DB_POOL
+    if DB_POOL is not None:
+        DB_POOL.closeall()
+        DB_POOL = None
+
+
+def db_pool_health():
+    pool_obj = DB_POOL
+    used = len(getattr(pool_obj, "_used", {}) or {}) if pool_obj else 0
+    available = len(getattr(pool_obj, "_pool", []) or []) if pool_obj else 0
+    return {
+        "pool_available": available,
+        "pool_used": used,
+        "connection_errors": DB_POOL_CONNECTION_ERRORS,
+        "statement_timeout_ms": DB_STATEMENT_TIMEOUT_MS,
+    }
 
 def init_db():
     conn = get_db_conn()
@@ -10417,7 +10493,15 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     await bot.close()
+    close_db_pool()
     logging.info("Бот остановлен.")
+
+
+async def health(request):
+    return web.json_response({
+        "ok": True,
+        "db": db_pool_health(),
+    })
 
 
 if __name__ == "__main__":
@@ -10425,6 +10509,7 @@ if __name__ == "__main__":
 
     app = get_new_configured_app(dispatcher=dp, path=get_telegram_webhook_path())
     app.router.add_post('/stripe-payment', stripe_webhook)
+    app.router.add_get('/health', health)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
