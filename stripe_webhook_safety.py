@@ -5,6 +5,8 @@ from datetime import datetime
 
 import stripe
 
+from stripe_invoice_rules import redact_identifier
+
 
 STRIPE_WEBHOOK_SECRET_PREFIX = "wh" + "sec_"
 RAILWAY_DIAGNOSTIC_ENV_KEYS = (
@@ -101,6 +103,10 @@ def require_normalized_stripe_event(normalized_event):
     return normalized_event
 
 
+def safe_log_identifier(value):
+    return redact_identifier(value) or "нет"
+
+
 async def claim_normalized_stripe_event(
     claim_event_processing,
     release_event_processing,
@@ -123,7 +129,7 @@ async def claim_normalized_stripe_event(
         except Exception as release_error:
             logging.exception(
                 "Stripe webhook event release after claim failure also failed: event_id=%s, error=%s",
-                event_id,
+                safe_log_identifier(event_id),
                 release_error,
             )
         raise
