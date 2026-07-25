@@ -8414,24 +8414,34 @@ async def stripe_webhook(request):
             customer_id = stripe_object_id(stripe_value(sub, 'customer'))
             status = stripe_value(sub, 'status')
             if sub_id:
-                conn = get_db_conn()
-                cur = conn.cursor()
-                cur.execute("""
-                    UPDATE users
-                    SET paid = CASE
-                            WHEN expiry_date IS NOT NULL AND expiry_date > NOW() THEN paid
-                            ELSE FALSE
-                        END,
-                        auto_renew = FALSE,
-                        stripe_subscription_id = NULL,
-                        stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                    WHERE stripe_subscription_id = %s
-                    RETURNING telegram_id, paid, expiry_date
-                """, (customer_id, sub_id))
-                row = cur.fetchone()
-                conn.commit()
-                cur.close()
-                conn.close()
+                conn = None
+                cur = None
+                try:
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    cur.execute("""
+                        UPDATE users
+                        SET paid = CASE
+                                WHEN expiry_date IS NOT NULL AND expiry_date > NOW() THEN paid
+                                ELSE FALSE
+                            END,
+                            auto_renew = FALSE,
+                            stripe_subscription_id = NULL,
+                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                        WHERE stripe_subscription_id = %s
+                        RETURNING telegram_id, paid, expiry_date
+                    """, (customer_id, sub_id))
+                    row = cur.fetchone()
+                    conn.commit()
+                except Exception:
+                    if conn:
+                        conn.rollback()
+                    raise
+                finally:
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
                 logging.warning(
                     "STRIPE_SUBSCRIPTION_DELETED_MARKED: event_id=%s, event.type=%s, "
                     "telegram_id=%s, customer_id=%s, subscription_id=%s, status=%s, paid=%s, expiry_date=%s",
@@ -8457,21 +8467,36 @@ async def stripe_webhook(request):
             period_value, period_source = subscription_update_period(status, current_period_end, trial_end)
             subscription_expiry = datetime.utcfromtimestamp(period_value) if period_value else None
             if sub_id:
-                conn = get_db_conn()
-                cur = conn.cursor()
+                conn = None
+                cur = None
                 old_auto_renew = None
-                cur.execute(
-                    """
-                    SELECT auto_renew,
-                           last_successful_invoice_created_at,
-                           last_subscription_state_event_created_at,
-                           telegram_id
-                    FROM users
-                    WHERE stripe_subscription_id = %s
-                    """,
-                    (sub_id,)
-                )
-                old_auto_row = cur.fetchone()
+                try:
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT auto_renew,
+                               last_successful_invoice_created_at,
+                               last_subscription_state_event_created_at,
+                               telegram_id
+                        FROM users
+                        WHERE stripe_subscription_id = %s
+                        """,
+                        (sub_id,)
+                    )
+                    old_auto_row = cur.fetchone()
+                    conn.commit()
+                except Exception:
+                    if conn:
+                        conn.rollback()
+                    raise
+                finally:
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
+                    cur = None
+                    conn = None
                 last_success_created_at = None
                 last_subscription_state_event_created_at = None
                 if old_auto_row:
@@ -8490,16 +8515,6 @@ async def stripe_webhook(request):
                             live_status = stripe_value(live_subscription, "status")
                             latest_invoice_status = stripe_value(live_subscription, "latest_invoice", "status")
                             if live_subscription_is_paid(live_status, latest_invoice_status) or latest_invoice_status == "paid":
-                                cur.execute("""
-                                    UPDATE users
-                                    SET last_subscription_state_event_created_at = GREATEST(
-                                            COALESCE(last_subscription_state_event_created_at, %s),
-                                            %s
-                                        ),
-                                        stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                                    WHERE stripe_subscription_id = %s
-                                """, (event_created_at, event_created_at, customer_id, sub_id))
-                                conn.commit()
                                 logging.warning(
                                     "SUBSCRIPTION_UPDATED_NEGATIVE_STALE_IGNORED: event_id=%s, event.type=%s, "
                                     "customer_id=%s, subscription_id=%s, status=%s, live_status=%s, "
@@ -8523,7 +8538,18 @@ async def stripe_webhook(request):
                                 str(e),
                                 exc_info=True,
                             )
+                    conn = get_db_conn()
+                    cur = conn.cursor()
                     if negative_update_skipped:
+                        cur.execute("""
+                            UPDATE users
+                            SET last_subscription_state_event_created_at = GREATEST(
+                                    COALESCE(last_subscription_state_event_created_at, %s),
+                                    %s
+                                ),
+                                stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                            WHERE stripe_subscription_id = %s
+                        """, (event_created_at, event_created_at, customer_id, sub_id))
                         row = None
                     else:
                         cur.execute("""
@@ -8585,6 +8611,8 @@ async def stripe_webhook(request):
                             source="customer.subscription.updated",
                         )
                 elif status in ("active", "trialing"):
+                    conn = get_db_conn()
+                    cur = conn.cursor()
                     if subscription_expiry:
                         cur.execute("""
                             UPDATE users
@@ -8720,6 +8748,8 @@ async def stripe_webhook(request):
                             "/link_stripe_user <telegram_id> <customer_id> <subscription_id>"
                         )
                 else:
+                    conn = get_db_conn()
+                    cur = conn.cursor()
                     cur.execute("""
                         UPDATE users
                         SET auto_renew = %s,
@@ -8772,9 +8802,17 @@ async def stripe_webhook(request):
                         sub_id,
                         f"status={status}; cancel_at_period_end=True",
                     ))
-                conn.commit()
-                cur.close()
-                conn.close()
+                try:
+                    conn.commit()
+                except Exception:
+                    if conn:
+                        conn.rollback()
+                    raise
+                finally:
+                    if cur:
+                        cur.close()
+                    if conn:
+                        conn.close()
 
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):

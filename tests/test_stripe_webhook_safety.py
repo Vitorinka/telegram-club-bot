@@ -452,6 +452,31 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, webhook_source)
 
+    def test_subscription_deleted_db_block_has_rollback_and_finally_close(self):
+        main_py = Path(__file__).resolve().parents[1] / "main.py"
+        source = main_py.read_text()
+        block = source[
+            source.index("elif event_type == 'customer.subscription.deleted'"):
+            source.index("# ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ")
+        ]
+        self.assertIn("conn = None", block)
+        self.assertIn("cur = None", block)
+        self.assertIn("conn.rollback()", block)
+        self.assertIn("finally:", block)
+        self.assertIn("cur.close()", block)
+        self.assertIn("conn.close()", block)
+
+    def test_subscription_updated_live_check_happens_after_read_connection_close(self):
+        main_py = Path(__file__).resolve().parents[1] / "main.py"
+        source = main_py.read_text()
+        block = source[
+            source.index("elif event_type == 'customer.subscription.updated'"):
+            source.index("# ---------- 5. СЕССИЯ ОПЛАТЫ")
+        ]
+        self.assertLess(block.index("conn.close()"), block.index("stripe.Subscription.retrieve"))
+        self.assertIn("conn.rollback()", block)
+        self.assertIn("raise", block)
+
     def test_claim_exception_releases_event_and_reraises(self):
         calls = []
 
