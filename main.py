@@ -402,6 +402,23 @@ def init_db():
         );
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_removal_events (
+            telegram_id BIGINT PRIMARY KEY,
+            status TEXT NOT NULL,
+            reason TEXT,
+            owner_id TEXT,
+            claimed_at TIMESTAMP,
+            lease_until TIMESTAMP,
+            telegram_removed_at TIMESTAMP,
+            db_finalized_at TIMESTAMP,
+            admin_notified_at TIMESTAMP,
+            attempt_count INTEGER DEFAULT 0,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_invite_links (
             invite_link TEXT PRIMARY KEY,
             source TEXT,
@@ -2061,7 +2078,166 @@ async def send_existing_subscription_action(callback, user_id, stripe_subscripti
     return True
 
 
-async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur):
+def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None, lease_minutes=30):
+    owner_id = owner_id or OWNER_ID
+    now = now or datetime.utcnow()
+    lease_until = now + timedelta(minutes=lease_minutes)
+    cur.execute(
+        """
+        INSERT INTO subscription_removal_events (
+            telegram_id, status, reason, owner_id, claimed_at, lease_until, attempt_count, created_at, updated_at
+        )
+        VALUES (%s, 'processing', %s, %s, %s, %s, 1, %s, %s)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            status = 'processing',
+            reason = EXCLUDED.reason,
+            owner_id = EXCLUDED.owner_id,
+            claimed_at = EXCLUDED.claimed_at,
+            lease_until = EXCLUDED.lease_until,
+            attempt_count = subscription_removal_events.attempt_count + 1,
+            last_error = NULL,
+            updated_at = EXCLUDED.updated_at
+        WHERE subscription_removal_events.status IN ('pending', 'telegram_failed')
+           OR (
+                subscription_removal_events.status = 'processing'
+                AND subscription_removal_events.lease_until < %s
+           )
+        RETURNING telegram_id
+        """,
+        (int(telegram_id), reason, owner_id, now, lease_until, now, now, now),
+    )
+    if cur.fetchone():
+        return "claimed"
+    cur.execute("SELECT status FROM subscription_removal_events WHERE telegram_id = %s", (int(telegram_id),))
+    row = cur.fetchone()
+    if row and row[0] in ("removed", "db_finalized"):
+        return "already_finalized"
+    if row and row[0] == "processing":
+        return "already_processing"
+    return row[0] if row else "not_claimed"
+
+
+def mark_subscription_removal_status(cur, telegram_id, status, error_text=None):
+    fields = {
+        "removed": "telegram_removed_at = COALESCE(telegram_removed_at, NOW()),",
+        "db_finalized": "db_finalized_at = COALESCE(db_finalized_at, NOW()),",
+    }.get(status, "")
+    cur.execute(
+        f"""
+        UPDATE subscription_removal_events
+        SET status = %s,
+            {fields}
+            last_error = LEFT(%s, 1000),
+            updated_at = NOW()
+        WHERE telegram_id = %s
+        """,
+        (status, str(error_text) if error_text else None, int(telegram_id)),
+    )
+
+
+def fetch_subscription_removal_user(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                paid,
+                expiry_date,
+                stripe_subscription_id,
+                payment_failed,
+                payment_failed_at,
+                grace_period_end,
+                auto_renew,
+                stripe_customer_id
+            FROM users
+            WHERE telegram_id = %s
+        """, (int(telegram_id),))
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def fetch_user_expiry_customer(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
+            (int(telegram_id),)
+        )
+        return cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def set_subscription_reminder_sent(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def update_user_blocked_bot(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def finalize_subscription_removal_in_db(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE users
+            SET paid = FALSE,
+                payment_failed = FALSE,
+                payment_failed_at = NULL,
+                grace_period_end = NULL,
+                reminder_sent = FALSE
+            WHERE telegram_id = %s
+        """, (int(telegram_id),))
+        mark_subscription_removal_status(cur, telegram_id, "db_finalized")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def mark_subscription_removal_short(telegram_id, status, error_text=None):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        mark_subscription_removal_status(cur, telegram_id, status, error_text)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur=None):
     if not has_valid_stripe_subscription_id(stripe_subscription_id):
         logging.info(
             f"NO_STRIPE_SUBSCRIPTION_ID — proceed to removal. telegram_id={telegram_id}, "
@@ -2102,28 +2278,10 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                 f"Stripe subscription active/trialing, но period_end не найден. "
                 f"telegram_id={telegram_id}, stripe_subscription_id={stripe_subscription_id}"
             )
-            cur.execute("""
-                UPDATE users
-                SET payment_failed = FALSE,
-                    payment_failed_at = NULL,
-                    last_payment_succeeded_at = NOW(),
-                    grace_period_end = NULL,
-                    reminder_sent = FALSE,
-                    auto_renew = TRUE,
-                    blocked_bot = FALSE
-                WHERE telegram_id = %s
-            """, (int(telegram_id),))
-            return "STRIPE_ACTIVE"
-
-        if status in ('active', 'trialing') and current_period_end:
-            new_expiry = datetime.utcfromtimestamp(current_period_end)
-
-            if new_expiry > datetime.utcnow():
+            if cur is not None:
                 cur.execute("""
                     UPDATE users
-                    SET paid = TRUE,
-                        expiry_date = %s,
-                        payment_failed = FALSE,
+                    SET payment_failed = FALSE,
                         payment_failed_at = NULL,
                         last_payment_succeeded_at = NOW(),
                         grace_period_end = NULL,
@@ -2131,7 +2289,73 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
                         auto_renew = TRUE,
                         blocked_bot = FALSE
                     WHERE telegram_id = %s
-                """, (new_expiry, int(telegram_id)))
+                """, (int(telegram_id),))
+            else:
+                conn = get_db_conn()
+                active_cur = conn.cursor()
+                try:
+                    active_cur.execute("""
+                        UPDATE users
+                        SET payment_failed = FALSE,
+                            payment_failed_at = NULL,
+                            last_payment_succeeded_at = NOW(),
+                            grace_period_end = NULL,
+                            reminder_sent = FALSE,
+                            auto_renew = TRUE,
+                            blocked_bot = FALSE
+                        WHERE telegram_id = %s
+                    """, (int(telegram_id),))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    active_cur.close()
+                    conn.close()
+            return "STRIPE_ACTIVE"
+
+        if status in ('active', 'trialing') and current_period_end:
+            new_expiry = datetime.utcfromtimestamp(current_period_end)
+
+            if new_expiry > datetime.utcnow():
+                if cur is not None:
+                    cur.execute("""
+                        UPDATE users
+                        SET paid = TRUE,
+                            expiry_date = %s,
+                            payment_failed = FALSE,
+                            payment_failed_at = NULL,
+                            last_payment_succeeded_at = NOW(),
+                            grace_period_end = NULL,
+                            reminder_sent = FALSE,
+                            auto_renew = TRUE,
+                            blocked_bot = FALSE
+                        WHERE telegram_id = %s
+                    """, (new_expiry, int(telegram_id)))
+                else:
+                    conn = get_db_conn()
+                    active_cur = conn.cursor()
+                    try:
+                        active_cur.execute("""
+                            UPDATE users
+                            SET paid = TRUE,
+                                expiry_date = %s,
+                                payment_failed = FALSE,
+                                payment_failed_at = NULL,
+                                last_payment_succeeded_at = NOW(),
+                                grace_period_end = NULL,
+                                reminder_sent = FALSE,
+                                auto_renew = TRUE,
+                                blocked_bot = FALSE
+                            WHERE telegram_id = %s
+                        """, (new_expiry, int(telegram_id)))
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                    finally:
+                        active_cur.close()
+                        conn.close()
 
                 logging.info(
                     f"Пользователь {telegram_id} не удален: Stripe подписка активна до {new_expiry} UTC."
@@ -2153,21 +2377,28 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
 
     return False
 
-async def ban_user_logic(telegram_id, cur):
-    cur.execute("""
-        SELECT
-            paid,
-            expiry_date,
-            stripe_subscription_id,
-            payment_failed,
-            payment_failed_at,
-            grace_period_end,
-            auto_renew,
-            stripe_customer_id
-        FROM users
-        WHERE telegram_id = %s
-    """, (int(telegram_id),))
-    user = cur.fetchone()
+async def ban_user_logic(telegram_id, cur=None):
+    claim_conn = get_db_conn()
+    claim_cur = claim_conn.cursor()
+    try:
+        claim = claim_subscription_removal(claim_cur, telegram_id, "subscription_expired")
+        claim_conn.commit()
+    except Exception:
+        claim_conn.rollback()
+        raise
+    finally:
+        claim_cur.close()
+        claim_conn.close()
+
+    if claim != "claimed":
+        logging.info(
+            "USER_REMOVE_CLAIM_SKIPPED: telegram_id=%s, claim=%s",
+            telegram_id,
+            claim,
+        )
+        return claim
+
+    user = fetch_subscription_removal_user(telegram_id)
 
     if not user:
         logging.warning(
@@ -2175,6 +2406,7 @@ async def ban_user_logic(telegram_id, cur):
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "user_not_found", None, None, None, None, None
         )
+        mark_subscription_removal_short(telegram_id, "db_finalized", "user_not_found")
         return "not_found"
 
     (
@@ -2197,6 +2429,7 @@ async def ban_user_logic(telegram_id, cur):
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "active_access_in_db", paid, expiry_date, grace, auto_renew, stripe_subscription_id
         )
+        mark_subscription_removal_short(telegram_id, "pending", "active_access_in_db")
         return "active_in_db"
 
     if payment_failed and payment_failed_at:
@@ -2207,6 +2440,7 @@ async def ban_user_logic(telegram_id, cur):
                 "payment_failed_at=%s, grace_until=%s, expiry_date=%s, stripe_subscription_id=%s",
                 telegram_id, None, payment_failed_at, retry_until, expiry_date, stripe_subscription_id
             )
+            mark_subscription_removal_short(telegram_id, "pending", "recent_payment_failure")
             return "recent_payment_failure"
 
     if grace_period_end and now < grace_period_end:
@@ -2215,6 +2449,7 @@ async def ban_user_logic(telegram_id, cur):
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "grace_period_active", paid, expiry_date, grace_period_end, auto_renew, stripe_subscription_id
         )
+        mark_subscription_removal_short(telegram_id, "pending", "grace_period_active")
         return "grace_active"
 
     if auto_renew and not has_valid_stripe_subscription_id(stripe_subscription_id):
@@ -2241,6 +2476,7 @@ async def ban_user_logic(telegram_id, cur):
             "Нужно вручную проверить Stripe и связать пользователя командой "
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id>."
         )
+        mark_subscription_removal_short(telegram_id, "pending", "auto_renew_without_valid_subscription_id")
         return "STRIPE_UNLINKED_REVIEW"
 
     if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
@@ -2251,8 +2487,9 @@ async def ban_user_logic(telegram_id, cur):
             grace_period_end, auto_renew, stripe_subscription_id
         )
 
-    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id)
     if stripe_guard_status:
+        mark_subscription_removal_short(telegram_id, "pending", stripe_guard_status)
         return stripe_guard_status
 
     try:
@@ -2265,6 +2502,7 @@ async def ban_user_logic(telegram_id, cur):
                 GROUP_ID,
                 telegram_status,
             )
+            mark_subscription_removal_short(telegram_id, "pending", "telegram_admin")
             return "telegram_admin"
     except Exception as e:
         logging.critical(
@@ -2280,6 +2518,7 @@ async def ban_user_logic(telegram_id, cur):
             f"Ошибка: {e}\n\n"
             "Пользователь НЕ удалён автоматически."
         )
+        mark_subscription_removal_short(telegram_id, "pending", f"telegram_status_error: {e}")
         return "telegram_status_error"
 
     # 1. Пытаемся удалить пользователя из группы
@@ -2316,6 +2555,7 @@ async def ban_user_logic(telegram_id, cur):
             "USER_REMOVED_FROM_GROUP: telegram_id=%s, username=%s, chat_id=%s, reason=%s, result=%s",
             telegram_id, None, GROUP_ID, reason, unban_result
         )
+        mark_subscription_removal_short(telegram_id, "removed")
         await notify_admins(
             "Пользователь удалён из группы ботом.\n\n"
             f"Telegram ID: {telegram_id}\n"
@@ -2336,18 +2576,14 @@ async def ban_user_logic(telegram_id, cur):
             f"Ошибка: {e}\n\n"
             "Пользователь мог остаться в группе. Проверьте вручную."
         )
+        mark_subscription_removal_short(telegram_id, "telegram_failed", e)
         status = "kick_failed"
 
-    # 2. В любом случае закрываем доступ в базе
-    cur.execute("""
-        UPDATE users
-        SET paid = FALSE,
-            payment_failed = FALSE,
-            payment_failed_at = NULL,
-            grace_period_end = NULL,
-            reminder_sent = FALSE
-        WHERE telegram_id = %s
-    """, (int(telegram_id),))
+    if status == "kick_failed":
+        return status
+
+    # 2. Закрываем доступ в базе только после успешного Telegram side effect.
+    finalize_subscription_removal_in_db(telegram_id)
 
     # 3. Пытаемся уведомить пользователя
     try:
@@ -2358,10 +2594,7 @@ async def ban_user_logic(telegram_id, cur):
             reply_markup=get_tariffs_keyboard(show_trial=False)
         )
     except BotBlocked:
-        cur.execute(
-            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
-            (int(telegram_id),)
-        )
+        update_user_blocked_bot(telegram_id)
         logging.info(
             f"Пользователь {telegram_id} заблокировал бота: сообщение об окончании доступа "
             "не отправлено, но доступ уже закрыт в БД."
@@ -2370,10 +2603,7 @@ async def ban_user_logic(telegram_id, cur):
     except Exception as e:
         logging.error(f"Не удалось отправить сообщение об окончании доступа пользователю {telegram_id}: {e}")
         if is_undeliverable_user_error(e):
-            cur.execute(
-                "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
-                (int(telegram_id),)
-            )
+            update_user_blocked_bot(telegram_id)
             logging.info(
                 f"Пользователь {telegram_id}: сообщение об окончании доступа недоставляемо, "
                 "но доступ уже закрыт в БД."
@@ -2425,6 +2655,9 @@ async def check_subscriptions_and_reminders():
           )
     """)
     removal_users = cur.fetchall()
+    conn.commit()
+    cur.close()
+    conn.close()
     now = datetime.utcnow()
     checked_total = len(reminder_users) + len(removal_users)
     logging.info(
@@ -2555,7 +2788,7 @@ async def check_subscriptions_and_reminders():
                 log_report_user("GRACE_USER", grace_user)
 
                 if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
-                    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+                    stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id)
                     if stripe_guard_status:
                         protected_user = build_report_user(
                             telegram_id,
@@ -2575,14 +2808,14 @@ async def check_subscriptions_and_reminders():
                             "⏳ Ваша подписка истекла, но у вас ещё активен льготный период после ошибки оплаты.\n"
                             "Пожалуйста, продлите подписку как можно скорее.",
                             reply_markup=get_tariffs_keyboard(show_trial=False))
-                        cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                        set_subscription_reminder_sent(telegram_id)
                         reminders_sent += 1
                     except Exception as e:
                         reminder_errors += 1
                         telegram_errors += 1
                         logging.warning(f"Не удалось отправить сообщение пользователю {telegram_id}: {e}")
                         if is_undeliverable_user_error(e):
-                            cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (telegram_id,))
+                            update_user_blocked_bot(telegram_id)
 
         # ----- Напоминание за 48 часов -----
         elif timedelta(0) < time_left < timedelta(days=2):
@@ -2594,14 +2827,14 @@ async def check_subscriptions_and_reminders():
                 text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
                 try:
                     await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
-                    cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (telegram_id,))
+                    set_subscription_reminder_sent(telegram_id)
                     reminders_sent += 1
                 except Exception as e:
                     reminder_errors += 1
                     telegram_errors += 1
                     logging.warning(f"Не удалось отправить напоминание пользователю {telegram_id}: {e}")
                     if is_undeliverable_user_error(e):
-                        cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (telegram_id,))
+                        update_user_blocked_bot(telegram_id)
 
     for (telegram_id, expiry, payment_failed, payment_failed_at, grace_end, auto_renew, reminder_sent, _, stripe_subscription_id, stripe_customer_id) in removal_users:
         expired_total += 1
@@ -2650,13 +2883,9 @@ async def check_subscriptions_and_reminders():
 
         if has_valid_stripe_subscription_id(stripe_subscription_id):
             removal_reason = "STRIPE_INACTIVE_OR_EXPIRED — proceed to removal"
-            stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id, cur)
+            stripe_guard_status = await refresh_active_stripe_subscription(telegram_id, stripe_subscription_id)
             if stripe_guard_status:
-                cur.execute(
-                    "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
-                    (telegram_id,)
-                )
-                row = cur.fetchone()
+                row = fetch_user_expiry_customer(telegram_id)
                 refreshed_expiry = row[0] if row else None
                 refreshed_customer_id = row[1] if row else stripe_customer_id
                 protected_user = build_report_user(
@@ -2685,16 +2914,12 @@ async def check_subscriptions_and_reminders():
                 f"stripe_subscription_id={stripe_subscription_id or 'нет'}"
             )
 
-        ban_status = await ban_user_logic(telegram_id, cur)
+        ban_status = await ban_user_logic(telegram_id)
 
         if ban_status == "active_in_db":
             active_in_db_skipped += 1
         elif ban_status in ("STRIPE_ACTIVE", "STRIPE_CHECK_FAILED", "STRIPE_UNLINKED_REVIEW"):
-            cur.execute(
-                "SELECT expiry_date, stripe_customer_id FROM users WHERE telegram_id = %s",
-                (telegram_id,)
-            )
-            row = cur.fetchone()
+            row = fetch_user_expiry_customer(telegram_id)
             refreshed_expiry = row[0] if row else None
             refreshed_customer_id = row[1] if row else stripe_customer_id
             protected_user = build_report_user(
@@ -2752,10 +2977,6 @@ async def check_subscriptions_and_reminders():
             if ban_status == "kick_failed":
                 telegram_errors += 1
                 logging.error(f"DELETED_USER: не получилось удалить из группы telegram_id={telegram_id}")
-
-    conn.commit()
-    cur.close()
-    conn.close()
 
     for access_event in pending_access_events:
         await log_access_event(**access_event)

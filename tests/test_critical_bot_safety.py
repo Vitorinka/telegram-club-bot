@@ -514,6 +514,38 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn('telegram_status in ("administrator", "creator")', source)
         self.assertIn("telegram_status_error", source)
 
+    def test_subscription_removal_has_durable_lease_table(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS subscription_removal_events", MAIN_SOURCE)
+        self.assertIn("telegram_removed_at TIMESTAMP", MAIN_SOURCE)
+        self.assertIn("db_finalized_at TIMESTAMP", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def claim_subscription_removal"):MAIN_SOURCE.index("def mark_subscription_removal_status")]
+        self.assertIn("ON CONFLICT (telegram_id) DO UPDATE", source)
+        self.assertIn("lease_until < %s", source)
+        self.assertIn("status IN ('pending', 'telegram_failed')", source)
+        self.assertIn("already_processing", source)
+
+    def test_subscription_removal_closes_db_before_stripe_and_telegram(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
+        self.assertLess(source.index("claim_conn.close()"), source.index("fetch_subscription_removal_user"))
+        self.assertLess(source.index("fetch_subscription_removal_user"), source.index("refresh_active_stripe_subscription"))
+        self.assertLess(source.index("fetch_subscription_removal_user"), source.index("bot.get_chat_member"))
+        self.assertLess(source.index("mark_subscription_removal_short(telegram_id, \"removed\")"), source.index("finalize_subscription_removal_in_db"))
+
+    def test_subscription_removal_kick_failure_does_not_close_access(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
+        failure_pos = source.index("mark_subscription_removal_short(telegram_id, \"telegram_failed\", e)")
+        return_pos = source.index("if status == \"kick_failed\":")
+        finalize_pos = source.index("finalize_subscription_removal_in_db")
+        self.assertLess(failure_pos, return_pos)
+        self.assertLess(return_pos, finalize_pos)
+
+    def test_subscription_check_releases_batch_cursor_before_side_effects(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
+        self.assertLess(source.index("conn.close()"), source.index("for (telegram_id, expiry"))
+        self.assertIn("set_subscription_reminder_sent", source)
+        self.assertIn("ban_status = await ban_user_logic(telegram_id)", source)
+        self.assertNotIn("ban_user_logic(telegram_id, cur)", source)
+
     def test_duplicate_subscriptions_uses_live_stripe_list(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['revoke_invite_links']")]
         self.assertIn("stripe.Subscription.list", source)
