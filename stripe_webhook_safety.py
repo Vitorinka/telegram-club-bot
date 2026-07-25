@@ -1,5 +1,7 @@
 import hashlib
+import logging
 import os
+from datetime import datetime
 
 import stripe
 
@@ -63,6 +65,68 @@ def stripe_value(obj, *path):
         else:
             current = getattr(current, key, None)
     return current
+
+
+def stripe_event_created_at(created):
+    if created in (None, ""):
+        return None
+    try:
+        return datetime.utcfromtimestamp(int(created))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def normalize_stripe_event(event):
+    event_object = stripe_value(event, "data", "object")
+    return {
+        "event_id": stripe_value(event, "id"),
+        "event_type": stripe_value(event, "type"),
+        "event_created_at": stripe_event_created_at(stripe_value(event, "created")),
+        "event_object": event_object,
+        "object_id": stripe_value(event_object, "id"),
+    }
+
+
+def require_normalized_stripe_event(normalized_event):
+    event_id = normalized_event.get("event_id")
+    event_type = normalized_event.get("event_type")
+    if not isinstance(event_id, str) or not event_id.strip():
+        raise ValueError("Stripe event id missing")
+    if not isinstance(event_type, str) or not event_type.strip():
+        raise ValueError("Stripe event type missing")
+
+    normalized_event = dict(normalized_event)
+    normalized_event["event_id"] = event_id.strip()
+    normalized_event["event_type"] = event_type.strip()
+    return normalized_event
+
+
+async def claim_normalized_stripe_event(
+    claim_event_processing,
+    release_event_processing,
+    event_id,
+    *,
+    event_created_at=None,
+    event_type=None,
+    object_id=None,
+):
+    try:
+        return await claim_event_processing(
+            event_id,
+            event_created_at=event_created_at,
+            event_type=event_type,
+            object_id=object_id,
+        )
+    except Exception:
+        try:
+            await release_event_processing(event_id)
+        except Exception as release_error:
+            logging.exception(
+                "Stripe webhook event release after claim failure also failed: event_id=%s, error=%s",
+                event_id,
+                release_error,
+            )
+        raise
 
 
 def stripe_webhook_diagnostics(request, payload, sig_header, webhook_secret, env=None):

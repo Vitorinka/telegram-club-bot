@@ -1,13 +1,19 @@
+import asyncio
 import hashlib
 import hmac
 import json
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from stripe_webhook_safety import (
+    claim_normalized_stripe_event,
     construct_verified_stripe_event,
+    normalize_stripe_event,
+    require_normalized_stripe_event,
     stripe_signature_error_class,
+    stripe_event_created_at,
     stripe_signature_timestamp,
     stripe_value,
     stripe_webhook_diagnostics,
@@ -125,6 +131,67 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         event_object = stripe_value(event, "data", "object")
         self.assertEqual(stripe_value(event_object, "id"), "sub_dict")
 
+    def test_normalize_stripe_event_reads_dict_event(self):
+        event = {
+            "id": " evt_dict ",
+            "type": "invoice.payment_succeeded",
+            "created": 123,
+            "data": {"object": {"id": "in_dict"}},
+        }
+
+        normalized = require_normalized_stripe_event(normalize_stripe_event(event))
+
+        self.assertEqual(normalized["event_id"], "evt_dict")
+        self.assertEqual(normalized["event_type"], "invoice.payment_succeeded")
+        self.assertEqual(normalized["event_created_at"], datetime.utcfromtimestamp(123))
+        self.assertEqual(stripe_value(normalized["event_object"], "id"), "in_dict")
+        self.assertEqual(normalized["object_id"], "in_dict")
+
+    def test_normalize_stripe_event_reads_object_without_get_or_item_access(self):
+        event_object = FakeStripeObject(id="sub_object")
+        event = NoItemEvent("customer.subscription.updated", event_object)
+
+        self.assertFalse(hasattr(event, "get"))
+        self.assertFalse(hasattr(event, "__getitem__"))
+        normalized = require_normalized_stripe_event(normalize_stripe_event(event))
+
+        self.assertEqual(normalized["event_id"], "evt_no_item")
+        self.assertEqual(normalized["event_type"], "customer.subscription.updated")
+        self.assertEqual(stripe_value(normalized["event_object"], "id"), "sub_object")
+        self.assertEqual(normalized["object_id"], "sub_object")
+
+    def test_stripe_event_created_at_tolerates_missing_and_invalid_values(self):
+        for created in (None, "", "bad", 10**100):
+            with self.subTest(created=created):
+                self.assertIsNone(stripe_event_created_at(created))
+
+    def test_normalize_stripe_event_tolerates_missing_created(self):
+        event = FakeStripeObject(
+            id="evt_missing_created",
+            type="checkout.session.completed",
+            data=FakeStripeObject(object=FakeStripeObject(id="cs_test")),
+        )
+
+        normalized = require_normalized_stripe_event(normalize_stripe_event(event))
+
+        self.assertIsNone(normalized["event_created_at"])
+
+    def test_require_normalized_stripe_event_rejects_missing_event_id(self):
+        normalized = normalize_stripe_event(
+            FakeStripeObject(type="invoice.payment_failed", data=FakeStripeObject(object=FakeStripeObject(id="in_test")))
+        )
+
+        with self.assertRaises(ValueError):
+            require_normalized_stripe_event(normalized)
+
+    def test_require_normalized_stripe_event_rejects_missing_event_type(self):
+        normalized = normalize_stripe_event(
+            FakeStripeObject(id="evt_missing_type", data=FakeStripeObject(object=FakeStripeObject(id="in_test")))
+        )
+
+        with self.assertRaises(ValueError):
+            require_normalized_stripe_event(normalized)
+
     def test_webhook_claim_extraction_does_not_use_get(self):
         event = FakeStripeObject(
             id="evt_no_get",
@@ -186,6 +253,71 @@ class StripeWebhookSafetyTests(unittest.TestCase):
             "event['data']['object']",
         ):
             self.assertNotIn(forbidden, webhook_source)
+
+    def test_claim_exception_releases_event_and_reraises(self):
+        calls = []
+
+        async def claim(event_id, **kwargs):
+            calls.append(("claim", event_id, kwargs))
+            raise RuntimeError("db down")
+
+        async def release(event_id):
+            calls.append(("release", event_id))
+
+        async def run_claim():
+            await claim_normalized_stripe_event(
+                claim,
+                release,
+                "evt_claim_error",
+                event_created_at=None,
+                event_type="invoice.payment_succeeded",
+                object_id="in_test",
+            )
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run_claim())
+
+        self.assertEqual(calls[0][0], "claim")
+        self.assertEqual(calls[1], ("release", "evt_claim_error"))
+
+    def test_claim_exception_reraises_when_release_also_fails(self):
+        calls = []
+
+        async def claim(event_id, **kwargs):
+            calls.append(("claim", event_id))
+            raise RuntimeError("claim failed")
+
+        async def release(event_id):
+            calls.append(("release", event_id))
+            raise RuntimeError("release failed")
+
+        async def run_claim():
+            await claim_normalized_stripe_event(claim, release, "evt_release_error")
+
+        with self.assertLogs(level="ERROR"):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(run_claim())
+
+        self.assertEqual(str(ctx.exception), "claim failed")
+        self.assertEqual(calls, [("claim", "evt_release_error"), ("release", "evt_release_error")])
+
+    def test_duplicate_processed_result_passes_through_without_release(self):
+        calls = []
+
+        async def claim(event_id, **kwargs):
+            calls.append(("claim", event_id))
+            return "duplicate_processed"
+
+        async def release(event_id):
+            calls.append(("release", event_id))
+
+        async def run_claim():
+            return await claim_normalized_stripe_event(claim, release, "evt_duplicate")
+
+        result = asyncio.run(run_claim())
+
+        self.assertEqual(result, "duplicate_processed")
+        self.assertEqual(calls, [("claim", "evt_duplicate")])
 
 
 if __name__ == "__main__":

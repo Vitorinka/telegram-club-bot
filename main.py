@@ -93,7 +93,10 @@ from weekly_report import (
     to_utc_naive,
 )
 from stripe_webhook_safety import (
+    claim_normalized_stripe_event,
     construct_verified_stripe_event,
+    normalize_stripe_event,
+    require_normalized_stripe_event,
     stripe_signature_error_class,
     stripe_value,
     stripe_webhook_diagnostics,
@@ -6435,20 +6438,40 @@ async def stripe_webhook(request):
         logging.exception("Stripe webhook construct_event failed: error=%s diagnostics=%s", e, diagnostics)
         return web.Response(status=400, text="Stripe webhook verification error")
 
-    event_id = stripe_value(event, "id")
-    event_type = stripe_value(event, "type")
+    try:
+        normalized_event = require_normalized_stripe_event(normalize_stripe_event(event))
+        event_id = normalized_event["event_id"]
+        event_type = normalized_event["event_type"]
+        event_created_at = normalized_event["event_created_at"]
+        event_object = normalized_event["event_object"]
+        object_id = normalized_event["object_id"]
+    except Exception as e:
+        logging.exception(
+            "Stripe webhook event normalization failed: error=%s diagnostics=%s",
+            e,
+            diagnostics,
+        )
+        return web.Response(status=500, text="Stripe webhook event normalization failed")
+
     logging.info(f"Stripe webhook event: event_id={safe_log_id(event_id)}, event.type={event_type}")
 
-    event_created = stripe_value(event, "created")
-    event_created_at = datetime.utcfromtimestamp(int(event_created)) if event_created else None
-    event_object = stripe_value(event, "data", "object")
-    object_id = stripe_value(event_object, "id")
-    claim_result = await claim_event_processing(
-        event_id,
-        event_created_at=event_created_at,
-        event_type=event_type,
-        object_id=object_id,
-    )
+    try:
+        claim_result = await claim_normalized_stripe_event(
+            claim_event_processing,
+            release_event_processing,
+            event_id,
+            event_created_at=event_created_at,
+            event_type=event_type,
+            object_id=object_id,
+        )
+    except Exception as e:
+        logging.exception(
+            "Stripe webhook event claim failed: event_id=%s, event.type=%s, error=%s",
+            safe_log_id(event_id),
+            event_type,
+            e,
+        )
+        return web.Response(status=500, text="Stripe webhook event claim failed")
     if claim_result != "claimed":
         logging.info(
             "Stripe webhook event already claimed: event_id=%s, event.type=%s, claim_result=%s",
