@@ -7,22 +7,52 @@ on:
 jobs:
   unittest:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: codex_ci
+          POSTGRES_USER: codex_ci
+          POSTGRES_PASSWORD: codex_ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U codex_ci -d codex_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_TEST_DSN: postgresql://codex_ci:codex_ci_password@localhost:5432/codex_ci
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit
       - name: Compile
         run: >
           PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
           main.py stripe_invoice_rules.py weekly_report.py checkout_safety.py
           admin_security.py scheduled_jobs.py group_access.py
-          stripe_webhook_safety.py tests/test_stripe_invoice_rules.py
+          stripe_webhook_safety.py db_migrations.py tests/test_stripe_invoice_rules.py
           tests/test_weekly_report.py tests/test_stripe_webhook_safety.py
+          tests/test_db_migrations.py tests/test_postgres_migrations_integration.py
+      - name: PostgreSQL migration integration tests
+        run: >
+          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest
+          tests.test_postgres_migrations_integration -v
+      - name: PostgreSQL migration integration tests repeated
+        run: >
+          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest
+          tests.test_postgres_migrations_integration -v
       - name: Unit tests
         run: PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest discover -s tests -v
       - name: Secret scan
         run: |
           ! grep -RInE --binary-files=without-match --exclude='*.patch' --exclude='tests.yml' --exclude-dir='.git' '(sk_live_|whsec_|xox[baprs]-|BEGIN RSA PRIVATE KEY|DATABASE_URL=.*:.*@)' .
+      - name: pip-audit
+        run: pip-audit -r requirements.txt

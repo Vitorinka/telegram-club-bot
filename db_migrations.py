@@ -1,12 +1,17 @@
 import hashlib
 import logging
 import re
+import time
 from pathlib import Path
 
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 MIGRATION_ID_RE = re.compile(r"^(\d{4}_[a-z0-9_]+)\.sql$")
 MIGRATION_LOCK_KEY = "telegram_club_bot:schema_migrations"
+DESTRUCTIVE_SQL_RE = re.compile(
+    r"\b(DROP\s+TABLE|DROP\s+SCHEMA|TRUNCATE|ALTER\s+TABLE\s+\S+\s+DROP\s+COLUMN|DELETE\s+FROM\s+(?!checkout_retry_events|checkout_sessions))\b",
+    re.IGNORECASE,
+)
 
 BASELINE_REQUIRED_TABLES = (
     "users",
@@ -54,6 +59,8 @@ def load_migrations(migrations_dir=MIGRATIONS_DIR):
         if not match:
             raise MigrationError(f"Invalid migration filename: {path.name}")
         sql = path.read_text(encoding="utf-8")
+        if DESTRUCTIVE_SQL_RE.search(sql):
+            raise MigrationError(f"Destructive SQL is not allowed in migration: {path.name}")
         migrations.append({
             "version": match.group(1),
             "path": path,
@@ -157,13 +164,15 @@ def baseline_existing_database(cur, migrations):
 
 
 def apply_migration(cur, migration):
+    started = time.monotonic()
     cur.execute(migration["sql"])
+    execution_ms = int((time.monotonic() - started) * 1000)
     cur.execute(
         """
-        INSERT INTO schema_migrations (version, checksum, baseline)
-        VALUES (%s, %s, FALSE)
+        INSERT INTO schema_migrations (version, checksum, execution_ms, baseline)
+        VALUES (%s, %s, %s, FALSE)
         """,
-        (migration["version"], migration["checksum"]),
+        (migration["version"], migration["checksum"], execution_ms),
     )
 
 
