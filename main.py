@@ -62,6 +62,7 @@ from checkout_safety import (
     stripe_identity_conflict_queries,
     subscription_status_action,
 )
+from db_migrations import run_migrations
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -254,6 +255,10 @@ def db_pool_health():
     }
 
 def init_db():
+    result = run_migrations(get_db_conn)
+    logging.info("--- DB MIGRATIONS VERIFIED --- %s", result)
+    return
+
     conn = get_db_conn()
     cur = conn.cursor()
     # Основная таблица пользователей

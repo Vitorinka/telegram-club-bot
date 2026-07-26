@@ -183,6 +183,12 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ):
             self.assertIn(needle, MAIN_SOURCE)
 
+    def test_init_db_uses_versioned_migration_runner_before_legacy_ddl(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def init_db"):MAIN_SOURCE.index("# Идемпотентность вебхуков")]
+        self.assertIn("run_migrations(get_db_conn)", source)
+        self.assertLess(source.index("run_migrations(get_db_conn)"), source.index("return"))
+        self.assertLess(source.index("return"), source.index("CREATE TABLE IF NOT EXISTS users"))
+
     def test_process_payment_uses_db_claim_and_stripe_idempotency_key(self):
         self.assertIn("claim_checkout_session_record", MAIN_SOURCE)
         self.assertIn("idempotency_key=checkout_record", MAIN_SOURCE)
