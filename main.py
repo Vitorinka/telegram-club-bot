@@ -416,6 +416,26 @@ def init_db():
         WHERE status IN ('creating', 'creation_unknown', 'open');
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS checkout_retry_events (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT NOT NULL,
+            tariff_code TEXT NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            attempt_at TIMESTAMP DEFAULT NOW(),
+            last_admin_alert_at TIMESTAMP,
+            resolved_at TIMESTAMP,
+            resolved_source TEXT
+        );
+    """)
+    cur.execute("ALTER TABLE checkout_retry_events ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;")
+    cur.execute("ALTER TABLE checkout_retry_events ADD COLUMN IF NOT EXISTS resolved_source TEXT;")
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS checkout_retry_events_user_attempt_idx
+        ON checkout_retry_events (telegram_id, attempt_at DESC);
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS trial_redemptions (
             telegram_id BIGINT PRIMARY KEY,
             stripe_event_id TEXT UNIQUE,
@@ -1232,34 +1252,61 @@ def clear_cached_checkout_sessions_for_user(user_id):
 
 def register_checkout_attempt(telegram_user, sub_type):
     user_id = int(telegram_user.id)
-    now_timestamp = datetime.utcnow().timestamp()
-    retry_state = checkout_retry_state.setdefault(
-        user_id,
-        {"attempts": [], "last_admin_alert_at": None}
-    )
-    retry_state["attempts"] = [
-        attempt
-        for attempt in retry_state["attempts"]
-        if now_timestamp - attempt["timestamp"] < CHECKOUT_RETRY_WINDOW_SECONDS
-    ]
-    retry_state["attempts"].append({"timestamp": now_timestamp, "sub_type": sub_type})
-    retry_state["username"] = telegram_user.username
-    retry_state["first_name"] = telegram_user.first_name
-    retry_state["last_name"] = telegram_user.last_name
+    now = datetime.utcnow()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO checkout_retry_events (
+                telegram_id, tariff_code, username, first_name, last_name, attempt_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                user_id,
+                sub_type,
+                getattr(telegram_user, "username", None),
+                getattr(telegram_user, "first_name", None),
+                getattr(telegram_user, "last_name", None),
+                now,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM checkout_retry_events
+            WHERE telegram_id = %s
+              AND attempt_at >= %s
+            """,
+            (user_id, now - timedelta(seconds=CHECKOUT_RETRY_WINDOW_SECONDS)),
+        )
+        attempt_count = cur.fetchone()[0]
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
-    attempt_count = len(retry_state["attempts"])
+    checkout_retry_state[user_id] = {
+        "username": getattr(telegram_user, "username", None),
+        "first_name": getattr(telegram_user, "first_name", None),
+        "last_name": getattr(telegram_user, "last_name", None),
+    }
     if attempt_count >= 2:
         logging.warning(
             f"Checkout retry detected: user_id={user_id}, sub_type={sub_type}, "
             f"attempts_in_window={attempt_count}, window_seconds={CHECKOUT_RETRY_WINDOW_SECONDS}"
         )
 
-    return attempt_count, now_timestamp
+    return attempt_count, now.timestamp()
 
 
 async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, session_id, attempt_timestamp):
-    retry_state = checkout_retry_state.get(int(user_id))
-    if not retry_state or attempt_count < 2:
+    user_id = int(user_id)
+    if attempt_count < 2:
         return
 
     if not ADMIN_IDS:
@@ -1269,15 +1316,52 @@ async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, s
         )
         return
 
-    last_admin_alert_at = retry_state.get("last_admin_alert_at")
-    if last_admin_alert_at and attempt_timestamp - last_admin_alert_at < CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS:
+    attempt_dt = datetime.utcfromtimestamp(attempt_timestamp)
+    cooldown_before = attempt_dt - timedelta(seconds=CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT id
+                FROM checkout_retry_events
+                WHERE telegram_id = %s
+                ORDER BY attempt_at DESC
+                LIMIT 1
+                FOR UPDATE
+            )
+            UPDATE checkout_retry_events
+            SET last_admin_alert_at = %s
+            WHERE id IN (SELECT id FROM latest)
+              AND (
+                    last_admin_alert_at IS NULL
+                    OR last_admin_alert_at < %s
+                  )
+            RETURNING username, first_name, last_name
+            """,
+            (user_id, attempt_dt, cooldown_before),
+        )
+        row = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    if not row:
         return
 
-    username = retry_state.get("username")
+    username = row[0] or checkout_retry_state.get(user_id, {}).get("username")
     username_text = f"@{username}" if username else "нет"
-    name_parts = [retry_state.get("first_name"), retry_state.get("last_name")]
+    name_parts = [
+        row[1] or checkout_retry_state.get(user_id, {}).get("first_name"),
+        row[2] or checkout_retry_state.get(user_id, {}).get("last_name"),
+    ]
     name_text = " ".join(part for part in name_parts if part) or "нет"
-    attempt_time_text = datetime.utcfromtimestamp(attempt_timestamp).strftime("%d.%m.%Y %H:%M:%S UTC")
+    attempt_time_text = attempt_dt.strftime("%d.%m.%Y %H:%M:%S UTC")
 
     await notify_admins(
         "Возможная проблема с оплатой\n\n"
@@ -1292,7 +1376,6 @@ async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, s
         "Возможная причина: Stripe Checkout сбрасывается во встроенном браузере Telegram. "
         "Пользователю отправлена инструкция открыть оплату во внешнем браузере."
     )
-    retry_state["last_admin_alert_at"] = attempt_timestamp
     logging.info(
         f"Admin checkout issue alert sent: user_id={user_id}, sub_type={sub_type}, "
         f"attempts={attempt_count}, session_id={session_id}"
@@ -1303,6 +1386,42 @@ def reset_checkout_retry_state_after_success(user_id, source):
     user_id = int(user_id)
     clear_cached_checkout_sessions_for_user(user_id)
     checkout_retry_state.pop(user_id, None)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE checkout_retry_events
+            SET resolved_at = COALESCE(resolved_at, NOW()),
+                resolved_source = COALESCE(resolved_source, %s)
+            WHERE telegram_id = %s
+              AND resolved_at IS NULL
+            """,
+            (source, user_id),
+        )
+        cur.execute(
+            """
+            DELETE FROM checkout_retry_events
+            WHERE resolved_at IS NOT NULL
+              AND resolved_at < NOW() - INTERVAL '30 days'
+            """
+        )
+        cur.execute(
+            """
+            DELETE FROM checkout_sessions
+            WHERE telegram_id = %s
+              AND status IN ('completed', 'expired', 'failed')
+              AND updated_at < NOW() - INTERVAL '30 days'
+            """,
+            (user_id,),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
     logging.info(
         f"Checkout retry state reset after successful payment: user_id={user_id}, source={source}"
     )

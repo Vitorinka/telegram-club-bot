@@ -677,6 +677,44 @@ class CriticalBotSafetyTests(unittest.TestCase):
     def test_checkout_unique_index_includes_creation_unknown(self):
         self.assertIn("WHERE status IN ('creating', 'creation_unknown', 'open')", MAIN_SOURCE)
 
+    def test_checkout_retry_events_persist_attempts_for_restart_and_replicas(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS checkout_retry_events", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def register_checkout_attempt"):MAIN_SOURCE.index("async def notify_admins_about_checkout_retry")]
+        self.assertIn("INSERT INTO checkout_retry_events", source)
+        self.assertIn("SELECT COUNT(*)", source)
+        self.assertIn("FROM checkout_retry_events", source)
+        self.assertNotIn("len(retry_state", source)
+
+    def test_checkout_retry_admin_cooldown_is_db_persisted(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def notify_admins_about_checkout_retry"):MAIN_SOURCE.index("def reset_checkout_retry_state_after_success")]
+        self.assertIn("FOR UPDATE", source)
+        self.assertIn("UPDATE checkout_retry_events", source)
+        self.assertIn("last_admin_alert_at < %s", source)
+        self.assertIn("RETURNING username, first_name, last_name", source)
+        self.assertNotIn('retry_state["last_admin_alert_at"]', source)
+
+    def test_checkout_success_resolves_retry_rows_without_deleting_fresh_audit(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def reset_checkout_retry_state_after_success"):MAIN_SOURCE.index("async def send_checkout_open_instruction")]
+        self.assertIn("resolved_at = COALESCE(resolved_at, NOW())", source)
+        self.assertIn("resolved_source = COALESCE(resolved_source, %s)", source)
+        self.assertIn("resolved_at < NOW() - INTERVAL '30 days'", source)
+        self.assertNotIn("DELETE FROM checkout_retry_events\n            WHERE telegram_id = %s", source)
+
+    def test_checkout_cleanup_preserves_active_creating_and_unknown_rows(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def reset_checkout_retry_state_after_success"):MAIN_SOURCE.index("async def send_checkout_open_instruction")]
+        self.assertIn("DELETE FROM checkout_sessions", source)
+        self.assertIn("status IN ('completed', 'expired', 'failed')", source)
+        self.assertNotIn("'creating'", source)
+        self.assertNotIn("'creation_unknown'", source)
+        self.assertNotIn("'open'", source)
+
+    def test_checkout_retry_memory_is_optional_cache_only(self):
+        register_source = MAIN_SOURCE[MAIN_SOURCE.index("def register_checkout_attempt"):MAIN_SOURCE.index("async def notify_admins_about_checkout_retry")]
+        notify_source = MAIN_SOURCE[MAIN_SOURCE.index("async def notify_admins_about_checkout_retry"):MAIN_SOURCE.index("def reset_checkout_retry_state_after_success")]
+        self.assertLess(register_source.index("INSERT INTO checkout_retry_events"), register_source.index("checkout_retry_state[user_id]"))
+        self.assertIn("row[0] or checkout_retry_state.get", notify_source)
+        self.assertIn("if not row:\n        return", notify_source)
+
     def test_revoke_invite_links_command_is_confirm_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
         self.assertIn("make_action_request", source)
