@@ -9,12 +9,14 @@ import psycopg2
 from psycopg2 import pool as psycopg2_pool
 import subprocess
 from datetime import datetime, timedelta, timezone
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.filters import Command, StateFilter
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.utils.exceptions import BotBlocked
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from stripe_invoice_rules import (
@@ -147,9 +149,30 @@ if missing_env_vars:
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
 
+BotBlocked = TelegramForbiddenError
+
+
+class _CompatContentTypes:
+    TEXT = "text"
+    ANY = "any"
+
+
+class _CompatContentType:
+    NEW_CHAT_MEMBERS = "new_chat_members"
+    LEFT_CHAT_MEMBER = "left_chat_member"
+
+
+if not hasattr(types, "ContentTypes"):
+    types.ContentTypes = _CompatContentTypes
+if not hasattr(types, "ContentType"):
+    types.ContentType = _CompatContentType
+
+
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
+router = Router()
+dp = Dispatcher(storage=storage)
+dp.include_router(router)
 scheduler = AsyncIOScheduler()
 
 CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
@@ -165,6 +188,79 @@ DB_POOL_CONNECTION_ERRORS = 0
 checkout_session_cache = {}
 checkout_retry_state = {}
 checkout_session_cache_lock = asyncio.Lock()
+SCHEDULER_JOBS_REGISTERED = False
+
+
+def _as_sequence(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _content_type_filter(content_types):
+    values = [str(item) for item in _as_sequence(content_types)]
+    if not values:
+        return None
+    return F.content_type.in_(values)
+
+
+def _state_filter(state):
+    if state == "*":
+        return None
+    return StateFilter(state)
+
+
+def _message_filters(filters, commands=None, text=None, content_types=None, state=None):
+    resolved = list(filters)
+    if commands:
+        resolved.append(Command(*_as_sequence(commands)))
+    if text is not None:
+        resolved.append(F.text == text)
+    content_filter = _content_type_filter(content_types)
+    if content_filter is not None:
+        resolved.append(content_filter)
+    state_filter = _state_filter(state)
+    if state_filter is not None:
+        resolved.append(state_filter)
+    return resolved
+
+
+def _callback_filters(filters, text=None, state=None):
+    resolved = list(filters)
+    if text is not None:
+        resolved.append(F.data == text)
+    state_filter = _state_filter(state)
+    if state_filter is not None:
+        resolved.append(state_filter)
+    return resolved
+
+
+def _legacy_message_handler(*filters, commands=None, text=None, content_types=None, state=None, **kwargs):
+    def decorator(handler):
+        router.message.register(
+            handler,
+            *_message_filters(filters, commands=commands, text=text, content_types=content_types, state=state),
+            **kwargs,
+        )
+        return handler
+    return decorator
+
+
+def _legacy_callback_query_handler(*filters, text=None, state=None, **kwargs):
+    def decorator(handler):
+        router.callback_query.register(
+            handler,
+            *_callback_filters(filters, text=text, state=state),
+            **kwargs,
+        )
+        return handler
+    return decorator
+
+
+dp.message_handler = _legacy_message_handler
+dp.callback_query_handler = _legacy_callback_query_handler
 
 CHECKOUT_OPEN_INSTRUCTION = (
     "💳 Нажмите кнопку ниже, чтобы перейти к оплате.\n\n"
@@ -10524,35 +10620,10 @@ async def scheduled_process_message_deliveries():
     )
 
 
-async def on_startup(app):
-    init_db()
-
-    await bot.set_my_commands([
-        types.BotCommand("start", "Запуск бота"),
-        types.BotCommand("menu", "Главное меню"),
-        types.BotCommand("profile", "Мой профиль и подписка"),
-        types.BotCommand("ask", "Задать вопрос"),
-    ])
-
-    domain = os.getenv("YOUR_DOMAIN")
-    webhook_path = get_telegram_webhook_path()
-    safe_webhook_path = get_safe_telegram_webhook_path()
-    webhook_url = f"{domain}{webhook_path}"
-
-    await bot.set_webhook(webhook_url)
-    webhook_info = await bot.get_webhook_info()
-    actual_url = getattr(webhook_info, "url", "")
-    pending_update_count = getattr(webhook_info, "pending_update_count", None)
-    last_error_message = getattr(webhook_info, "last_error_message", None)
-    if actual_url != webhook_url:
-        raise ValueError("Telegram webhook URL mismatch after set_webhook")
-    logging.info(
-        "Webhook установлен: path=%s, pending_update_count=%s, last_error=%s",
-        safe_webhook_path,
-        pending_update_count,
-        last_error_message,
-    )
-
+def register_scheduler_jobs_once():
+    global SCHEDULER_JOBS_REGISTERED
+    if SCHEDULER_JOBS_REGISTERED:
+        return
     scheduler.add_job(
         scheduled_check_subscriptions_and_reminders,
         'cron',
@@ -10613,10 +10684,55 @@ async def on_startup(app):
         max_instances=1
     )
 
-    scheduler.start()
+    SCHEDULER_JOBS_REGISTERED = True
+
+
+def start_scheduler_once():
+    if not getattr(scheduler, "running", False):
+        scheduler.start()
+
+
+async def on_startup(app):
+    init_db()
+
+    await bot.set_my_commands([
+        types.BotCommand(command="start", description="Запуск бота"),
+        types.BotCommand(command="menu", description="Главное меню"),
+        types.BotCommand(command="profile", description="Мой профиль и подписка"),
+        types.BotCommand(command="ask", description="Задать вопрос"),
+    ])
+
+    domain = os.getenv("YOUR_DOMAIN")
+    webhook_path = get_telegram_webhook_path()
+    safe_webhook_path = get_safe_telegram_webhook_path()
+    webhook_url = f"{domain}{webhook_path}"
+
+    await bot.set_webhook(webhook_url)
+    webhook_info = await bot.get_webhook_info()
+    actual_url = getattr(webhook_info, "url", "")
+    pending_update_count = getattr(webhook_info, "pending_update_count", None)
+    last_error_message = getattr(webhook_info, "last_error_message", None)
+    if actual_url != webhook_url:
+        raise ValueError("Telegram webhook URL mismatch after set_webhook")
+    logging.info(
+        "Webhook установлен: path=%s, pending_update_count=%s, last_error=%s",
+        safe_webhook_path,
+        pending_update_count,
+        last_error_message,
+    )
+
+    # register_scheduler_jobs_once keeps scheduled_process_message_deliveries registered once.
+    register_scheduler_jobs_once()
+    start_scheduler_once()
 
 async def on_shutdown(app):
-    await bot.close()
+    if getattr(scheduler, "running", False):
+        scheduler.shutdown(wait=False)
+    bot_session = getattr(bot, "session", None)
+    if bot_session is not None and hasattr(bot_session, "close"):
+        await bot_session.close()
+    elif hasattr(bot, "close"):
+        await bot.close()
     close_db_pool()
     logging.info("Бот остановлен.")
 
@@ -10628,14 +10744,35 @@ async def health(request):
     })
 
 
-if __name__ == "__main__":
-    from aiogram.dispatcher.webhook import get_new_configured_app
+def _route_exists(app, method, path):
+    expected_method = method.upper()
+    for route in app.router.routes():
+        resource = getattr(route, "resource", None)
+        canonical = getattr(resource, "canonical", None)
+        if canonical == path and route.method == expected_method:
+            return True
+    return False
 
-    app = get_new_configured_app(dispatcher=dp, path=get_telegram_webhook_path())
-    app.router.add_post('/stripe-payment', stripe_webhook)
-    app.router.add_get('/health', health)
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+
+def create_app():
+    app = web.Application()
+    telegram_path = get_telegram_webhook_path()
+    if not _route_exists(app, "POST", telegram_path):
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=telegram_path)
+    if not _route_exists(app, "POST", "/stripe-payment"):
+        app.router.add_post('/stripe-payment', stripe_webhook)
+    if not _route_exists(app, "GET", "/health"):
+        app.router.add_get('/health', health)
+    setup_application(app, dp, bot=bot)
+    if on_startup not in app.on_startup:
+        app.on_startup.append(on_startup)
+    if on_shutdown not in app.on_shutdown:
+        app.on_shutdown.append(on_shutdown)
+    return app
+
+
+if __name__ == "__main__":
+    app = create_app()
 
     port = int(os.environ.get("PORT", 8080))
     web.run_app(app, host='0.0.0.0', port=port, access_log=None)

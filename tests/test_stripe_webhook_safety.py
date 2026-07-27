@@ -101,7 +101,7 @@ def stripe_webhook_test_env(secret):
 
 class _FakeBot:
     def __init__(self, *args, **kwargs):
-        pass
+        self.session = type("Session", (), {"close": AsyncMock()})()
 
     async def close(self):
         pass
@@ -116,6 +116,26 @@ class _FakeDispatcher:
 
     def callback_query_handler(self, *args, **kwargs):
         return lambda func: func
+
+    def include_router(self, *args, **kwargs):
+        pass
+
+
+class _FakeRouter:
+    def __init__(self, *args, **kwargs):
+        self.message = type("MessageObserver", (), {"register": lambda self, *args, **kwargs: None})()
+        self.callback_query = type("CallbackObserver", (), {"register": lambda self, *args, **kwargs: None})()
+
+
+class _FakeMagicFilter:
+    def __getattr__(self, name):
+        return self
+
+    def __eq__(self, other):
+        return self
+
+    def in_(self, values):
+        return self
 
 
 class _FakeMarkup:
@@ -168,6 +188,8 @@ def install_aiogram_import_stubs():
     aiogram = types.ModuleType("aiogram")
     aiogram.Bot = _FakeBot
     aiogram.Dispatcher = _FakeDispatcher
+    aiogram.Router = _FakeRouter
+    aiogram.F = _FakeMagicFilter()
 
     aiogram_types = types.ModuleType("aiogram.types")
     for name in (
@@ -190,6 +212,8 @@ def install_aiogram_import_stubs():
 
     exceptions_module = types.ModuleType("aiogram.utils.exceptions")
     exceptions_module.BotBlocked = _FakeBotBlocked
+    new_exceptions_module = types.ModuleType("aiogram.exceptions")
+    new_exceptions_module.TelegramForbiddenError = _FakeBotBlocked
 
     dispatcher_module = types.ModuleType("aiogram.dispatcher")
     dispatcher_module.FSMContext = type("FSMContext", (), {})
@@ -198,9 +222,41 @@ def install_aiogram_import_stubs():
     state_module.State = _FakeState
     state_module.StatesGroup = _FakeStatesGroup
 
+    filters_module = types.ModuleType("aiogram.filters")
+    filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
+    filters_module.StateFilter = type("StateFilter", (), {"__init__": lambda self, *args, **kwargs: None})
+
+    fsm_context_module = types.ModuleType("aiogram.fsm.context")
+    fsm_context_module.FSMContext = type("FSMContext", (), {})
+    fsm_state_module = types.ModuleType("aiogram.fsm.state")
+    fsm_state_module.State = _FakeState
+    fsm_state_module.StatesGroup = _FakeStatesGroup
+    fsm_storage_memory_module = types.ModuleType("aiogram.fsm.storage.memory")
+    fsm_storage_memory_module.MemoryStorage = type("MemoryStorage", (), {"__init__": lambda self, *args, **kwargs: None})
+
+    webhook_module = types.ModuleType("aiogram.webhook.aiohttp_server")
+    webhook_module.SimpleRequestHandler = type(
+        "SimpleRequestHandler",
+        (),
+        {
+            "__init__": lambda self, *args, **kwargs: None,
+            "register": lambda self, app, path: app.router.add_post(path, lambda request: None),
+        },
+    )
+    webhook_module.setup_application = lambda *args, **kwargs: None
+
     sys.modules.update({
         "aiogram": aiogram,
         "aiogram.types": aiogram_types,
+        "aiogram.filters": filters_module,
+        "aiogram.exceptions": new_exceptions_module,
+        "aiogram.fsm": types.ModuleType("aiogram.fsm"),
+        "aiogram.fsm.context": fsm_context_module,
+        "aiogram.fsm.state": fsm_state_module,
+        "aiogram.fsm.storage": types.ModuleType("aiogram.fsm.storage"),
+        "aiogram.fsm.storage.memory": fsm_storage_memory_module,
+        "aiogram.webhook": types.ModuleType("aiogram.webhook"),
+        "aiogram.webhook.aiohttp_server": webhook_module,
         "aiogram.contrib": types.ModuleType("aiogram.contrib"),
         "aiogram.contrib.fsm_storage": types.ModuleType("aiogram.contrib.fsm_storage"),
         "aiogram.contrib.fsm_storage.memory": storage_module,
