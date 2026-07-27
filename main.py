@@ -10,7 +10,7 @@ from psycopg2 import pool as psycopg2_pool
 import subprocess
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -235,6 +235,17 @@ def _callback_filters(filters, text=None, state=None):
     if state_filter is not None:
         resolved.append(state_filter)
     return resolved
+
+
+def inline_keyboard(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reply_keyboard(rows, resize_keyboard=False, one_time_keyboard=None):
+    kwargs = {"keyboard": rows, "resize_keyboard": resize_keyboard}
+    if one_time_keyboard is not None:
+        kwargs["one_time_keyboard"] = one_time_keyboard
+    return ReplyKeyboardMarkup(**kwargs)
 
 
 def _legacy_message_handler(*filters, commands=None, text=None, content_types=None, state=None, **kwargs):
@@ -1292,20 +1303,20 @@ async def generate_invite_link():
         return None
 
 def get_tariffs_keyboard(show_trial=True):
-    kb = InlineKeyboardMarkup(row_width=1)
+    rows = []
     if show_trial:
-        kb.add(InlineKeyboardButton("🌟 Пробная неделя", callback_data="sub_trial"))
-    kb.add(
-        InlineKeyboardButton("💳 1 месяц (50€)", callback_data="sub_1"),
-        InlineKeyboardButton("💳 6 месяцев (240€)", callback_data="sub_6"),
-        InlineKeyboardButton("💳 12 месяцев (410€)", callback_data="sub_12")
-    )
-    return kb
+        rows.append([InlineKeyboardButton(text="🌟 Пробная неделя", callback_data="sub_trial")])
+    rows.extend([
+        [InlineKeyboardButton(text="💳 1 месяц (50€)", callback_data="sub_1")],
+        [InlineKeyboardButton(text="💳 6 месяцев (240€)", callback_data="sub_6")],
+        [InlineKeyboardButton(text="💳 12 месяцев (410€)", callback_data="sub_12")],
+    ])
+    return inline_keyboard(rows)
 
 def get_cancel_subscription_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("❌ Отменить подписку", callback_data="cancel_subscription"))
-    return kb
+    return inline_keyboard([[
+        InlineKeyboardButton(text="❌ Отменить подписку", callback_data="cancel_subscription")
+    ]])
 
 
 def get_reusable_checkout_session(cache_key):
@@ -1529,10 +1540,10 @@ def reset_checkout_retry_state_after_success(user_id, source):
 
 
 async def send_checkout_open_instruction(callback, checkout_url, user_id, session_id, sub_type, mode, reused=False):
-    payment_keyboard = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("💳 Перейти к оплате", url=checkout_url),
-        InlineKeyboardButton("🔙 Назад к тарифам", callback_data="back_to_tariffs")
-    )
+    payment_keyboard = inline_keyboard([
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=checkout_url)],
+        [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="back_to_tariffs")],
+    ])
     instruction_text = (
         f"{CHECKOUT_OPEN_INSTRUCTION}\n\n"
         f"Ссылка для оплаты:\n{checkout_url}"
@@ -1891,10 +1902,10 @@ def _fetch_payment_history_started_at(cur):
 
 
 def _weekly_report_keyboard(key):
-    return InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("📄 Скачать CSV покупок", callback_data=f"weekly_csv:{key}"),
-        InlineKeyboardButton("🔄 Обновить отчёт", callback_data=f"weekly_refresh:{key}"),
-    )
+    return inline_keyboard([
+        [InlineKeyboardButton(text="📄 Скачать CSV покупок", callback_data=f"weekly_csv:{key}")],
+        [InlineKeyboardButton(text="🔄 Обновить отчёт", callback_data=f"weekly_refresh:{key}")],
+    ])
 
 
 async def hydrate_missing_buyer_profiles(payments, concurrency=3):
@@ -2311,9 +2322,9 @@ async def create_billing_portal_url(stripe_customer_id):
 async def send_existing_subscription_action(callback, user_id, stripe_subscription_id, stripe_customer_id, status, current_period_end=None):
     invoice_url, invoice_id = await get_open_invoice_url_for_subscription(stripe_subscription_id)
     if invoice_url:
-        kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("💳 Оплатить открытый счёт", url=invoice_url)
-        )
+        kb = inline_keyboard([[
+            InlineKeyboardButton(text="💳 Оплатить открытый счёт", url=invoice_url)
+        ]])
         await callback.message.answer(
             "У вас уже есть подписка Stripe, поэтому новую подписку я не создаю.\n\n"
             "Stripe ждёт оплату открытого счёта. Нажмите кнопку ниже, чтобы оплатить его.",
@@ -2333,9 +2344,9 @@ async def send_existing_subscription_action(callback, user_id, stripe_subscripti
 
     portal_url = await create_billing_portal_url(stripe_customer_id)
     if portal_url:
-        kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("💳 Управлять оплатой", url=portal_url)
-        )
+        kb = inline_keyboard([[
+            InlineKeyboardButton(text="💳 Управлять оплатой", url=portal_url)
+        ]])
         expiry_text = (
             datetime.utcfromtimestamp(current_period_end).strftime("%d.%m.%Y %H:%M")
             if current_period_end else "не определён"
@@ -3470,7 +3481,7 @@ async def send_db_backup():
         if os.path.exists(encrypted_filename):
             os.remove(encrypted_filename)
 
-@dp.message_handler(content_types=['video'], state=None)
+@router.message(F.content_type == 'video', StateFilter(None))
 async def reply_with_video_id(message: types.Message):
     # Только в личных сообщениях (не в группе)
     if message.chat.type != 'private':
@@ -3482,7 +3493,7 @@ async def reply_with_video_id(message: types.Message):
     file_id = message.video.file_id
     await message.reply(f"Ваш video file_id:\n`{file_id}`", parse_mode="Markdown")
 
-@dp.message_handler(content_types=['photo'], state=None)
+@router.message(F.content_type == 'photo', StateFilter(None))
 async def reply_with_photo_id(message: types.Message):
     if message.chat.type != 'private':
         return
@@ -3492,28 +3503,28 @@ async def reply_with_photo_id(message: types.Message):
     file_id = message.photo[-1].file_id
     await message.reply(f"Ваш photo file_id:\n`{file_id}`", parse_mode="Markdown")
 
-@dp.message_handler(commands=['promo_trial'], state='*')
+@router.message(Command('promo_trial'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def promo_trial(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
     logging.info(f"Команда promo_trial от {message.from_user.id}")
     if message.from_user.id not in ADMIN_IDS:
         logging.warning(f"Отказано {message.from_user.id}")
         return
-    await PromoStates.waiting_for_media.set()
+    await state.set_state(PromoStates.waiting_for_media)
     await message.reply("📎 Отправьте фото или видео, которое будет в рассылке.\n\n"
                         "Чтобы отменить, отправьте /cancel")
 
-@dp.message_handler(commands=['cancel'], state='*')
+@router.message(Command('cancel'), StateFilter('*'))
 async def cancel_handler(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         await message.reply("Нет активного действия для отмены.")
         return
-    await state.finish()
+    await state.clear()
     await message.reply("✅ Действие отменено. Можете начать заново.")
 
-@dp.message_handler(content_types=['photo', 'video'], state=PromoStates.waiting_for_media)
+@router.message(F.content_type.in_(['photo', 'video']), StateFilter(PromoStates.waiting_for_media))
 async def promo_get_media(message: types.Message, state: FSMContext):
     if message.photo:
         file_id = message.photo[-1].file_id
@@ -3522,11 +3533,11 @@ async def promo_get_media(message: types.Message, state: FSMContext):
         file_id = message.video.file_id
         media_type = 'video'
     await state.update_data(media_type=media_type, file_id=file_id)
-    await PromoStates.waiting_for_text.set()
+    await state.set_state(PromoStates.waiting_for_text)
     await message.reply("✏️ Теперь отправьте текст сообщения.\n\n"
                         "Можно использовать HTML-разметку (<b>жирный</b>, <i>курсив</i>).")
 
-@dp.message_handler(state=PromoStates.waiting_for_text, content_types=types.ContentTypes.TEXT)
+@router.message(F.content_type == 'text', StateFilter(PromoStates.waiting_for_text))
 async def promo_get_text(message: types.Message, state: FSMContext):
     text = message.html_text
 
@@ -3543,10 +3554,10 @@ async def promo_get_text(message: types.Message, state: FSMContext):
     media_type = data['media_type']
     file_id = data['file_id']
 
-    kb = InlineKeyboardMarkup(row_width=2).add(
-        InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_promo"),
-        InlineKeyboardButton("❌ Отмена", callback_data="cancel_promo")
-    )
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="✅ Да, отправить", callback_data="confirm_promo"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_promo"),
+    ]])
 
     await state.update_data(text=text)
 
@@ -3574,7 +3585,7 @@ async def promo_get_text(message: types.Message, state: FSMContext):
             "Сократите текст и попробуйте снова."
         )
 
-@dp.callback_query_handler(text="confirm_promo", state=PromoStates.waiting_for_text)
+@router.callback_query(F.data == "confirm_promo", StateFilter(PromoStates.waiting_for_text))
 @admin_private_only(ADMIN_IDS)
 async def promo_send(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -3587,7 +3598,9 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
     cur.execute("SELECT telegram_id FROM users WHERE paid = FALSE AND (blocked_bot IS NOT TRUE)")
     users = cur.fetchall()
 
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("Начать пробную неделю", callback_data="sub_trial"))
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="Начать пробную неделю", callback_data="sub_trial")
+    ]])
 
     success = 0
     blocked = 0
@@ -3617,45 +3630,42 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
         f"🚫 Заблокировали бота: {blocked}\n"
         f"⚠️ Другие ошибки: {failed}"
     )
-    await state.finish()
+    await state.clear()
     await callback.answer()
 
-@dp.callback_query_handler(text="cancel_promo", state=PromoStates.waiting_for_text)
+@router.callback_query(F.data == "cancel_promo", StateFilter(PromoStates.waiting_for_text))
 @admin_private_only(ADMIN_IDS)
 async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ Рассылка отменена.")
-    await state.finish()
+    await state.clear()
     await callback.answer()
 
 def get_main_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(KeyboardButton("🎁 Бесплатный урок"))
-    kb.add(
-        KeyboardButton("💬 Задать вопрос"),
-        KeyboardButton("🆘 Правила клуба")
-    )
-    kb.add(KeyboardButton("👤 Профиль и подписка"))
-    return kb
+    return reply_keyboard([
+        [KeyboardButton(text="🎁 Бесплатный урок")],
+        [KeyboardButton(text="💬 Задать вопрос"), KeyboardButton(text="🆘 Правила клуба")],
+        [KeyboardButton(text="👤 Профиль и подписка")],
+    ], resize_keyboard=True)
 
 
-@dp.message_handler(commands=['menu'], state='*')
+@router.message(Command('menu'), StateFilter('*'))
 async def show_menu(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
     await message.answer(
         "Главное меню\n\nВыберите нужный раздел:",
         reply_markup=get_main_keyboard()
     )
 
 
-@dp.message_handler(text="👤 Профиль и подписка", state='*')
+@router.message(F.text == "👤 Профиль и подписка", StateFilter('*'))
 async def profile_button_handler(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
     await profile(message)
 
 
-@dp.message_handler(text="🆘 Правила клуба", state='*')
+@router.message(F.text == "🆘 Правила клуба", StateFilter('*'))
 async def rules_button_handler(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
 
     rules_text = """📜 <b>Правила и регламент онлайн-клуба</b>
 
@@ -3703,12 +3713,11 @@ async def rules_button_handler(message: types.Message, state: FSMContext):
     await message.answer(rules_text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
-@dp.message_handler(text="💬 Задать вопрос", state='*')
+@router.message(F.text == "💬 Задать вопрос", StateFilter('*'))
 async def ask_question_button(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
 
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    kb.add(KeyboardButton("❌ Отмена"))
+    kb = reply_keyboard([[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
 
     await message.answer(
         "💬 Напишите ваш вопрос одним сообщением.\n\n"
@@ -3716,12 +3725,12 @@ async def ask_question_button(message: types.Message, state: FSMContext):
         reply_markup=kb
     )
 
-    await ContactState.waiting_for_message.set()
+    await state.set_state(ContactState.waiting_for_message)
 
-@dp.message_handler(state=ContactState.waiting_for_message, content_types=types.ContentTypes.ANY)
+@router.message(StateFilter(ContactState.waiting_for_message))
 async def forward_question_to_admin(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
-        await state.finish()
+        await state.clear()
         await message.answer(
             "Отправка вопроса отменена.",
             reply_markup=get_main_keyboard()
@@ -3739,9 +3748,9 @@ async def forward_question_to_admin(message: types.Message, state: FSMContext):
                 message_id=message.message_id
             )
 
-            kb = InlineKeyboardMarkup(row_width=1).add(
-                InlineKeyboardButton("✍️ Ответить", callback_data=f"reply_to_{user.id}")
-            )
+            kb = inline_keyboard([[
+                InlineKeyboardButton(text="✍️ Ответить", callback_data=f"reply_to_{user.id}")
+            ]])
 
             await bot.send_message(
                 admin_id,
@@ -3779,9 +3788,9 @@ async def forward_question_to_admin(message: types.Message, state: FSMContext):
         )
 
     finally:
-        await state.finish()
+        await state.clear()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("reply_to_"), state='*')
+@router.callback_query(F.data.startswith("reply_to_"), StateFilter('*'))
 async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Недоступно.", show_alert=True)
@@ -3794,7 +3803,7 @@ async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(reply_to_user=target_user_id)
-    await ReplyState.waiting_for_reply.set()
+    await state.set_state(ReplyState.waiting_for_reply)
 
     await callback.message.answer(
         f"✍️ Отправьте ответ для пользователя {target_user_id} одним сообщением.\n\n"
@@ -3804,13 +3813,13 @@ async def start_admin_reply(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.answer()
 
-@dp.message_handler(state=ReplyState.waiting_for_reply, content_types=types.ContentTypes.ANY)
+@router.message(StateFilter(ReplyState.waiting_for_reply))
 async def send_admin_reply(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
 
     if message.text in ["/cancel", "❌ Отмена"]:
-        await state.finish()
+        await state.clear()
         await message.answer("Ответ отменен.")
         return
 
@@ -3818,7 +3827,7 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
     target_user_id = data.get("reply_to_user")
 
     if not target_user_id:
-        await state.finish()
+        await state.clear()
         await message.answer("❌ Не найден пользователь для ответа.")
         return
 
@@ -3835,7 +3844,7 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
         )
 
         await message.answer(f"✅ Ответ отправлен пользователю {target_user_id}.")
-        await state.finish()
+        await state.clear()
 
     except BotBlocked:
         conn = get_db_conn()
@@ -3852,20 +3861,20 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
             conn.close()
 
         await message.answer("⚠️ Пользователь заблокировал бота. Ответ не отправлен.")
-        await state.finish()
+        await state.clear()
 
     except Exception as e:
         logging.error(f"Ошибка отправки ответа пользователю {target_user_id}: {e}")
         await message.answer(f"❌ Не удалось отправить ответ: {e}")
-        await state.finish()
+        await state.clear()
 
-@dp.message_handler(commands=['ask'], state='*')
+@router.message(Command('ask'), StateFilter('*'))
 async def ask_command(message: types.Message, state: FSMContext):
     await ask_question_button(message, state)
 
-@dp.callback_query_handler(text="feedback_join", state='*')
+@router.callback_query(F.data == "feedback_join", StateFilter('*'))
 async def feedback_join(callback: types.CallbackQuery, state: FSMContext):
-    await state.finish()
+    await state.clear()
 
     user_id = callback.from_user.id
 
@@ -3892,7 +3901,7 @@ async def feedback_join(callback: types.CallbackQuery, state: FSMContext):
         trial_used = row[1] if row else False
         show_trial = not (paid or trial_used)
 
-        await RegistrationStates.choice.set()
+        await state.set_state(RegistrationStates.choice)
 
         await callback.message.answer(
             "Отлично. Выберите удобный формат участия:",
@@ -3911,7 +3920,7 @@ async def feedback_join(callback: types.CallbackQuery, state: FSMContext):
         conn.close()
 
 
-@dp.callback_query_handler(text="feedback_question", state='*')
+@router.callback_query(F.data == "feedback_question", StateFilter('*'))
 async def feedback_question(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
@@ -3932,10 +3941,9 @@ async def feedback_question(callback: types.CallbackQuery, state: FSMContext):
         cur.close()
         conn.close()
 
-    await state.finish()
+    await state.clear()
 
-    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    kb.add(KeyboardButton("❌ Отмена"))
+    kb = reply_keyboard([[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True)
 
     await callback.message.answer(
         "💬 Напишите ваш вопрос одним сообщением.\n\n"
@@ -3943,13 +3951,13 @@ async def feedback_question(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=kb
     )
 
-    await ContactState.waiting_for_message.set()
+    await state.set_state(ContactState.waiting_for_message)
     await callback.answer()
 
 
-@dp.callback_query_handler(text="feedback_think", state='*')
+@router.callback_query(F.data == "feedback_think", StateFilter('*'))
 async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
-    await state.finish()
+    await state.clear()
 
     user_id = callback.from_user.id
 
@@ -3981,9 +3989,9 @@ async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
         cur.close()
         conn.close()
 
-@dp.message_handler(text="🎁 Бесплатный урок", state='*')
+@router.message(F.text == "🎁 Бесплатный урок", StateFilter('*'))
 async def free_lesson_button(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
     user_id = message.from_user.id
 
     conn = get_db_conn()
@@ -4051,9 +4059,9 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
 
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
-        kb = InlineKeyboardMarkup(row_width=1).add(
-            InlineKeyboardButton("Хочу в клуб", callback_data="sub_trial")
-        )
+        kb = inline_keyboard([[
+            InlineKeyboardButton(text="Хочу в клуб", callback_data="sub_trial")
+        ]])
 
         delivery_key = f"free_lesson:{user_id}"
         delivery_claim = claim_message_delivery(cur, delivery_key, user_id, "free_lesson")
@@ -4099,13 +4107,11 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
         conn.close()
 
 def get_free_lesson_feedback_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("Хочу в клуб", callback_data="feedback_join"),
-        InlineKeyboardButton("Задать вопрос", callback_data="feedback_question"),
-        InlineKeyboardButton("Пока думаю", callback_data="feedback_think")
-    )
-    return kb
+    return inline_keyboard([
+        [InlineKeyboardButton(text="Хочу в клуб", callback_data="feedback_join")],
+        [InlineKeyboardButton(text="Задать вопрос", callback_data="feedback_question")],
+        [InlineKeyboardButton(text="Пока думаю", callback_data="feedback_think")],
+    ])
 
 async def send_auto_free_lesson(user_id, cur=None):
     video_id = os.getenv("FREE_LESSON_VIDEO_ID")
@@ -4127,9 +4133,9 @@ async def send_auto_free_lesson(user_id, cur=None):
 
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
-    kb = InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("Хочу в клуб", callback_data="sub_trial")
-    )
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="Хочу в клуб", callback_data="sub_trial")
+    ]])
 
     async def send_video_once():
         await bot.send_video(
@@ -4261,13 +4267,10 @@ async def send_free_lesson_followup(user_id, cur=None):
         logging.info("FREE_LESSON_FOLLOWUP_DELIVERY_SKIPPED: user_id=%s, status=%s", user_id, result)
     return result == "sent"
 
-@dp.message_handler(
-    content_types=[
-        types.ContentType.NEW_CHAT_MEMBERS,
-        types.ContentType.LEFT_CHAT_MEMBER
-    ],
-    state='*'
-)
+@router.message(F.content_type.in_([
+    types.ContentType.NEW_CHAT_MEMBERS,
+    types.ContentType.LEFT_CHAT_MEMBER,
+]), StateFilter('*'))
 async def delete_join_leave_service_messages(message: types.Message):
     if str(message.chat.id) != str(GROUP_ID):
         return
@@ -4478,9 +4481,9 @@ async def delete_join_leave_service_messages(message: types.Message):
         )
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
-@dp.message_handler(commands=['start'], state='*')
+@router.message(CommandStart(), StateFilter('*'))
 async def start(message: types.Message, state: FSMContext):
-    await state.finish()
+    await state.clear()
     user_id = message.from_user.id
     save_telegram_user_profile(message.from_user)
 
@@ -4501,7 +4504,7 @@ async def start(message: types.Message, state: FSMContext):
         conn.close()
 
     # Отправка приветствия
-    await RegistrationStates.intro.set()
+    await state.set_state(RegistrationStates.intro)
     text = """<b>Добро пожаловать в закрытый клуб Натальи Ребковец.</b>
 
 Здесь тренировки построены на современных знаниях о движении, нейрофизиологии и работе тела.
@@ -4509,12 +4512,14 @@ async def start(message: types.Message, state: FSMContext):
 Силовые тренировки, йога, пилатес, кинезиологические упражнения, работа с дыханием, мобильностью и двигательными паттернами — для сильного, здорового и функционального тела без перегрузки.
 
 <b>Готовы начать путь к здоровому и сильному телу? Тогда — поехали!</b>"""
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_desc"))
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="➡️ Продолжить", callback_data="to_desc")
+    ]])
     await bot.send_photo(message.chat.id, PHOTO_URL_INTRO, caption=text, reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query_handler(text="to_desc", state=RegistrationStates.intro)
+@router.callback_query(F.data == "to_desc", StateFilter(RegistrationStates.intro))
 async def show_description(callback: types.CallbackQuery, state: FSMContext):
-    await RegistrationStates.description.set()
+    await state.set_state(RegistrationStates.description)
     text = """<b>Внутри клуба вас ждёт:</b>
 
 🧠 <b>Библиотека тренировок</b> — 50+ уроков с системным подходом: осанка, сила, мобильность, стопы, гибкость и работа с движением. База регулярно пополняется.
@@ -4530,7 +4535,9 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
 👩🏽‍💻 <b>Живые Zoom-уроки 2–4 раза в месяц</b> — разбор техники, двигательных паттернов, перекосов и индивидуальная коррекция в формате группы.
 
 💬 <b>Закрытый чат поддержки,</b> — где я лично отвечаю на вопросы."""
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_rules"))
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="➡️ Продолжить", callback_data="to_rules")
+    ]])
 
     # ВСТАВЬТЕ СЮДА ВАШ VIDEO FILE_ID, КОТОРЫЙ ВЫ ПОЛУЧИЛИ
     VIDEO_DESCRIPTION = "BAACAgIAAxkBAAIGMmoS7DVlRexpNBTPxk0wPmGESaPYAAKzrgAC-F-YSKfL_HEbOt--OwQ"
@@ -4544,9 +4551,9 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@dp.callback_query_handler(text="to_rules", state=RegistrationStates.description)
+@router.callback_query(F.data == "to_rules", StateFilter(RegistrationStates.description))
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):
-    await RegistrationStates.rules.set()
+    await state.set_state(RegistrationStates.rules)
     text = """Часто спрашивают:
 
 ❔ <i>«Я новичок, справлюсь?»</i>
@@ -4563,13 +4570,15 @@ async def show_rules(callback: types.CallbackQuery, state: FSMContext):
 
 Клуб подходит и мужчинам, и женщинам, любому возрасту и уровню подготовки.
 Главное — желание чувствовать себя лучше."""
-    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("➡️ Продолжить", callback_data="to_choice"))
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="➡️ Продолжить", callback_data="to_choice")
+    ]])
     await bot.send_message(callback.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query_handler(text="to_choice", state=RegistrationStates.rules)
+@router.callback_query(F.data == "to_choice", StateFilter(RegistrationStates.rules))
 async def show_choice(callback: types.CallbackQuery, state: FSMContext):
-    await RegistrationStates.choice.set()
+    await state.set_state(RegistrationStates.choice)
     text = """<b>Выберите свой формат участия:</b>
 
 👀 <i>Пробная неделя</i> — чтобы познакомиться с клубом и попробовать формат
@@ -4596,7 +4605,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('sub_'), state='*')
+@router.callback_query(F.data.startswith('sub_'), StateFilter('*'))
 async def process_payment(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer("⏳ Проверяем...")
     sub_type = callback.data
@@ -4644,7 +4653,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             f"✅ У вас уже есть активный доступ до {expiry_date.strftime('%d.%m.%Y %H:%M')}.\n"
             "Повторная оплата не нужна."
         )
-        await state.finish()
+        await state.clear()
         return
 
     mode = 'payment' if sub_type == "sub_trial" else 'subscription'
@@ -4677,7 +4686,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 await callback.message.answer(
                     "Мы проверяем вашу подписку вручную. Напишите администратору, пожалуйста."
                 )
-                await state.finish()
+                await state.clear()
                 return
             if blocking_subscriptions:
                 existing_sub = blocking_subscriptions[0]
@@ -4713,7 +4722,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     existing_status,
                     current_period_end=getattr(existing_sub, "current_period_end", None),
                 )
-                await state.finish()
+                await state.clear()
                 return
         except Exception as e:
             logging.error(
@@ -4737,7 +4746,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 "Сейчас не получается безопасно проверить вашу подписку в Stripe.\n"
                 "Попробуйте позже или напишите администратору."
             )
-            await state.finish()
+            await state.clear()
             return
 
     if mode == 'subscription' and stripe_subscription_id:
@@ -4772,7 +4781,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     status,
                     current_period_end=current_period_end
                 )
-                await state.finish()
+                await state.clear()
                 return
 
             if status in ('active', 'trialing') and not current_period_end:
@@ -4844,7 +4853,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                         f"✅ У вас уже есть активная подписка до {new_expiry.strftime('%d.%m.%Y %H:%M')}.\n"
                         "Повторная оплата не нужна."
                     )
-                    await state.finish()
+                    await state.clear()
                     return
 
             if status in ('active', 'trialing') and not current_period_end:
@@ -4890,7 +4899,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     "✅ У вас уже есть активная подписка.\n"
                     "Повторная оплата не нужна. Если доступ не обновился, напишите администратору."
                 )
-                await state.finish()
+                await state.clear()
                 return
 
             if status not in (None, 'canceled', 'incomplete_expired'):
@@ -4915,7 +4924,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     status,
                     current_period_end=current_period_end
                 )
-                await state.finish()
+                await state.clear()
                 return
         except Exception as e:
             logging.error(f"Не удалось проверить Stripe перед Checkout для пользователя {user_id}: {e}")
@@ -4933,7 +4942,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 "Сейчас не получается безопасно проверить вашу подписку в Stripe.\n"
                 "Попробуйте позже или напишите администратору."
             )
-            await state.finish()
+            await state.clear()
             return
 
     cur.close()
@@ -4944,7 +4953,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         # Если пробный период уже использован ИЛИ у пользователя есть активная подписка
         if trial_used or paid:
             # Показываем клавиатуру с обычными тарифами (без пробного)
-            await state.finish()
+            await state.clear()
             kb = get_tariffs_keyboard(show_trial=False)
             text = "Вы уже использовали пробную неделю (или у вас активна подписка). Выберите платный тариф:"
             # Если сообщение имеет caption/текст, отредактируем, иначе отправим новое
@@ -4959,7 +4968,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 await callback.message.reply(text, reply_markup=kb, parse_mode="HTML")
             return  # не создаём Stripe сессию
         if trial_redeemed:
-            await state.finish()
+            await state.clear()
             kb = get_tariffs_keyboard(show_trial=False)
             await callback.message.answer(
                 "Пробная неделя уже была использована. Выберите платный тариф:",
@@ -5026,7 +5035,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
 
         if claim_result["action"] == "creating_in_progress":
             await callback.message.answer("⏳ Ссылка на оплату уже создаётся. Попробуйте ещё раз через минуту.")
-            await state.finish()
+            await state.clear()
             return
 
         if claim_result["action"] == "manual_review_required":
@@ -5051,7 +5060,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 "Предыдущая попытка оплаты требует ручной проверки. "
                 "Администратор уже получил диагностическое сообщение."
             )
-            await state.finish()
+            await state.clear()
             return
 
         if claim_result["action"] == "reuse_open":
@@ -5072,7 +5081,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                         terminal_cur.close()
                         terminal_conn.close()
                     await callback.message.answer("Предыдущая ссылка уже закрыта. Нажмите тариф ещё раз, чтобы создать новую.")
-                    await state.finish()
+                    await state.clear()
                     return
                 if live_expires_at and datetime.utcfromtimestamp(int(live_expires_at)) <= datetime.utcnow():
                     terminal_conn = get_db_conn()
@@ -5084,7 +5093,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                         terminal_cur.close()
                         terminal_conn.close()
                     await callback.message.answer("Предыдущая ссылка истекла. Нажмите тариф ещё раз, чтобы создать новую.")
-                    await state.finish()
+                    await state.clear()
                     return
             except Exception as e:
                 logging.warning(
@@ -5176,7 +5185,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             session_id,
             attempt_timestamp
         )
-        await state.finish()
+        await state.clear()
     except Exception as e:
         logging.exception(
             f"Ошибка создания или отправки Stripe Checkout: user_id={user_id}, "
@@ -5187,9 +5196,9 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             show_alert=True
         )
 
-@dp.callback_query_handler(text="retry_payment", state='*')
+@router.callback_query(F.data == "retry_payment", StateFilter('*'))
 async def retry_payment(callback: types.CallbackQuery, state: FSMContext):
-    await RegistrationStates.choice.set()
+    await state.set_state(RegistrationStates.choice)
 
     conn = get_db_conn()
     cur = conn.cursor()
@@ -5221,9 +5230,9 @@ async def retry_payment(callback: types.CallbackQuery, state: FSMContext):
         cur.close()
         conn.close()
 
-@dp.callback_query_handler(text="back_to_tariffs", state='*')
+@router.callback_query(F.data == "back_to_tariffs", StateFilter('*'))
 async def back_to_tariffs(callback: types.CallbackQuery, state: FSMContext):
-    await RegistrationStates.choice.set()
+    await state.set_state(RegistrationStates.choice)
     conn = get_db_conn()
     cur = conn.cursor()
     # Исправлено: получаем и paid, и trial_used
@@ -5241,7 +5250,7 @@ async def back_to_tariffs(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.edit_text(text=text, reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query_handler(text="cancel_subscription", state='*')
+@router.callback_query(F.data == "cancel_subscription", StateFilter('*'))
 async def cancel_subscription(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     conn = get_db_conn()
@@ -5269,7 +5278,7 @@ async def cancel_subscription(callback: types.CallbackQuery):
         logging.error(f"Ошибка отмены подписки {safe_log_id(sub_id)}: {e}")
         await callback.answer("Ошибка при отмене. Напишите администратору.", show_alert=True)
 
-@dp.message_handler(commands=['profile'], state='*')
+@router.message(Command('profile'), StateFilter('*'))
 async def profile(message: types.Message):
     user_id = message.from_user.id
 
@@ -5292,10 +5301,12 @@ async def profile(message: types.Message):
 
         user = cur.fetchone()
 
-        kb = InlineKeyboardMarkup(row_width=1)
+        keyboard_rows = []
 
         if not user:
-            kb.add(InlineKeyboardButton("💳 Выбрать тариф", callback_data="retry_payment"))
+            kb = inline_keyboard([[
+                InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="retry_payment")
+            ]])
             await message.answer(
                 "👤 Ваш профиль\n\n"
                 "❌ Активной подписки нет.\n\n"
@@ -5317,9 +5328,9 @@ async def profile(message: types.Message):
             time_text = f"осталось {delta.days} дн."
 
             if stripe_subscription_id and auto_renew:
-                kb.add(InlineKeyboardButton("❌ Отменить автопродление", callback_data="cancel_subscription"))
+                keyboard_rows.append([InlineKeyboardButton(text="❌ Отменить автопродление", callback_data="cancel_subscription")])
             else:
-                kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
+                keyboard_rows.append([InlineKeyboardButton(text="💳 Продлить доступ", callback_data="show_renew_options")])
 
         elif paid and expiry_date and expiry_date <= now:
             delta = now - expiry_date
@@ -5331,12 +5342,12 @@ async def profile(message: types.Message):
                 status_text = "⚠️ Подписка истекла"
                 time_text = f"истекла {delta.days} дн. назад"
 
-            kb.add(InlineKeyboardButton("💳 Продлить доступ", callback_data="show_renew_options"))
+            keyboard_rows.append([InlineKeyboardButton(text="💳 Продлить доступ", callback_data="show_renew_options")])
 
         else:
             status_text = "❌ Активной подписки нет"
             time_text = "нет активного доступа"
-            kb.add(InlineKeyboardButton("💳 Выбрать тариф", callback_data="retry_payment"))
+            keyboard_rows.append([InlineKeyboardButton(text="💳 Выбрать тариф", callback_data="retry_payment")])
 
         text = (
             "👤 Ваш профиль\n\n"
@@ -5347,7 +5358,7 @@ async def profile(message: types.Message):
             "Вы можете управлять доступом ниже."
         )
 
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text, reply_markup=inline_keyboard(keyboard_rows))
 
     except Exception as e:
         logging.error(f"Ошибка profile: {e}")
@@ -5357,13 +5368,13 @@ async def profile(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.callback_query_handler(text="show_renew_options", state='*')
+@router.callback_query(F.data == "show_renew_options", StateFilter('*'))
 async def show_renew_options(callback: types.CallbackQuery):
     kb = get_tariffs_keyboard(show_trial=False)
     await callback.message.edit_text("Выберите тариф для продления доступа:", reply_markup=kb)
     await callback.answer()
 
-@dp.message_handler(commands=['send_user'], state='*')
+@router.message(Command('send_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def send_user_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5423,7 +5434,7 @@ async def send_user_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['broadcast'], state='*')
+@router.message(Command('broadcast'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def broadcast(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5453,11 +5464,10 @@ async def broadcast(message: types.Message):
     conn.close()
 
     callbacks = admin_action_confirmation_keyboard(action_id)
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Confirm", callback_data=callbacks["confirm"]),
-        InlineKeyboardButton("❌ Cancel", callback_data=callbacks["cancel"]),
-    )
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="✅ Confirm", callback_data=callbacks["confirm"]),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=callbacks["cancel"]),
+    ]])
     await message.answer(
         "Подтвердите рассылку.\n\n"
         f"Получателей: {preview['recipient_count']}\n"
@@ -5466,7 +5476,7 @@ async def broadcast(message: types.Message):
         reply_markup=kb,
     )
 
-@dp.message_handler(commands=['give_access'], state='*')
+@router.message(Command('give_access'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def give_access_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5521,7 +5531,7 @@ async def give_access_command(message: types.Message):
         f"effective_expiry: {effective_expiry}",
     )
 
-@dp.message_handler(commands=['set_expiry'], state='*')
+@router.message(Command('set_expiry'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def set_expiry_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5575,7 +5585,7 @@ async def set_expiry_command(message: types.Message):
         f"new_expiry: {expiry_text}",
     )
 
-@dp.message_handler(commands=['sync_stripe_user'], state='*')
+@router.message(Command('sync_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def sync_stripe_user_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5772,7 +5782,7 @@ async def sync_stripe_user_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['expired_users'], state='*')
+@router.message(Command('expired_users'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def expired_users_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5838,7 +5848,7 @@ async def expired_users_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['user'], state='*')
+@router.message(Command('user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def user_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -5964,7 +5974,7 @@ async def user_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['access_history'], state='*')
+@router.message(Command('access_history'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def access_history_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6050,7 +6060,7 @@ async def access_history_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['recent_access_events'], state='*')
+@router.message(Command('recent_access_events'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def recent_access_events_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6126,7 +6136,7 @@ async def recent_access_events_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['find_by_stripe'], state='*')
+@router.message(Command('find_by_stripe'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def find_by_stripe_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6259,7 +6269,7 @@ async def find_by_stripe_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['bot_health'], state='*')
+@router.message(Command('bot_health'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def bot_health_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6486,16 +6496,16 @@ ADMIN_MENU_SECTIONS = {
 
 
 def get_admin_menu_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    for section_key, section in ADMIN_MENU_SECTIONS.items():
-        kb.add(InlineKeyboardButton(section["button"], callback_data=f"admin_menu:{section_key}"))
-    return kb
+    return inline_keyboard([
+        [InlineKeyboardButton(text=section["button"], callback_data=f"admin_menu:{section_key}")]
+        for section_key, section in ADMIN_MENU_SECTIONS.items()
+    ])
 
 
 def get_admin_back_keyboard():
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("⬅️ Назад в админ-меню", callback_data="admin_menu:back"))
-    return kb
+    return inline_keyboard([[
+        InlineKeyboardButton(text="⬅️ Назад в админ-меню", callback_data="admin_menu:back")
+    ]])
 
 
 def get_admin_menu_text():
@@ -6546,7 +6556,7 @@ def get_admin_help_text():
     return "\n".join(lines)
 
 
-@dp.message_handler(commands=['admin'], state='*')
+@router.message(Command('admin'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def admin_menu_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6556,7 +6566,7 @@ async def admin_menu_command(message: types.Message):
     await message.answer(get_admin_menu_text(), reply_markup=get_admin_menu_keyboard())
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("admin_menu:"), state='*')
+@router.callback_query(F.data.startswith("admin_menu:"), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def admin_menu_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -6578,7 +6588,7 @@ async def admin_menu_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.message_handler(commands=['admin_help'], state='*')
+@router.message(Command('admin_help'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def admin_help_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6586,7 +6596,7 @@ async def admin_help_command(message: types.Message):
 
     await message.answer(get_admin_help_text())
 
-@dp.message_handler(commands=['expiring_users'], state='*')
+@router.message(Command('expiring_users'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def expiring_users_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6663,7 +6673,7 @@ async def expiring_users_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['test_followup'], state='*')
+@router.message(Command('test_followup'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def test_followup_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6713,11 +6723,11 @@ async def test_followup_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['help'], state='*')
+@router.message(Command('help'), StateFilter('*'))
 async def help_command(message: types.Message):
     await message.answer("По всем вопросам @re_tasha")
 
-@dp.message_handler(commands=['stats'], state='*')
+@router.message(Command('stats'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def stats_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6789,7 +6799,7 @@ async def stats_command(message: types.Message):
         conn.close()
 
 
-@dp.message_handler(commands=['weekly_report'], state='*')
+@router.message(Command('weekly_report'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def weekly_report_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6798,7 +6808,7 @@ async def weekly_report_command(message: types.Message):
     await send_weekly_report_to_admin(message, period_start, period_end)
 
 
-@dp.message_handler(commands=['weekly_report_current'], state='*')
+@router.message(Command('weekly_report_current'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def weekly_report_current_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6807,7 +6817,7 @@ async def weekly_report_current_command(message: types.Message):
     await send_weekly_report_to_admin(message, period_start, period_end, with_actions=False)
 
 
-@dp.message_handler(commands=['weekly_report_send'], state='*')
+@router.message(Command('weekly_report_send'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def weekly_report_send_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -6848,7 +6858,7 @@ def weekly_period_from_key(key):
     return period_start, period_start + timedelta(days=7)
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("weekly_csv:"), state='*')
+@router.callback_query(F.data.startswith("weekly_csv:"), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def weekly_csv_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -6864,7 +6874,7 @@ async def weekly_csv_callback(callback: types.CallbackQuery):
     await send_weekly_csv(callback, period_start, period_end)
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("weekly_refresh:"), state='*')
+@router.callback_query(F.data.startswith("weekly_refresh:"), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def weekly_refresh_callback(callback: types.CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -6885,7 +6895,7 @@ async def weekly_refresh_callback(callback: types.CallbackQuery):
     await callback.answer("Обновлено.")
 
 
-@dp.message_handler(commands=['test_expiry'])
+@router.message(Command('test_expiry'))
 @admin_private_only(ADMIN_IDS)
 async def test_expiry(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
@@ -6895,7 +6905,7 @@ async def test_expiry(message: types.Message):
     else:
         await message.answer("Нет прав.")
 
-@dp.message_handler(commands=['test_grace'])
+@router.message(Command('test_grace'))
 @admin_private_only(ADMIN_IDS)
 async def test_grace(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9140,9 +9150,9 @@ async def stripe_webhook(request):
 
             if user_id:
                 clear_cached_checkout_sessions_for_user(user_id)
-                kb = InlineKeyboardMarkup(row_width=1).add(
-                    InlineKeyboardButton("🔁 Выбрать тариф заново", callback_data="retry_payment")
-                )
+                kb = inline_keyboard([[
+                    InlineKeyboardButton(text="🔁 Выбрать тариф заново", callback_data="retry_payment")
+                ]])
 
                 try:
                     await bot.send_message(
@@ -9178,7 +9188,7 @@ async def stripe_webhook(request):
         )
         return web.Response(status=500)
 
-@dp.message_handler(commands=['test_auto_lesson'], state='*')
+@router.message(Command('test_auto_lesson'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def test_auto_lesson_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9231,7 +9241,7 @@ async def test_auto_lesson_command(message: types.Message):
         cur.close()
         conn.close()
 
-@dp.message_handler(commands=['test_backup'])
+@router.message(Command('test_backup'))
 @admin_private_only(ADMIN_IDS)
 async def test_backup(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9241,7 +9251,7 @@ async def test_backup(message: types.Message):
     await send_db_backup()
     await message.answer("✅ Бэкап завершён. Проверьте личные сообщения от бота (файл должен прийти админам).")
 
-@dp.message_handler(commands=['unblock_user'], state='*')
+@router.message(Command('unblock_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def unblock_user(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9259,7 +9269,7 @@ async def unblock_user(message: types.Message):
     conn.close()
     await message.reply(f"✅ Пользователь {user_id} удалён из чёрного списка бота.")
 
-@dp.message_handler(commands=['send_invite_link'], state='*')
+@router.message(Command('send_invite_link'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def send_invite_link_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9364,7 +9374,7 @@ async def send_invite_link_command(message: types.Message):
         conn.close()
 
 
-@dp.message_handler(commands=['unlinked_stripe'], state='*')
+@router.message(Command('unlinked_stripe'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def unlinked_stripe_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9438,7 +9448,7 @@ async def unlinked_stripe_command(message: types.Message):
         conn.close()
 
 
-@dp.message_handler(commands=['stripe_links'], state='*')
+@router.message(Command('stripe_links'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def stripe_links_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -9554,11 +9564,10 @@ async def execute_confirmed_broadcast(payload):
 
 async def send_admin_action_confirmation(message, action_id, text):
     callbacks = admin_action_confirmation_keyboard(action_id)
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Confirm", callback_data=callbacks["confirm"]),
-        InlineKeyboardButton("❌ Cancel", callback_data=callbacks["cancel"]),
-    )
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="✅ Confirm", callback_data=callbacks["confirm"]),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=callbacks["cancel"]),
+    ]])
     await message.reply(text, reply_markup=kb)
 
 
@@ -10039,7 +10048,7 @@ async def execute_confirmed_revoke_invite_links(payload):
     return {"revoked": revoked, "failed": failed}
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("admin_action:confirm:"), state='*')
+@router.callback_query(F.data.startswith("admin_action:confirm:"), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def admin_action_confirm_callback(callback: types.CallbackQuery):
     action_id = callback.data.rsplit(":", 1)[-1]
@@ -10091,7 +10100,7 @@ async def admin_action_confirm_callback(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("admin_action:cancel:"), state='*')
+@router.callback_query(F.data.startswith("admin_action:cancel:"), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def admin_action_cancel_callback(callback: types.CallbackQuery):
     action_id = callback.data.rsplit(":", 1)[-1]
@@ -10106,7 +10115,7 @@ async def admin_action_cancel_callback(callback: types.CallbackQuery):
     await callback.answer("Отменено." if cancelled else "Запрос уже обработан, истёк или не найден.", show_alert=True)
 
 
-@dp.message_handler(commands=['duplicate_subscriptions'], state='*')
+@router.message(Command('duplicate_subscriptions'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def duplicate_subscriptions_command(message: types.Message):
     conn = get_db_conn()
@@ -10208,7 +10217,7 @@ async def duplicate_subscriptions_command(message: types.Message):
             conn.close()
 
 
-@dp.message_handler(commands=['revoke_invite_links'], state='*')
+@router.message(Command('revoke_invite_links'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def revoke_invite_links_command(message: types.Message):
     conn = get_db_conn()
@@ -10226,11 +10235,10 @@ async def revoke_invite_links_command(message: types.Message):
         cur.close()
         conn.close()
     callbacks = admin_action_confirmation_keyboard(action_id)
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Confirm", callback_data=callbacks["confirm"]),
-        InlineKeyboardButton("❌ Cancel", callback_data=callbacks["cancel"]),
-    )
+    kb = inline_keyboard([[
+        InlineKeyboardButton(text="✅ Confirm", callback_data=callbacks["confirm"]),
+        InlineKeyboardButton(text="❌ Cancel", callback_data=callbacks["cancel"]),
+    ]])
     await message.reply(
         "Подтвердите отзыв активных ссылок, созданных ботом.\n\n"
         f"Найдено активных ссылок: {len(invite_links)}\n"
@@ -10239,7 +10247,7 @@ async def revoke_invite_links_command(message: types.Message):
     )
 
 
-@dp.message_handler(commands=['resolve_checkout'], state='*')
+@router.message(Command('resolve_checkout'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def resolve_checkout_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -10302,7 +10310,7 @@ async def resolve_checkout_command(message: types.Message):
     )
 
 
-@dp.message_handler(commands=['link_stripe_user'], state='*')
+@router.message(Command('link_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def link_stripe_user_command(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -10394,7 +10402,7 @@ async def link_stripe_user_command(message: types.Message):
         f"payment_events_to_backfill: {backfill_count}",
     )
 
-@dp.message_handler(commands=['unban_user'], state='*')
+@router.message(Command('unban_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def unban_user(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:

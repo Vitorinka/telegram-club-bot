@@ -4,6 +4,7 @@ import hmac
 import importlib
 import json
 import os
+from pathlib import Path
 import sys
 import time
 import unittest
@@ -91,6 +92,31 @@ class FakeStripeRequest:
         return self.payload
 
 
+class FakeMessage:
+    def __init__(self):
+        self.answers = []
+
+    async def answer(self, text, **kwargs):
+        self.answers.append((text, kwargs))
+
+
+class FakeCallback:
+    def __init__(self):
+        self.message = FakeMessage()
+
+
+class FakeState:
+    def __init__(self):
+        self.clear_calls = 0
+        self.states = []
+
+    async def clear(self):
+        self.clear_calls += 1
+
+    async def set_state(self, state):
+        self.states.append(state)
+
+
 class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.main = import_main()
@@ -121,6 +147,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.main.dp, Dispatcher)
         self.assertIsInstance(self.main.storage, MemoryStorage)
         self.assertIsInstance(app, web.Application)
+
+    async def test_handlers_are_registered_on_native_aiogram3_router(self):
+        self.assertEqual(len(self.main.router.message.handlers), 50)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 19)
+
+    async def test_production_code_no_longer_uses_aiogram2_handler_or_fsm_api(self):
+        source = Path(self.main.__file__).read_text()
+        self.assertNotIn("@dp.message_handler", source)
+        self.assertNotIn("@dp.callback_query_handler", source)
+        self.assertNotIn("await state.finish()", source)
+        self.assertNotIn("InlineKeyboardMarkup(row_width", source)
+        self.assertNotIn("ReplyKeyboardMarkup(row_width", source)
+        self.assertNotIn("InlineKeyboardMarkup().add", source)
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()
@@ -163,6 +202,61 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(close_session.await_count, 2)
         self.assertEqual(close_db_pool.call_count, 2)
         self.assertEqual(fake_scheduler.shutdown_calls, 1)
+
+    async def test_main_and_question_fsm_handlers_use_aiogram3_state_api(self):
+        state = FakeState()
+        message = FakeMessage()
+
+        await self.main.show_menu(message, state)
+        self.assertEqual(state.clear_calls, 1)
+        self.assertEqual(message.answers[-1][0], "Главное меню\n\nВыберите нужный раздел:")
+        menu_keyboard = message.answers[-1][1]["reply_markup"]
+        self.assertEqual(
+            [[button.text for button in row] for row in menu_keyboard.keyboard],
+            [
+                ["🎁 Бесплатный урок"],
+                ["💬 Задать вопрос", "🆘 Правила клуба"],
+                ["👤 Профиль и подписка"],
+            ],
+        )
+
+        await self.main.ask_question_button(message, state)
+        self.assertEqual(state.clear_calls, 2)
+        self.assertEqual(state.states[-1], self.main.ContactState.waiting_for_message)
+        question_keyboard = message.answers[-1][1]["reply_markup"]
+        self.assertEqual(question_keyboard.keyboard[0][0].text, "❌ Отмена")
+
+    async def test_inline_keyboards_keep_expected_callback_data_and_urls(self):
+        tariffs = self.main.get_tariffs_keyboard(show_trial=True)
+        self.assertEqual(
+            [row[0].callback_data for row in tariffs.inline_keyboard],
+            ["sub_trial", "sub_1", "sub_6", "sub_12"],
+        )
+
+        no_trial = self.main.get_tariffs_keyboard(show_trial=False)
+        self.assertEqual(
+            [row[0].callback_data for row in no_trial.inline_keyboard],
+            ["sub_1", "sub_6", "sub_12"],
+        )
+
+        feedback = self.main.get_free_lesson_feedback_keyboard()
+        self.assertEqual(
+            [row[0].callback_data for row in feedback.inline_keyboard],
+            ["feedback_join", "feedback_question", "feedback_think"],
+        )
+
+        callback = FakeCallback()
+        await self.main.send_checkout_open_instruction(
+            callback,
+            "https://checkout.example/session",
+            42,
+            "cs_test_123",
+            "sub_1",
+            "subscription",
+        )
+        payment_keyboard = callback.message.answers[-1][1]["reply_markup"]
+        self.assertEqual(payment_keyboard.inline_keyboard[0][0].url, "https://checkout.example/session")
+        self.assertEqual(payment_keyboard.inline_keyboard[1][0].callback_data, "back_to_tariffs")
 
     async def test_telegram_webhook_request_passes_through_aiogram3_handler(self):
         app = self.main.create_app()

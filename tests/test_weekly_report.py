@@ -330,7 +330,7 @@ class WeeklyReportTest(unittest.TestCase):
         self.assertIn("if not event[\"create_payment_event\"]:", backfill_block)
         self.assertIn("continue", backfill_block)
         link_start = source.index("async def link_stripe_user_command")
-        link_block = source[link_start:source.index("@dp.message_handler(commands=['unban_user']", link_start)]
+        link_block = source[link_start:source.index("@router.message(Command('unban_user')", link_start)]
         self.assertNotIn("UPDATE unlinked_stripe_events", link_block)
         perform_start = source.index("async def perform_link_stripe_user")
         perform_block = source[perform_start:source.index("async def execute_confirmed_give_access", perform_start)]

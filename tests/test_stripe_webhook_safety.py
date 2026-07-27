@@ -121,10 +121,18 @@ class _FakeDispatcher:
         pass
 
 
+class _FakeObserver:
+    def __call__(self, *args, **kwargs):
+        return lambda func: func
+
+    def register(self, *args, **kwargs):
+        pass
+
+
 class _FakeRouter:
     def __init__(self, *args, **kwargs):
-        self.message = type("MessageObserver", (), {"register": lambda self, *args, **kwargs: None})()
-        self.callback_query = type("CallbackObserver", (), {"register": lambda self, *args, **kwargs: None})()
+        self.message = _FakeObserver()
+        self.callback_query = _FakeObserver()
 
 
 class _FakeMagicFilter:
@@ -132,6 +140,9 @@ class _FakeMagicFilter:
         return self
 
     def __eq__(self, other):
+        return self
+
+    def __call__(self, *args, **kwargs):
         return self
 
     def in_(self, values):
@@ -224,6 +235,7 @@ def install_aiogram_import_stubs():
 
     filters_module = types.ModuleType("aiogram.filters")
     filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
+    filters_module.CommandStart = type("CommandStart", (), {"__init__": lambda self, *args, **kwargs: None})
     filters_module.StateFilter = type("StateFilter", (), {"__init__": lambda self, *args, **kwargs: None})
 
     fsm_context_module = types.ModuleType("aiogram.fsm.context")
@@ -497,7 +509,7 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
         start = source.index("async def stripe_webhook(request):")
-        end = source.index("@dp.message_handler(commands=['test_auto_lesson']", start)
+        end = source.index("@router.message(Command('test_auto_lesson')", start)
         webhook_source = source[start:end]
 
         for forbidden in (

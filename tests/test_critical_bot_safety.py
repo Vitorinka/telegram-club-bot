@@ -228,7 +228,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
             "duplicate_subscriptions",
             "revoke_invite_links",
         ):
-            marker = f"@dp.message_handler(commands=['{command}']"
+            marker = f"@router.message(Command('{command}')"
             start = MAIN_SOURCE.index(marker)
             snippet = MAIN_SOURCE[start:start + 220]
             self.assertIn("@admin_private_only(ADMIN_IDS)", snippet, command)
@@ -458,7 +458,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_process_payment_trial_redeemed_loaded_before_cursor_close(self):
         start = MAIN_SOURCE.index("async def process_payment")
-        end = MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"", start)
+        end = MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"', start)
         source = MAIN_SOURCE[start:end]
         self.assertIn("EXISTS (\n                SELECT 1\n                FROM trial_redemptions", source)
         first_close = source.index("cur.close()")
@@ -617,7 +617,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("ban_user_logic(telegram_id, cur)", source)
 
     def test_duplicate_subscriptions_uses_live_stripe_list(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['revoke_invite_links']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@router.message(Command('revoke_invite_links')")]
         self.assertIn("stripe.Subscription.list", source)
         self.assertIn("asyncio.to_thread", source)
         self.assertIn("asyncio.Semaphore(5)", source)
@@ -625,10 +625,10 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_bot_invite_links_migration_and_revoke_command(self):
         self.assertIn("CREATE TABLE IF NOT EXISTS bot_invite_links", MAIN_SOURCE)
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@router.message(Command('resolve_checkout')")]
         self.assertIn("load_active_bot_invite_links", source)
         self.assertIn("make_action_request", source)
-        executor = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_revoke_invite_links"):MAIN_SOURCE.index("@dp.callback_query_handler(lambda c: c.data.startswith(\"admin_action:confirm:\"")]
+        executor = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_revoke_invite_links"):MAIN_SOURCE.index('@router.callback_query(F.data.startswith("admin_action:confirm:")')]
         self.assertIn("revoke_chat_invite_link", executor)
         self.assertIn("mark_bot_invite_link_revoked", executor)
         self.assertNotIn("create_chat_invite_link", source)
@@ -646,16 +646,16 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("revoked_at = NOW()", sql)
 
     def test_subscription_checkout_stripe_check_failure_is_fail_closed(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"')]
         self.assertIn("CHECKOUT_CUSTOMER_SUBSCRIPTIONS_CHECK_FAILED", source)
         self.assertIn("Новый subscription Checkout НЕ создан", source)
-        self.assertIn("await state.finish()", source)
+        self.assertIn("await state.clear()", source)
         failure_index = source.index("CHECKOUT_CUSTOMER_SUBSCRIPTIONS_CHECK_FAILED")
         create_index = source.index("stripe.checkout.Session.create")
         self.assertLess(failure_index, create_index)
 
     def test_trial_checkout_not_blocked_by_subscription_fail_closed_guard(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"')]
         self.assertIn("mode = 'payment' if sub_type == \"sub_trial\" else 'subscription'", source)
         self.assertIn("if mode == 'subscription' and stripe_customer_id", source)
         self.assertIn("if mode == 'subscription' and stripe_subscription_id", source)
@@ -722,7 +722,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("if not row:\n        return", notify_source)
 
     def test_revoke_invite_links_command_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@router.message(Command('resolve_checkout')")]
         self.assertIn("make_action_request", source)
         self.assertIn("admin_action_confirmation_keyboard", source)
         self.assertIn("До подтверждения ссылки не отзываются", source)
@@ -748,7 +748,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertLess(source.index("bot.get_chat_member"), source.index("bot.ban_chat_member"))
 
     def test_followup_uses_per_user_delivery_claim(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def send_free_lesson_followup"):MAIN_SOURCE.index("@dp.message_handler(\n    content_types")]
+        start = MAIN_SOURCE.index("async def send_free_lesson_followup")
+        source = MAIN_SOURCE[start:MAIN_SOURCE.index("@router.message(F.content_type.in_([", start)]
         self.assertIn("process_claimed_delivery", source)
         self.assertIn("free_lesson_followup", source)
         self.assertIn("feedback_sent = TRUE", source)
@@ -759,7 +760,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("conn.commit()\n\n        logging.info", source)
 
     def test_duplicate_subscriptions_closes_db_before_stripe_gather(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['revoke_invite_links']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@router.message(Command('revoke_invite_links')")]
         self.assertLess(source.index("cur.close()"), source.index("await asyncio.gather"))
         self.assertLess(source.index("await asyncio.gather"), source.rindex("conn = get_db_conn()"))
 
@@ -770,7 +771,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("пропущен из-за активного grace_period_end={fmt_report_dt(grace_end)}\"\n                )\n                continue", source)
 
     def test_give_access_handler_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def give_access_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['set_expiry']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def give_access_command"):MAIN_SOURCE.index("@router.message(Command('set_expiry')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("INSERT INTO users", source)
@@ -779,7 +780,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("bot.send_message", source)
 
     def test_set_expiry_handler_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def set_expiry_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['remove_user']") if "@dp.message_handler(commands=['remove_user']" in MAIN_SOURCE else MAIN_SOURCE.index("@dp.message_handler(commands=['sync_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def set_expiry_command"):MAIN_SOURCE.index("@router.message(Command('sync_stripe_user')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("INSERT INTO users", source)
@@ -788,7 +789,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_link_stripe_user_handler_is_confirm_only(self):
         link_start = MAIN_SOURCE.index("async def link_stripe_user_command")
-        next_handler = MAIN_SOURCE.find("\n@dp.message_handler", link_start + 1)
+        next_handler = MAIN_SOURCE.find("\n@router.message", link_start + 1)
         source = MAIN_SOURCE[link_start:next_handler]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
@@ -808,7 +809,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn('action_type == "link_stripe_user"', source)
 
     def test_admin_confirm_callback_closes_claim_connection_before_action(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def admin_action_confirm_callback"):MAIN_SOURCE.index("@dp.callback_query_handler(lambda c: c.data.startswith(\"admin_action:cancel:\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def admin_action_confirm_callback"):MAIN_SOURCE.index('@router.callback_query(F.data.startswith("admin_action:cancel:")')]
         self.assertLess(source.index("conn.close()"), source.index("execute_confirmed_admin_action"))
         self.assertIn("complete_conn = get_db_conn()", source)
         self.assertIn("fail_conn = get_db_conn()", source)
@@ -970,7 +971,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("stripe.checkout.Session.create", source)
 
     def test_resolve_checkout_command_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def resolve_checkout_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def resolve_checkout_command"):MAIN_SOURCE.index("@router.message(Command('link_stripe_user')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("UPDATE checkout_sessions", source)
