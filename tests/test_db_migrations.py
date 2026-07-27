@@ -49,6 +49,8 @@ class FakeMigrationCursor:
         if "information_schema.columns" in self.last_query:
             table = self.last_params[0]
             return [(column,) for column in self.db.columns.get(table, ())]
+        if "FROM pg_indexes" in self.last_query:
+            return [(index,) for index in self.db.indexes]
         return []
 
     def close(self):
@@ -83,10 +85,12 @@ class FakeMigrationDb:
         self.conflict_count = conflict_count
         self.fail_on_sql = fail_on_sql
         self.tables = set(BASELINE_REQUIRED_TABLES)
+        self.tables.update({"users", "stripe_links"})
         self.columns = {
             table: set(columns)
             for table, columns in BASELINE_REQUIRED_COLUMNS.items()
         }
+        self.indexes = set()
         self.connections = []
         self.lock_calls = 0
         self.unlock_calls = 0
@@ -120,18 +124,20 @@ class DbMigrationTests(unittest.TestCase):
             self.assertIn("pg_advisory_lock", queries)
             self.assertIn("pg_advisory_unlock", queries)
 
-    def test_existing_schema_is_safely_baselined(self):
+    def test_existing_schema_runs_unproven_migration_instead_of_baselining(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_migration(tmp, "0001_initial.sql", "CREATE TABLE users(id int);")
             db = FakeMigrationDb(existing_schema=True)
             result = run_migrations(db.get_conn, migrations_dir=tmp)
 
-            self.assertEqual(result["baselined"], ["0001_initial"])
+            self.assertEqual(result["baselined"], [])
             self.assertIn("0001_initial", db.applied)
 
     def test_existing_schema_with_identity_conflicts_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            write_migration(tmp, "0001_initial.sql", "CREATE TABLE users(id int);")
+            write_migration(tmp, "0001_initial_schema.sql", "CREATE TABLE users(id int);")
+            write_migration(tmp, "0002_checkout_and_hardening_tables.sql", "CREATE TABLE stripe_links(id int);")
+            write_migration(tmp, "0003_stripe_identity_guards.sql", "CREATE INDEX idx ON users(id);")
             db = FakeMigrationDb(existing_schema=True, conflict_count=1)
 
             with self.assertRaisesRegex(MigrationError, "Stripe identity conflicts"):

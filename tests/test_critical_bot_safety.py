@@ -40,6 +40,7 @@ from scheduled_jobs import (
     claim_pending_message_deliveries,
     claim_scheduled_job,
     enqueue_message_delivery,
+    mark_delivery_failed,
     process_claimed_delivery,
 )
 from stripe_invoice_rules import (
@@ -273,6 +274,14 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("status IN ('pending', 'failed')", sql)
         self.assertIn("RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link", sql)
 
+    def test_permanent_message_delivery_failure_is_terminal(self):
+        cur = FakeCursor()
+        mark_delivery_failed(cur, "stripe:evt_1:notice", "blocked", permanently_failed=True)
+        sql, params = cur.queries[-1]
+        self.assertIn("SET status = %s", sql)
+        self.assertIn("next_attempt_at = NULL", sql)
+        self.assertEqual(params[0], "permanently_failed")
+
     def test_stripe_delivery_worker_uses_existing_outbox_and_saved_invite_links(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_pending_message_deliveries"):MAIN_SOURCE.index("async def scheduled_process_message_deliveries")]
         self.assertIn("claim_pending_message_deliveries", source)
@@ -281,14 +290,21 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("mark_delivery_failed", source)
         self.assertIn("TelegramForbiddenError", source)
         self.assertIn("blocked_bot = TRUE", source)
+        self.assertLess(source.index("try:"), source.index("payload = json.loads"))
 
     def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
         self.assertIn("async def scheduled_process_message_deliveries", MAIN_SOURCE)
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def scheduled_process_message_deliveries"):MAIN_SOURCE.index("async def on_startup")]
         self.assertIn("run_scheduled_with_lock", source)
         self.assertIn('"process_message_deliveries"', source)
+        self.assertIn("five_minute_schedule_slot()", source)
         startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
         self.assertIn("scheduled_process_message_deliveries", startup)
+
+    def test_aiogram3_commands_use_command_object_for_args(self):
+        self.assertIn("CommandObject", MAIN_SOURCE)
+        self.assertNotIn("message.get_args()", MAIN_SOURCE)
+        self.assertIn('(command.args or "").split()', MAIN_SOURCE)
 
     def test_stale_negative_event_decisions(self):
         success = datetime(2026, 7, 23, 12, 0)
@@ -589,9 +605,12 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("telegram_removed_at TIMESTAMP", MAIN_SOURCE)
         self.assertIn("db_finalized_at TIMESTAMP", MAIN_SOURCE)
         source = MAIN_SOURCE[MAIN_SOURCE.index("def claim_subscription_removal"):MAIN_SOURCE.index("def mark_subscription_removal_status")]
-        self.assertIn("ON CONFLICT (telegram_id) DO UPDATE", source)
-        self.assertIn("lease_until < %s", source)
-        self.assertIn("status IN ('pending', 'telegram_failed')", source)
+        self.assertIn("FOR UPDATE", source)
+        self.assertIn("current_lease_until < now", source)
+        self.assertIn('current_status in ("pending", "telegram_failed")', source)
+        self.assertIn('"telegram_removed"', source)
+        self.assertIn("claimed_after_telegram_removed", source)
+        self.assertIn("last_payment_succeeded_at > %s", source)
         self.assertIn("already_processing", source)
 
     def test_subscription_removal_closes_db_before_stripe_and_telegram(self):
@@ -599,13 +618,13 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertLess(source.index("claim_conn.close()"), source.index("fetch_subscription_removal_user"))
         self.assertLess(source.index("fetch_subscription_removal_user"), source.index("refresh_active_stripe_subscription"))
         self.assertLess(source.index("fetch_subscription_removal_user"), source.index("bot.get_chat_member"))
-        self.assertLess(source.index("mark_subscription_removal_short(telegram_id, \"removed\")"), source.index("finalize_subscription_removal_in_db"))
+        self.assertLess(source.index("mark_subscription_removal_short(telegram_id, \"telegram_removed\")"), source.rindex("finalize_subscription_removal_in_db"))
 
     def test_subscription_removal_kick_failure_does_not_close_access(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
         failure_pos = source.index("mark_subscription_removal_short(telegram_id, \"telegram_failed\", e)")
         return_pos = source.index("if status == \"kick_failed\":")
-        finalize_pos = source.index("finalize_subscription_removal_in_db")
+        finalize_pos = source.rindex("finalize_subscription_removal_in_db")
         self.assertLess(failure_pos, return_pos)
         self.assertLess(return_pos, finalize_pos)
 

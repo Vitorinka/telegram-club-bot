@@ -166,16 +166,17 @@ def mark_delivery_sent(cur, delivery_key):
 
 
 def mark_delivery_failed(cur, delivery_key, error_text, retry_delay_minutes=15, permanently_failed=False):
+    status = "permanently_failed" if permanently_failed else "failed"
     next_attempt_sql = "NULL" if permanently_failed else "NOW() + (%s * INTERVAL '1 minute')"
     params = (
-        (str(error_text), delivery_key)
+        (status, str(error_text), delivery_key)
         if permanently_failed
-        else (str(error_text), retry_delay_minutes, delivery_key)
+        else (status, str(error_text), retry_delay_minutes, delivery_key)
     )
     cur.execute(
         f"""
         UPDATE message_delivery_events
-        SET status = 'failed',
+        SET status = %s,
             last_error = LEFT(%s, 500),
             lease_until = NULL,
             next_attempt_at = {next_attempt_sql}

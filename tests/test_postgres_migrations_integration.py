@@ -136,40 +136,66 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         rows_after = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual(rows, rows_after)
 
-    def test_existing_production_like_schema_baselines_and_preserves_data(self):
-        run_migrations(self.get_conn)
+    def test_minimal_old_schema_is_upgraded_without_fictitious_baseline(self):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
+            cur.execute(
+                """
+                CREATE TABLE users (
+                    telegram_id BIGINT UNIQUE NOT NULL,
+                    paid BOOLEAN DEFAULT FALSE,
+                    expiry_date TIMESTAMP,
+                    stripe_customer_id TEXT
+                )
+                """
+            )
             cur.execute("INSERT INTO users (telegram_id, paid, stripe_customer_id) VALUES (1001, TRUE, 'cus_keep')")
             cur.execute(
                 """
-                INSERT INTO payment_events (
-                    stripe_event_id, event_type, telegram_id, payment_status
+                CREATE TABLE checkout_sessions (
+                    telegram_id BIGINT,
+                    tariff_code TEXT,
+                    status TEXT,
+                    idempotency_key TEXT
                 )
-                VALUES ('evt_keep', 'invoice.payment_succeeded', 1001, 'succeeded')
                 """
             )
             cur.execute(
                 """
                 INSERT INTO checkout_sessions (
-                    telegram_id, tariff_code, mode, idempotency_key, status
+                    telegram_id, tariff_code, idempotency_key, status
                 )
-                VALUES (1001, 'sub_1', 'subscription', 'idem_keep', 'completed')
+                VALUES (1001, 'sub_1', 'idem_keep', 'completed')
                 """
             )
-            cur.execute("DROP TABLE schema_migrations")
             conn.commit()
         finally:
             cur.close()
             conn.close()
 
         result = run_migrations(self.get_conn)
-        self.assertEqual(result["applied"], [])
-        self.assertTrue(result["baselined"])
+        self.assertEqual(result["baselined"], [])
         self.assertEqual(self.query_one("SELECT paid, stripe_customer_id FROM users WHERE telegram_id = 1001"), (True, "cus_keep"))
-        self.assertEqual(self.query_one("SELECT payment_status FROM payment_events WHERE stripe_event_id = 'evt_keep'"), ("succeeded",))
+        self.assertEqual(self.query_one("SELECT to_regclass('public.payment_events')")[0], "payment_events")
+        self.assertEqual(self.query_one("SELECT to_regclass('public.subscription_removal_events')")[0], "subscription_removal_events")
+        self.assertEqual(self.query_one("SELECT to_regclass('public.checkout_retry_events')")[0], "checkout_retry_events")
+        self.assertEqual(self.query_one("SELECT to_regclass('public.scheduled_job_runs')")[0], "scheduled_job_runs")
         self.assertEqual(self.query_one("SELECT status FROM checkout_sessions WHERE idempotency_key = 'idem_keep'"), ("completed",))
+        columns = {row[0] for row in self.query_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'message_delivery_events'
+            """
+        )}
+        self.assertTrue({"next_attempt_at", "payload_json", "invite_link"} <= columns)
+        rows = self.query_all("SELECT version, baseline FROM schema_migrations ORDER BY version")
+        self.assertTrue(rows)
+        self.assertFalse(any(baseline for _, baseline in rows))
+
+        run_migrations(self.get_conn)
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM users WHERE telegram_id = 1001")[0], 1)
 
     def test_hardening_tables_columns_and_indexes_exist(self):
         run_migrations(self.get_conn)
@@ -298,7 +324,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(TrackingConnection.closed_count, 2)
         self.assertGreaterEqual(TrackingConnection.cursor_closed_count, 2)
 
-    def test_missing_required_column_fails_closed_on_baseline(self):
+    def test_missing_required_column_is_added_by_idempotent_migration(self):
         run_migrations(self.get_conn)
         conn = self.get_conn()
         cur = conn.cursor()
@@ -310,8 +336,15 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.close()
             conn.close()
 
-        with self.assertRaisesRegex(MigrationError, "missing columns"):
-            run_migrations(self.get_conn)
+        run_migrations(self.get_conn)
+        columns = {row[0] for row in self.query_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'users'
+            """
+        )}
+        self.assertIn("blocked_bot", columns)
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:

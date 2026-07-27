@@ -10,7 +10,7 @@ from psycopg2 import pool as psycopg2_pool
 import subprocess
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -2341,42 +2341,91 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
+        SELECT status, lease_until, db_finalized_at
+        FROM subscription_removal_events
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (int(telegram_id),),
+    )
+    row = cur.fetchone()
+    if row:
+        current_status, current_lease_until, db_finalized_at = row
+        can_start_new_cycle = False
+        if current_status == "db_finalized" and db_finalized_at:
+            cur.execute(
+                """
+                SELECT 1
+                FROM users
+                WHERE telegram_id = %s
+                  AND (
+                        last_payment_succeeded_at > %s
+                        OR expiry_date > %s
+                  )
+                LIMIT 1
+                """,
+                (int(telegram_id), db_finalized_at, db_finalized_at),
+            )
+            can_start_new_cycle = cur.fetchone() is not None
+        if current_status in ("pending", "telegram_failed") or (
+            current_status == "processing"
+            and current_lease_until
+            and current_lease_until < now
+        ) or current_status == "telegram_removed" or can_start_new_cycle:
+            cur.execute(
+                """
+                UPDATE subscription_removal_events
+                SET status = 'processing',
+                    reason = %s,
+                    owner_id = %s,
+                    claimed_at = %s,
+                    lease_until = %s,
+                    attempt_count = attempt_count + 1,
+                    last_error = NULL,
+                    telegram_removed_at = CASE WHEN %s THEN NULL ELSE telegram_removed_at END,
+                    db_finalized_at = CASE WHEN %s THEN NULL ELSE db_finalized_at END,
+                    updated_at = %s
+                WHERE telegram_id = %s
+                """,
+                (
+                    reason,
+                    owner_id,
+                    now,
+                    lease_until,
+                    can_start_new_cycle,
+                    can_start_new_cycle,
+                    now,
+                    int(telegram_id),
+                ),
+            )
+            if current_status == "telegram_removed" and not can_start_new_cycle:
+                return "claimed_after_telegram_removed"
+            return "claimed"
+        if current_status == "db_finalized":
+            return "already_finalized"
+        if current_status == "processing":
+            return "already_processing"
+        return current_status
+
+    cur.execute(
+        """
         INSERT INTO subscription_removal_events (
             telegram_id, status, reason, owner_id, claimed_at, lease_until, attempt_count, created_at, updated_at
         )
         VALUES (%s, 'processing', %s, %s, %s, %s, 1, %s, %s)
-        ON CONFLICT (telegram_id) DO UPDATE SET
-            status = 'processing',
-            reason = EXCLUDED.reason,
-            owner_id = EXCLUDED.owner_id,
-            claimed_at = EXCLUDED.claimed_at,
-            lease_until = EXCLUDED.lease_until,
-            attempt_count = subscription_removal_events.attempt_count + 1,
-            last_error = NULL,
-            updated_at = EXCLUDED.updated_at
-        WHERE subscription_removal_events.status IN ('pending', 'telegram_failed')
-           OR (
-                subscription_removal_events.status = 'processing'
-                AND subscription_removal_events.lease_until < %s
-           )
+        ON CONFLICT (telegram_id) DO NOTHING
         RETURNING telegram_id
         """,
-        (int(telegram_id), reason, owner_id, now, lease_until, now, now, now),
+        (int(telegram_id), reason, owner_id, now, lease_until, now, now),
     )
     if cur.fetchone():
         return "claimed"
-    cur.execute("SELECT status FROM subscription_removal_events WHERE telegram_id = %s", (int(telegram_id),))
-    row = cur.fetchone()
-    if row and row[0] in ("removed", "db_finalized"):
-        return "already_finalized"
-    if row and row[0] == "processing":
-        return "already_processing"
-    return row[0] if row else "not_claimed"
+    return "not_claimed"
 
 
 def mark_subscription_removal_status(cur, telegram_id, status, error_text=None):
     fields = {
-        "removed": "telegram_removed_at = COALESCE(telegram_removed_at, NOW()),",
+        "telegram_removed": "telegram_removed_at = COALESCE(telegram_removed_at, NOW()),",
         "db_finalized": "db_finalized_at = COALESCE(db_finalized_at, NOW()),",
     }.get(status, "")
     cur.execute(
@@ -2647,7 +2696,7 @@ async def ban_user_logic(telegram_id, cur=None):
         claim_cur.close()
         claim_conn.close()
 
-    if claim != "claimed":
+    if claim not in ("claimed", "claimed_after_telegram_removed"):
         logging.info(
             "USER_REMOVE_CLAIM_SKIPPED: telegram_id=%s, claim=%s",
             telegram_id,
@@ -2778,6 +2827,10 @@ async def ban_user_logic(telegram_id, cur=None):
         mark_subscription_removal_short(telegram_id, "pending", f"telegram_status_error: {e}")
         return "telegram_status_error"
 
+    if claim == "claimed_after_telegram_removed":
+        finalize_subscription_removal_in_db(telegram_id)
+        return "db_finalized"
+
     # 1. Пытаемся удалить пользователя из группы
     status = "removed"
     logging.warning(
@@ -2812,7 +2865,7 @@ async def ban_user_logic(telegram_id, cur=None):
             "USER_REMOVED_FROM_GROUP: telegram_id=%s, username=%s, chat_id=%s, reason=%s, result=%s",
             telegram_id, None, GROUP_ID, reason, unban_result
         )
-        mark_subscription_removal_short(telegram_id, "removed")
+        mark_subscription_removal_short(telegram_id, "telegram_removed")
         await notify_admins(
             "Пользователь удалён из группы ботом.\n\n"
             f"Telegram ID: {telegram_id}\n"
@@ -5317,11 +5370,11 @@ async def show_renew_options(callback: types.CallbackQuery):
 
 @router.message(Command('send_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def send_user_command(message: types.Message):
+async def send_user_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split(maxsplit=1)
+    args = (command.args or "").split(maxsplit=1)
 
     if len(args) < 2:
         await message.reply(
@@ -5419,11 +5472,11 @@ async def broadcast(message: types.Message):
 
 @router.message(Command('give_access'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def give_access_command(message: types.Message):
+async def give_access_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) < 1 or len(args) > 2:
         await message.reply("⚠️ Использование: /give_access <telegram_id> [дней]")
         return
@@ -5474,11 +5527,11 @@ async def give_access_command(message: types.Message):
 
 @router.message(Command('set_expiry'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def set_expiry_command(message: types.Message):
+async def set_expiry_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) not in (2, 3):
         await message.reply("⚠️ Использование: /set_expiry <telegram_id> <dd.mm.yyyy> [hh:mm]")
         return
@@ -5528,11 +5581,11 @@ async def set_expiry_command(message: types.Message):
 
 @router.message(Command('sync_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def sync_stripe_user_command(message: types.Message):
+async def sync_stripe_user_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /sync_stripe_user <telegram_id>")
@@ -5791,11 +5844,11 @@ async def expired_users_command(message: types.Message):
 
 @router.message(Command('user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def user_command(message: types.Message):
+async def user_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /user <telegram_id>")
@@ -5917,11 +5970,11 @@ async def user_command(message: types.Message):
 
 @router.message(Command('access_history'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def access_history_command(message: types.Message):
+async def access_history_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /access_history <telegram_id>")
@@ -6079,11 +6132,11 @@ async def recent_access_events_command(message: types.Message):
 
 @router.message(Command('find_by_stripe'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def find_by_stripe_command(message: types.Message):
+async def find_by_stripe_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /find_by_stripe <sub_... | cus_... | evt_...>")
@@ -6616,11 +6669,11 @@ async def expiring_users_command(message: types.Message):
 
 @router.message(Command('test_followup'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def test_followup_command(message: types.Message):
+async def test_followup_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /test_followup <telegram_id>")
@@ -6848,10 +6901,10 @@ async def test_expiry(message: types.Message):
 
 @router.message(Command('test_grace'))
 @admin_private_only(ADMIN_IDS)
-async def test_grace(message: types.Message):
+async def test_grace(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) != 1:
         await message.reply("Использование: /test_grace <user_id>")
         return
@@ -9131,11 +9184,11 @@ async def stripe_webhook(request):
 
 @router.message(Command('test_auto_lesson'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def test_auto_lesson_command(message: types.Message):
+async def test_auto_lesson_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /test_auto_lesson <telegram_id>")
@@ -9194,10 +9247,10 @@ async def test_backup(message: types.Message):
 
 @router.message(Command('unblock_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def unblock_user(message: types.Message):
+async def unblock_user(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) != 1:
         await message.reply("⚠️ Использование: /unblock_user <telegram_id>")
         return
@@ -9212,11 +9265,11 @@ async def unblock_user(message: types.Message):
 
 @router.message(Command('send_invite_link'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def send_invite_link_command(message: types.Message):
+async def send_invite_link_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /send_invite_link <telegram_id>")
@@ -9391,11 +9444,11 @@ async def unlinked_stripe_command(message: types.Message):
 
 @router.message(Command('stripe_links'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def stripe_links_command(message: types.Message):
+async def stripe_links_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) != 1:
         await message.reply("⚠️ Использование: /stripe_links <telegram_id>")
         return
@@ -10190,10 +10243,10 @@ async def revoke_invite_links_command(message: types.Message):
 
 @router.message(Command('resolve_checkout'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def resolve_checkout_command(message: types.Message):
+async def resolve_checkout_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) != 2:
         await message.reply("⚠️ Использование: /resolve_checkout <record_id> <failed|expired>")
         return
@@ -10253,11 +10306,11 @@ async def resolve_checkout_command(message: types.Message):
 
 @router.message(Command('link_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def link_stripe_user_command(message: types.Message):
+async def link_stripe_user_command(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
     if len(args) != 3:
         await message.reply("⚠️ Использование: /link_stripe_user <telegram_id> <customer_id> <subscription_id>")
         return
@@ -10345,11 +10398,11 @@ async def link_stripe_user_command(message: types.Message):
 
 @router.message(Command('unban_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
-async def unban_user(message: types.Message):
+async def unban_user(message: types.Message, command: CommandObject):
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    args = message.get_args().split()
+    args = (command.args or "").split()
 
     if len(args) != 1:
         await message.reply("⚠️ Использование: /unban_user <telegram_id>")
@@ -10428,6 +10481,12 @@ async def scheduled_check_subscriptions_and_reminders():
     )
 
 
+def five_minute_schedule_slot(now=None):
+    now = now or datetime.utcnow()
+    minute = now.minute - (now.minute % 5)
+    return now.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+
+
 async def scheduled_check_auto_free_lessons():
     return await run_scheduled_with_lock(
         "check_auto_free_lessons",
@@ -10474,8 +10533,8 @@ async def process_pending_message_deliveries(limit=25):
     blocked = 0
 
     for delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link in deliveries:
-        payload = json.loads(payload_json or "{}")
         try:
+            payload = json.loads(payload_json or "{}")
             if delivery_type == "stripe_rejoin_invite":
                 link = invite_link
                 if not link:
@@ -10563,7 +10622,7 @@ async def process_pending_message_deliveries(limit=25):
 async def scheduled_process_message_deliveries():
     return await run_scheduled_with_lock(
         "process_message_deliveries",
-        datetime.utcnow().strftime("%Y-%m-%dT%H"),
+        five_minute_schedule_slot(),
         process_pending_message_deliveries,
         lease_minutes=20,
     )

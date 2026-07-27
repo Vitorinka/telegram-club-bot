@@ -30,6 +30,36 @@ CREATE TABLE IF NOT EXISTS users (
     manual_sync_at TIMESTAMP
 );
 
+ALTER TABLE users ADD COLUMN IF NOT EXISTS id SERIAL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS paid BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS expiry_date TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS payment_failed_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_payment_succeeded_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS grace_period_end TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_payment_done BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS registered_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_bot BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS video_sent BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS video_sent_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_sent_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS feedback_received BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_updated_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_successful_invoice_created_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_subscription_state_event_created_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_payment_failure_event_created_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS manual_sync_at TIMESTAMP;
+CREATE UNIQUE INDEX IF NOT EXISTS users_telegram_id_unique ON users (telegram_id);
+
 CREATE TABLE IF NOT EXISTS stripe_events (
     event_id TEXT PRIMARY KEY,
     processed BOOLEAN DEFAULT TRUE,
@@ -38,6 +68,12 @@ CREATE TABLE IF NOT EXISTS stripe_events (
     event_type TEXT,
     object_id TEXT
 );
+
+ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS processed BOOLEAN DEFAULT TRUE;
+ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS event_created_at TIMESTAMP;
+ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE stripe_events ADD COLUMN IF NOT EXISTS object_id TEXT;
 
 CREATE TABLE IF NOT EXISTS access_events (
     id SERIAL PRIMARY KEY,
@@ -51,6 +87,16 @@ CREATE TABLE IF NOT EXISTS access_events (
     notes TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS old_expiry TIMESTAMP;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS new_expiry TIMESTAMP;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS stripe_event_id TEXT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS notes TEXT;
+ALTER TABLE access_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS stripe_links (
     id SERIAL PRIMARY KEY,
@@ -66,6 +112,17 @@ CREATE TABLE IF NOT EXISTS stripe_links (
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE (telegram_id, stripe_customer_id, stripe_subscription_id)
 );
+
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS customer_email TEXT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS current_period_end TIMESTAMP;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE stripe_links ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS unlinked_stripe_events (
     id SERIAL PRIMARY KEY,
@@ -86,6 +143,23 @@ CREATE TABLE IF NOT EXISTS unlinked_stripe_events (
     resolved_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS event_id TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS invoice_id TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS customer_email TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS amount_paid BIGINT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS billing_reason TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS period_end TIMESTAMP;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS raw_summary TEXT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved BOOLEAN DEFAULT FALSE;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_by BIGINT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_telegram_id BIGINT;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
+ALTER TABLE unlinked_stripe_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 
 CREATE TABLE IF NOT EXISTS payment_events (
     id BIGSERIAL PRIMARY KEY,
@@ -109,6 +183,25 @@ CREATE TABLE IF NOT EXISTS payment_events (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS stripe_event_id TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS event_type TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS telegram_id BIGINT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS invoice_id TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS checkout_session_id TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS payment_status TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS payment_kind TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS billing_reason TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS tariff_code TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS amount_paid BIGINT DEFAULT 0;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS amount_due BIGINT DEFAULT 0;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS currency TEXT;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS period_start TIMESTAMP;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS period_end TIMESTAMP;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS recovered_after_failure BOOLEAN DEFAULT FALSE;
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
 CREATE INDEX IF NOT EXISTS payment_events_created_at_idx ON payment_events (created_at);
 CREATE INDEX IF NOT EXISTS payment_events_telegram_id_idx ON payment_events (telegram_id);
 CREATE INDEX IF NOT EXISTS payment_events_status_kind_idx ON payment_events (payment_status, payment_kind);
@@ -125,12 +218,25 @@ CREATE TABLE IF NOT EXISTS weekly_report_runs (
     error_text TEXT
 );
 
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS period_start TIMESTAMP;
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS period_end TIMESTAMP;
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS sent_admin_ids TEXT;
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP;
+ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS error_text TEXT;
+
 CREATE TABLE IF NOT EXISTS system_settings (
     key TEXT PRIMARY KEY,
     value_text TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS value_text TEXT;
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 
 INSERT INTO system_settings (key, value_text)
 VALUES ('payment_history_started_at', NOW()::TEXT)
