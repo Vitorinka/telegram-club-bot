@@ -9,6 +9,8 @@ from pathlib import Path
 import sys
 import time
 import unittest
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
@@ -119,20 +121,28 @@ class FakeState:
 
 
 class FakeCursor:
-    def __init__(self):
+    def __init__(self, fetches=None):
         self.queries = []
+        self.fetches = list(fetches or [])
 
     def execute(self, query, params=None):
         self.queries.append((query, params))
+
+    def fetchone(self):
+        return self.fetches.pop(0) if self.fetches else None
+
+    def fetchall(self):
+        return self.fetches.pop(0) if self.fetches else []
 
     def close(self):
         pass
 
 
 class FakeConnection:
-    def __init__(self):
-        self.cursor_obj = FakeCursor()
+    def __init__(self, fetches=None):
+        self.cursor_obj = FakeCursor(fetches=fetches)
         self.commits = 0
+        self.rollbacks = 0
         self.closed = False
 
     def cursor(self):
@@ -142,7 +152,7 @@ class FakeConnection:
         self.commits += 1
 
     def rollback(self):
-        pass
+        self.rollbacks += 1
 
     def close(self):
         self.closed = True
@@ -411,6 +421,288 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         unban.assert_awaited_once()
         create_link.assert_not_awaited()
         self.assertIn("https://t.me/+saved", send_message.await_args.args[1])
+
+    async def test_rejoin_unban_network_failure_retries_without_send_or_sent(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        connections = [FakeConnection(), FakeConnection()]
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_network_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network down"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe:evt_network_secret:rejoin_invite", "TelegramNetworkError", 5, False)])
+        send_message.assert_not_awaited()
+        mark_sent.assert_not_called()
+
+    async def test_rejoin_unban_retry_after_sets_retry_delay(self):
+        from aiogram.exceptions import TelegramRetryAfter
+
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_retry_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramRetryAfter(method=None, message="retry", retry_after=125))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe:evt_retry_secret:rejoin_invite", "TelegramRetryAfter", 3, False)])
+        send_message.assert_not_awaited()
+        mark_sent.assert_not_called()
+
+    async def test_rejoin_unban_group_permission_error_does_not_block_user(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+
+        connections = [FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_group_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="not enough rights"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe:evt_group_secret:rejoin_invite", "TelegramForbiddenError", False)])
+        self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+        send_message.assert_not_awaited()
+        mark_sent.assert_not_called()
+
+    async def test_rejoin_unban_benign_administrator_error_continues(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        invite = SimpleNamespace(invite_link="https://t.me/+new")
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_admin_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="user is an administrator"))), \
+             patch.object(self.main.bot, "create_chat_invite_link", AsyncMock(return_value=invite)) as create_link, \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
+             patch.object(self.main, "mark_delivery_failed") as mark_failed, \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        create_link.assert_awaited_once()
+        send_message.assert_awaited_once()
+        mark_sent.assert_called_once()
+        mark_failed.assert_not_called()
+
+    async def test_rejoin_send_forbidden_blocks_and_permanently_fails(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+
+        connections = [FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_send_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, "https://t.me/+saved")
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="bot was blocked"))), \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "failed": 0, "blocked": 1})
+        self.assertEqual(failed_calls, [("stripe:evt_send_secret:rejoin_invite", "TelegramForbiddenError", True)])
+        self.assertTrue(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+        mark_sent.assert_not_called()
+
+    async def test_rejoin_unban_logs_mask_delivery_key(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        full_key = "stripe:evt_full_secret_identifier_123456789:rejoin_invite"
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 (full_key, 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="not enough rights"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()), \
+             patch.object(self.main, "mark_delivery_failed"), \
+             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             self.assertLogs(level="WARNING") as logs:
+            await self.main.process_pending_message_deliveries()
+
+        log_text = "\n".join(logs.output)
+        self.assertNotIn(full_key, log_text)
+        self.assertNotIn("evt_full_secret_identifier_123456789", log_text)
+        self.assertIn("stripe:evt_***invite", log_text)
+
+    async def test_checkout_rejoin_membership_check_does_not_hold_write_connection(self):
+        payload = json.dumps(
+            {
+                "id": "evt_checkout_boundary",
+                "object": "event",
+                "type": "checkout.session.completed",
+                "created": 1720000000,
+                "data": {
+                    "object": {
+                        "id": "cs_boundary",
+                        "object": "checkout.session",
+                        "client_reference_id": "123",
+                        "metadata": {"days": "30"},
+                        "mode": "payment",
+                        "payment_status": "paid",
+                        "customer": "cus_boundary",
+                        "subscription": None,
+                        "amount_total": 1000,
+                        "currency": "usd",
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        membership_started = asyncio.Event()
+        release_membership = asyncio.Event()
+        db_calls = []
+        conn = FakeConnection(fetches=[
+            (False, datetime.utcnow() - timedelta(days=1), False),
+            ("stripe:evt_checkout_boundary:rejoin_invite",),
+        ])
+
+        async def fake_get_chat_member(*args, **kwargs):
+            membership_started.set()
+            await release_membership.wait()
+            return SimpleNamespace(status="left", is_member=False)
+
+        def fake_get_db_conn():
+            db_calls.append("opened")
+            return conn
+
+        event = SimpleNamespace(
+            id="evt_checkout_boundary",
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_boundary",
+                client_reference_id="123",
+                metadata={"days": "30"},
+                mode="payment",
+                payment_status="paid",
+                customer="cus_boundary",
+                subscription=None,
+                amount_total=1000,
+                currency="usd",
+            )),
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(side_effect=fake_get_chat_member)), \
+             patch.object(self.main, "get_db_conn", side_effect=fake_get_db_conn):
+            task = asyncio.create_task(self.main.stripe_webhook(request))
+            await asyncio.wait_for(membership_started.wait(), timeout=1)
+            self.assertEqual(db_calls, [])
+            release_membership.set()
+            response = await task
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(conn.closed)
+        queries = [query for query, _ in conn.cursor_obj.queries]
+        enqueue_index = next(i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query)
+        access_index = next(i for i, query in enumerate(queries) if "INSERT INTO users" in query)
+        self.assertLess(access_index, enqueue_index)
+        self.assertEqual(conn.commits, 1)
+
+    async def test_checkout_rejoin_membership_error_does_not_leave_open_write_connection(self):
+        payload = json.dumps(
+            {
+                "id": "evt_checkout_membership_error",
+                "object": "event",
+                "type": "checkout.session.completed",
+                "created": 1720000000,
+                "data": {
+                    "object": {
+                        "id": "cs_membership_error",
+                        "object": "checkout.session",
+                        "client_reference_id": "123",
+                        "metadata": {"days": "30"},
+                        "mode": "payment",
+                        "payment_status": "paid",
+                        "customer": "cus_boundary",
+                        "subscription": None,
+                        "amount_total": 1000,
+                        "currency": "usd",
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (False, datetime.utcnow() - timedelta(days=1), False),
+            ("stripe:evt_checkout_membership_error:payment_success",),
+        ])
+
+        event = SimpleNamespace(
+            id="evt_checkout_membership_error",
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_membership_error",
+                client_reference_id="123",
+                metadata={"days": "30"},
+                mode="payment",
+                payment_status="paid",
+                customer="cus_boundary",
+                subscription=None,
+                amount_total=1000,
+                currency="usd",
+            )),
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(side_effect=RuntimeError("telegram timeout"))), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(conn.closed)
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(conn.rollbacks, 0)
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()

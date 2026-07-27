@@ -341,11 +341,19 @@ class CriticalBotSafetyTests(unittest.TestCase):
             self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
 
         rejoin_blocks = (
-            webhook_source[webhook_source.index("if await payment_needs_rejoin_invite"):],
+            webhook_source[webhook_source.index("if should_send_checkout_rejoin_invite:"):],
             webhook_source[webhook_source.index("if should_send_invoice_rejoin_invite:\n                    enqueue"):],
         )
         for block in rejoin_blocks:
             self.assertLess(block.index("enqueue_rejoin_invite_after_payment"), block.index("conn.commit()"))
+        checkout_branch = webhook_source[
+            webhook_source.index("has_subscription = bool(sub_id)"):
+            webhook_source.index("elif event_type == 'invoice.payment_succeeded':")
+        ]
+        self.assertLess(
+            checkout_branch.index("get_group_member_status_for_payment"),
+            checkout_branch.index("conn = get_db_conn()"),
+        )
 
     def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
         self.assertIn("async def scheduled_process_message_deliveries", MAIN_SOURCE)

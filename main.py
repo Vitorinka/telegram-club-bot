@@ -2140,6 +2140,21 @@ async def payment_needs_rejoin_invite(telegram_id, old_expiry, source, stripe_ev
     )
 
 
+def is_benign_rejoin_unban_error(error):
+    if not is_telegram_bad_request_error(error):
+        return False
+    error_text = str(error).lower()
+    benign_markers = (
+        "administrator",
+        "already unbanned",
+        "already-unbanned",
+        "not banned",
+        "not restricted",
+        "user is not banned",
+    )
+    return any(marker in error_text for marker in benign_markers)
+
+
 async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, stripe_event_id=None, stripe_subscription_id=None):
     raise RuntimeError("Stripe rejoin invites must be enqueued with enqueue_rejoin_invite_after_payment")
 
@@ -7279,6 +7294,11 @@ async def stripe_webhook(request):
 
             is_trial = (days_to_add == 7)
             has_subscription = bool(sub_id)
+            preflight_member_status, preflight_restricted_has_access = await get_group_member_status_for_payment(
+                user_id,
+                "checkout.session.completed",
+                stripe_event_id=event_id,
+            )
             conn = get_db_conn()
             cur = conn.cursor()
             try:
@@ -7323,8 +7343,13 @@ async def stripe_webhook(request):
                         await mark_event_processed(event_id)
                         return web.Response(status=200)
 
-                # Нужна ли ссылка? Да, если нет активной подписки (paid=False или expiry_date < now)
                 needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
+                should_send_checkout_rejoin_invite = should_send_rejoin_invite(
+                    old_expiry,
+                    now,
+                    telegram_member_status=preflight_member_status,
+                    restricted_has_access=preflight_restricted_has_access,
+                )
                 cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, payment_failed_at, last_payment_succeeded_at, grace_period_end, first_payment_done, blocked_bot)
                 VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, NOW(), NULL, FALSE, FALSE)
@@ -7394,12 +7419,7 @@ async def stripe_webhook(request):
                     f"days={days_to_add}; customer_id={safe_log_id(customer_id)}",
                 ))
 
-                if await payment_needs_rejoin_invite(
-                    user_id,
-                    old_expiry,
-                    "checkout.session.completed",
-                    stripe_event_id=event_id,
-                ):
+                if should_send_checkout_rejoin_invite:
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         user_id,
@@ -10443,23 +10463,39 @@ async def process_pending_message_deliveries(limit=25):
     blocked = 0
 
     for delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link in deliveries:
+        sending_user_message = False
         try:
             payload = json.loads(payload_json or "{}")
             if delivery_type == "stripe_rejoin_invite":
                 link = invite_link
                 try:
                     await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
-                except Exception as e:
-                    if "administrator" in str(e).lower():
-                        logging.warning("Stripe rejoin unban skipped for admin %s: %s", telegram_id, e)
+                except TelegramBadRequest as e:
+                    if is_benign_rejoin_unban_error(e):
+                        logging.warning(
+                            "STRIPE_REJOIN_UNBAN_BENIGN: telegram_id=%s, delivery_key=%s, error=%s",
+                            telegram_id,
+                            safe_log_id(delivery_key),
+                            str(e),
+                        )
                     else:
                         logging.warning(
-                            "ACCESS_REJOIN_UNBAN_FAILED_IN_OUTBOX: telegram_id=%s, delivery_key=%s, error=%s",
+                            "STRIPE_REJOIN_UNBAN_RETRYABLE: telegram_id=%s, delivery_key=%s, error=%s",
                             telegram_id,
-                            delivery_key,
+                            safe_log_id(delivery_key),
                             str(e),
                             exc_info=True,
                         )
+                        raise
+                except Exception as e:
+                    logging.warning(
+                        "STRIPE_REJOIN_UNBAN_RETRYABLE: telegram_id=%s, delivery_key=%s, error=%s",
+                        telegram_id,
+                        safe_log_id(delivery_key),
+                        str(e),
+                        exc_info=True,
+                    )
+                    raise
                 if not link:
                     options = invite_link_options("stripe_rejoin", telegram_id)
                     invite = await bot.create_chat_invite_link(chat_id=int(GROUP_ID), **options)
@@ -10485,6 +10521,7 @@ async def process_pending_message_deliveries(limit=25):
                 )
                 if "{invite_link}" in text:
                     text = text.replace("{invite_link}", link)
+                sending_user_message = True
                 await bot.send_message(
                     int(telegram_id),
                     text,
@@ -10495,6 +10532,7 @@ async def process_pending_message_deliveries(limit=25):
                 text = payload.get("text")
                 if not text:
                     raise ValueError(f"delivery text missing for {delivery_type}")
+                sending_user_message = True
                 await bot.send_message(
                     int(telegram_id),
                     text,
@@ -10530,16 +10568,33 @@ async def process_pending_message_deliveries(limit=25):
                 sent_conn.close()
             sent += 1
         except TelegramForbiddenError as e:
-            block_conn = get_db_conn()
-            block_cur = block_conn.cursor()
-            try:
-                block_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
-                mark_delivery_failed(block_cur, delivery_key, e, permanently_failed=True)
-                block_conn.commit()
-            finally:
-                block_cur.close()
-                block_conn.close()
-            blocked += 1
+            if sending_user_message:
+                block_conn = get_db_conn()
+                block_cur = block_conn.cursor()
+                try:
+                    block_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+                    mark_delivery_failed(block_cur, delivery_key, e, permanently_failed=True)
+                    block_conn.commit()
+                finally:
+                    block_cur.close()
+                    block_conn.close()
+                blocked += 1
+            else:
+                fail_conn = get_db_conn()
+                fail_cur = fail_conn.cursor()
+                try:
+                    mark_delivery_failed(
+                        fail_cur,
+                        delivery_key,
+                        e,
+                        retry_delay_minutes=telegram_retry_delay_minutes(e, attempt_count),
+                        permanently_failed=False,
+                    )
+                    fail_conn.commit()
+                finally:
+                    fail_cur.close()
+                    fail_conn.close()
+                failed += 1
         except Exception as e:
             fail_conn = get_db_conn()
             fail_cur = fail_conn.cursor()
