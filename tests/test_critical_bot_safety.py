@@ -262,7 +262,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertTrue(created)
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", sql)
-        self.assertIn("WHERE message_delivery_events.status <> 'sent'", sql)
+        self.assertIn("WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')", sql)
         self.assertIn("payload_json", sql)
 
     def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
@@ -272,6 +272,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("FOR UPDATE SKIP LOCKED", sql)
         self.assertIn("status IN ('pending', 'failed')", sql)
+        self.assertIn("status = 'processing'", sql)
+        self.assertIn("lease_until < NOW()", sql)
         self.assertIn("RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link", sql)
 
     def test_permanent_message_delivery_failure_is_terminal(self):
@@ -291,6 +293,59 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("TelegramForbiddenError", source)
         self.assertIn("blocked_bot = TRUE", source)
         self.assertLess(source.index("try:"), source.index("payload = json.loads"))
+        self.assertIn("stripe_delivery_reply_markup", source)
+
+    def test_stripe_webhook_user_notifications_are_outbox_only(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        for forbidden in (
+            "bot.send_message",
+            "bot.send_video",
+            "bot.send_photo",
+            "bot.create_chat_invite_link",
+            "generate_invite_link(",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("enqueue_stripe_user_message", source)
+        self.assertIn("enqueue_rejoin_invite_after_payment", source)
+        self.assertIn('stripe_delivery_key(event_id, purpose)', MAIN_SOURCE)
+        for purpose in (
+            "payment_success",
+            "trial_success",
+            "renewal_success",
+            "payment_recovered",
+            "rejoin_invite",
+            "payment_failed",
+            "checkout_expired",
+        ):
+            self.assertIn(purpose, MAIN_SOURCE)
+        rejoin_helper = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def send_rejoin_invite_after_payment"):
+            MAIN_SOURCE.index("def is_undeliverable_user_error")
+        ]
+        for forbidden in (
+            "bot.send_message",
+            "bot.create_chat_invite_link",
+            "generate_invite_link(",
+        ):
+            self.assertNotIn(forbidden, rejoin_helper)
+
+    def test_stripe_webhook_enqueues_user_notifications_before_transaction_commit(self):
+        webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        notification_blocks = (
+            webhook_source[webhook_source.index('purpose = "trial_success"'):],
+            webhook_source[webhook_source.index('notice_marker = "INITIAL_SUBSCRIPTION_NOTICE_SENT"'):],
+            webhook_source[webhook_source.index('"PAYMENT_FAILED_MARKED: telegram_id=%s'):],
+            webhook_source[webhook_source.index("if user_id:\n                    enqueue_stripe_user_message"):],
+        )
+        for block in notification_blocks:
+            self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
+
+        rejoin_blocks = (
+            webhook_source[webhook_source.index("if await payment_needs_rejoin_invite"):],
+            webhook_source[webhook_source.index("if should_send_invoice_rejoin_invite:\n                    enqueue"):],
+        )
+        for block in rejoin_blocks:
+            self.assertLess(block.index("enqueue_rejoin_invite_after_payment"), block.index("conn.commit()"))
 
     def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
         self.assertIn("async def scheduled_process_message_deliveries", MAIN_SOURCE)

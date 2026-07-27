@@ -347,6 +347,71 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
                 mark_sent.assert_not_called()
 
+    async def test_message_delivery_retry_keyboard_payload_renders_callback_data(self):
+        send_message = AsyncMock()
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("key_retry", 123, "stripe_user_message", '{"text":"retry","keyboard_kind":"retry_payment"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        markup = send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "retry_payment")
+
+    async def test_message_delivery_invalid_payload_does_not_stop_batch(self):
+        connections = [FakeConnection(), FakeConnection(), FakeConnection()]
+        failed_calls = []
+        send_message = AsyncMock()
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("bad_payload", 123, "stripe_user_message", "{bad json", 1, None),
+                 ("good_payload", 124, "stripe_user_message", '{"text":"ok"}', 1, None),
+             ]), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("bad_payload", "JSONDecodeError", False)])
+        send_message.assert_awaited_once()
+
+    async def test_rejoin_delivery_reuses_saved_invite_after_restart(self):
+        send_message = AsyncMock()
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 (
+                     "stripe:evt_1:rejoin_invite",
+                     123,
+                     "stripe_rejoin_invite",
+                     '{"text":"link {invite_link}","source":"invoice.payment_succeeded","stripe_event_id":"evt_1"}',
+                     1,
+                     "https://t.me/+saved",
+                 )
+             ]), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
+             patch.object(self.main.bot, "create_chat_invite_link", AsyncMock()) as create_link, \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        unban.assert_awaited_once()
+        create_link.assert_not_awaited()
+        self.assertIn("https://t.me/+saved", send_message.await_args.args[1])
+
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()
         telegram_path = self.main.get_telegram_webhook_path()

@@ -115,7 +115,7 @@ def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payl
             delivery_type = EXCLUDED.delivery_type,
             payload_json = COALESCE(message_delivery_events.payload_json, EXCLUDED.payload_json),
             next_attempt_at = COALESCE(message_delivery_events.next_attempt_at, EXCLUDED.next_attempt_at)
-        WHERE message_delivery_events.status <> 'sent'
+        WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')
         RETURNING delivery_key
         """,
         (delivery_key, int(telegram_id), delivery_type, payload_json, next_attempt_at),
@@ -131,8 +131,14 @@ def claim_pending_message_deliveries(cur, limit=25, now=None, lease_minutes=10):
         WITH due AS (
             SELECT delivery_key
             FROM message_delivery_events
-            WHERE status IN ('pending', 'failed')
-              AND COALESCE(next_attempt_at, NOW()) <= NOW()
+            WHERE (
+                    status IN ('pending', 'failed')
+                    AND COALESCE(next_attempt_at, NOW()) <= NOW()
+                  )
+               OR (
+                    status = 'processing'
+                    AND lease_until < NOW()
+                  )
             ORDER BY next_attempt_at NULLS FIRST, delivery_key
             LIMIT %s
             FOR UPDATE SKIP LOCKED

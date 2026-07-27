@@ -231,6 +231,7 @@ def install_aiogram_import_stubs():
 
     filters_module = types.ModuleType("aiogram.filters")
     filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
+    filters_module.CommandObject = type("CommandObject", (), {})
     filters_module.CommandStart = type("CommandStart", (), {"__init__": lambda self, *args, **kwargs: None})
     filters_module.StateFilter = type("StateFilter", (), {"__init__": lambda self, *args, **kwargs: None})
 
