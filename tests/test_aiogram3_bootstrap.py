@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import hashlib
 import hmac
 import importlib
@@ -117,6 +118,36 @@ class FakeState:
         self.states.append(state)
 
 
+class FakeCursor:
+    def __init__(self):
+        self.queries = []
+
+    def execute(self, query, params=None):
+        self.queries.append((query, params))
+
+    def close(self):
+        pass
+
+
+class FakeConnection:
+    def __init__(self):
+        self.cursor_obj = FakeCursor()
+        self.commits = 0
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.main = import_main()
@@ -152,14 +183,169 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.main.router.message.handlers), 50)
         self.assertEqual(len(self.main.router.callback_query.handlers), 19)
 
+    async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
+        source = Path(self.main.__file__).read_text()
+        tree = ast.parse(source)
+        message_handlers = []
+        callback_handlers = []
+        commands = []
+        callback_filters = []
+        catch_all_messages = []
+
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                text = ast.unparse(decorator)
+                if text.startswith("router.message"):
+                    message_handlers.append(node.name)
+                    if "CommandStart()" in text:
+                        commands.append("start")
+                    elif "Command(" in text and isinstance(decorator, ast.Call):
+                        command_call = decorator.args[0]
+                        for arg in getattr(command_call, "args", []):
+                            if isinstance(arg, ast.Constant):
+                                commands.append(arg.value)
+                    if "Command(" not in text and "CommandStart()" not in text and "F." not in text and "StateFilter(" not in text:
+                        catch_all_messages.append((node.name, text))
+                elif text.startswith("router.callback_query"):
+                    callback_handlers.append(node.name)
+                    callback_filters.append(text)
+
+        self.assertEqual(len(message_handlers), 50)
+        self.assertEqual(len(callback_handlers), 19)
+        self.assertEqual(
+            commands,
+            [
+                "promo_trial", "cancel", "menu", "ask", "start", "profile",
+                "send_user", "broadcast", "give_access", "set_expiry", "sync_stripe_user",
+                "expired_users", "user", "access_history", "recent_access_events",
+                "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
+                "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
+                "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
+                "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
+                "stripe_links", "duplicate_subscriptions", "revoke_invite_links",
+                "resolve_checkout", "link_stripe_user", "unban_user",
+            ],
+        )
+        self.assertEqual(len(commands), len(set(commands)))
+        self.assertEqual(len(callback_handlers), len(set(callback_handlers)))
+        self.assertEqual(catch_all_messages, [])
+        self.assertTrue(any("F.data.startswith('sub_')" in item for item in callback_filters))
+        self.assertTrue(any("F.data == 'retry_payment'" in item for item in callback_filters))
+
+    async def test_keyboard_callback_data_are_routable(self):
+        source = Path(self.main.__file__).read_text()
+        tree = ast.parse(source)
+        callback_values = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.keyword) and node.arg == "callback_data":
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    callback_values.add(node.value.value)
+
+        exact = {
+            "confirm_promo", "cancel_promo", "feedback_join", "feedback_question",
+            "feedback_think", "to_desc", "to_rules", "to_choice", "retry_payment",
+            "back_to_tariffs", "cancel_subscription", "show_renew_options",
+        }
+        prefix_covered = {"sub_trial", "sub_1", "sub_6", "sub_12", "admin_menu:back"}
+        self.assertTrue(exact.issubset(callback_values))
+        self.assertTrue(prefix_covered.issubset(callback_values))
+        for value in exact:
+            self.assertIn(f'F.data == "{value}"', source)
+        self.assertIn("F.data.startswith('sub_')", source)
+        self.assertIn('F.data.startswith("admin_menu:")', source)
+
     async def test_production_code_no_longer_uses_aiogram2_handler_or_fsm_api(self):
         source = Path(self.main.__file__).read_text()
         self.assertNotIn("@dp.message_handler", source)
         self.assertNotIn("@dp.callback_query_handler", source)
+        self.assertNotIn("_legacy_message_handler", source)
+        self.assertNotIn("_legacy_callback_query_handler", source)
+        self.assertNotIn("dp.message_handler =", source)
+        self.assertNotIn("dp.callback_query_handler =", source)
+        self.assertNotIn("get_new_configured_app", source)
+        self.assertNotIn("Dispatcher(bot", source)
+        self.assertNotIn("BotBlocked", source)
+        self.assertNotIn("aiogram.utils.exceptions", source)
         self.assertNotIn("await state.finish()", source)
         self.assertNotIn("InlineKeyboardMarkup(row_width", source)
         self.assertNotIn("ReplyKeyboardMarkup(row_width", source)
         self.assertNotIn("InlineKeyboardMarkup().add", source)
+
+    async def test_telegram_exception_helpers_prioritize_aiogram3_classes(self):
+        from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
+
+        forbidden = TelegramForbiddenError(method=None, message="bot was blocked by the user")
+        bad_request = TelegramBadRequest(method=None, message="chat not found")
+        network = TelegramNetworkError(method=None, message="temporary network error")
+        retry_after = TelegramRetryAfter(method=None, message="Too Many Requests", retry_after=125)
+
+        self.assertTrue(self.main.is_undeliverable_user_error(forbidden))
+        self.assertFalse(self.main.is_undeliverable_user_error(bad_request))
+        self.assertFalse(self.main.is_undeliverable_user_error(network))
+        self.assertFalse(self.main.is_undeliverable_user_error(retry_after))
+        self.assertEqual(self.main.telegram_retry_delay_minutes(retry_after, attempt_count=1), 3)
+
+    async def test_message_delivery_forbidden_marks_blocked_permanent(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        connections = []
+        failed_calls = []
+
+        def fake_conn():
+            conn = FakeConnection()
+            connections.append(conn)
+            return conn
+
+        def fake_mark_failed(cur, delivery_key, error, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(error).__name__, retry_delay_minutes, permanently_failed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key1", 123, "notice", '{"text":"hi"}', 1, None)]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "failed": 0, "blocked": 1})
+        self.assertEqual(failed_calls, [("key1", "TelegramForbiddenError", None, True)])
+        self.assertTrue(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+        mark_sent.assert_not_called()
+
+    async def test_message_delivery_bad_request_and_network_errors_remain_retryable(self):
+        from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+
+        for error, expected_delay in (
+            (TelegramBadRequest(method=None, message="chat not found"), 5),
+            (TelegramNetworkError(method=None, message="network down"), 5),
+            (TelegramRetryAfter(method=None, message="retry later", retry_after=125), 3),
+        ):
+            with self.subTest(error=type(error).__name__):
+                connections = []
+                failed_calls = []
+
+                def fake_conn():
+                    conn = FakeConnection()
+                    connections.append(conn)
+                    return conn
+
+                def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+                    failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+                with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
+                     patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key2", 123, "notice", '{"text":"hi"}', 1, None)]), \
+                     patch.object(self.main.bot, "send_message", AsyncMock(side_effect=error)), \
+                     patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+                     patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+                     patch.object(self.main, "notify_admins", AsyncMock()):
+                    result = await self.main.process_pending_message_deliveries()
+
+                self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+                self.assertEqual(failed_calls, [("key2", type(error).__name__, expected_delay, False)])
+                self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+                mark_sent.assert_not_called()
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()
@@ -276,6 +462,33 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         response = await handler(FakeTelegramRequest(update))
 
         self.assertEqual(response.status, 200)
+
+    async def test_unknown_callback_passes_through_dispatcher_without_payment_or_admin_action(self):
+        app = self.main.create_app()
+        app.on_startup.clear()
+        app.on_shutdown.clear()
+        update = {
+            "update_id": 1002,
+            "callback_query": {
+                "id": "unknown-callback",
+                "from": {"id": 2002, "is_bot": False, "first_name": "Test"},
+                "chat_instance": "ci",
+                "data": "unknown_callback",
+                "message": {
+                    "message_id": 2,
+                    "date": int(time.time()),
+                    "chat": {"id": 2002, "type": "private"},
+                },
+            },
+        }
+        handler = self.route_handler(app, "POST", self.main.get_telegram_webhook_path())
+        with patch.object(self.main, "process_payment", AsyncMock()) as process_payment, \
+             patch.object(self.main, "admin_action_confirm_callback", AsyncMock()) as confirm_action:
+            response = await handler(FakeTelegramRequest(update))
+
+        self.assertEqual(response.status, 200)
+        process_payment.assert_not_awaited()
+        confirm_action.assert_not_awaited()
 
     async def test_signed_stripe_webhook_route_still_returns_expected_response(self):
         app = self.main.create_app()

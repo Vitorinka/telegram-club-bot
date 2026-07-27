@@ -279,7 +279,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("save_delivery_invite_link", source)
         self.assertIn("mark_delivery_sent", source)
         self.assertIn("mark_delivery_failed", source)
-        self.assertIn("BotBlocked", source)
+        self.assertIn("TelegramForbiddenError", source)
         self.assertIn("blocked_bot = TRUE", source)
 
     def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
@@ -987,7 +987,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_set_expiry"):MAIN_SOURCE.index("async def perform_link_stripe_user")]
         self.assertIn("user_is_current_group_member", source)
         self.assertIn("generate_invite_link", source)
-        self.assertIn("BotBlocked", source)
+        self.assertIn("TelegramForbiddenError", source)
         self.assertIn("mark_user_blocked_bot", source)
         self.assertIn("completed_with_warning", MAIN_SOURCE)
 

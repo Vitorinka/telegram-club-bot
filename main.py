@@ -14,7 +14,12 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
@@ -149,23 +154,25 @@ if missing_env_vars:
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
 
-BotBlocked = TelegramForbiddenError
+
+def is_telegram_forbidden_error(error):
+    return isinstance(error, TelegramForbiddenError)
 
 
-class _CompatContentTypes:
-    TEXT = "text"
-    ANY = "any"
+def is_telegram_bad_request_error(error):
+    return isinstance(error, TelegramBadRequest)
 
 
-class _CompatContentType:
-    NEW_CHAT_MEMBERS = "new_chat_members"
-    LEFT_CHAT_MEMBER = "left_chat_member"
+def is_telegram_temporary_error(error):
+    return isinstance(error, (TelegramNetworkError, TelegramRetryAfter))
 
 
-if not hasattr(types, "ContentTypes"):
-    types.ContentTypes = _CompatContentTypes
-if not hasattr(types, "ContentType"):
-    types.ContentType = _CompatContentType
+def telegram_retry_delay_minutes(error, attempt_count=1):
+    if isinstance(error, TelegramRetryAfter):
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after is not None:
+            return max(1, min(60, int((int(retry_after) + 59) / 60)))
+    return min(60, max(5, int(attempt_count) * 5))
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -191,52 +198,6 @@ checkout_session_cache_lock = asyncio.Lock()
 SCHEDULER_JOBS_REGISTERED = False
 
 
-def _as_sequence(value):
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return list(value)
-    return [value]
-
-
-def _content_type_filter(content_types):
-    values = [str(item) for item in _as_sequence(content_types)]
-    if not values:
-        return None
-    return F.content_type.in_(values)
-
-
-def _state_filter(state):
-    if state == "*":
-        return None
-    return StateFilter(state)
-
-
-def _message_filters(filters, commands=None, text=None, content_types=None, state=None):
-    resolved = list(filters)
-    if commands:
-        resolved.append(Command(*_as_sequence(commands)))
-    if text is not None:
-        resolved.append(F.text == text)
-    content_filter = _content_type_filter(content_types)
-    if content_filter is not None:
-        resolved.append(content_filter)
-    state_filter = _state_filter(state)
-    if state_filter is not None:
-        resolved.append(state_filter)
-    return resolved
-
-
-def _callback_filters(filters, text=None, state=None):
-    resolved = list(filters)
-    if text is not None:
-        resolved.append(F.data == text)
-    state_filter = _state_filter(state)
-    if state_filter is not None:
-        resolved.append(state_filter)
-    return resolved
-
-
 def inline_keyboard(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -247,31 +208,6 @@ def reply_keyboard(rows, resize_keyboard=False, one_time_keyboard=None):
         kwargs["one_time_keyboard"] = one_time_keyboard
     return ReplyKeyboardMarkup(**kwargs)
 
-
-def _legacy_message_handler(*filters, commands=None, text=None, content_types=None, state=None, **kwargs):
-    def decorator(handler):
-        router.message.register(
-            handler,
-            *_message_filters(filters, commands=commands, text=text, content_types=content_types, state=state),
-            **kwargs,
-        )
-        return handler
-    return decorator
-
-
-def _legacy_callback_query_handler(*filters, text=None, state=None, **kwargs):
-    def decorator(handler):
-        router.callback_query.register(
-            handler,
-            *_callback_filters(filters, text=text, state=state),
-            **kwargs,
-        )
-        return handler
-    return decorator
-
-
-dp.message_handler = _legacy_message_handler
-dp.callback_query_handler = _legacy_callback_query_handler
 
 CHECKOUT_OPEN_INSTRUCTION = (
     "💳 Нажмите кнопку ниже, чтобы перейти к оплате.\n\n"
@@ -2195,7 +2131,7 @@ async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, str
             notes="invite link sent after payment"
         )
         return True
-    except BotBlocked as e:
+    except TelegramForbiddenError as e:
         conn = get_db_conn()
         cur = conn.cursor()
         try:
@@ -2214,7 +2150,7 @@ async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, str
             source,
             safe_log_id(stripe_event_id),
             safe_log_id(stripe_subscription_id),
-            "BotBlocked",
+            "TelegramForbiddenError",
             exc_info=True,
         )
         await notify_admins(
@@ -2222,7 +2158,7 @@ async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, str
             f"telegram_id: {telegram_id}\n"
             f"source: {source}\n"
             f"subscription_id: {stripe_subscription_id or 'нет'}\n"
-            f"ошибка: BotBlocked"
+            f"ошибка: TelegramForbiddenError"
         )
         return False
     except Exception as e:
@@ -2247,6 +2183,11 @@ async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, str
 
 
 def is_undeliverable_user_error(error):
+    if is_telegram_forbidden_error(error):
+        return True
+    if is_telegram_bad_request_error(error) or is_telegram_temporary_error(error):
+        return False
+
     error_text = str(error).lower()
     undeliverable_markers = (
         "chat not found",
@@ -2909,7 +2850,7 @@ async def ban_user_logic(telegram_id, cur=None):
             "Вы можете оформить новую подписку в любое время.",
             reply_markup=get_tariffs_keyboard(show_trial=False)
         )
-    except BotBlocked:
+    except TelegramForbiddenError:
         update_user_blocked_bot(telegram_id)
         logging.info(
             f"Пользователь {telegram_id} заблокировал бота: сообщение об окончании доступа "
@@ -3370,7 +3311,7 @@ async def check_free_lesson_followups():
                 was_sent = await send_free_lesson_followup(user_id)
                 if was_sent:
                     sent += 1
-            except BotBlocked:
+            except TelegramForbiddenError:
                 blocked += 1
                 user_conn = get_db_conn()
                 user_cur = user_conn.cursor()
@@ -3613,7 +3554,7 @@ async def promo_send(callback: types.CallbackQuery, state: FSMContext):
             else:
                 await bot.send_video(user_id, file_id, caption=text, reply_markup=kb, parse_mode="HTML")
             success += 1
-        except BotBlocked:
+        except TelegramForbiddenError:
             blocked += 1
             cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
         except Exception as e:
@@ -3846,7 +3787,7 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Ответ отправлен пользователю {target_user_id}.")
         await state.clear()
 
-    except BotBlocked:
+    except TelegramForbiddenError:
         conn = get_db_conn()
         cur = conn.cursor()
 
@@ -4152,7 +4093,7 @@ async def send_auto_free_lesson(user_id, cur=None):
         int(user_id),
         "free_lesson",
         send_video_once,
-        blocked_exc=(BotBlocked,),
+        blocked_exc=(TelegramForbiddenError,),
     )
     return result == "sent"
 
@@ -4187,7 +4128,7 @@ async def check_auto_free_lessons():
                 was_sent = await send_auto_free_lesson(user_id)
                 if was_sent:
                     sent += 1
-            except BotBlocked:
+            except TelegramForbiddenError:
                 blocked += 1
                 user_conn = get_db_conn()
                 user_cur = user_conn.cursor()
@@ -4254,7 +4195,7 @@ async def send_free_lesson_followup(user_id, cur=None):
         int(user_id),
         "free_lesson_followup",
         send_followup_once,
-        blocked_exc=(BotBlocked,),
+        blocked_exc=(TelegramForbiddenError,),
         success_update_sql="""
         UPDATE users
         SET feedback_sent = TRUE,
@@ -5414,7 +5355,7 @@ async def send_user_command(message: types.Message):
 
         await message.answer(f"✅ Сообщение отправлено пользователю {target_user_id}.")
 
-    except BotBlocked:
+    except TelegramForbiddenError:
         cur.execute(
             "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
             (target_user_id,)
@@ -6706,7 +6647,7 @@ async def test_followup_command(message: types.Message):
 
         await message.answer(f"✅ Тестовый follow-up отправлен пользователю {target_user_id}.")
 
-    except BotBlocked:
+    except TelegramForbiddenError:
         cur.execute(
             "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
             (target_user_id,)
@@ -7476,14 +7417,14 @@ async def stripe_webhook(request):
 
                     try:
                         await bot.send_message(int(user_id), msg, reply_markup=reply_markup)
-                    except BotBlocked:
+                    except TelegramForbiddenError:
                         cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (user_id,))
                         conn.commit()
                         await notify_critical_delivery_failed(
                             user_id,
                             "checkout.session.completed",
                             "сообщение об успешной оплате/продлении",
-                            "BotBlocked",
+                            "TelegramForbiddenError",
                             f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
                         )
                     except Exception as e:
@@ -8301,7 +8242,7 @@ async def stripe_webhook(request):
                         safe_log_id(invoice_id),
                         new_expiry,
                     )
-                except BotBlocked:
+                except TelegramForbiddenError:
                     cur.execute(
                         "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
                         (int(telegram_id),)
@@ -8316,7 +8257,7 @@ async def stripe_webhook(request):
                         telegram_id,
                         "invoice.payment_succeeded",
                         failed_action,
-                        "BotBlocked",
+                        "TelegramForbiddenError",
                         f"paid = TRUE; expiry_date = {new_expiry.strftime('%d.%m.%Y %H:%M')}; blocked_bot = TRUE"
                     )
                 except Exception as e:
@@ -8687,7 +8628,7 @@ async def stripe_webhook(request):
                         await bot.send_message(telegram_id,
                             f"⚠️ Не удалось списать оплату за подписку. У вас есть {PAYMENT_RETRY_GRACE_HOURS} часов, чтобы пополнить карту или связаться с администратором.\n"
                             "После устранения проблемы доступ восстановится автоматически.")
-                    except BotBlocked:
+                    except TelegramForbiddenError:
                         conn = get_db_conn()
                         cur = conn.cursor()
                         try:
@@ -9161,7 +9102,7 @@ async def stripe_webhook(request):
                         "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь.",
                         reply_markup=kb
                     )
-                except BotBlocked:
+                except TelegramForbiddenError:
                     conn = get_db_conn()
                     cur = conn.cursor()
                     try:
@@ -9224,7 +9165,7 @@ async def test_auto_lesson_command(message: types.Message):
         else:
             await message.answer("⚠️ Урок не отправлен. Проверьте FREE_LESSON_VIDEO_ID.")
 
-    except BotBlocked:
+    except TelegramForbiddenError:
         cur.execute(
             "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
             (target_user_id,)
@@ -9334,7 +9275,7 @@ async def send_invite_link_command(message: types.Message):
 
         try:
             await bot.send_message(target_user_id, user_text)
-        except BotBlocked:
+        except TelegramForbiddenError:
             cur.execute(
                 "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
                 (target_user_id,)
@@ -9668,7 +9609,7 @@ async def perform_give_access(payload):
         text += f"\nСсылка: {invite_link}"
     try:
         await bot.send_message(telegram_id, text)
-    except BotBlocked:
+    except TelegramForbiddenError:
         notification_failed = True
         warnings.append("bot_blocked")
         mark_user_blocked_bot(telegram_id)
@@ -9763,7 +9704,7 @@ async def perform_set_expiry(payload):
         text += f"\nСсылка: {invite_link}"
     try:
         await bot.send_message(telegram_id, text)
-    except BotBlocked:
+    except TelegramForbiddenError:
         notification_failed = True
         warnings.append("bot_blocked")
         mark_user_blocked_bot(telegram_id)
@@ -9949,7 +9890,7 @@ async def perform_link_stripe_user(payload):
                 invite_sent = True
                 try:
                     await bot.send_message(telegram_id, f"✅ Подписка привязана. Ссылка для входа: {invite_link}")
-                except BotBlocked:
+                except TelegramForbiddenError:
                     warnings.append("bot_blocked")
                     mark_user_blocked_bot(telegram_id)
                 except Exception as e:
@@ -10578,7 +10519,7 @@ async def process_pending_message_deliveries(limit=25):
                 sent_cur.close()
                 sent_conn.close()
             sent += 1
-        except BotBlocked as e:
+        except TelegramForbiddenError as e:
             block_conn = get_db_conn()
             block_cur = block_conn.cursor()
             try:
@@ -10598,7 +10539,7 @@ async def process_pending_message_deliveries(limit=25):
                     fail_cur,
                     delivery_key,
                     e,
-                    retry_delay_minutes=min(60, max(5, int(attempt_count) * 5)),
+                    retry_delay_minutes=telegram_retry_delay_minutes(e, attempt_count),
                     permanently_failed=permanently_failed,
                 )
                 fail_conn.commit()

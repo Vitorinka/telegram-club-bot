@@ -111,12 +111,6 @@ class _FakeDispatcher:
     def __init__(self, *args, **kwargs):
         pass
 
-    def message_handler(self, *args, **kwargs):
-        return lambda func: func
-
-    def callback_query_handler(self, *args, **kwargs):
-        return lambda func: func
-
     def include_router(self, *args, **kwargs):
         pass
 
@@ -167,7 +161,18 @@ class _FakeStatesGroup:
     pass
 
 
-class _FakeBotBlocked(Exception):
+class _FakeTelegramError(Exception):
+    def __init__(self, *args, **kwargs):
+        super().__init__(kwargs.get("message") or (args[0] if args else "telegram error"))
+
+
+class _FakeTelegramRetryAfter(_FakeTelegramError):
+    def __init__(self, *args, retry_after=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retry_after = retry_after
+
+
+class _FakeTelegramForbiddenError(_FakeTelegramError):
     pass
 
 
@@ -218,20 +223,11 @@ def install_aiogram_import_stubs():
     aiogram_types.ContentType = _FakeContentType
     aiogram.types = aiogram_types
 
-    storage_module = types.ModuleType("aiogram.contrib.fsm_storage.memory")
-    storage_module.MemoryStorage = type("MemoryStorage", (), {"__init__": lambda self, *args, **kwargs: None})
-
-    exceptions_module = types.ModuleType("aiogram.utils.exceptions")
-    exceptions_module.BotBlocked = _FakeBotBlocked
     new_exceptions_module = types.ModuleType("aiogram.exceptions")
-    new_exceptions_module.TelegramForbiddenError = _FakeBotBlocked
-
-    dispatcher_module = types.ModuleType("aiogram.dispatcher")
-    dispatcher_module.FSMContext = type("FSMContext", (), {})
-
-    state_module = types.ModuleType("aiogram.dispatcher.filters.state")
-    state_module.State = _FakeState
-    state_module.StatesGroup = _FakeStatesGroup
+    new_exceptions_module.TelegramBadRequest = type("TelegramBadRequest", (_FakeTelegramError,), {})
+    new_exceptions_module.TelegramForbiddenError = _FakeTelegramForbiddenError
+    new_exceptions_module.TelegramNetworkError = type("TelegramNetworkError", (_FakeTelegramError,), {})
+    new_exceptions_module.TelegramRetryAfter = _FakeTelegramRetryAfter
 
     filters_module = types.ModuleType("aiogram.filters")
     filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
@@ -269,14 +265,6 @@ def install_aiogram_import_stubs():
         "aiogram.fsm.storage.memory": fsm_storage_memory_module,
         "aiogram.webhook": types.ModuleType("aiogram.webhook"),
         "aiogram.webhook.aiohttp_server": webhook_module,
-        "aiogram.contrib": types.ModuleType("aiogram.contrib"),
-        "aiogram.contrib.fsm_storage": types.ModuleType("aiogram.contrib.fsm_storage"),
-        "aiogram.contrib.fsm_storage.memory": storage_module,
-        "aiogram.utils": types.ModuleType("aiogram.utils"),
-        "aiogram.utils.exceptions": exceptions_module,
-        "aiogram.dispatcher": dispatcher_module,
-        "aiogram.dispatcher.filters": types.ModuleType("aiogram.dispatcher.filters"),
-        "aiogram.dispatcher.filters.state": state_module,
     })
 
 
