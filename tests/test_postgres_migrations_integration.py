@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import tempfile
 import threading
@@ -5,9 +7,11 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import psycopg2
 from psycopg2 import sql
+from psycopg2.extensions import make_dsn
 
 from db_migrations import MIGRATIONS_DIR, MigrationError, load_migrations, run_migrations
 
@@ -20,13 +24,18 @@ def connect(dsn):
 
 
 def db_dsn(dbname):
-    base = connect(POSTGRES_TEST_DSN)
-    params = base.get_dsn_parameters()
-    base.close()
-    params["dbname"] = dbname
-    return " ".join(f"{key}={value}" for key, value in params.items() if key in {
-        "host", "port", "user", "password", "dbname", "sslmode"
-    } and value)
+    return make_dsn(POSTGRES_TEST_DSN, dbname=dbname)
+
+
+def dsn_password(dsn):
+    if "://" in dsn:
+        password = urlsplit(dsn).password
+        return unquote(password) if password else None
+    for part in dsn.split():
+        key, sep, value = part.partition("=")
+        if sep and key == "password":
+            return value
+    return None
 
 
 def create_temp_db(prefix="codex_pg_migrations"):
@@ -247,6 +256,19 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM schema_migrations WHERE version = '0001_fail'")[0], 0)
 
     def test_two_replicas_are_serialized_by_advisory_lock(self):
+        password = dsn_password(POSTGRES_TEST_DSN)
+        self.assertTrue(password)
+        self.assertIn(self.db_name, self.dsn)
+        self.assertIn("password=", self.dsn)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            conn = connect(self.dsn)
+            conn.close()
+        self.assertNotIn(password, stdout.getvalue())
+        self.assertNotIn(password, stderr.getvalue())
+
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "0001_slow.sql").write_text(
                 "SELECT pg_sleep(0.35);\nCREATE TABLE replica_probe(id integer);\n",
