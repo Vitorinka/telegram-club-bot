@@ -480,7 +480,9 @@ class StripeInvoiceRulesTest(unittest.TestCase):
         self.assertNotIn("if needs_link and await payment_needs_rejoin_invite", source)
         self.assertNotIn("if needs_rejoin_invite and await payment_needs_rejoin_invite", source)
         self.assertNotIn("needs_rejoin_invite =", source)
-        self.assertIn("should_enqueue_invoice_rejoin_check = old_expiry is None or old_expiry < datetime.utcnow()", source)
+        self.assertNotIn("should_enqueue_checkout_rejoin_check = needs_link", source)
+        self.assertNotIn("should_enqueue_invoice_rejoin_check = old_expiry is None or old_expiry < datetime.utcnow()", source)
+        self.assertIn('delivery_type="stripe_rejoin_check"', source)
         webhook_source = source[source.index("async def stripe_webhook"):source.index("@router.message(Command('test_auto_lesson')")]
         self.assertNotIn("await payment_needs_rejoin_invite", webhook_source)
 

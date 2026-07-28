@@ -342,8 +342,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
             self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
 
         rejoin_blocks = (
-            webhook_source[webhook_source.index("if should_enqueue_checkout_rejoin_check:"):],
-            webhook_source[webhook_source.index("if should_enqueue_invoice_rejoin_check:\n                        enqueue"):],
+            webhook_source[webhook_source.index("if checkout_access_confirmed:"):],
+            webhook_source[webhook_source.index("if invoice_access_confirmed:\n                        enqueue"):],
         )
         for block in rejoin_blocks:
             self.assertLess(block.index("enqueue_rejoin_invite_after_payment"), block.index("conn.commit()"))

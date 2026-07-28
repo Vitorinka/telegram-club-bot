@@ -7354,7 +7354,7 @@ async def stripe_webhook(request):
                         return web.Response(status=200)
 
                 needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
-                should_enqueue_checkout_rejoin_check = needs_link
+                checkout_access_confirmed = checkout_action == "activate_access" and days_to_add > 0
                 cur.execute("""
                 INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, payment_failed_at, last_payment_succeeded_at, grace_period_end, first_payment_done, blocked_bot)
                 VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, NOW(), NULL, FALSE, FALSE)
@@ -7424,7 +7424,7 @@ async def stripe_webhook(request):
                     f"days={days_to_add}; customer_id={safe_log_id(customer_id)}",
                 ))
 
-                if should_enqueue_checkout_rejoin_check:
+                if checkout_access_confirmed:
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         user_id,
@@ -8184,14 +8184,14 @@ async def stripe_webhook(request):
                         new_expiry,
                     )
 
-                should_enqueue_invoice_rejoin_check = old_expiry is None or old_expiry < datetime.utcnow()
+                invoice_access_confirmed = payment_kind != "out_of_band" and telegram_id is not None and new_expiry is not None
 
                 if should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, new_expiry):
                     logging.info(
                         f"invoice.payment_succeeded: срок уже актуален, пропускаю повторное уведомление. "
                         f"telegram_id={telegram_id}, old_expiry={old_expiry}, new_expiry={new_expiry}, event={safe_log_id(event_id)}"
                     )
-                    if should_enqueue_invoice_rejoin_check:
+                    if invoice_access_confirmed:
                         enqueue_rejoin_invite_after_payment(
                             cur,
                             telegram_id,
@@ -8205,7 +8205,7 @@ async def stripe_webhook(request):
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
 
-                if should_enqueue_invoice_rejoin_check:
+                if invoice_access_confirmed:
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         telegram_id,

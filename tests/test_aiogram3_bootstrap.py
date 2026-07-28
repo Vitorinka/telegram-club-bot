@@ -178,6 +178,87 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 return route.handler
         self.fail(f"route not found: {method} {path}")
 
+    def invoice_payment_event(self, event_id, *, period_end=None):
+        period_end = period_end or int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        period_start = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+        payment = SimpleNamespace(
+            status="paid",
+            amount_paid=1000,
+            payment=SimpleNamespace(type="payment_intent", payment_intent="pi_" + event_id[-6:]),
+        )
+        invoice = SimpleNamespace(
+            id="in_" + event_id[-8:],
+            subscription="sub_rejoin",
+            customer="cus_rejoin",
+            customer_email="paid@example.com",
+            amount_paid=1000,
+            amount_due=1000,
+            currency="rub",
+            billing_reason="subscription_cycle",
+            status="paid",
+            paid_out_of_band=False,
+            metadata={},
+            payments=SimpleNamespace(data=[payment]),
+            lines=SimpleNamespace(data=[
+                SimpleNamespace(
+                    subscription="sub_rejoin",
+                    period=SimpleNamespace(start=period_start, end=period_end),
+                    price=SimpleNamespace(id="price_1m"),
+                )
+            ]),
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="invoice.payment_succeeded",
+            created=1720000000,
+            data=SimpleNamespace(object=invoice),
+        )
+        subscription = SimpleNamespace(
+            id="sub_rejoin",
+            customer="cus_rejoin",
+            status="active",
+            trial_end=None,
+            current_period_end=period_end,
+            metadata={},
+        )
+        payload = json.dumps(
+            {
+                "id": event_id,
+                "object": "event",
+                "type": "invoice.payment_succeeded",
+                "created": 1720000000,
+                "data": {"object": {"id": invoice.id, "object": "invoice"}},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return payload, event, subscription
+
+    async def run_invoice_webhook_with_future_expiry(self, event_id):
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() + timedelta(days=14), False),
+            ("stripe:%s:rejoin_invite" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(conn.closed)
+        enqueue_params = next(
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        )
+        self.assertEqual(enqueue_params[0], "stripe:%s:rejoin_invite" % event_id)
+        self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
+        return enqueue_params
+
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
         from aiogram.fsm.storage.memory import MemoryStorage
@@ -724,7 +805,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
-            (False, datetime.utcnow() - timedelta(days=1), False),
+            (True, datetime.utcnow() + timedelta(days=14), True),
             ("stripe:evt_checkout_boundary:rejoin_invite",),
         ])
 
@@ -764,6 +845,57 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enqueue_params[0], "stripe:evt_checkout_boundary:rejoin_invite")
         self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
         self.assertEqual(conn.commits, 1)
+
+    async def test_subscription_checkout_link_only_does_not_enqueue_rejoin_check(self):
+        payload = json.dumps(
+            {
+                "id": "evt_checkout_link_only",
+                "object": "event",
+                "type": "checkout.session.completed",
+                "created": 1720000000,
+                "data": {
+                    "object": {
+                        "id": "cs_link_only",
+                        "object": "checkout.session",
+                        "client_reference_id": "123",
+                        "metadata": {},
+                        "mode": "subscription",
+                        "payment_status": "paid",
+                        "customer": "cus_link_only",
+                        "subscription": "sub_link_only",
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection()
+        event = SimpleNamespace(
+            id="evt_checkout_link_only",
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_link_only",
+                client_reference_id="123",
+                metadata={},
+                mode="subscription",
+                payment_status="paid",
+                customer="cus_link_only",
+                subscription="sub_link_only",
+            )),
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(conn.closed)
+        queries = [query for query, _ in conn.cursor_obj.queries]
+        self.assertFalse(any("INSERT INTO message_delivery_events" in query for query in queries))
 
     async def test_checkout_webhook_duplicate_does_not_create_second_rejoin_check(self):
         payload = json.dumps(
@@ -828,6 +960,44 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         enqueue_queries = [query for query, _ in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
         self.assertEqual(len(enqueue_queries), 1)
         self.assertEqual(conn.rollbacks, 0)
+
+    async def test_invoice_future_expiry_kicked_user_gets_rejoin_task_and_link(self):
+        enqueue_params = await self.run_invoice_webhook_with_future_expiry("evt_invoice_future_kicked")
+        payload_json = enqueue_params[3]
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_invoice_future_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+             ]), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
+             patch.object(self.main.bot, "create_chat_invite_link", AsyncMock(return_value=SimpleNamespace(invite_link="https://t.me/+again"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result["sent"], 1)
+        unban.assert_awaited_once()
+        send_message.assert_awaited_once()
+        self.assertIn("https://t.me/+again", send_message.await_args.args[1])
+
+    async def test_invoice_future_expiry_member_gets_rejoin_task_completed_without_message(self):
+        enqueue_params = await self.run_invoice_webhook_with_future_expiry("evt_invoice_future_member")
+        payload_json = enqueue_params[3]
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_invoice_future_member:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+             ]), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
+             patch.object(self.main.bot, "create_chat_invite_link", AsyncMock()) as create_link, \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result["sent"], 1)
+        unban.assert_not_awaited()
+        create_link.assert_not_awaited()
+        send_message.assert_not_awaited()
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()
