@@ -178,7 +178,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 return route.handler
         self.fail(f"route not found: {method} {path}")
 
-    def invoice_payment_event(self, event_id, *, period_end=None):
+    def invoice_payment_event(self, event_id, *, period_end=None, paid_out_of_band=False):
         period_end = period_end or int((datetime.utcnow() + timedelta(days=30)).timestamp())
         period_start = int((datetime.utcnow() - timedelta(days=1)).timestamp())
         payment = SimpleNamespace(
@@ -196,7 +196,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             currency="rub",
             billing_reason="subscription_cycle",
             status="paid",
-            paid_out_of_band=False,
+            paid_out_of_band=paid_out_of_band,
             metadata={},
             payments=SimpleNamespace(data=[payment]),
             lines=SimpleNamespace(data=[
@@ -233,8 +233,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         return payload, event, subscription
 
-    async def run_invoice_webhook_with_future_expiry(self, event_id):
-        payload, event, subscription = self.invoice_payment_event(event_id)
+    async def run_invoice_webhook_with_future_expiry(self, event_id, *, paid_out_of_band=False):
+        payload, event, subscription = self.invoice_payment_event(event_id, paid_out_of_band=paid_out_of_band)
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             (123, datetime.utcnow() + timedelta(days=14), False),
@@ -998,6 +998,50 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         unban.assert_not_awaited()
         create_link.assert_not_awaited()
         send_message.assert_not_awaited()
+
+    async def test_out_of_band_invoice_future_expiry_kicked_user_gets_rejoin_task_and_link(self):
+        enqueue_params = await self.run_invoice_webhook_with_future_expiry(
+            "evt_invoice_oob_kicked",
+            paid_out_of_band=True,
+        )
+        payload_json = enqueue_params[3]
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe:evt_invoice_oob_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+             ]), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
+             patch.object(self.main.bot, "create_chat_invite_link", AsyncMock(return_value=SimpleNamespace(invite_link="https://t.me/+oob"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result["sent"], 1)
+        unban.assert_awaited_once()
+        send_message.assert_awaited_once()
+        self.assertIn("https://t.me/+oob", send_message.await_args.args[1])
+
+    async def test_out_of_band_invoice_without_linked_user_does_not_enqueue_rejoin_task(self):
+        payload, event, subscription = self.invoice_payment_event(
+            "evt_invoice_oob_unlinked",
+            paid_out_of_band=True,
+        )
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[None, None, None, None, None, None])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(conn.closed)
+        queries = [query for query, _ in conn.cursor_obj.queries]
+        self.assertFalse(any("INSERT INTO message_delivery_events" in query for query in queries))
+        self.assertTrue(any("INSERT INTO unlinked_stripe_events" in query for query in queries))
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()

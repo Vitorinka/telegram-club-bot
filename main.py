@@ -8184,7 +8184,11 @@ async def stripe_webhook(request):
                         new_expiry,
                     )
 
-                invoice_access_confirmed = payment_kind != "out_of_band" and telegram_id is not None and new_expiry is not None
+                invoice_access_confirmed = bool(
+                    row is not None
+                    and telegram_id is not None
+                    and new_expiry is not None
+                )
 
                 if should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, new_expiry):
                     logging.info(
