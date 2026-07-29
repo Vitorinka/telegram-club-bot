@@ -215,11 +215,20 @@ async def process_claimed_delivery(
     blocked_exc=(),
     success_update_sql=None,
     success_update_params=None,
+    attempt_count=1,
+    classify_error_func=None,
+    log_failure_func=None,
+    terminal_error_callback=None,
 ):
     claim_conn = get_conn()
     claim_cur = claim_conn.cursor()
     try:
         claim = claim_message_delivery(claim_cur, delivery_key, telegram_id, delivery_type)
+        claimed_attempt_count = None
+        if claim == "claimed":
+            claim_cur.execute("SELECT attempt_count FROM message_delivery_events WHERE delivery_key = %s", (delivery_key,))
+            row = claim_cur.fetchone()
+            claimed_attempt_count = row[0] if row else None
         claim_conn.commit()
     finally:
         claim_cur.close()
@@ -228,29 +237,83 @@ async def process_claimed_delivery(
     if claim != "claimed":
         return claim
 
+    if claimed_attempt_count is not None:
+        attempt_count = claimed_attempt_count
+
+    return await process_already_claimed_delivery(
+        get_conn,
+        delivery_key,
+        telegram_id,
+        delivery_type,
+        send_func,
+        blocked_exc=blocked_exc,
+        success_update_sql=success_update_sql,
+        success_update_params=success_update_params,
+        attempt_count=attempt_count,
+        classify_error_func=classify_error_func,
+        log_failure_func=log_failure_func,
+        terminal_error_callback=terminal_error_callback,
+    )
+
+
+async def process_already_claimed_delivery(
+    get_conn,
+    delivery_key,
+    telegram_id,
+    delivery_type,
+    send_func,
+    blocked_exc=(),
+    success_update_sql=None,
+    success_update_params=None,
+    attempt_count=1,
+    classify_error_func=None,
+    log_failure_func=None,
+    terminal_error_callback=None,
+):
     try:
         await send_func()
     except blocked_exc as exc:
-        fail_conn = get_conn()
-        fail_cur = fail_conn.cursor()
-        try:
-            fail_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
-            mark_delivery_failed(fail_cur, delivery_key, exc)
-            fail_conn.commit()
-        finally:
-            fail_cur.close()
-            fail_conn.close()
-        return "blocked"
+        if classify_error_func:
+            decision = classify_error_func(exc, attempt_count=attempt_count, sending_user_message=True)
+        else:
+            decision = {
+                "blocked": True,
+                "retryable": False,
+                "permanently_failed": True,
+                "retry_delay_minutes": None,
+            }
+        return await _mark_claimed_delivery_failed(
+            get_conn,
+            delivery_key,
+            telegram_id,
+            delivery_type,
+            attempt_count,
+            exc,
+            decision,
+            log_failure_func,
+            terminal_error_callback,
+        )
     except Exception as exc:
-        fail_conn = get_conn()
-        fail_cur = fail_conn.cursor()
-        try:
-            mark_delivery_failed(fail_cur, delivery_key, exc)
-            fail_conn.commit()
-        finally:
-            fail_cur.close()
-            fail_conn.close()
-        return "failed"
+        if classify_error_func:
+            decision = classify_error_func(exc, attempt_count=attempt_count, sending_user_message=True)
+        else:
+            decision = {
+                "blocked": False,
+                "retryable": True,
+                "permanently_failed": False,
+                "retry_delay_minutes": 15,
+            }
+        return await _mark_claimed_delivery_failed(
+            get_conn,
+            delivery_key,
+            telegram_id,
+            delivery_type,
+            attempt_count,
+            exc,
+            decision,
+            log_failure_func,
+            terminal_error_callback,
+        )
 
     sent_conn = get_conn()
     sent_cur = sent_conn.cursor()
@@ -271,3 +334,46 @@ async def process_claimed_delivery(
         sent_cur.close()
         sent_conn.close()
     return "sent"
+
+
+async def _mark_claimed_delivery_failed(
+    get_conn,
+    delivery_key,
+    telegram_id,
+    delivery_type,
+    attempt_count,
+    exc,
+    decision,
+    log_failure_func=None,
+    terminal_error_callback=None,
+):
+    if log_failure_func:
+        log_failure_func(delivery_key, delivery_type, attempt_count, exc, decision)
+    fail_conn = get_conn()
+    fail_cur = fail_conn.cursor()
+    try:
+        if decision.get("blocked"):
+            fail_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+        retry_delay = decision.get("retry_delay_minutes")
+        if retry_delay is None and not decision.get("permanently_failed", False):
+            retry_delay = 15
+        mark_delivery_failed(
+            fail_cur,
+            delivery_key,
+            exc,
+            retry_delay_minutes=retry_delay,
+            permanently_failed=decision.get("permanently_failed", False),
+        )
+        fail_conn.commit()
+    finally:
+        fail_cur.close()
+        fail_conn.close()
+
+    if terminal_error_callback and decision.get("permanently_failed"):
+        await terminal_error_callback(exc, decision, attempt_count)
+
+    if decision.get("blocked"):
+        return "blocked"
+    if decision.get("permanently_failed"):
+        return "permanently_failed"
+    return "failed"
