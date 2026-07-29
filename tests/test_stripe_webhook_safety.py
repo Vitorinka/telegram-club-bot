@@ -101,7 +101,7 @@ def stripe_webhook_test_env(secret):
 
 class _FakeBot:
     def __init__(self, *args, **kwargs):
-        pass
+        self.session = type("Session", (), {"close": AsyncMock()})()
 
     async def close(self):
         pass
@@ -111,11 +111,36 @@ class _FakeDispatcher:
     def __init__(self, *args, **kwargs):
         pass
 
-    def message_handler(self, *args, **kwargs):
+    def include_router(self, *args, **kwargs):
+        pass
+
+
+class _FakeObserver:
+    def __call__(self, *args, **kwargs):
         return lambda func: func
 
-    def callback_query_handler(self, *args, **kwargs):
-        return lambda func: func
+    def register(self, *args, **kwargs):
+        pass
+
+
+class _FakeRouter:
+    def __init__(self, *args, **kwargs):
+        self.message = _FakeObserver()
+        self.callback_query = _FakeObserver()
+
+
+class _FakeMagicFilter:
+    def __getattr__(self, name):
+        return self
+
+    def __eq__(self, other):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def in_(self, values):
+        return self
 
 
 class _FakeMarkup:
@@ -136,7 +161,18 @@ class _FakeStatesGroup:
     pass
 
 
-class _FakeBotBlocked(Exception):
+class _FakeTelegramError(Exception):
+    def __init__(self, *args, **kwargs):
+        super().__init__(kwargs.get("message") or (args[0] if args else "telegram error"))
+
+
+class _FakeTelegramRetryAfter(_FakeTelegramError):
+    def __init__(self, *args, retry_after=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.retry_after = retry_after
+
+
+class _FakeTelegramForbiddenError(_FakeTelegramError):
     pass
 
 
@@ -168,6 +204,8 @@ def install_aiogram_import_stubs():
     aiogram = types.ModuleType("aiogram")
     aiogram.Bot = _FakeBot
     aiogram.Dispatcher = _FakeDispatcher
+    aiogram.Router = _FakeRouter
+    aiogram.F = _FakeMagicFilter()
 
     aiogram_types = types.ModuleType("aiogram.types")
     for name in (
@@ -185,30 +223,49 @@ def install_aiogram_import_stubs():
     aiogram_types.ContentType = _FakeContentType
     aiogram.types = aiogram_types
 
-    storage_module = types.ModuleType("aiogram.contrib.fsm_storage.memory")
-    storage_module.MemoryStorage = type("MemoryStorage", (), {"__init__": lambda self, *args, **kwargs: None})
+    new_exceptions_module = types.ModuleType("aiogram.exceptions")
+    new_exceptions_module.TelegramBadRequest = type("TelegramBadRequest", (_FakeTelegramError,), {})
+    new_exceptions_module.TelegramForbiddenError = _FakeTelegramForbiddenError
+    new_exceptions_module.TelegramNetworkError = type("TelegramNetworkError", (_FakeTelegramError,), {})
+    new_exceptions_module.TelegramRetryAfter = _FakeTelegramRetryAfter
 
-    exceptions_module = types.ModuleType("aiogram.utils.exceptions")
-    exceptions_module.BotBlocked = _FakeBotBlocked
+    filters_module = types.ModuleType("aiogram.filters")
+    filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
+    filters_module.CommandObject = type("CommandObject", (), {})
+    filters_module.CommandStart = type("CommandStart", (), {"__init__": lambda self, *args, **kwargs: None})
+    filters_module.StateFilter = type("StateFilter", (), {"__init__": lambda self, *args, **kwargs: None})
 
-    dispatcher_module = types.ModuleType("aiogram.dispatcher")
-    dispatcher_module.FSMContext = type("FSMContext", (), {})
+    fsm_context_module = types.ModuleType("aiogram.fsm.context")
+    fsm_context_module.FSMContext = type("FSMContext", (), {})
+    fsm_state_module = types.ModuleType("aiogram.fsm.state")
+    fsm_state_module.State = _FakeState
+    fsm_state_module.StatesGroup = _FakeStatesGroup
+    fsm_storage_memory_module = types.ModuleType("aiogram.fsm.storage.memory")
+    fsm_storage_memory_module.MemoryStorage = type("MemoryStorage", (), {"__init__": lambda self, *args, **kwargs: None})
 
-    state_module = types.ModuleType("aiogram.dispatcher.filters.state")
-    state_module.State = _FakeState
-    state_module.StatesGroup = _FakeStatesGroup
+    webhook_module = types.ModuleType("aiogram.webhook.aiohttp_server")
+    webhook_module.SimpleRequestHandler = type(
+        "SimpleRequestHandler",
+        (),
+        {
+            "__init__": lambda self, *args, **kwargs: None,
+            "register": lambda self, app, path: app.router.add_post(path, lambda request: None),
+        },
+    )
+    webhook_module.setup_application = lambda *args, **kwargs: None
 
     sys.modules.update({
         "aiogram": aiogram,
         "aiogram.types": aiogram_types,
-        "aiogram.contrib": types.ModuleType("aiogram.contrib"),
-        "aiogram.contrib.fsm_storage": types.ModuleType("aiogram.contrib.fsm_storage"),
-        "aiogram.contrib.fsm_storage.memory": storage_module,
-        "aiogram.utils": types.ModuleType("aiogram.utils"),
-        "aiogram.utils.exceptions": exceptions_module,
-        "aiogram.dispatcher": dispatcher_module,
-        "aiogram.dispatcher.filters": types.ModuleType("aiogram.dispatcher.filters"),
-        "aiogram.dispatcher.filters.state": state_module,
+        "aiogram.filters": filters_module,
+        "aiogram.exceptions": new_exceptions_module,
+        "aiogram.fsm": types.ModuleType("aiogram.fsm"),
+        "aiogram.fsm.context": fsm_context_module,
+        "aiogram.fsm.state": fsm_state_module,
+        "aiogram.fsm.storage": types.ModuleType("aiogram.fsm.storage"),
+        "aiogram.fsm.storage.memory": fsm_storage_memory_module,
+        "aiogram.webhook": types.ModuleType("aiogram.webhook"),
+        "aiogram.webhook.aiohttp_server": webhook_module,
     })
 
 
@@ -441,7 +498,7 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
         start = source.index("async def stripe_webhook(request):")
-        end = source.index("@dp.message_handler(commands=['test_auto_lesson']", start)
+        end = source.index("@router.message(Command('test_auto_lesson')", start)
         webhook_source = source[start:end]
 
         for forbidden in (
@@ -451,6 +508,31 @@ class StripeWebhookSafetyTests(unittest.TestCase):
             "event['data']['object']",
         ):
             self.assertNotIn(forbidden, webhook_source)
+
+    def test_subscription_deleted_db_block_has_rollback_and_finally_close(self):
+        main_py = Path(__file__).resolve().parents[1] / "main.py"
+        source = main_py.read_text()
+        block = source[
+            source.index("elif event_type == 'customer.subscription.deleted'"):
+            source.index("# ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ")
+        ]
+        self.assertIn("conn = None", block)
+        self.assertIn("cur = None", block)
+        self.assertIn("conn.rollback()", block)
+        self.assertIn("finally:", block)
+        self.assertIn("cur.close()", block)
+        self.assertIn("conn.close()", block)
+
+    def test_subscription_updated_live_check_happens_after_read_connection_close(self):
+        main_py = Path(__file__).resolve().parents[1] / "main.py"
+        source = main_py.read_text()
+        block = source[
+            source.index("elif event_type == 'customer.subscription.updated'"):
+            source.index("# ---------- 5. СЕССИЯ ОПЛАТЫ")
+        ]
+        self.assertLess(block.index("conn.close()"), block.index("stripe.Subscription.retrieve"))
+        self.assertIn("conn.rollback()", block)
+        self.assertIn("raise", block)
 
     def test_claim_exception_releases_event_and_reraises(self):
         calls = []

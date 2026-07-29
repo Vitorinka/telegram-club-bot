@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 import os
 import socket
 import uuid
@@ -101,22 +102,108 @@ def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=No
     return row[0] if row else "not_claimed"
 
 
+def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload=None, next_attempt_at=None):
+    payload_json = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
+    cur.execute(
+        """
+        INSERT INTO message_delivery_events (
+            delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
+        )
+        VALUES (%s, %s, %s, 'pending', 0, NULL, %s, COALESCE(%s, NOW()))
+        ON CONFLICT (delivery_key) DO UPDATE SET
+            telegram_id = EXCLUDED.telegram_id,
+            delivery_type = EXCLUDED.delivery_type,
+            payload_json = COALESCE(message_delivery_events.payload_json, EXCLUDED.payload_json),
+            next_attempt_at = COALESCE(message_delivery_events.next_attempt_at, EXCLUDED.next_attempt_at)
+        WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')
+        RETURNING delivery_key
+        """,
+        (delivery_key, int(telegram_id), delivery_type, payload_json, next_attempt_at),
+    )
+    return cur.fetchone() is not None
+
+
+def claim_pending_message_deliveries(cur, limit=25, now=None, lease_minutes=10):
+    now = now or datetime.utcnow()
+    lease_until = now + timedelta(minutes=lease_minutes)
+    cur.execute(
+        """
+        WITH due AS (
+            SELECT delivery_key
+            FROM message_delivery_events
+            WHERE (
+                    status IN ('pending', 'failed')
+                    AND COALESCE(next_attempt_at, NOW()) <= NOW()
+                  )
+               OR (
+                    status = 'processing'
+                    AND lease_until < NOW()
+                  )
+            ORDER BY next_attempt_at NULLS FIRST, delivery_key
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE message_delivery_events
+        SET status = 'processing',
+            attempt_count = attempt_count + 1,
+            claimed_at = %s,
+            lease_until = %s,
+            last_error = NULL
+        WHERE delivery_key IN (SELECT delivery_key FROM due)
+        RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link
+        """,
+        (limit, now, lease_until),
+    )
+    return cur.fetchall()
+
+
 def mark_delivery_sent(cur, delivery_key):
     cur.execute(
-        "UPDATE message_delivery_events SET status = 'sent', sent_at = NOW() WHERE delivery_key = %s",
+        """
+        UPDATE message_delivery_events
+        SET status = 'sent',
+            sent_at = NOW(),
+            lease_until = NULL,
+            next_attempt_at = NULL
+        WHERE delivery_key = %s
+        """,
         (delivery_key,),
     )
 
 
-def mark_delivery_failed(cur, delivery_key, error_text):
+def mark_delivery_failed(cur, delivery_key, error_text, retry_delay_minutes=15, permanently_failed=False):
+    status = "permanently_failed" if permanently_failed else "failed"
+    next_attempt_sql = "NULL" if permanently_failed else "NOW() + (%s * INTERVAL '1 minute')"
+    params = (
+        (status, str(error_text), delivery_key)
+        if permanently_failed
+        else (status, str(error_text), retry_delay_minutes, delivery_key)
+    )
+    cur.execute(
+        f"""
+        UPDATE message_delivery_events
+        SET status = %s,
+            last_error = LEFT(%s, 500),
+            lease_until = NULL,
+            next_attempt_at = {next_attempt_sql}
+        WHERE delivery_key = %s
+        """,
+        params,
+    )
+
+
+def save_delivery_invite_link(cur, delivery_key, invite_link):
     cur.execute(
         """
         UPDATE message_delivery_events
-        SET status = 'failed', last_error = LEFT(%s, 500)
+        SET invite_link = COALESCE(invite_link, %s)
         WHERE delivery_key = %s
+        RETURNING invite_link
         """,
-        (str(error_text), delivery_key),
+        (invite_link, delivery_key),
     )
+    row = cur.fetchone()
+    return row[0] if row else invite_link
 
 
 async def process_claimed_delivery(

@@ -35,7 +35,14 @@ from group_access import (
     mark_bot_invite_link_revoked,
     save_bot_invite_link,
 )
-from scheduled_jobs import claim_message_delivery, claim_scheduled_job, process_claimed_delivery
+from scheduled_jobs import (
+    claim_message_delivery,
+    claim_pending_message_deliveries,
+    claim_scheduled_job,
+    enqueue_message_delivery,
+    mark_delivery_failed,
+    process_claimed_delivery,
+)
 from stripe_invoice_rules import (
     should_apply_subscription_state_update,
     should_live_check_stale_negative_subscription_update,
@@ -177,6 +184,12 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ):
             self.assertIn(needle, MAIN_SOURCE)
 
+    def test_init_db_uses_versioned_migration_runner_before_legacy_ddl(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def init_db"):MAIN_SOURCE.index("# Идемпотентность вебхуков")]
+        self.assertIn("run_migrations(get_db_conn)", source)
+        self.assertLess(source.index("run_migrations(get_db_conn)"), source.index("return"))
+        self.assertLess(source.index("return"), source.index("CREATE TABLE IF NOT EXISTS users"))
+
     def test_process_payment_uses_db_claim_and_stripe_idempotency_key(self):
         self.assertIn("claim_checkout_session_record", MAIN_SOURCE)
         self.assertIn("idempotency_key=checkout_record", MAIN_SOURCE)
@@ -216,7 +229,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
             "duplicate_subscriptions",
             "revoke_invite_links",
         ):
-            marker = f"@dp.message_handler(commands=['{command}']"
+            marker = f"@router.message(Command('{command}')"
             start = MAIN_SOURCE.index(marker)
             snippet = MAIN_SOURCE[start:start + 220]
             self.assertIn("@admin_private_only(ADMIN_IDS)", snippet, command)
@@ -236,6 +249,124 @@ class CriticalBotSafetyTests(unittest.TestCase):
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("message_delivery_events", sql)
         self.assertIn("lease_until < %s", sql)
+
+    def test_message_delivery_outbox_enqueue_is_idempotent(self):
+        cur = FakeCursor(fetches=[("stripe:evt_1:payment_success_notice",)])
+        created = enqueue_message_delivery(
+            cur,
+            "stripe:evt_1:payment_success_notice",
+            1,
+            "stripe_payment_success",
+            {"text": "ok"},
+        )
+        self.assertTrue(created)
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", sql)
+        self.assertIn("WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')", sql)
+        self.assertIn("payload_json", sql)
+
+    def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
+        cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None)]])
+        rows = claim_pending_message_deliveries(cur, limit=5)
+        self.assertEqual(rows[0][0], "stripe:evt_1:payment_success_notice")
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("FOR UPDATE SKIP LOCKED", sql)
+        self.assertIn("status IN ('pending', 'failed')", sql)
+        self.assertIn("status = 'processing'", sql)
+        self.assertIn("lease_until < NOW()", sql)
+        self.assertNotIn("permanently_failed", sql)
+        self.assertIn("RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link", sql)
+
+    def test_permanent_message_delivery_failure_is_terminal(self):
+        cur = FakeCursor()
+        mark_delivery_failed(cur, "stripe:evt_1:notice", "blocked", permanently_failed=True)
+        sql, params = cur.queries[-1]
+        self.assertIn("SET status = %s", sql)
+        self.assertIn("next_attempt_at = NULL", sql)
+        self.assertEqual(params[0], "permanently_failed")
+
+    def test_stripe_delivery_worker_uses_existing_outbox_and_saved_invite_links(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_pending_message_deliveries"):MAIN_SOURCE.index("async def scheduled_process_message_deliveries")]
+        self.assertIn("claim_pending_message_deliveries", source)
+        self.assertIn("save_delivery_invite_link", source)
+        self.assertIn("mark_delivery_sent", source)
+        self.assertIn("mark_delivery_failed", source)
+        self.assertIn("TelegramForbiddenError", source)
+        self.assertIn("blocked_bot = TRUE", source)
+        self.assertLess(source.index("try:"), source.index("payload = json.loads"))
+        self.assertIn("stripe_delivery_reply_markup", source)
+
+    def test_stripe_webhook_user_notifications_are_outbox_only(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        for forbidden in (
+            "bot.send_message",
+            "bot.send_video",
+            "bot.send_photo",
+            "bot.create_chat_invite_link",
+            "generate_invite_link(",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("enqueue_stripe_user_message", source)
+        self.assertIn("enqueue_rejoin_invite_after_payment", source)
+        self.assertIn('stripe_delivery_key(event_id, purpose)', MAIN_SOURCE)
+        for purpose in (
+            "payment_success",
+            "trial_success",
+            "renewal_success",
+            "payment_recovered",
+            "rejoin_invite",
+            "payment_failed",
+            "checkout_expired",
+        ):
+            self.assertIn(purpose, MAIN_SOURCE)
+        rejoin_helper = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def send_rejoin_invite_after_payment"):
+            MAIN_SOURCE.index("def is_undeliverable_user_error")
+        ]
+        for forbidden in (
+            "bot.send_message",
+            "bot.create_chat_invite_link",
+            "generate_invite_link(",
+        ):
+            self.assertNotIn(forbidden, rejoin_helper)
+
+    def test_stripe_webhook_enqueues_user_notifications_before_transaction_commit(self):
+        webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        notification_blocks = (
+            webhook_source[webhook_source.index('purpose = "trial_success"'):],
+            webhook_source[webhook_source.index('notice_marker = "INITIAL_SUBSCRIPTION_NOTICE_SENT"'):],
+            webhook_source[webhook_source.index('"PAYMENT_FAILED_MARKED: telegram_id=%s'):],
+            webhook_source[webhook_source.index("if user_id:\n                    enqueue_stripe_user_message"):],
+        )
+        for block in notification_blocks:
+            self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
+
+        rejoin_blocks = (
+            webhook_source[webhook_source.index("if checkout_access_confirmed:"):],
+            webhook_source[webhook_source.index("if invoice_access_confirmed:\n                        enqueue"):],
+        )
+        for block in rejoin_blocks:
+            self.assertLess(block.index("enqueue_rejoin_invite_after_payment"), block.index("conn.commit()"))
+        checkout_branch = webhook_source[
+            webhook_source.index("has_subscription = bool(sub_id)"):
+            webhook_source.index("elif event_type == 'invoice.payment_succeeded':")
+        ]
+        self.assertNotIn("get_group_member_status_for_payment", checkout_branch)
+        self.assertNotIn("payment_needs_rejoin_invite", webhook_source)
+
+    def test_message_delivery_worker_is_scheduled_with_distributed_lock(self):
+        self.assertIn("async def scheduled_process_message_deliveries", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def scheduled_process_message_deliveries"):MAIN_SOURCE.index("async def on_startup")]
+        self.assertIn("run_scheduled_with_lock", source)
+        self.assertIn('"process_message_deliveries"', source)
+        self.assertIn("five_minute_schedule_slot()", source)
+        startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
+        self.assertIn("scheduled_process_message_deliveries", startup)
+
+    def test_aiogram3_commands_use_command_object_for_args(self):
+        self.assertIn("CommandObject", MAIN_SOURCE)
+        self.assertNotIn("message.get_args()", MAIN_SOURCE)
+        self.assertIn('(command.args or "").split()', MAIN_SOURCE)
 
     def test_stale_negative_event_decisions(self):
         success = datetime(2026, 7, 23, 12, 0)
@@ -273,6 +404,23 @@ class CriticalBotSafetyTests(unittest.TestCase):
             "PRICE_12M",
         ):
             self.assertIn(name, MAIN_SOURCE)
+
+    def test_db_pool_uses_timeouts_and_threaded_pool(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("class PooledDbConnection"):MAIN_SOURCE.index("def init_db")]
+        self.assertIn("ThreadedConnectionPool", source)
+        self.assertIn("connect_timeout=DB_CONNECT_TIMEOUT_SECONDS", source)
+        self.assertIn("statement_timeout", source)
+        self.assertIn("putconn(self._raw_conn)", source)
+        self.assertIn("putconn(self._raw_conn, close=True)", source)
+        self.assertIn("DB_POOL_CONNECTION_ERRORS", source)
+
+    def test_db_pool_health_and_shutdown_are_exposed(self):
+        self.assertIn("def db_pool_health", MAIN_SOURCE)
+        self.assertIn("pool_available", MAIN_SOURCE)
+        self.assertIn("pool_used", MAIN_SOURCE)
+        self.assertIn("connection_errors", MAIN_SOURCE)
+        self.assertIn("close_db_pool()", MAIN_SOURCE[MAIN_SOURCE.index("async def on_shutdown"):])
+        self.assertIn("app.router.add_get('/health', health)", MAIN_SOURCE)
 
     def test_backup_config_decision(self):
         self.assertEqual(backup_decision({})["telegram_enabled"], False)
@@ -388,7 +536,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_process_payment_trial_redeemed_loaded_before_cursor_close(self):
         start = MAIN_SOURCE.index("async def process_payment")
-        end = MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"", start)
+        end = MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"', start)
         source = MAIN_SOURCE[start:end]
         self.assertIn("EXISTS (\n                SELECT 1\n                FROM trial_redemptions", source)
         first_close = source.index("cur.close()")
@@ -514,8 +662,43 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn('telegram_status in ("administrator", "creator")', source)
         self.assertIn("telegram_status_error", source)
 
+    def test_subscription_removal_has_durable_lease_table(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS subscription_removal_events", MAIN_SOURCE)
+        self.assertIn("telegram_removed_at TIMESTAMP", MAIN_SOURCE)
+        self.assertIn("db_finalized_at TIMESTAMP", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def claim_subscription_removal"):MAIN_SOURCE.index("def mark_subscription_removal_status")]
+        self.assertIn("FOR UPDATE", source)
+        self.assertIn("current_lease_until < now", source)
+        self.assertIn('current_status in ("pending", "telegram_failed")', source)
+        self.assertIn('"telegram_removed"', source)
+        self.assertIn("claimed_after_telegram_removed", source)
+        self.assertIn("last_payment_succeeded_at > %s", source)
+        self.assertIn("already_processing", source)
+
+    def test_subscription_removal_closes_db_before_stripe_and_telegram(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
+        self.assertLess(source.index("claim_conn.close()"), source.index("fetch_subscription_removal_user"))
+        self.assertLess(source.index("fetch_subscription_removal_user"), source.index("refresh_active_stripe_subscription"))
+        self.assertLess(source.index("fetch_subscription_removal_user"), source.index("bot.get_chat_member"))
+        self.assertLess(source.index("mark_subscription_removal_short(telegram_id, \"telegram_removed\")"), source.rindex("finalize_subscription_removal_in_db"))
+
+    def test_subscription_removal_kick_failure_does_not_close_access(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
+        failure_pos = source.index("mark_subscription_removal_short(telegram_id, \"telegram_failed\", e)")
+        return_pos = source.index("if status == \"kick_failed\":")
+        finalize_pos = source.rindex("finalize_subscription_removal_in_db")
+        self.assertLess(failure_pos, return_pos)
+        self.assertLess(return_pos, finalize_pos)
+
+    def test_subscription_check_releases_batch_cursor_before_side_effects(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
+        self.assertLess(source.index("conn.close()"), source.index("for (telegram_id, expiry"))
+        self.assertIn("set_subscription_reminder_sent", source)
+        self.assertIn("ban_status = await ban_user_logic(telegram_id)", source)
+        self.assertNotIn("ban_user_logic(telegram_id, cur)", source)
+
     def test_duplicate_subscriptions_uses_live_stripe_list(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['revoke_invite_links']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@router.message(Command('revoke_invite_links')")]
         self.assertIn("stripe.Subscription.list", source)
         self.assertIn("asyncio.to_thread", source)
         self.assertIn("asyncio.Semaphore(5)", source)
@@ -523,10 +706,10 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_bot_invite_links_migration_and_revoke_command(self):
         self.assertIn("CREATE TABLE IF NOT EXISTS bot_invite_links", MAIN_SOURCE)
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@router.message(Command('resolve_checkout')")]
         self.assertIn("load_active_bot_invite_links", source)
         self.assertIn("make_action_request", source)
-        executor = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_revoke_invite_links"):MAIN_SOURCE.index("@dp.callback_query_handler(lambda c: c.data.startswith(\"admin_action:confirm:\"")]
+        executor = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_revoke_invite_links"):MAIN_SOURCE.index('@router.callback_query(F.data.startswith("admin_action:confirm:")')]
         self.assertIn("revoke_chat_invite_link", executor)
         self.assertIn("mark_bot_invite_link_revoked", executor)
         self.assertNotIn("create_chat_invite_link", source)
@@ -544,16 +727,16 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("revoked_at = NOW()", sql)
 
     def test_subscription_checkout_stripe_check_failure_is_fail_closed(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"')]
         self.assertIn("CHECKOUT_CUSTOMER_SUBSCRIPTIONS_CHECK_FAILED", source)
         self.assertIn("Новый subscription Checkout НЕ создан", source)
-        self.assertIn("await state.finish()", source)
+        self.assertIn("await state.clear()", source)
         failure_index = source.index("CHECKOUT_CUSTOMER_SUBSCRIPTIONS_CHECK_FAILED")
         create_index = source.index("stripe.checkout.Session.create")
         self.assertLess(failure_index, create_index)
 
     def test_trial_checkout_not_blocked_by_subscription_fail_closed_guard(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index("@dp.callback_query_handler(text=\"retry_payment\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def process_payment"):MAIN_SOURCE.index('@router.callback_query(F.data == "retry_payment"')]
         self.assertIn("mode = 'payment' if sub_type == \"sub_trial\" else 'subscription'", source)
         self.assertIn("if mode == 'subscription' and stripe_customer_id", source)
         self.assertIn("if mode == 'subscription' and stripe_subscription_id", source)
@@ -581,8 +764,46 @@ class CriticalBotSafetyTests(unittest.TestCase):
     def test_checkout_unique_index_includes_creation_unknown(self):
         self.assertIn("WHERE status IN ('creating', 'creation_unknown', 'open')", MAIN_SOURCE)
 
+    def test_checkout_retry_events_persist_attempts_for_restart_and_replicas(self):
+        self.assertIn("CREATE TABLE IF NOT EXISTS checkout_retry_events", MAIN_SOURCE)
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def register_checkout_attempt"):MAIN_SOURCE.index("async def notify_admins_about_checkout_retry")]
+        self.assertIn("INSERT INTO checkout_retry_events", source)
+        self.assertIn("SELECT COUNT(*)", source)
+        self.assertIn("FROM checkout_retry_events", source)
+        self.assertNotIn("len(retry_state", source)
+
+    def test_checkout_retry_admin_cooldown_is_db_persisted(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def notify_admins_about_checkout_retry"):MAIN_SOURCE.index("def reset_checkout_retry_state_after_success")]
+        self.assertIn("FOR UPDATE", source)
+        self.assertIn("UPDATE checkout_retry_events", source)
+        self.assertIn("last_admin_alert_at < %s", source)
+        self.assertIn("RETURNING username, first_name, last_name", source)
+        self.assertNotIn('retry_state["last_admin_alert_at"]', source)
+
+    def test_checkout_success_resolves_retry_rows_without_deleting_fresh_audit(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def reset_checkout_retry_state_after_success"):MAIN_SOURCE.index("async def send_checkout_open_instruction")]
+        self.assertIn("resolved_at = COALESCE(resolved_at, NOW())", source)
+        self.assertIn("resolved_source = COALESCE(resolved_source, %s)", source)
+        self.assertIn("resolved_at < NOW() - INTERVAL '30 days'", source)
+        self.assertNotIn("DELETE FROM checkout_retry_events\n            WHERE telegram_id = %s", source)
+
+    def test_checkout_cleanup_preserves_active_creating_and_unknown_rows(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("def reset_checkout_retry_state_after_success"):MAIN_SOURCE.index("async def send_checkout_open_instruction")]
+        self.assertIn("DELETE FROM checkout_sessions", source)
+        self.assertIn("status IN ('completed', 'expired', 'failed')", source)
+        self.assertNotIn("'creating'", source)
+        self.assertNotIn("'creation_unknown'", source)
+        self.assertNotIn("'open'", source)
+
+    def test_checkout_retry_memory_is_optional_cache_only(self):
+        register_source = MAIN_SOURCE[MAIN_SOURCE.index("def register_checkout_attempt"):MAIN_SOURCE.index("async def notify_admins_about_checkout_retry")]
+        notify_source = MAIN_SOURCE[MAIN_SOURCE.index("async def notify_admins_about_checkout_retry"):MAIN_SOURCE.index("def reset_checkout_retry_state_after_success")]
+        self.assertLess(register_source.index("INSERT INTO checkout_retry_events"), register_source.index("checkout_retry_state[user_id]"))
+        self.assertIn("row[0] or checkout_retry_state.get", notify_source)
+        self.assertIn("if not row:\n        return", notify_source)
+
     def test_revoke_invite_links_command_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@router.message(Command('resolve_checkout')")]
         self.assertIn("make_action_request", source)
         self.assertIn("admin_action_confirmation_keyboard", source)
         self.assertIn("До подтверждения ссылки не отзываются", source)
@@ -608,7 +829,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertLess(source.index("bot.get_chat_member"), source.index("bot.ban_chat_member"))
 
     def test_followup_uses_per_user_delivery_claim(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def send_free_lesson_followup"):MAIN_SOURCE.index("@dp.message_handler(\n    content_types")]
+        start = MAIN_SOURCE.index("async def send_free_lesson_followup")
+        source = MAIN_SOURCE[start:MAIN_SOURCE.index("@router.message(F.content_type.in_([", start)]
         self.assertIn("process_claimed_delivery", source)
         self.assertIn("free_lesson_followup", source)
         self.assertIn("feedback_sent = TRUE", source)
@@ -619,7 +841,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("conn.commit()\n\n        logging.info", source)
 
     def test_duplicate_subscriptions_closes_db_before_stripe_gather(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['revoke_invite_links']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def duplicate_subscriptions_command"):MAIN_SOURCE.index("@router.message(Command('revoke_invite_links')")]
         self.assertLess(source.index("cur.close()"), source.index("await asyncio.gather"))
         self.assertLess(source.index("await asyncio.gather"), source.rindex("conn = get_db_conn()"))
 
@@ -630,7 +852,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("пропущен из-за активного grace_period_end={fmt_report_dt(grace_end)}\"\n                )\n                continue", source)
 
     def test_give_access_handler_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def give_access_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['set_expiry']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def give_access_command"):MAIN_SOURCE.index("@router.message(Command('set_expiry')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("INSERT INTO users", source)
@@ -639,7 +861,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("bot.send_message", source)
 
     def test_set_expiry_handler_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def set_expiry_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['remove_user']") if "@dp.message_handler(commands=['remove_user']" in MAIN_SOURCE else MAIN_SOURCE.index("@dp.message_handler(commands=['sync_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def set_expiry_command"):MAIN_SOURCE.index("@router.message(Command('sync_stripe_user')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("INSERT INTO users", source)
@@ -648,7 +870,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_link_stripe_user_handler_is_confirm_only(self):
         link_start = MAIN_SOURCE.index("async def link_stripe_user_command")
-        next_handler = MAIN_SOURCE.find("\n@dp.message_handler", link_start + 1)
+        next_handler = MAIN_SOURCE.find("\n@router.message", link_start + 1)
         source = MAIN_SOURCE[link_start:next_handler]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
@@ -668,7 +890,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn('action_type == "link_stripe_user"', source)
 
     def test_admin_confirm_callback_closes_claim_connection_before_action(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def admin_action_confirm_callback"):MAIN_SOURCE.index("@dp.callback_query_handler(lambda c: c.data.startswith(\"admin_action:cancel:\"")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def admin_action_confirm_callback"):MAIN_SOURCE.index('@router.callback_query(F.data.startswith("admin_action:cancel:")')]
         self.assertLess(source.index("conn.close()"), source.index("execute_confirmed_admin_action"))
         self.assertIn("complete_conn = get_db_conn()", source)
         self.assertIn("fail_conn = get_db_conn()", source)
@@ -830,7 +1052,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("stripe.checkout.Session.create", source)
 
     def test_resolve_checkout_command_is_confirm_only(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def resolve_checkout_command"):MAIN_SOURCE.index("@dp.message_handler(commands=['link_stripe_user']")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def resolve_checkout_command"):MAIN_SOURCE.index("@router.message(Command('link_stripe_user')")]
         self.assertIn("make_action_request", source)
         self.assertIn("send_admin_action_confirmation", source)
         self.assertNotIn("UPDATE checkout_sessions", source)
@@ -846,7 +1068,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_set_expiry"):MAIN_SOURCE.index("async def perform_link_stripe_user")]
         self.assertIn("user_is_current_group_member", source)
         self.assertIn("generate_invite_link", source)
-        self.assertIn("BotBlocked", source)
+        self.assertIn("TelegramForbiddenError", source)
         self.assertIn("mark_user_blocked_bot", source)
         self.assertIn("completed_with_warning", MAIN_SOURCE)
 
