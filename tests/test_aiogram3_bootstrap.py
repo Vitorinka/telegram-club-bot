@@ -271,7 +271,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(app, web.Application)
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 50)
+        self.assertEqual(len(self.main.router.message.handlers), 52)
         self.assertEqual(len(self.main.router.callback_query.handlers), 19)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -303,7 +303,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 50)
+        self.assertEqual(len(message_handlers), 52)
         self.assertEqual(len(callback_handlers), 19)
         self.assertEqual(
             commands,
@@ -311,7 +311,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "promo_trial", "cancel", "menu", "ask", "start", "profile",
                 "send_user", "broadcast", "give_access", "set_expiry", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
-                "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
+                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
                 "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
                 "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
@@ -373,7 +373,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         retry_after = TelegramRetryAfter(method=None, message="Too Many Requests", retry_after=125)
 
         self.assertTrue(self.main.is_undeliverable_user_error(forbidden))
-        self.assertFalse(self.main.is_undeliverable_user_error(bad_request))
+        self.assertTrue(self.main.is_undeliverable_user_error(bad_request))
         self.assertFalse(self.main.is_undeliverable_user_error(network))
         self.assertFalse(self.main.is_undeliverable_user_error(retry_after))
         self.assertEqual(self.main.telegram_retry_delay_minutes(retry_after, attempt_count=1), 3)
@@ -409,7 +409,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 
         for error, expected_delay in (
-            (TelegramBadRequest(method=None, message="chat not found"), 5),
+            (TelegramBadRequest(method=None, message="message is not modified"), 5),
             (TelegramNetworkError(method=None, message="network down"), 5),
             (TelegramRetryAfter(method=None, message="retry later", retry_after=125), 3),
         ):
@@ -607,7 +607,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(notify_admins.await_count, 1)
         alert_text = notify_admins.await_args_list[0].args[0]
         self.assertNotIn("evt_group_limit_secret", alert_text)
-        self.assertIn("evt_***secret", alert_text)
+        self.assertIn("delivery_hash:", alert_text)
+        self.assertNotIn("evt_***secret", alert_text)
 
     async def test_rejoin_unban_bot_not_administrator_is_not_benign(self):
         from aiogram.exceptions import TelegramBadRequest

@@ -3,6 +3,7 @@ import logging
 import asyncio
 import io
 import json
+import hashlib
 import shutil
 import stripe
 import psycopg2
@@ -800,6 +801,33 @@ def safe_log_url(value):
     return redact_url(value) or "нет"
 
 
+def safe_delivery_hash(delivery_key):
+    return hashlib.sha256(str(delivery_key).encode("utf-8")).hexdigest()[:16] if delivery_key else "нет"
+
+
+def safe_error_category(error_text):
+    if not error_text:
+        return "нет"
+    text = str(error_text).lower()
+    if "free_lesson_video_id" in text or "video_id" in text:
+        return "free_lesson_video_missing"
+    if "forbidden" in text or "blocked" in text:
+        return "telegram_forbidden"
+    if "retry" in text or "too many requests" in text:
+        return "telegram_retry_after"
+    if "network" in text or "timeout" in text:
+        return "telegram_network"
+    if "bad request" in text or "chat not found" in text:
+        return "telegram_bad_request"
+    if "delivery text missing" in text:
+        return "payload_missing"
+    return "other"
+
+
+def fmt_outbox_dt(value):
+    return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
+
+
 def stripe_period_to_datetime(period_end):
     return datetime.utcfromtimestamp(period_end) if period_end else None
 
@@ -1563,6 +1591,47 @@ def split_telegram_text(text, limit=4096):
 
 
 async def notify_admins(text: str, alert_key=None, severity="WARNING"):
+    dedupe_key = alert_key or (f"critical:{safe_log_id(text)}" if severity == "CRITICAL" else None)
+    claim_id = None
+    if dedupe_key:
+        conn = None
+        cur = None
+        try:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO admin_alerts (alert_key, severity, text, status, delivered_admin_ids)
+                SELECT %s, %s, %s, 'claimed', ''
+                WHERE pg_try_advisory_xact_lock(hashtext(%s))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM admin_alerts
+                      WHERE alert_key = %s
+                        AND created_at > NOW() - INTERVAL '15 minutes'
+                        AND status IN ('claimed', 'delivered', 'partial', 'failed')
+                  )
+                RETURNING id
+                """,
+                (dedupe_key, severity, str(text)[:4000], dedupe_key, dedupe_key),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                logging.info("ADMIN_ALERT_DEDUPED: alert_key=%s, severity=%s", safe_log_id(dedupe_key), severity)
+                return {"delivered": [], "failed": [], "deduped": True}
+            claim_id = row[0]
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logging.error("ADMIN_ALERT_CLAIM_FAILED: alert_key=%s, severity=%s, error=%s", safe_log_id(dedupe_key), severity, str(e), exc_info=True)
+            if severity != "CRITICAL":
+                return {"delivered": [], "failed": [], "claim_failed": True}
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
     delivered = []
     failed = []
     for admin_id in ADMIN_IDS:
@@ -1574,36 +1643,38 @@ async def notify_admins(text: str, alert_key=None, severity="WARNING"):
         except Exception as e:
             failed.append(admin_id)
             logging.error("NOTIFY_ADMINS_FAILED: admin_id=%s, error=%s", admin_id, str(e), exc_info=True)
-    if alert_key or severity == "CRITICAL":
-        conn = get_db_conn()
-        cur = conn.cursor()
+
+    if claim_id:
+        conn = None
+        cur = None
         try:
+            conn = get_db_conn()
+            cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO admin_alerts (alert_key, severity, text, status, delivered_admin_ids)
-                SELECT %s, %s, %s, %s, %s
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM admin_alerts
-                    WHERE alert_key = %s
-                      AND created_at > NOW() - INTERVAL '15 minutes'
-                )
+                UPDATE admin_alerts
+                SET status = %s,
+                    delivered_admin_ids = %s,
+                    updated_at = NOW()
+                WHERE id = %s
                 """,
                 (
-                    alert_key,
-                    severity,
-                    str(text)[:4000],
                     "delivered" if delivered and not failed else "partial" if delivered else "failed",
                     ",".join(str(x) for x in delivered),
-                    alert_key,
+                    claim_id,
                 ),
             )
             conn.commit()
         except Exception as e:
-            conn.rollback()
-            logging.error("ADMIN_ALERT_SAVE_FAILED: alert_key=%s, error=%s", alert_key, str(e), exc_info=True)
+            if conn:
+                conn.rollback()
+            logging.error("ADMIN_ALERT_RESULT_SAVE_FAILED: alert_id=%s, error=%s", claim_id, str(e), exc_info=True)
         finally:
-            cur.close()
-            conn.close()
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
     return {"delivered": delivered, "failed": failed}
 
 
@@ -2177,7 +2248,7 @@ async def send_rejoin_invite_after_payment(telegram_id, expiry_date, source, str
 def is_undeliverable_user_error(error):
     if is_telegram_forbidden_error(error):
         return True
-    if is_telegram_bad_request_error(error) or is_telegram_temporary_error(error):
+    if is_telegram_temporary_error(error):
         return False
 
     error_text = str(error).lower()
@@ -2190,6 +2261,104 @@ def is_undeliverable_user_error(error):
         "forbidden",
     )
     return any(marker in error_text for marker in undeliverable_markers)
+
+
+OUTBOX_UNKNOWN_FAILURE_LIMIT = 10
+OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT = 3
+OUTBOX_BAD_REQUEST_RETRY_LIMIT = 5
+
+
+class MissingFreeLessonVideoError(RuntimeError):
+    pass
+
+
+def clean_error_reason(error, limit=180):
+    text = " ".join(str(error).replace("\n", " ").replace("\r", " ").split())
+    return text[:limit] if text else type(error).__name__
+
+
+def classify_delivery_error(error, attempt_count=1, sending_user_message=True):
+    if isinstance(error, MissingFreeLessonVideoError):
+        permanently_failed = int(attempt_count) >= OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT
+        return {
+            "blocked": False,
+            "retryable": not permanently_failed,
+            "permanently_failed": permanently_failed,
+            "retry_delay_minutes": telegram_retry_delay_minutes(error, attempt_count),
+            "reason": "free_lesson_video_id_missing",
+        }
+
+    if isinstance(error, TelegramForbiddenError):
+        if sending_user_message:
+            return {
+                "blocked": True,
+                "retryable": False,
+                "permanently_failed": True,
+                "retry_delay_minutes": None,
+                "reason": "telegram_forbidden_user_delivery",
+            }
+        permanently_failed = int(attempt_count) >= REJOIN_GROUP_PERMISSION_FAILURE_LIMIT
+        return {
+            "blocked": False,
+            "retryable": not permanently_failed,
+            "permanently_failed": permanently_failed,
+            "retry_delay_minutes": None if permanently_failed else telegram_retry_delay_minutes(error, attempt_count),
+            "reason": "telegram_forbidden_group_stage",
+        }
+
+    if isinstance(error, TelegramRetryAfter):
+        return {
+            "blocked": False,
+            "retryable": True,
+            "permanently_failed": False,
+            "retry_delay_minutes": telegram_retry_delay_minutes(error, attempt_count),
+            "reason": "telegram_retry_after",
+        }
+
+    if isinstance(error, TelegramNetworkError):
+        return {
+            "blocked": False,
+            "retryable": True,
+            "permanently_failed": False,
+            "retry_delay_minutes": telegram_retry_delay_minutes(error, attempt_count),
+            "reason": "telegram_network_error",
+        }
+
+    if isinstance(error, TelegramBadRequest):
+        undeliverable = sending_user_message and is_undeliverable_user_error(error)
+        permanently_failed = undeliverable or int(attempt_count) >= OUTBOX_BAD_REQUEST_RETRY_LIMIT
+        return {
+            "blocked": bool(undeliverable),
+            "retryable": not permanently_failed,
+            "permanently_failed": permanently_failed,
+            "retry_delay_minutes": None if permanently_failed else telegram_retry_delay_minutes(error, attempt_count),
+            "reason": "telegram_bad_request_terminal" if permanently_failed else "telegram_bad_request_retryable",
+        }
+
+    permanently_failed = int(attempt_count) >= OUTBOX_UNKNOWN_FAILURE_LIMIT
+    return {
+        "blocked": False,
+        "retryable": not permanently_failed,
+        "permanently_failed": permanently_failed,
+        "retry_delay_minutes": None if permanently_failed else telegram_retry_delay_minutes(error, attempt_count),
+        "reason": "unknown_error_limit_reached" if permanently_failed else "unknown_error_retryable",
+    }
+
+
+def log_outbox_delivery_failure(delivery_key, delivery_type, attempt_count, error, decision):
+    delay = decision.get("retry_delay_minutes")
+    logging.warning(
+        "OUTBOX_DELIVERY_FAILED: delivery_type=%s, attempt_count=%s, delivery_key_hash=%s, "
+        "error_class=%s, reason=%s, retryable=%s, permanent=%s, next_retry_delay=%s",
+        delivery_type,
+        attempt_count,
+        safe_delivery_hash(delivery_key),
+        type(error).__name__,
+        clean_error_reason(decision.get("reason") or error),
+        bool(decision.get("retryable")),
+        bool(decision.get("permanently_failed")),
+        f"{delay}m" if delay is not None else "none",
+    )
 
 
 # --- АВТОМАТИЧЕСКАЯ ПРОВЕРКА ПОДПИСОК (КРОН) ---
@@ -3978,56 +4147,65 @@ async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
 @router.message(F.text == "🎁 Бесплатный урок", StateFilter('*'))
 async def free_lesson_button(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-
+    user_id = int(message.from_user.id)
+    show_trial = True
     conn = get_db_conn()
     cur = conn.cursor()
-
     try:
         cur.execute("""
             INSERT INTO users (telegram_id, paid)
             VALUES (%s, FALSE)
             ON CONFLICT (telegram_id) DO NOTHING
         """, (user_id,))
-
         cur.execute("""
             SELECT video_sent, paid, trial_used
             FROM users
             WHERE telegram_id = %s
         """, (user_id,))
-
         row = cur.fetchone()
-
         video_sent = row[0] if row else False
         paid = row[1] if row else False
         trial_used = row[2] if row else False
-
         show_trial = not (paid or trial_used)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
-        if video_sent:
-            conn.commit()
-            kb = get_tariffs_keyboard(show_trial=show_trial)
+    if video_sent:
+        await message.answer(
+            "✅ Вы уже получали бесплатный урок.\n\n"
+            "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:",
+            reply_markup=get_tariffs_keyboard(show_trial=show_trial)
+        )
+        return
 
-            await message.answer(
-                "✅ Вы уже получали бесплатный урок.\n\n"
-                "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:",
-                reply_markup=kb
-            )
-            return
+    result = await process_claimed_delivery(
+        get_db_conn,
+        f"free_lesson:{user_id}",
+        user_id,
+        "free_lesson",
+        lambda: send_free_lesson_delivery(user_id, {"variant": "manual"}),
+        blocked_exc=(TelegramForbiddenError,),
+    )
+    if result in ("already_sent", "already_processing"):
+        logging.info("FREE_LESSON_DELIVERY_SKIPPED: user_id=%s, status=%s", safe_log_id(user_id), result)
+        return
+    if result != "sent":
+        await message.answer(
+            "❌ Не удалось отправить бесплатный урок. Попробуйте позже или напишите @re_tasha.",
+            reply_markup=get_main_keyboard()
+        )
 
-        video_id = os.getenv("FREE_LESSON_VIDEO_ID")
+def get_free_lesson_feedback_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="Хочу в клуб", callback_data="feedback_join")],
+        [InlineKeyboardButton(text="Задать вопрос", callback_data="feedback_question")],
+        [InlineKeyboardButton(text="Пока думаю", callback_data="feedback_think")],
+    ])
 
-        if not video_id:
-            conn.commit()
-            await message.answer(
-                "🎁 Бесплатный урок скоро появится здесь.\n\n"
-                "Пока вы можете посмотреть тарифы и выбрать удобный формат участия.",
-                reply_markup=get_tariffs_keyboard(show_trial=show_trial)
-            )
-            await notify_admins("FREE_LESSON_VIDEO_ID не задан в Railway Variables.")
-            return
-
-        caption_text = """<b>Чтобы почувствовать изменения в теле и самочувствии, не нужно усложнять.</b>
+def get_manual_free_lesson_caption():
+    return """<b>Чтобы почувствовать изменения в теле и самочувствии, не нужно усложнять.</b>
 
 Для того чтобы уменьшить напряжение, скованность и дискомфорт в теле, не нужен зал, сложное оборудование и час свободного времени. Иногда достаточно коврика и 15 минут правильного движения.
 
@@ -4045,68 +4223,9 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
 
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
-        kb = inline_keyboard([[
-            InlineKeyboardButton(text="Хочу в клуб", callback_data="sub_trial")
-        ]])
 
-        delivery_key = f"free_lesson:{user_id}"
-        delivery_claim = claim_message_delivery(cur, delivery_key, user_id, "free_lesson")
-        conn.commit()
-        if delivery_claim in ("already_sent", "already_processing"):
-            logging.info("FREE_LESSON_DELIVERY_SKIPPED: user_id=%s, status=%s", user_id, delivery_claim)
-            return
-
-        await bot.send_video(
-            chat_id=message.chat.id,
-            video=video_id,
-            caption=caption_text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-
-        cur.execute("""
-            UPDATE users
-            SET video_sent = TRUE,
-                video_sent_at = NOW()
-            WHERE telegram_id = %s
-        """, (user_id,))
-        mark_delivery_sent(cur, delivery_key)
-
-        conn.commit()
-
-    except Exception as e:
-        conn.rollback()
-        try:
-            if "delivery_key" in locals():
-                mark_delivery_failed(cur, delivery_key, e)
-                conn.commit()
-        except Exception:
-            conn.rollback()
-        logging.error(f"Ошибка free_lesson_button для {user_id}: {e}")
-        await message.answer(
-            "❌ Не удалось отправить бесплатный урок. Попробуйте позже или напишите @re_tasha.",
-            reply_markup=get_main_keyboard()
-        )
-
-    finally:
-        cur.close()
-        conn.close()
-
-def get_free_lesson_feedback_keyboard():
-    return inline_keyboard([
-        [InlineKeyboardButton(text="Хочу в клуб", callback_data="feedback_join")],
-        [InlineKeyboardButton(text="Задать вопрос", callback_data="feedback_question")],
-        [InlineKeyboardButton(text="Пока думаю", callback_data="feedback_think")],
-    ])
-
-async def send_auto_free_lesson(user_id, cur=None):
-    video_id = os.getenv("FREE_LESSON_VIDEO_ID")
-
-    if not video_id:
-        await notify_admins("FREE_LESSON_VIDEO_ID не задан в Railway Variables. Автоурок не отправлен.")
-        return False
-
-    caption_text = """<b>Я подготовила для вас бесплатную пробную тренировку.</b>
+def get_auto_free_lesson_caption():
+    return """<b>Я подготовила для вас бесплатную пробную тренировку.</b>
 
 Иногда, чтобы почувствовать больше легкости, подвижности и контакта с телом, не нужен зал, сложное оборудование и час свободного времени. Достаточно коврика и 15 минут правильного движения.
 
@@ -4119,18 +4238,49 @@ async def send_auto_free_lesson(user_id, cur=None):
 
 Если вам понравится такой подход, вы сможете попробовать онлайн-клуб и получить доступ к полноценным тренировкам, зарядкам, дыхательным практикам, рецептам и поддержке."""
 
-    kb = inline_keyboard([[
+
+def get_free_lesson_join_keyboard():
+    return inline_keyboard([[
         InlineKeyboardButton(text="Хочу в клуб", callback_data="sub_trial")
     ]])
 
+
+def get_free_lesson_followup_text():
+    return (
+        "Как ощущения после пробной тренировки?\n\n"
+        "Удалось почувствовать больше легкости, подвижности или контакта с телом?\n\n"
+        "Если вам откликнулся такой формат, вы можете продолжить занятия в клубе: "
+        "там собраны тренировки, зарядки, дыхательные практики, рецепты и поддержка.\n\n"
+        "Выберите, что вам сейчас ближе:"
+    )
+
+
+async def send_free_lesson_delivery(user_id, payload=None):
+    video_id = os.getenv("FREE_LESSON_VIDEO_ID")
+    if not video_id:
+        raise MissingFreeLessonVideoError("FREE_LESSON_VIDEO_ID missing for free_lesson")
+    payload = payload or {}
+    caption = get_manual_free_lesson_caption() if payload.get("variant") == "manual" else get_auto_free_lesson_caption()
+    await bot.send_video(
+        chat_id=int(user_id),
+        video=video_id,
+        caption=caption,
+        reply_markup=get_free_lesson_join_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+async def send_free_lesson_followup_delivery(user_id, payload=None):
+    await bot.send_message(
+        int(user_id),
+        get_free_lesson_followup_text(),
+        reply_markup=get_free_lesson_feedback_keyboard(),
+    )
+
+
+async def send_auto_free_lesson(user_id, cur=None):
     async def send_video_once():
-        await bot.send_video(
-            chat_id=int(user_id),
-            video=video_id,
-            caption=caption_text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        await send_free_lesson_delivery(user_id, {})
 
     result = await process_claimed_delivery(
         get_db_conn,
@@ -4163,6 +4313,10 @@ async def check_auto_free_lessons():
         """)
 
         users = cur.fetchall()
+        cur.close()
+        conn.close()
+        cur = None
+        conn = None
 
         sent = 0
         blocked = 0
@@ -4214,25 +4368,15 @@ async def check_auto_free_lessons():
         logging.error(f"Ошибка check_auto_free_lessons: {e}")
 
     finally:
-        cur.close()
-        conn.close()
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 async def send_free_lesson_followup(user_id, cur=None):
-    text = (
-        "Как ощущения после пробной тренировки?\n\n"
-        "Удалось почувствовать больше легкости, подвижности или контакта с телом?\n\n"
-        "Если вам откликнулся такой формат, вы можете продолжить занятия в клубе: "
-        "там собраны тренировки, зарядки, дыхательные практики, рецепты и поддержка.\n\n"
-        "Выберите, что вам сейчас ближе:"
-    )
-
     async def send_followup_once():
-        await bot.send_message(
-            int(user_id),
-            text,
-            reply_markup=get_free_lesson_feedback_keyboard()
-        )
+        await send_free_lesson_followup_delivery(user_id, {})
 
     result = await process_claimed_delivery(
         get_db_conn,
@@ -4250,7 +4394,7 @@ async def send_free_lesson_followup(user_id, cur=None):
         success_update_params=(int(user_id),),
     )
     if result in ("already_sent", "already_processing"):
-        logging.info("FREE_LESSON_FOLLOWUP_DELIVERY_SKIPPED: user_id=%s, status=%s", user_id, result)
+        logging.info("FREE_LESSON_FOLLOWUP_DELIVERY_SKIPPED: user_id=%s, status=%s", safe_log_id(user_id), result)
     return result == "sent"
 
 @router.message(F.content_type.in_([
@@ -6122,6 +6266,164 @@ async def recent_access_events_command(message: types.Message):
         cur.close()
         conn.close()
 
+@router.message(Command('outbox_status'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def outbox_status_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT status, COUNT(*)
+            FROM message_delivery_events
+            GROUP BY status
+        """)
+        status_counts = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute("""
+            SELECT delivery_type, status, COUNT(*)
+            FROM message_delivery_events
+            GROUP BY delivery_type, status
+            ORDER BY delivery_type, status
+        """)
+        type_counts = cur.fetchall()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE status = 'sent'
+              AND sent_at >= NOW() - INTERVAL '24 hours'
+        """)
+        sent_24h = cur.fetchone()[0]
+        cur.execute("""
+            SELECT EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(next_attempt_at, claimed_at))))::BIGINT
+            FROM message_delivery_events
+            WHERE status IN ('pending', 'failed')
+        """)
+        oldest_age_seconds = cur.fetchone()[0]
+        cur.execute("""
+            SELECT MIN(next_attempt_at)
+            FROM message_delivery_events
+            WHERE status IN ('pending', 'failed')
+              AND next_attempt_at IS NOT NULL
+        """)
+        next_attempt = cur.fetchone()[0]
+        cur.execute("SELECT COALESCE(MAX(attempt_count), 0) FROM message_delivery_events")
+        max_attempt_count = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE status = 'processing'
+              AND lease_until < NOW()
+        """)
+        stale_processing = cur.fetchone()[0]
+        cur.execute("""
+            SELECT last_error
+            FROM message_delivery_events
+            WHERE last_error IS NOT NULL
+            ORDER BY COALESCE(claimed_at, next_attempt_at, sent_at) DESC NULLS LAST
+            LIMIT 1
+        """)
+        last_error_row = cur.fetchone()
+        cur.execute("""
+            SELECT delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, next_attempt_at
+            FROM message_delivery_events
+            WHERE status IN ('failed', 'permanently_failed')
+            ORDER BY COALESCE(next_attempt_at, claimed_at) ASC NULLS LAST
+            LIMIT 10
+        """)
+        failed_rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    oldest_age_text = f"{int(oldest_age_seconds // 60)} мин." if oldest_age_seconds else "нет"
+    lines = [
+        "📦 Outbox status",
+        "",
+        f"pending: {status_counts.get('pending', 0)}",
+        f"processing: {status_counts.get('processing', 0)}",
+        f"failed/retry: {status_counts.get('failed', 0)}",
+        f"permanently_failed: {status_counts.get('permanently_failed', 0)}",
+        f"sent за 24 часа: {sent_24h}",
+        f"stale processing: {stale_processing}",
+        f"oldest pending/failed age: {oldest_age_text}",
+        f"nearest next_attempt_at: {fmt_outbox_dt(next_attempt)}",
+        f"maximum attempt_count: {max_attempt_count}",
+        f"latest error category: {safe_error_category(last_error_row[0] if last_error_row else None)}",
+        "",
+        "By delivery_type:",
+    ]
+    lines.extend([f"{delivery_type}/{status}: {count}" for delivery_type, status, count in type_counts])
+    if failed_rows:
+        lines.extend(["", "Failed deliveries для retry:"])
+        for delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, next_attempt_at in failed_rows:
+            lines.extend([
+                f"hash: {safe_delivery_hash(delivery_key)}",
+                f"type: {delivery_type}",
+                f"status: {status}",
+                f"telegram_id: {safe_log_id(telegram_id)}",
+                f"attempt_count: {attempt_count}",
+                f"next_attempt_at: {fmt_outbox_dt(next_attempt_at)}",
+                f"error_category: {safe_error_category(last_error)}",
+                "",
+            ])
+    text = "\n".join(lines).strip()
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    await message.answer(text)
+
+
+@router.message(Command('retry_delivery'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def retry_delivery_command(message: types.Message, command: CommandObject):
+    args = (command.args or "").split()
+    if len(args) != 1:
+        await message.reply("⚠️ Использование: /retry_delivery <delivery_hash>")
+        return
+    requested_hash = args[0].strip().lower()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, next_attempt_at
+            FROM message_delivery_events
+            WHERE status IN ('failed', 'permanently_failed')
+            ORDER BY COALESCE(next_attempt_at, claimed_at) ASC NULLS LAST
+            LIMIT 500
+        """)
+        candidates = cur.fetchall()
+        matched = [row for row in candidates if safe_delivery_hash(row[0]) == requested_hash]
+        if not matched:
+            await message.reply("❌ Delivery не найден или не подходит для retry.")
+            return
+        if len(matched) > 1:
+            await message.reply("⚠️ Найдено несколько delivery с таким hash. Retry отменен.")
+            return
+        delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, next_attempt_at = matched[0]
+        payload = {
+            "delivery_key": delivery_key,
+            "delivery_hash": requested_hash,
+            "admin_id": message.from_user.id,
+        }
+        action_id = make_action_request(cur, message.from_user.id, "retry_delivery", payload)
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+    await send_admin_action_confirmation(
+        message,
+        action_id,
+        "Повторить одну outbox-доставку?\n\n"
+        f"delivery_hash: {requested_hash}\n"
+        f"delivery_type: {delivery_type}\n"
+        f"status: {status}\n"
+        f"telegram_id: {safe_log_id(telegram_id)}\n"
+        f"attempt_count: {attempt_count}\n"
+        f"next_attempt_at: {fmt_outbox_dt(next_attempt_at)}\n"
+        f"last_error_category: {safe_error_category(last_error)}\n\n"
+        "После Confirm команда только вернет delivery в очередь. Worker отправит сообщение сам."
+    )
+
+
 @router.message(Command('find_by_stripe'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def find_by_stripe_command(message: types.Message, command: CommandObject):
@@ -6287,6 +6589,14 @@ async def bot_health_command(message: types.Message):
         "last_24h": "нет",
         "last_event": "нет"
     }
+    outbox_stats = {
+        "pending": "нет",
+        "processing": "нет",
+        "failed": "нет",
+        "permanently_failed": "нет",
+        "stale_processing": "нет",
+        "sent_24h": "нет",
+    }
     conn = None
     cur = None
 
@@ -6334,6 +6644,30 @@ async def bot_health_command(message: types.Message):
               AND processed_at < NOW() - INTERVAL '10 minutes'
         """)
         stale_processing_events = cur.fetchone()[0]
+        cur.execute("""
+            SELECT status, COUNT(*)
+            FROM message_delivery_events
+            GROUP BY status
+        """)
+        delivery_status_counts = {row[0]: row[1] for row in cur.fetchall()}
+        outbox_stats["pending"] = delivery_status_counts.get("pending", 0)
+        outbox_stats["processing"] = delivery_status_counts.get("processing", 0)
+        outbox_stats["failed"] = delivery_status_counts.get("failed", 0)
+        outbox_stats["permanently_failed"] = delivery_status_counts.get("permanently_failed", 0)
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE status = 'processing'
+              AND lease_until < NOW()
+        """)
+        outbox_stats["stale_processing"] = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE status = 'sent'
+              AND sent_at >= NOW() - INTERVAL '24 hours'
+        """)
+        outbox_stats["sent_24h"] = cur.fetchone()[0]
     except Exception as e:
         db_status = f"ERROR: {e}"
         logging.error(f"Ошибка bot_health_command: {e}")
@@ -6374,6 +6708,18 @@ async def bot_health_command(message: types.Message):
         f"Stale processing Stripe events: {stale_processing_events}\n"
         f"Scheduler jobs: {len(scheduler.get_jobs())}\n"
         f"Owner: {OWNER_ID}\n\n"
+        "DB pool:\n"
+        f"used: {db_pool_health()['pool_used']}\n"
+        f"available: {db_pool_health()['pool_available']}\n"
+        f"connection errors: {db_pool_health()['connection_errors']}\n"
+        f"statement timeout: {db_pool_health()['statement_timeout_ms']} ms\n\n"
+        "Outbox:\n"
+        f"pending: {outbox_stats['pending']}\n"
+        f"processing: {outbox_stats['processing']}\n"
+        f"failed/retry: {outbox_stats['failed']}\n"
+        f"permanently_failed: {outbox_stats['permanently_failed']}\n"
+        f"stale processing: {outbox_stats['stale_processing']}\n"
+        f"sent за 24 часа: {outbox_stats['sent_24h']}\n\n"
         "Users:\n"
         f"Всего пользователей: {user_stats['total']}\n"
         f"paid=True: {user_stats['paid']}\n"
@@ -6465,6 +6811,8 @@ ADMIN_MENU_SECTIONS = {
         "commands": [
             "/access_history <telegram_id>",
             "/recent_access_events",
+            "/outbox_status — состояние outbox доставок",
+            "/retry_delivery <delivery_hash> — повторить одну failed/permanently_failed доставку через worker",
             "/find_by_stripe <stripe_id>",
         ],
     },
@@ -6474,6 +6822,8 @@ ADMIN_MENU_SECTIONS = {
         "danger": True,
         "commands": [
             "/test_backup — backup",
+            "/outbox_status — состояние outbox доставок",
+            "/retry_delivery <delivery_hash> — подготовить retry одной outbox-доставки",
             "Отправь боту фото или видео от имени админа — бот ответит file_id",
             "/admin_help — список всех команд",
         ],
@@ -9454,6 +9804,39 @@ async def stripe_links_command(message: types.Message, command: CommandObject):
         conn.close()
 
 
+async def execute_confirmed_retry_delivery(payload):
+    delivery_key = payload.get("delivery_key")
+    if not delivery_key:
+        raise ValueError("Missing delivery_key")
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE message_delivery_events
+            SET status = 'failed',
+                next_attempt_at = NOW(),
+                lease_until = NULL,
+                last_error = LEFT(COALESCE(last_error, '') || '; admin_retry_requested', 500)
+            WHERE delivery_key = %s
+              AND status IN ('failed', 'permanently_failed')
+            RETURNING delivery_type, telegram_id, status
+        """, (delivery_key,))
+        row = cur.fetchone()
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    if not row:
+        raise ValueError("Delivery is not retryable or already sent")
+    return {
+        "status": "completed",
+        "delivery_hash": safe_delivery_hash(delivery_key),
+        "delivery_type": row[0],
+        "telegram_id": safe_log_id(row[1]),
+        "queued_status": row[2],
+    }
+
+
 async def execute_confirmed_admin_action(action_type, payload):
     if action_type == "broadcast":
         return await execute_confirmed_broadcast(payload)
@@ -9467,6 +9850,8 @@ async def execute_confirmed_admin_action(action_type, payload):
         return await execute_confirmed_resolve_checkout(payload)
     if action_type == "revoke_invite_links":
         return await execute_confirmed_revoke_invite_links(payload)
+    if action_type == "retry_delivery":
+        return await execute_confirmed_retry_delivery(payload)
     raise ValueError(f"Unsupported admin action: {action_type}")
 
 
@@ -10468,16 +10853,23 @@ async def process_pending_message_deliveries(limit=25):
 
     for delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link in deliveries:
         sending_user_message = False
+        payload = {}
         try:
             payload = json.loads(payload_json or "{}")
-            if delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check"):
+            if delivery_type == "free_lesson":
+                sending_user_message = True
+                await send_free_lesson_delivery(telegram_id, payload)
+            elif delivery_type == "free_lesson_followup":
+                sending_user_message = True
+                await send_free_lesson_followup_delivery(telegram_id, payload)
+            elif delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check"):
                 if delivery_type == "stripe_rejoin_check":
                     member = await bot.get_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
                     member_status = getattr(member, "status", None)
                     restricted_has_access = getattr(member, "is_member", True)
                     logging.info(
                         "STRIPE_REJOIN_MEMBERSHIP_CHECKED: telegram_id=%s, delivery_key=%s, status=%s, is_member=%s",
-                        telegram_id,
+                        safe_log_id(telegram_id),
                         safe_log_id(delivery_key),
                         member_status,
                         restricted_has_access,
@@ -10485,7 +10877,7 @@ async def process_pending_message_deliveries(limit=25):
                     if rejoin_delivery_should_skip_invite(member_status, restricted_has_access):
                         logging.info(
                             "STRIPE_REJOIN_CHECK_COMPLETED_WITHOUT_INVITE: telegram_id=%s, delivery_key=%s, status=%s",
-                            telegram_id,
+                            safe_log_id(telegram_id),
                             safe_log_id(delivery_key),
                             member_status,
                         )
@@ -10500,25 +10892,25 @@ async def process_pending_message_deliveries(limit=25):
                         if is_benign_rejoin_unban_error(e):
                             logging.warning(
                                 "STRIPE_REJOIN_UNBAN_BENIGN: telegram_id=%s, delivery_key=%s, error=%s",
-                                telegram_id,
+                                safe_log_id(telegram_id),
                                 safe_log_id(delivery_key),
-                                str(e),
+                                clean_error_reason(e),
                             )
                         else:
                             logging.warning(
                                 "STRIPE_REJOIN_UNBAN_RETRYABLE: telegram_id=%s, delivery_key=%s, error=%s",
-                                telegram_id,
+                                safe_log_id(telegram_id),
                                 safe_log_id(delivery_key),
-                                str(e),
+                                clean_error_reason(e),
                                 exc_info=True,
                             )
                             raise
                     except Exception as e:
                         logging.warning(
                             "STRIPE_REJOIN_UNBAN_RETRYABLE: telegram_id=%s, delivery_key=%s, error=%s",
-                            telegram_id,
+                            safe_log_id(telegram_id),
                             safe_log_id(delivery_key),
-                            str(e),
+                            clean_error_reason(e),
                             exc_info=True,
                         )
                         raise
@@ -10569,7 +10961,21 @@ async def process_pending_message_deliveries(limit=25):
             sent_conn = get_db_conn()
             sent_cur = sent_conn.cursor()
             try:
-                if delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check") and sending_user_message:
+                if delivery_type == "free_lesson" and sending_user_message:
+                    sent_cur.execute("""
+                        UPDATE users
+                        SET video_sent = TRUE,
+                            video_sent_at = NOW()
+                        WHERE telegram_id = %s
+                    """, (int(telegram_id),))
+                elif delivery_type == "free_lesson_followup" and sending_user_message:
+                    sent_cur.execute("""
+                        UPDATE users
+                        SET feedback_sent = TRUE,
+                            feedback_sent_at = NOW()
+                        WHERE telegram_id = %s
+                    """, (int(telegram_id),))
+                elif delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check") and sending_user_message:
                     new_expiry_raw = payload.get("new_expiry")
                     new_expiry = datetime.fromisoformat(new_expiry_raw) if new_expiry_raw else None
                     sent_cur.execute("""
@@ -10593,63 +10999,53 @@ async def process_pending_message_deliveries(limit=25):
                 sent_cur.close()
                 sent_conn.close()
             sent += 1
-        except TelegramForbiddenError as e:
-            if sending_user_message:
-                block_conn = get_db_conn()
-                block_cur = block_conn.cursor()
-                try:
-                    block_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
-                    mark_delivery_failed(block_cur, delivery_key, e, permanently_failed=True)
-                    block_conn.commit()
-                finally:
-                    block_cur.close()
-                    block_conn.close()
-                blocked += 1
-            else:
-                fail_conn = get_db_conn()
-                fail_cur = fail_conn.cursor()
-                try:
-                    permanently_failed = attempt_count >= REJOIN_GROUP_PERMISSION_FAILURE_LIMIT
-                    mark_delivery_failed(
-                        fail_cur,
-                        delivery_key,
-                        e,
-                        retry_delay_minutes=telegram_retry_delay_minutes(e, attempt_count),
-                        permanently_failed=permanently_failed,
-                    )
-                    fail_conn.commit()
-                finally:
-                    fail_cur.close()
-                    fail_conn.close()
-                if permanently_failed:
-                    await notify_admins(
-                        "Stripe rejoin delivery failed before user message.\n\n"
-                        f"telegram_id: {telegram_id}\n"
-                        f"delivery_key: {safe_log_id(delivery_key)}\n"
-                        f"stripe_event_id: {safe_log_id(payload.get('stripe_event_id'))}\n"
-                        "stage: group_permission\n"
-                        f"error: {type(e).__name__}",
-                        alert_key=f"stripe_rejoin_group_error:{safe_log_id(delivery_key)}",
-                        severity="CRITICAL",
-                    )
-                failed += 1
         except Exception as e:
+            decision = classify_delivery_error(e, attempt_count=attempt_count, sending_user_message=sending_user_message)
+            log_outbox_delivery_failure(delivery_key, delivery_type, attempt_count, e, decision)
             fail_conn = get_db_conn()
             fail_cur = fail_conn.cursor()
             try:
-                permanently_failed = attempt_count >= 10
+                if decision.get("blocked"):
+                    fail_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
+                retry_delay = decision.get("retry_delay_minutes")
+                if retry_delay is None and not decision.get("permanently_failed", False):
+                    retry_delay = 15
                 mark_delivery_failed(
                     fail_cur,
                     delivery_key,
                     e,
-                    retry_delay_minutes=telegram_retry_delay_minutes(e, attempt_count),
-                    permanently_failed=permanently_failed,
+                    retry_delay_minutes=retry_delay,
+                    permanently_failed=decision.get("permanently_failed", False),
                 )
                 fail_conn.commit()
             finally:
                 fail_cur.close()
                 fail_conn.close()
-            failed += 1
+
+            if decision.get("blocked"):
+                blocked += 1
+            else:
+                failed += 1
+
+            if isinstance(e, MissingFreeLessonVideoError) and decision.get("permanently_failed"):
+                await notify_admins(
+                    "FREE_LESSON_VIDEO_ID отсутствует. Доставка бесплатного урока стала terminal после лимита попыток.\n\n"
+                    f"delivery_type: {delivery_type}\n"
+                    f"delivery_hash: {safe_delivery_hash(delivery_key)}\n"
+                    f"attempt_count: {attempt_count}",
+                    alert_key=f"free_lesson_video_missing:{safe_delivery_hash(delivery_key)}",
+                    severity="CRITICAL",
+                )
+            elif decision.get("permanently_failed") and not decision.get("blocked") and delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check"):
+                await notify_admins(
+                    "Stripe rejoin delivery failed before user message.\n\n"
+                    f"delivery_type: {delivery_type}\n"
+                    f"delivery_hash: {safe_delivery_hash(delivery_key)}\n"
+                    f"stage: {'user_message' if sending_user_message else 'group_permission'}\n"
+                    f"error: {type(e).__name__}",
+                    alert_key=f"stripe_rejoin_group_error:{safe_delivery_hash(delivery_key)}",
+                    severity="CRITICAL",
+                )
 
     if failed or blocked:
         await notify_admins(
