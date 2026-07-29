@@ -291,7 +291,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("save_delivery_invite_link", source)
         self.assertIn("mark_delivery_sent", source)
         self.assertIn("mark_delivery_failed", source)
-        self.assertIn("TelegramForbiddenError", source)
+        self.assertIn("classify_delivery_error", source)
         self.assertIn("blocked_bot = TRUE", source)
         self.assertLess(source.index("try:"), source.index("payload = json.loads"))
         self.assertIn("stripe_delivery_reply_markup", source)
@@ -599,7 +599,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("cur.execute(\"\"\"\n        UPDATE users\n        SET video_sent", source)
 
     def test_check_auto_free_lessons_has_no_single_commit_for_all_users(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_auto_free_lessons"):MAIN_SOURCE.index("async def send_free_lesson_followup")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_auto_free_lessons"):MAIN_SOURCE.index("async def send_free_lesson_followup(user_id")]
         self.assertIn("for (user_id,) in users:", source)
         self.assertNotIn("\n        conn.commit()\n\n        logging.info", source)
 

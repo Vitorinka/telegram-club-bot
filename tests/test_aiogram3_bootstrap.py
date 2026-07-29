@@ -158,6 +158,20 @@ class FakeConnection:
         self.closed = True
 
 
+class FakeIncomingMessage:
+    def __init__(self, user_id=123):
+        self.from_user = SimpleNamespace(id=user_id)
+        self.chat = SimpleNamespace(type="private")
+        self.answers = []
+        self.replies = []
+
+    async def answer(self, text, **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def reply(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
+
 class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.main = import_main()
@@ -271,7 +285,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(app, web.Application)
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 50)
+        self.assertEqual(len(self.main.router.message.handlers), 52)
         self.assertEqual(len(self.main.router.callback_query.handlers), 19)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -303,7 +317,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 50)
+        self.assertEqual(len(message_handlers), 52)
         self.assertEqual(len(callback_handlers), 19)
         self.assertEqual(
             commands,
@@ -311,7 +325,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "promo_trial", "cancel", "menu", "ask", "start", "profile",
                 "send_user", "broadcast", "give_access", "set_expiry", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
-                "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
+                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
                 "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
                 "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
@@ -373,7 +387,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         retry_after = TelegramRetryAfter(method=None, message="Too Many Requests", retry_after=125)
 
         self.assertTrue(self.main.is_undeliverable_user_error(forbidden))
-        self.assertFalse(self.main.is_undeliverable_user_error(bad_request))
+        self.assertTrue(self.main.is_undeliverable_user_error(bad_request))
         self.assertFalse(self.main.is_undeliverable_user_error(network))
         self.assertFalse(self.main.is_undeliverable_user_error(retry_after))
         self.assertEqual(self.main.telegram_retry_delay_minutes(retry_after, attempt_count=1), 3)
@@ -400,7 +414,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 0, "blocked": 1})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 1})
         self.assertEqual(failed_calls, [("key1", "TelegramForbiddenError", None, True)])
         self.assertTrue(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
         mark_sent.assert_not_called()
@@ -409,7 +423,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 
         for error, expected_delay in (
-            (TelegramBadRequest(method=None, message="chat not found"), 5),
+            (TelegramBadRequest(method=None, message="message is not modified"), 5),
             (TelegramNetworkError(method=None, message="network down"), 5),
             (TelegramRetryAfter(method=None, message="retry later", retry_after=125), 3),
         ):
@@ -433,7 +447,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                      patch.object(self.main, "notify_admins", AsyncMock()):
                     result = await self.main.process_pending_message_deliveries()
 
-                self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+                self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
                 self.assertEqual(failed_calls, [("key2", type(error).__name__, expected_delay, False)])
                 self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
                 mark_sent.assert_not_called()
@@ -450,9 +464,340 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         markup = send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, "retry_payment")
+
+    async def test_legacy_free_lesson_null_payload_sends_video_with_trial_button(self):
+        send_video = AsyncMock()
+
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson:123", 123, "free_lesson", None, 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_video", send_video), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        send_video.assert_awaited_once()
+        self.assertEqual(send_video.await_args.kwargs["video"], "video_free_1")
+        markup = send_video.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "sub_trial")
+
+    async def test_legacy_free_lesson_followup_null_payload_sends_feedback_keyboard(self):
+        send_message = AsyncMock()
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson_followup:123", 123, "free_lesson_followup", None, 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        send_message.assert_awaited_once()
+        self.assertEqual(send_message.await_args.args[1], self.main.get_free_lesson_followup_text())
+        self.assertIs(send_message.await_args.kwargs["reply_markup"].__class__, self.main.get_free_lesson_feedback_keyboard().__class__)
+        self.assertEqual(send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "feedback_join")
+
+    async def test_success_free_lesson_updates_user_and_delivery_in_one_final_transaction(self):
+        connections = []
+
+        def fake_conn():
+            conn = FakeConnection()
+            connections.append(conn)
+            return conn
+
+        async def send_video_side_effect(**kwargs):
+            self.assertTrue(all(conn.closed for conn in connections))
+
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_video", AsyncMock(side_effect=send_video_side_effect)), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        final_queries = "\n".join(query for query, _ in connections[-1].cursor_obj.queries)
+        self.assertIn("video_sent = TRUE", final_queries)
+        self.assertIn("video_sent_at = NOW()", final_queries)
+        self.assertIn("status = 'sent'", final_queries)
+        self.assertEqual(connections[-1].commits, 1)
+
+    async def test_success_followup_updates_user_and_delivery_in_one_final_transaction(self):
+        connections = []
+
+        def fake_conn():
+            conn = FakeConnection()
+            connections.append(conn)
+            return conn
+
+        async def send_message_side_effect(*args, **kwargs):
+            self.assertTrue(all(conn.closed for conn in connections))
+
+        with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_message_side_effect)), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        final_queries = "\n".join(query for query, _ in connections[-1].cursor_obj.queries)
+        self.assertIn("feedback_sent = TRUE", final_queries)
+        self.assertIn("feedback_sent_at = NOW()", final_queries)
+        self.assertIn("status = 'sent'", final_queries)
+        self.assertEqual(connections[-1].commits, 1)
+
+    async def test_manual_free_lesson_forbidden_uses_shared_classification(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        connections = [
+            FakeConnection(fetches=[(False, False, False)]),
+            FakeConnection(fetches=[("free_lesson:123",), (1,)]),
+            FakeConnection(),
+        ]
+        message = FakeIncomingMessage(123)
+
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main.bot, "send_video", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            await self.main.free_lesson_button(message, FakeState())
+
+        fail_queries = "\n".join(query for query, _ in connections[-1].cursor_obj.queries)
+        self.assertIn("blocked_bot = TRUE", fail_queries)
+        self.assertIn("status = %s", fail_queries)
+        self.assertIn("next_attempt_at = NULL", fail_queries)
+        self.assertEqual(connections[-1].cursor_obj.queries[-1][1][0], "permanently_failed")
+
+    async def test_automatic_free_lesson_forbidden_uses_shared_classification(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        connections = [
+            FakeConnection(fetches=[("free_lesson:123",), (1,)]),
+            FakeConnection(),
+        ]
+
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main.bot, "send_video", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            sent = await self.main.send_auto_free_lesson(123)
+
+        self.assertFalse(sent)
+        self.assertIn("next_attempt_at = NULL", "\n".join(query for query, _ in connections[-1].cursor_obj.queries))
+        self.assertEqual(connections[-1].cursor_obj.queries[-1][1][0], "permanently_failed")
+
+    async def test_automatic_followup_forbidden_uses_shared_classification(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        connections = [
+            FakeConnection(fetches=[("free_lesson_followup:123",), (1,)]),
+            FakeConnection(),
+        ]
+
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            sent = await self.main.send_free_lesson_followup(123)
+
+        self.assertFalse(sent)
+        self.assertIn("next_attempt_at = NULL", "\n".join(query for query, _ in connections[-1].cursor_obj.queries))
+        self.assertEqual(connections[-1].cursor_obj.queries[-1][1][0], "permanently_failed")
+
+    async def test_message_delivery_retry_after_network_bad_request_and_unknown_classification(self):
+        from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+
+        cases = [
+            (TelegramRetryAfter(method=None, message="retry later", retry_after=125), 1, "failed", 3, "retryable_failed"),
+            (TelegramNetworkError(method=None, message="network down"), 1, "failed", 5, "retryable_failed"),
+            (TelegramBadRequest(method=None, message="chat not found"), 1, "permanently_failed", None, "permanently_failed"),
+            (TelegramBadRequest(method=None, message="message is not modified"), 1, "failed", 5, "retryable_failed"),
+            (RuntimeError("boom"), self.main.OUTBOX_UNKNOWN_FAILURE_LIMIT, "permanently_failed", None, "permanently_failed"),
+        ]
+        for error, attempt_count, status, delay, counter in cases:
+            with self.subTest(error=type(error).__name__, message=str(error)):
+                connections = [FakeConnection(), FakeConnection()]
+                with patch.object(self.main, "get_db_conn", side_effect=connections), \
+                     patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                         ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", attempt_count, None)
+                     ]), \
+                     patch.object(self.main.bot, "send_message", AsyncMock(side_effect=error)), \
+                     patch.object(self.main, "notify_admins", AsyncMock()):
+                    result = await self.main.process_pending_message_deliveries()
+
+                expected = {"sent": 0, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0}
+                expected[counter] += 1
+                if status == "permanently_failed" and self.main.is_undeliverable_user_error(error):
+                    expected["blocked"] += 1
+                self.assertEqual(result, expected)
+                params = connections[-1].cursor_obj.queries[-1][1]
+                self.assertEqual(params[0], status)
+                if status == "failed":
+                    self.assertEqual(params[2], delay)
+                else:
+                    self.assertIsNone(delay)
+
+    async def test_missing_free_lesson_video_retries_until_limit_then_alerts_once(self):
+        notify_admins = AsyncMock()
+
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None)
+             ]), \
+             patch.object(self.main, "notify_admins", notify_admins):
+            os.environ.pop("FREE_LESSON_VIDEO_ID", None)
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
+        notify_admins.assert_awaited_once()
+
+        notify_admins.reset_mock()
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("free_lesson:123", 123, "free_lesson", "{}", self.main.OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT, None)
+             ]), \
+             patch.object(self.main, "notify_admins", notify_admins):
+            os.environ.pop("FREE_LESSON_VIDEO_ID", None)
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
+        self.assertGreaterEqual(notify_admins.await_count, 1)
+        keys = [call.kwargs.get("alert_key") for call in notify_admins.await_args_list]
+        self.assertIn(f"free_lesson_video_missing:{self.main.safe_delivery_hash('free_lesson:123')}", keys)
+
+    async def test_two_replicas_do_not_send_same_claimed_free_lesson_twice(self):
+        send_func = AsyncMock()
+        connections = [
+            FakeConnection(fetches=[("free_lesson:123",), (1,)]),
+            FakeConnection(),
+            FakeConnection(fetches=[None, ("processing",)]),
+        ]
+
+        first = await self.main.process_claimed_delivery(
+            lambda: connections.pop(0),
+            "free_lesson:123",
+            123,
+            "free_lesson",
+            send_func,
+            classify_error_func=self.main.classify_delivery_error,
+        )
+        second = await self.main.process_claimed_delivery(
+            lambda: connections.pop(0),
+            "free_lesson:123",
+            123,
+            "free_lesson",
+            send_func,
+            classify_error_func=self.main.classify_delivery_error,
+        )
+
+        self.assertEqual(first, "sent")
+        self.assertEqual(second, "already_processing")
+        send_func.assert_awaited_once()
+
+    async def test_sent_delivery_is_not_sent_again(self):
+        send_func = AsyncMock()
+        connections = [FakeConnection(fetches=[None, ("sent",)])]
+
+        result = await self.main.process_claimed_delivery(
+            lambda: connections.pop(0),
+            "free_lesson:123",
+            123,
+            "free_lesson",
+            send_func,
+            classify_error_func=self.main.classify_delivery_error,
+        )
+
+        self.assertEqual(result, "already_sent")
+        send_func.assert_not_awaited()
+
+    async def test_critical_alert_fingerprint_is_stable_and_full_text_sensitive(self):
+        text = "CRITICAL: payment check failed abc123"
+        self.assertEqual(
+            self.main.critical_alert_fingerprint(text),
+            self.main.critical_alert_fingerprint(text),
+        )
+        self.assertNotEqual(
+            self.main.critical_alert_fingerprint("CRITICAL: first prefix abc123"),
+            self.main.critical_alert_fingerprint("CRITICAL: second prefix abc123"),
+        )
+
+    async def test_critical_alert_race_two_replicas_sends_one_admin_alert(self):
+        send_message = AsyncMock()
+        connections = [
+            FakeConnection(fetches=[(10,)]),
+            FakeConnection(),
+            FakeConnection(fetches=[None]),
+        ]
+
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main.asyncio, "sleep", AsyncMock()):
+            first = await self.main.notify_admins("CRITICAL same alert abc123", severity="CRITICAL")
+            second = await self.main.notify_admins("CRITICAL same alert abc123", severity="CRITICAL")
+
+        self.assertEqual(first["delivered"], self.main.ADMIN_IDS)
+        self.assertTrue(second["deduped"])
+        self.assertEqual(send_message.await_count, len(self.main.ADMIN_IDS))
+        first_dedupe_key = connections[0].cursor_obj.queries[0][1][0]
+        self.assertTrue(first_dedupe_key.startswith("critical:"))
+        self.assertNotIn("abc123", first_dedupe_key)
+
+    async def test_critical_alert_cooldown_repeat_is_not_sent(self):
+        send_message = AsyncMock()
+        connections = [
+            FakeConnection(fetches=[None]),
+        ]
+
+        with patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main.bot, "send_message", send_message):
+            result = await self.main.notify_admins("CRITICAL repeat abc123", severity="CRITICAL")
+
+        self.assertTrue(result["deduped"])
+        send_message.assert_not_awaited()
+
+    async def test_retry_delivery_closes_db_before_replies_and_confirmation(self):
+        no_match_conn = FakeConnection(fetches=[[]])
+        no_match_message = FakeIncomingMessage(user_id=1)
+
+        async def reply_after_close(text, **kwargs):
+            self.assertTrue(no_match_conn.closed)
+            no_match_message.replies.append((text, kwargs))
+
+        no_match_message.reply = reply_after_close
+        with patch.object(self.main, "get_db_conn", return_value=no_match_conn):
+            await self.main.retry_delivery_command(no_match_message, SimpleNamespace(args="missinghash"))
+
+        self.assertEqual(no_match_message.replies[0][0], "❌ Delivery не найден или не подходит для retry.")
+
+        delivery_key = "free_lesson:123"
+        requested_hash = self.main.safe_delivery_hash(delivery_key)
+        match_conn = FakeConnection(fetches=[[
+            (delivery_key, 123, "free_lesson", "failed", 2, "network", None)
+        ]])
+        match_message = FakeIncomingMessage(user_id=1)
+        confirmations = []
+
+        async def confirmation_after_close(message, action_id, text):
+            self.assertTrue(match_conn.closed)
+            confirmations.append((action_id, text))
+
+        with patch.object(self.main, "get_db_conn", return_value=match_conn), \
+             patch.object(self.main, "send_admin_action_confirmation", AsyncMock(side_effect=confirmation_after_close)):
+            await self.main.retry_delivery_command(match_message, SimpleNamespace(args=requested_hash))
+
+        self.assertEqual(len(confirmations), 1)
+        self.assertIn(f"delivery_hash: {requested_hash}", confirmations[0][1])
 
     async def test_message_delivery_invalid_payload_does_not_stop_batch(self):
         connections = [FakeConnection(), FakeConnection(), FakeConnection()]
@@ -473,7 +818,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("bad_payload", "JSONDecodeError", False)])
         send_message.assert_awaited_once()
 
@@ -498,7 +843,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         unban.assert_awaited_once()
         create_link.assert_not_awaited()
         self.assertIn("https://t.me/+saved", send_message.await_args.args[1])
@@ -523,7 +868,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_network_secret:rejoin_invite", "TelegramNetworkError", 5, False)])
         send_message.assert_not_awaited()
         mark_sent.assert_not_called()
@@ -547,7 +892,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_retry_secret:rejoin_invite", "TelegramRetryAfter", 3, False)])
         send_message.assert_not_awaited()
         mark_sent.assert_not_called()
@@ -572,7 +917,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_group_secret:rejoin_invite", "TelegramForbiddenError", False)])
         self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
         send_message.assert_not_awaited()
@@ -599,7 +944,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", notify_admins):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_group_limit_secret:rejoin_invite", "TelegramForbiddenError", True)])
         self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
         send_message.assert_not_awaited()
@@ -607,7 +952,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(notify_admins.await_count, 1)
         alert_text = notify_admins.await_args_list[0].args[0]
         self.assertNotIn("evt_group_limit_secret", alert_text)
-        self.assertIn("evt_***secret", alert_text)
+        self.assertIn("delivery_hash:", alert_text)
+        self.assertNotIn("evt_***secret", alert_text)
 
     async def test_rejoin_unban_bot_not_administrator_is_not_benign(self):
         from aiogram.exceptions import TelegramBadRequest
@@ -630,7 +976,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_bot_admin_secret:rejoin_invite", "TelegramBadRequest", False)])
         self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
         create_link.assert_not_awaited()
@@ -653,7 +999,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         create_link.assert_awaited_once()
         send_message.assert_awaited_once()
         mark_sent.assert_called_once()
@@ -679,7 +1025,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 1, "blocked": 0})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("stripe:evt_member_timeout:rejoin_invite", "TelegramNetworkError", 5, False)])
         unban.assert_not_awaited()
         send_message.assert_not_awaited()
@@ -701,7 +1047,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         unban.assert_not_awaited()
         create_link.assert_not_awaited()
         send_message.assert_not_awaited()
@@ -725,7 +1071,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 1, "failed": 0, "blocked": 0})
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         unban.assert_awaited_once()
         create_link.assert_awaited_once()
         send_message.assert_awaited_once()
@@ -753,7 +1099,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
-        self.assertEqual(result, {"sent": 0, "failed": 0, "blocked": 1})
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 1})
         self.assertEqual(failed_calls, [("stripe:evt_send_secret:rejoin_invite", "TelegramForbiddenError", True)])
         self.assertTrue(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
         mark_sent.assert_not_called()
