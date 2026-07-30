@@ -833,20 +833,44 @@ def fmt_outbox_dt(value):
     return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
 
 
-def format_nonnegative_duration(seconds):
+def normalize_utc_naive(value):
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def format_elapsed_duration(seconds):
     if seconds is None:
         return "нет"
     seconds = max(0, int(seconds))
     return f"{seconds // 60} мин."
 
 
+def format_future_duration(seconds):
+    if seconds is None:
+        return "нет"
+    seconds = max(0, int(seconds))
+    minutes = (seconds + 59) // 60
+    return f"{minutes} мин."
+
+
+def format_nonnegative_duration(seconds):
+    return format_elapsed_duration(seconds)
+
+
 def outbox_unresolved_age_seconds(reference_time, oldest_unresolved_at):
+    reference_time = normalize_utc_naive(reference_time)
+    oldest_unresolved_at = normalize_utc_naive(oldest_unresolved_at)
     if not reference_time or not oldest_unresolved_at:
         return None
     return max(0, int((reference_time - oldest_unresolved_at).total_seconds()))
 
 
 def outbox_next_retry_seconds(reference_time, next_attempt_at):
+    reference_time = normalize_utc_naive(reference_time)
+    next_attempt_at = normalize_utc_naive(next_attempt_at)
     if not reference_time or not next_attempt_at or next_attempt_at <= reference_time:
         return None
     return max(0, int((next_attempt_at - reference_time).total_seconds()))
@@ -6349,7 +6373,7 @@ async def outbox_status_command(message: types.Message):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT NOW()")
+        cur.execute("SELECT NOW() AT TIME ZONE 'UTC'")
         db_now = cur.fetchone()[0]
         cur.execute("""
             SELECT status, COUNT(*)
@@ -6425,8 +6449,8 @@ async def outbox_status_command(message: types.Message):
         cur.close()
         conn.close()
 
-    oldest_age_text = format_nonnegative_duration(outbox_unresolved_age_seconds(db_now, oldest_unresolved_at))
-    next_retry_text = format_nonnegative_duration(outbox_next_retry_seconds(db_now, next_retry_at))
+    oldest_age_text = format_elapsed_duration(outbox_unresolved_age_seconds(db_now, oldest_unresolved_at))
+    next_retry_text = format_future_duration(outbox_next_retry_seconds(db_now, next_retry_at))
     lines = [
         "📦 Outbox status",
         "",

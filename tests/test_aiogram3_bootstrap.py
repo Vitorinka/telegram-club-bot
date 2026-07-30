@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -921,10 +921,56 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         future = now + timedelta(minutes=9)
         past = now - timedelta(minutes=18)
 
-        self.assertEqual(self.main.format_nonnegative_duration(self.main.outbox_unresolved_age_seconds(now, future)), "0 мин.")
-        self.assertEqual(self.main.format_nonnegative_duration(self.main.outbox_unresolved_age_seconds(now, past)), "18 мин.")
-        self.assertEqual(self.main.format_nonnegative_duration(self.main.outbox_next_retry_seconds(now, future)), "9 мин.")
-        self.assertEqual(self.main.format_nonnegative_duration(self.main.outbox_next_retry_seconds(now, past)), "нет")
+        self.assertEqual(self.main.format_elapsed_duration(self.main.outbox_unresolved_age_seconds(now, future)), "0 мин.")
+        self.assertEqual(self.main.format_elapsed_duration(self.main.outbox_unresolved_age_seconds(now, past)), "18 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, future)), "9 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, past)), "нет")
+
+    async def test_outbox_status_duration_helpers_accept_aware_now_and_naive_timestamps(self):
+        db_now = datetime(2026, 7, 29, 13, 16, tzinfo=timezone.utc)
+        oldest_unresolved = datetime(2026, 7, 29, 13, 4)
+        next_retry = datetime(2026, 7, 29, 13, 25)
+
+        self.assertEqual(self.main.outbox_unresolved_age_seconds(db_now, oldest_unresolved), 12 * 60)
+        self.assertEqual(self.main.outbox_next_retry_seconds(db_now, next_retry), 9 * 60)
+
+    async def test_outbox_status_duration_helpers_accept_naive_now_and_aware_timestamps(self):
+        db_now = datetime(2026, 7, 29, 13, 16)
+        oldest_unresolved = datetime(2026, 7, 29, 13, 4, tzinfo=timezone.utc)
+        next_retry = datetime(2026, 7, 29, 13, 25, tzinfo=timezone.utc)
+
+        self.assertEqual(self.main.outbox_unresolved_age_seconds(db_now, oldest_unresolved), 12 * 60)
+        self.assertEqual(self.main.outbox_next_retry_seconds(db_now, next_retry), 9 * 60)
+
+    async def test_outbox_status_future_retry_rounds_up_minutes(self):
+        now = datetime(2026, 7, 29, 13, 16)
+
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now + timedelta(seconds=20))), "1 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now + timedelta(seconds=61))), "2 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now)), "нет")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now - timedelta(seconds=1))), "нет")
+
+    async def test_outbox_status_uses_utc_naive_now_query(self):
+        now = datetime(2026, 7, 29, 13, 16)
+        conn = FakeConnection(fetches=[
+            (now,),
+            [],
+            [],
+            (0,),
+            (None,),
+            (None,),
+            (None,),
+            (0,),
+            (0,),
+            None,
+            [],
+        ])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.outbox_status_command(message)
+
+        self.assertEqual(conn.cursor_obj.queries[0][0], "SELECT NOW() AT TIME ZONE 'UTC'")
 
     async def test_outbox_status_text_shows_retry_and_no_negative_age(self):
         now = datetime(2026, 7, 29, 13, 16)
