@@ -833,6 +833,36 @@ def fmt_outbox_dt(value):
     return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
 
 
+def format_nonnegative_duration(seconds):
+    if seconds is None:
+        return "нет"
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60} мин."
+
+
+def outbox_unresolved_age_seconds(reference_time, oldest_unresolved_at):
+    if not reference_time or not oldest_unresolved_at:
+        return None
+    return max(0, int((reference_time - oldest_unresolved_at).total_seconds()))
+
+
+def outbox_next_retry_seconds(reference_time, next_attempt_at):
+    if not reference_time or not next_attempt_at or next_attempt_at <= reference_time:
+        return None
+    return max(0, int((next_attempt_at - reference_time).total_seconds()))
+
+
+def parse_checkout_days(metadata):
+    if metadata is None:
+        return None
+    raw_days = metadata.get("days") if isinstance(metadata, dict) else getattr(metadata, "days", None)
+    try:
+        days = int(raw_days)
+    except (TypeError, ValueError):
+        return None
+    return days if days > 0 else None
+
+
 def stripe_period_to_datetime(period_end):
     return datetime.utcfromtimestamp(period_end) if period_end else None
 
@@ -6319,6 +6349,8 @@ async def outbox_status_command(message: types.Message):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
+        cur.execute("SELECT NOW()")
+        db_now = cur.fetchone()[0]
         cur.execute("""
             SELECT status, COUNT(*)
             FROM message_delivery_events
@@ -6340,11 +6372,23 @@ async def outbox_status_command(message: types.Message):
         """)
         sent_24h = cur.fetchone()[0]
         cur.execute("""
-            SELECT EXTRACT(EPOCH FROM (NOW() - MIN(COALESCE(next_attempt_at, claimed_at))))::BIGINT
+            SELECT MIN(
+                CASE
+                    WHEN status = 'failed' THEN claimed_at
+                    ELSE COALESCE(claimed_at, next_attempt_at)
+                END
+            )
             FROM message_delivery_events
             WHERE status IN ('pending', 'failed')
         """)
-        oldest_age_seconds = cur.fetchone()[0]
+        oldest_unresolved_at = cur.fetchone()[0]
+        cur.execute("""
+            SELECT MIN(next_attempt_at)
+            FROM message_delivery_events
+            WHERE status IN ('pending', 'failed')
+              AND next_attempt_at > NOW()
+        """)
+        next_retry_at = cur.fetchone()[0]
         cur.execute("""
             SELECT MIN(next_attempt_at)
             FROM message_delivery_events
@@ -6381,7 +6425,8 @@ async def outbox_status_command(message: types.Message):
         cur.close()
         conn.close()
 
-    oldest_age_text = f"{int(oldest_age_seconds // 60)} мин." if oldest_age_seconds else "нет"
+    oldest_age_text = format_nonnegative_duration(outbox_unresolved_age_seconds(db_now, oldest_unresolved_at))
+    next_retry_text = format_nonnegative_duration(outbox_next_retry_seconds(db_now, next_retry_at))
     lines = [
         "📦 Outbox status",
         "",
@@ -6391,7 +6436,8 @@ async def outbox_status_command(message: types.Message):
         f"permanently_failed: {status_counts.get('permanently_failed', 0)}",
         f"sent за 24 часа: {sent_24h}",
         f"stale processing: {stale_processing}",
-        f"oldest pending/failed age: {oldest_age_text}",
+        f"oldest unresolved age: {oldest_age_text}",
+        f"next retry in: {next_retry_text}",
         f"nearest next_attempt_at: {fmt_outbox_dt(next_attempt)}",
         f"maximum attempt_count: {max_attempt_count}",
         f"latest error category: {safe_error_category(last_error_row[0] if last_error_row else None)}",
@@ -7702,23 +7748,41 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
 
-            days_to_add = 0
-            metadata_raw = getattr(session, 'metadata', None)
-            if metadata_raw is not None:
-                try:
-                    days_to_add = int(metadata_raw['days'])
-                except (KeyError, TypeError, ValueError):
-                    try:
-                        days_val = getattr(metadata_raw, 'days', None)
-                        if days_val is not None:
-                            days_to_add = int(days_val)
-                    except:
-                        pass
+            metadata_raw = stripe_value(session, 'metadata') or getattr(session, 'metadata', None)
+            days_to_add = parse_checkout_days(metadata_raw)
             logging.info(f"WEBHOOK DEBUG: user={user_id}, days={days_to_add}, mode={getattr(session, 'mode', '?')}")
-            if days_to_add <= 0:
-                logging.error(f"Не удалось получить days для {user_id}")
-                await mark_event_processed(event_id)
-                return web.Response(status=200)
+            if days_to_add is None:
+                session_id = stripe_value(session, 'id')
+                alert_key = f"checkout_invalid_days:{safe_delivery_hash(event_id or session_id)}"
+                logging.error(
+                    "CHECKOUT_INVALID_DAYS: event_id=%s, session_id=%s, user_id=%s, metadata_keys=%s. Access not granted.",
+                    safe_log_id(event_id),
+                    safe_log_id(session_id),
+                    user_id,
+                    metadata_keys,
+                )
+                try:
+                    await notify_admins(
+                        "CRITICAL: checkout.session.completed без валидного metadata.days.\n\n"
+                        f"event_id: {safe_log_id(event_id)}\n"
+                        f"session_id: {safe_log_id(session_id)}\n"
+                        f"user_id: {user_id}\n"
+                        "reason: metadata.days missing or invalid\n"
+                        "access_granted: false",
+                        alert_key=alert_key,
+                        severity="CRITICAL",
+                    )
+                except Exception as alert_error:
+                    logging.error(
+                        "CHECKOUT_INVALID_DAYS_ALERT_FAILED: event_id=%s, session_id=%s, error=%s",
+                        safe_log_id(event_id),
+                        safe_log_id(session_id),
+                        alert_error,
+                        exc_info=True,
+                    )
+                finally:
+                    await release_event_processing(event_id)
+                return web.Response(status=500, text="Invalid checkout metadata.days")
 
             is_trial = (days_to_add == 7)
             has_subscription = bool(sub_id)
