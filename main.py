@@ -15,7 +15,6 @@ from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -26,6 +25,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from postgres_fsm_storage import PostgresFSMStorage
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -178,13 +178,6 @@ def telegram_retry_delay_minutes(error, attempt_count=1):
     return min(60, max(5, int(attempt_count) * 5))
 
 
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-router = Router()
-dp = Dispatcher(storage=storage)
-dp.include_router(router)
-scheduler = AsyncIOScheduler()
-
 CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
 CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
@@ -226,6 +219,14 @@ class RegistrationStates(StatesGroup):
     description = State()
     rules = State()
     choice = State()
+
+
+bot = Bot(token=BOT_TOKEN)
+storage = PostgresFSMStorage(lambda: get_db_conn())
+router = Router()
+dp = Dispatcher(storage=storage)
+dp.include_router(router)
+scheduler = AsyncIOScheduler()
 
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
 class TrackedThreadedConnectionPool:
@@ -11167,6 +11168,7 @@ async def on_shutdown(app):
         await bot_session.close()
     elif hasattr(bot, "close"):
         await bot.close()
+    await storage.close()
     close_db_pool()
     logging.info("Бот остановлен.")
 

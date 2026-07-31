@@ -5,6 +5,7 @@ from pathlib import Path
 from db_migrations import (
     BASELINE_REQUIRED_COLUMNS,
     BASELINE_REQUIRED_TABLES,
+    MIGRATION_BASELINE_REQUIREMENTS,
     MigrationError,
     load_migrations,
     run_migrations,
@@ -108,6 +109,30 @@ def write_migration(directory, name, sql):
 
 
 class DbMigrationTests(unittest.TestCase):
+    def test_postgres_fsm_storage_migration_is_required(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0004_postgres_fsm_storage"]
+        self.assertIn("aiogram_fsm_states", migration["tables"])
+        columns = migration["columns"]["aiogram_fsm_states"]
+        for column in (
+            "bot_id",
+            "chat_id",
+            "user_id",
+            "thread_id",
+            "business_connection_id",
+            "destiny",
+            "state",
+            "data_json",
+            "updated_at",
+        ):
+            self.assertIn(column, columns)
+        self.assertIn("aiogram_fsm_states_updated_at_idx", migration["indexes"])
+
+    def test_postgres_fsm_storage_migration_has_expected_filename(self):
+        root = Path(__file__).resolve().parents[1]
+        self.assertTrue((root / "migrations" / "0004_postgres_fsm_storage.sql").exists())
+        old_name = "0004_" + "aiogram_fsm_storage.sql"
+        self.assertFalse((root / "migrations" / old_name).exists())
+
     def test_empty_schema_applies_numbered_migrations(self):
         with tempfile.TemporaryDirectory() as tmp:
             migrations = [

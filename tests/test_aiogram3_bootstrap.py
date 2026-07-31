@@ -281,14 +281,178 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
-        from aiogram.fsm.storage.memory import MemoryStorage
+        from postgres_fsm_storage import PostgresFSMStorage
 
         app = self.main.create_app()
 
         self.assertIsInstance(self.main.bot, Bot)
         self.assertIsInstance(self.main.dp, Dispatcher)
-        self.assertIsInstance(self.main.storage, MemoryStorage)
+        self.assertIsInstance(self.main.storage, PostgresFSMStorage)
         self.assertIsInstance(app, web.Application)
+
+    async def test_postgres_fsm_storage_module_imports_independently(self):
+        import postgres_fsm_storage
+
+        source = Path(self.main.__file__).read_text()
+        self.assertNotIn("class PostgresFSMStorage", source)
+        self.assertIs(self.main.PostgresFSMStorage, postgres_fsm_storage.PostgresFSMStorage)
+
+    async def test_postgres_fsm_storage_round_trip_and_clear(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        records = {}
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                key = params[:6]
+                if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.state" in normalized:
+                    records.setdefault(key, {"state": None, "data_json": "{}"})["state"] = params[6]
+                    return
+                if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.data_json" in normalized:
+                    records.setdefault(key, {"state": None, "data_json": "{}"})["data_json"] = params[6]
+                    return
+                if normalized.startswith("DELETE FROM aiogram_fsm_states"):
+                    record = records.get(key)
+                    if record and record["state"] is None and record["data_json"] == "{}":
+                        records.pop(key)
+                    return
+                if normalized.startswith("SELECT state"):
+                    record = records.get(key)
+                    self.row = (record["state"],) if record else None
+                    return
+                if normalized.startswith("SELECT data_json"):
+                    record = records.get(key)
+                    self.row = (record["data_json"],) if record else None
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+                self.closed = False
+                self.commits = 0
+                self.rollbacks = 0
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                self.closed = True
+
+        storage = PostgresFSMStorage(FsmConnection)
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+
+        await storage.set_state(key, self.main.ContactState.waiting_for_message)
+        await storage.set_data(key, {"reply_to_user": 42, "text": "hello"})
+
+        self.assertEqual(await storage.get_state(key), self.main.ContactState.waiting_for_message.state)
+        self.assertEqual(await storage.get_data(key), {"reply_to_user": 42, "text": "hello"})
+
+        await storage.set_state(key, None)
+        self.assertEqual(await storage.get_data(key), {"reply_to_user": 42, "text": "hello"})
+        await storage.set_data(key, {})
+
+        self.assertIsNone(await storage.get_state(key))
+        self.assertEqual(await storage.get_data(key), {})
+        self.assertEqual(records, {})
+
+    async def test_postgres_fsm_storage_concurrent_update_data_keeps_all_fields(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        records = {}
+        record_lock = threading.Lock()
+        connections = []
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+                self.lock_held = False
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                if normalized.startswith("INSERT INTO aiogram_fsm_states"):
+                    key = params[:6]
+                    with record_lock:
+                        records.setdefault(key, {"state": None, "data_json": "{}"})
+                    return
+                if normalized.startswith("SELECT data_json") and "FOR UPDATE" in normalized:
+                    key = params[:6]
+                    record_lock.acquire()
+                    self.lock_held = True
+                    record = records.get(key, {"data_json": "{}"})
+                    self.row = (record["data_json"],)
+                    return
+                if normalized.startswith("SELECT data_json"):
+                    key = params[:6]
+                    record = records.get(key, {"data_json": "{}"})
+                    self.row = (record["data_json"],)
+                    return
+                if normalized.startswith("UPDATE aiogram_fsm_states"):
+                    data_json = params[0]
+                    key = params[1:7]
+                    records.setdefault(key, {"state": None, "data_json": "{}"})["data_json"] = data_json
+                    return
+                if normalized.startswith("DELETE FROM aiogram_fsm_states"):
+                    key = params[:6]
+                    record = records.get(key)
+                    if record and record["state"] is None and record["data_json"] == "{}":
+                        records.pop(key)
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                if self.lock_held:
+                    self.lock_held = False
+                    record_lock.release()
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+                self.closed = False
+                connections.append(self)
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+        first = PostgresFSMStorage(FsmConnection)
+        second = PostgresFSMStorage(FsmConnection)
+
+        await asyncio.gather(
+            first.update_data(key, {"first": 1}),
+            second.update_data(key, {"second": 2}),
+        )
+
+        self.assertEqual(await first.get_data(key), {"first": 1, "second": 2})
+        self.assertTrue(all(conn.closed for conn in connections))
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 52)
@@ -377,6 +541,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("dp.callback_query_handler =", source)
         self.assertNotIn("get_new_configured_app", source)
         self.assertNotIn("Dispatcher(bot", source)
+        self.assertNotIn("MemoryStorage", source)
         self.assertNotIn("BotBlocked", source)
         self.assertNotIn("aiogram.utils.exceptions", source)
         self.assertNotIn("await state.finish()", source)
