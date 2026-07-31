@@ -298,6 +298,28 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("blocked_bot = TRUE", source)
         self.assertLess(source.index("try:"), source.index("payload = json.loads"))
         self.assertIn("stripe_delivery_reply_markup", source)
+        self.assertIn("first_purchase_recovery_reminder_still_due", source)
+
+    def test_first_purchase_recovery_reminder_uses_durable_outbox(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def first_purchase_recovery_delivery_key"):
+            MAIN_SOURCE.index("def enqueue_rejoin_invite_after_payment")
+        ]
+        self.assertIn('return f"first_purchase_recovery:{int(telegram_id)}:{failed_at}"', source)
+        self.assertIn("enqueue_message_delivery", source)
+        self.assertIn('"first_purchase_recovery_reminder"', source)
+        self.assertIn('keyboard_kind="retry_payment"', source)
+
+    def test_first_purchase_recovery_due_query_is_first_purchase_only(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def fetch_due_first_purchase_recovery_users"):
+            MAIN_SOURCE.index("def enqueue_first_purchase_recovery_reminder")
+        ]
+        sql = source
+        self.assertIn("payment_failed = TRUE", sql)
+        self.assertIn("first_payment_done IS NOT TRUE", sql)
+        self.assertIn("payment_failed_at <= NOW() - (%s * INTERVAL '1 hour')", sql)
+        self.assertIn("blocked_bot IS NOT TRUE", sql)
 
     def test_stripe_webhook_user_notifications_are_outbox_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
@@ -363,8 +385,16 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("run_scheduled_with_lock", source)
         self.assertIn('"process_message_deliveries"', source)
         self.assertIn("five_minute_schedule_slot()", source)
+        self.assertIn("async def scheduled_enqueue_first_purchase_recovery_reminders", MAIN_SOURCE)
+        reminder_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def scheduled_enqueue_first_purchase_recovery_reminders"):
+            MAIN_SOURCE.index("async def scheduled_check_auto_free_lessons")
+        ]
+        self.assertIn('"enqueue_first_purchase_recovery_reminders"', reminder_source)
+        self.assertIn("hourly_schedule_slot()", reminder_source)
         startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
         self.assertIn("scheduled_process_message_deliveries", startup)
+        self.assertIn("scheduled_enqueue_first_purchase_recovery_reminders", source)
 
     def test_aiogram3_commands_use_command_object_for_args(self):
         self.assertIn("CommandObject", MAIN_SOURCE)

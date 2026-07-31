@@ -454,6 +454,32 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await first.get_data(key), {"first": 1, "second": 2})
         self.assertTrue(all(conn.closed for conn in connections))
 
+    async def test_first_purchase_recovery_delivery_skips_when_no_longer_due(self):
+        delivery = (
+            "first_purchase_recovery:123:20260731T100000",
+            123,
+            "first_purchase_recovery_reminder",
+            json.dumps({"text": "retry", "keyboard_kind": "retry_payment"}),
+            1,
+            None,
+        )
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[(False, True, False)])
+        conns = iter([claim_conn, check_conn])
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["retryable_failed"], 0)
+        send_message.assert_not_awaited()
+        self.assertTrue(claim_conn.closed)
+        self.assertTrue(check_conn.closed)
+        sql = "\n".join(query for query, _ in check_conn.cursor_obj.queries)
+        self.assertIn("SELECT payment_failed, first_payment_done, blocked_bot", sql)
+        self.assertIn("UPDATE message_delivery_events", sql)
+
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 52)
         self.assertEqual(len(self.main.router.callback_query.handlers), 19)
@@ -2001,7 +2027,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 6)
+        self.assertEqual(len(fake_scheduler.jobs), 7)
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):

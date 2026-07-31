@@ -182,6 +182,7 @@ CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
 CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 PAYMENT_RETRY_GRACE_HOURS = int(os.getenv("PAYMENT_RETRY_GRACE_HOURS", "48"))
+FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = int(os.getenv("FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS", "1"))
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
@@ -1056,6 +1057,57 @@ def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keybo
         delivery_type or "stripe_user_message",
         stripe_delivery_payload(text, keyboard_kind=keyboard_kind, parse_mode=parse_mode, **extra),
     )
+
+
+def first_purchase_recovery_delivery_key(telegram_id, payment_failed_at):
+    failed_at = payment_failed_at.strftime("%Y%m%dT%H%M%S") if payment_failed_at else "unknown"
+    return f"first_purchase_recovery:{int(telegram_id)}:{failed_at}"
+
+
+def first_purchase_recovery_reminder_text():
+    return (
+        "Похоже, первая оплата не завершилась.\n\n"
+        "Вы можете выбрать тариф ещё раз. Если нужна помощь, напишите администратору."
+    )
+
+
+def fetch_due_first_purchase_recovery_users(cur, limit=100):
+    cur.execute("""
+        SELECT telegram_id, payment_failed_at
+        FROM users
+        WHERE payment_failed = TRUE
+          AND first_payment_done IS NOT TRUE
+          AND payment_failed_at IS NOT NULL
+          AND payment_failed_at <= NOW() - (%s * INTERVAL '1 hour')
+          AND (grace_period_end IS NULL OR grace_period_end > NOW())
+          AND blocked_bot IS NOT TRUE
+        ORDER BY payment_failed_at ASC
+        LIMIT %s
+    """, (FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, int(limit)))
+    return cur.fetchall()
+
+
+def enqueue_first_purchase_recovery_reminder(cur, telegram_id, payment_failed_at):
+    return enqueue_message_delivery(
+        cur,
+        first_purchase_recovery_delivery_key(telegram_id, payment_failed_at),
+        int(telegram_id),
+        "first_purchase_recovery_reminder",
+        stripe_delivery_payload(
+            first_purchase_recovery_reminder_text(),
+            keyboard_kind="retry_payment",
+        ),
+    )
+
+
+def first_purchase_recovery_reminder_still_due(cur, telegram_id):
+    cur.execute("""
+        SELECT payment_failed, first_payment_done, blocked_bot
+        FROM users
+        WHERE telegram_id = %s
+    """, (int(telegram_id),))
+    row = cur.fetchone()
+    return bool(row and row[0] and not row[1] and not row[2])
 
 
 def enqueue_rejoin_invite_after_payment(cur, telegram_id, expiry_date, source, stripe_event_id, stripe_subscription_id=None):
@@ -2411,6 +2463,30 @@ def set_subscription_reminder_sent(telegram_id):
     try:
         cur.execute("UPDATE users SET reminder_sent = TRUE WHERE telegram_id = %s", (int(telegram_id),))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def enqueue_due_first_purchase_recovery_reminders(limit=100):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        due_users = fetch_due_first_purchase_recovery_users(cur, limit=limit)
+        enqueued = 0
+        for telegram_id, payment_failed_at in due_users:
+            if enqueue_first_purchase_recovery_reminder(cur, telegram_id, payment_failed_at):
+                enqueued += 1
+        conn.commit()
+        logging.info(
+            "FIRST_PURCHASE_RECOVERY_REMINDERS_ENQUEUED: due=%s, enqueued=%s",
+            len(due_users),
+            enqueued,
+        )
+        return {"due": len(due_users), "enqueued": enqueued}
     except Exception:
         conn.rollback()
         raise
@@ -10731,6 +10807,20 @@ def five_minute_schedule_slot(now=None):
     return now.replace(minute=minute, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
 
 
+def hourly_schedule_slot(now=None):
+    now = now or datetime.utcnow()
+    return now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H")
+
+
+async def scheduled_enqueue_first_purchase_recovery_reminders():
+    return await run_scheduled_with_lock(
+        "enqueue_first_purchase_recovery_reminders",
+        hourly_schedule_slot(),
+        enqueue_due_first_purchase_recovery_reminders,
+        lease_minutes=50,
+    )
+
+
 async def scheduled_check_auto_free_lessons():
     return await run_scheduled_with_lock(
         "check_auto_free_lessons",
@@ -10782,6 +10872,25 @@ async def process_pending_message_deliveries(limit=25):
         payload = {}
         try:
             payload = json.loads(payload_json or "{}")
+            if delivery_type == "first_purchase_recovery_reminder":
+                check_conn = get_db_conn()
+                check_cur = check_conn.cursor()
+                try:
+                    still_due = first_purchase_recovery_reminder_still_due(check_cur, telegram_id)
+                    if not still_due:
+                        mark_delivery_sent(check_cur, delivery_key)
+                        check_conn.commit()
+                        sent += 1
+                        logging.info(
+                            "FIRST_PURCHASE_RECOVERY_REMINDER_SKIPPED: telegram_id=%s, delivery_key=%s",
+                            telegram_id,
+                            safe_log_id(delivery_key),
+                        )
+                        continue
+                    check_conn.commit()
+                finally:
+                    check_cur.close()
+                    check_conn.close()
             if delivery_type == "free_lesson":
                 result = await process_already_claimed_delivery(
                     get_db_conn,
@@ -11102,6 +11211,15 @@ def register_scheduler_jobs_once():
         scheduled_process_message_deliveries,
         'cron',
         minute='*/5',
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_enqueue_first_purchase_recovery_reminders,
+        'cron',
+        minute=45,
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1
