@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -104,8 +105,13 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self):
+    def __init__(self, user_id=123):
         self.message = FakeMessage()
+        self.from_user = SimpleNamespace(id=user_id)
+        self.answers = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
 
 
 class FakeState:
@@ -1077,6 +1083,88 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             await self.main.outbox_status_command(message)
 
         self.assertEqual(conn.cursor_obj.queries[0][0], "SELECT NOW() AT TIME ZONE 'UTC'")
+
+    async def test_feedback_join_closes_db_before_telegram_replies(self):
+        conn = FakeConnection(fetches=[(False, False)])
+        callback = FakeCallback(user_id=123)
+        state = FakeState()
+        answer_checks = []
+
+        async def answer_after_close(*args, **kwargs):
+            answer_checks.append(conn.closed)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            callback.message.answer = AsyncMock(side_effect=answer_after_close)
+            callback.answer = AsyncMock(side_effect=lambda *args, **kwargs: answer_checks.append(conn.closed))
+            await self.main.feedback_join(callback, state)
+
+        self.assertEqual(answer_checks, [True, True])
+        self.assertEqual(state.states, [self.main.RegistrationStates.choice])
+        self.assertEqual(conn.commits, 1)
+
+    async def test_feedback_think_closes_db_before_telegram_replies(self):
+        conn = FakeConnection()
+        callback = FakeCallback(user_id=123)
+        state = FakeState()
+        answer_checks = []
+
+        async def answer_after_close(*args, **kwargs):
+            answer_checks.append(conn.closed)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            callback.message.answer = AsyncMock(side_effect=answer_after_close)
+            callback.answer = AsyncMock(side_effect=lambda *args, **kwargs: answer_checks.append(conn.closed))
+            await self.main.feedback_think(callback, state)
+
+        self.assertEqual(answer_checks, [True, True])
+        self.assertEqual(state.clear_calls, 1)
+        self.assertEqual(conn.commits, 1)
+
+    def test_tracked_db_pool_concurrent_accounting_and_double_put_guard(self):
+        class RawPool:
+            def __init__(self, *args, **kwargs):
+                self.lock = threading.Lock()
+                self.next_id = 0
+                self.puts = []
+
+            def getconn(self):
+                with self.lock:
+                    self.next_id += 1
+                    return SimpleNamespace(id=self.next_id)
+
+            def putconn(self, conn, close=False):
+                with self.lock:
+                    self.puts.append((conn.id, close))
+
+            def closeall(self):
+                pass
+
+        with patch.object(self.main.psycopg2_pool, "ThreadedConnectionPool", RawPool):
+            pool = self.main.TrackedThreadedConnectionPool(1, 5, "postgresql://example")
+            errors = []
+
+            def worker():
+                try:
+                    conn = pool.getconn()
+                    self.assertGreaterEqual(pool.health()["pool_used"], 1)
+                    pool.putconn(conn)
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(pool.health()["pool_used"], 0)
+            self.assertEqual(pool.health()["pool_available"], 5)
+            raw_conn = pool.getconn()
+            pool.putconn(raw_conn)
+            pool.putconn(raw_conn)
+            self.assertEqual(pool.health()["pool_used"], 0)
+            self.assertEqual(len(pool._pool.puts), 9)
 
     async def test_outbox_status_text_shows_retry_and_no_negative_age(self):
         now = datetime(2026, 7, 29, 13, 16)
