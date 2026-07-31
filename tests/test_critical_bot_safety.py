@@ -611,6 +611,48 @@ class CriticalBotSafetyTests(unittest.TestCase):
         cur = DeliveryCursor(claim_fetch=None, status_fetch=("processing",))
         self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), "already_processing")
 
+    def test_delivery_claim_failed_rows_respect_next_attempt_at_backoff(self):
+        cur = DeliveryCursor(claim_fetch=None, status_fetch=("failed",))
+        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), "failed")
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("message_delivery_events.status = 'failed'", sql)
+        self.assertIn("COALESCE(message_delivery_events.next_attempt_at, %s) <= %s", sql)
+        self.assertIn("attempt_count = message_delivery_events.attempt_count + 1", sql)
+
+    def test_future_failed_delivery_does_not_increment_attempt_count_without_claim(self):
+        cur = DeliveryCursor(claim_fetch=None, status_fetch=("failed",))
+        result = claim_message_delivery(cur, "free_lesson:future", 1, "free_lesson")
+
+        self.assertEqual(result, "failed")
+        self.assertEqual(len(cur.queries), 2)
+        update_sql = cur.queries[0][0]
+        self.assertIn("attempt_count = message_delivery_events.attempt_count + 1", update_sql)
+        self.assertIn("COALESCE(message_delivery_events.next_attempt_at, %s) <= %s", update_sql)
+        self.assertIn("SELECT status FROM message_delivery_events", cur.queries[1][0])
+
+    def test_delivery_claim_due_failed_and_expired_processing_are_claimed(self):
+        due_failed = DeliveryCursor(claim_fetch=("free_lesson:1",))
+        self.assertEqual(claim_message_delivery(due_failed, "free_lesson:1", 1, "free_lesson"), "claimed")
+
+        expired_processing = DeliveryCursor(claim_fetch=("free_lesson:2",))
+        self.assertEqual(claim_message_delivery(expired_processing, "free_lesson:2", 2, "free_lesson"), "claimed")
+        sql = "\n".join(query for query, _ in expired_processing.queries)
+        self.assertIn("message_delivery_events.status = 'processing'", sql)
+        self.assertIn("message_delivery_events.lease_until < %s", sql)
+
+    def test_delivery_claim_sent_and_permanently_failed_do_not_auto_claim(self):
+        sent = DeliveryCursor(claim_fetch=None, status_fetch=("sent",))
+        self.assertEqual(claim_message_delivery(sent, "free_lesson:1", 1, "free_lesson"), "already_sent")
+
+        permanent = DeliveryCursor(claim_fetch=None, status_fetch=("permanently_failed",))
+        self.assertEqual(claim_message_delivery(permanent, "free_lesson:2", 2, "free_lesson"), "permanently_failed")
+
+    def test_confirmed_manual_retry_sets_now_for_worker_backoff(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_retry_delivery"):MAIN_SOURCE.index("async def execute_confirmed_admin_action")]
+        self.assertIn("SET status = 'failed'", source)
+        self.assertIn("next_attempt_at = NOW()", source)
+        self.assertIn("status IN ('failed', 'permanently_failed')", source)
+
     def test_process_claimed_delivery_commits_claim_before_send(self):
         cursors = [DeliveryCursor(claim_fetch=("free_lesson:1",)), FakeCursor()]
         claim_conn = FakeConn(cursors[0])

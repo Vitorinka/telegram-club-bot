@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -798,6 +798,235 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(confirmations), 1)
         self.assertIn(f"delivery_hash: {requested_hash}", confirmations[0][1])
+
+    async def run_checkout_days_webhook(self, days_marker, notify_side_effect=None):
+        session_payload = {
+            "id": f"cs_days_{days_marker if days_marker is not None else 'missing'}",
+            "client_reference_id": "123",
+            "mode": "payment",
+            "payment_status": "paid",
+            "customer": f"cus_days_{days_marker if days_marker is not None else 'missing'}",
+            "subscription": None,
+            "amount_total": 1000,
+            "currency": "usd",
+        }
+        if days_marker != "missing":
+            session_payload["metadata"] = {"days": days_marker}
+        event_id = f"evt_days_{days_marker if days_marker is not None else 'none'}"
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        payload = json.dumps({
+            "id": event_id,
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {"object": session_payload},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        notify = AsyncMock(side_effect=notify_side_effect)
+        release = AsyncMock()
+        mark_processed = AsyncMock()
+        get_db_conn = Mock(side_effect=AssertionError("invalid checkout days must not open DB"))
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "notify_admins", notify), \
+             patch.object(self.main, "get_db_conn", get_db_conn):
+            response = await self.main.stripe_webhook(request)
+
+        return SimpleNamespace(
+            response=response,
+            notify=notify,
+            release=release,
+            mark_processed=mark_processed,
+            get_db_conn=get_db_conn,
+            event_id=event_id,
+        )
+
+    async def test_checkout_invalid_days_missing_empty_text_zero_and_negative_fail_closed(self):
+        for days_marker in ("missing", "", "abc", "0", "-30"):
+            with self.subTest(days_marker=days_marker):
+                result = await self.run_checkout_days_webhook(days_marker)
+
+                self.assertEqual(result.response.status, 500)
+                result.release.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_not_awaited()
+                result.get_db_conn.assert_not_called()
+                result.notify.assert_awaited_once()
+                self.assertTrue(result.notify.await_args.kwargs["alert_key"].startswith("checkout_invalid_days:"))
+                self.assertEqual(result.notify.await_args.kwargs["severity"], "CRITICAL")
+                alert_text = result.notify.await_args.args[0]
+                self.assertIn("metadata.days missing or invalid", alert_text)
+                self.assertIn("access_granted: false", alert_text)
+                self.assertNotIn(result.event_id, alert_text)
+
+    async def test_checkout_invalid_days_notify_failure_still_releases_claim_and_returns_500(self):
+        result = await self.run_checkout_days_webhook("abc", notify_side_effect=RuntimeError("notify down"))
+
+        self.assertEqual(result.response.status, 500)
+        result.release.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_not_awaited()
+        result.get_db_conn.assert_not_called()
+
+    async def test_checkout_days_seven_success_path_still_processes(self):
+        event = SimpleNamespace(
+            id="evt_days_valid_7",
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_days_valid_7",
+                client_reference_id="123",
+                metadata={"days": "7"},
+                mode="payment",
+                payment_status="paid",
+                customer="cus_days_valid_7",
+                subscription=None,
+                amount_total=1000,
+                currency="usd",
+            )),
+        )
+        payload = json.dumps({
+            "id": "evt_days_valid_7",
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {"object": {"id": "cs_days_valid_7", "client_reference_id": "123", "metadata": {"days": "7"}}},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[(False, None, False)])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "claim_trial_redemption", return_value=True), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with("evt_days_valid_7")
+        release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO users", sql)
+        self.assertIn("INSERT INTO payment_events", sql)
+        self.assertIn("INSERT INTO access_events", sql)
+
+    async def test_outbox_status_duration_helpers_never_go_negative(self):
+        now = datetime(2026, 7, 29, 13, 16)
+        future = now + timedelta(minutes=9)
+        past = now - timedelta(minutes=18)
+
+        self.assertEqual(self.main.format_elapsed_duration(self.main.outbox_unresolved_age_seconds(now, future)), "0 мин.")
+        self.assertEqual(self.main.format_elapsed_duration(self.main.outbox_unresolved_age_seconds(now, past)), "18 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, future)), "9 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, past)), "нет")
+
+    async def test_outbox_status_duration_helpers_accept_aware_now_and_naive_timestamps(self):
+        db_now = datetime(2026, 7, 29, 13, 16, tzinfo=timezone.utc)
+        oldest_unresolved = datetime(2026, 7, 29, 13, 4)
+        next_retry = datetime(2026, 7, 29, 13, 25)
+
+        self.assertEqual(self.main.outbox_unresolved_age_seconds(db_now, oldest_unresolved), 12 * 60)
+        self.assertEqual(self.main.outbox_next_retry_seconds(db_now, next_retry), 9 * 60)
+
+    async def test_outbox_status_duration_helpers_accept_naive_now_and_aware_timestamps(self):
+        db_now = datetime(2026, 7, 29, 13, 16)
+        oldest_unresolved = datetime(2026, 7, 29, 13, 4, tzinfo=timezone.utc)
+        next_retry = datetime(2026, 7, 29, 13, 25, tzinfo=timezone.utc)
+
+        self.assertEqual(self.main.outbox_unresolved_age_seconds(db_now, oldest_unresolved), 12 * 60)
+        self.assertEqual(self.main.outbox_next_retry_seconds(db_now, next_retry), 9 * 60)
+
+    async def test_outbox_status_future_retry_rounds_up_minutes(self):
+        now = datetime(2026, 7, 29, 13, 16)
+
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now + timedelta(seconds=20))), "1 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now + timedelta(seconds=61))), "2 мин.")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now)), "нет")
+        self.assertEqual(self.main.format_future_duration(self.main.outbox_next_retry_seconds(now, now - timedelta(seconds=1))), "нет")
+
+    async def test_outbox_status_uses_utc_naive_now_query(self):
+        now = datetime(2026, 7, 29, 13, 16)
+        conn = FakeConnection(fetches=[
+            (now,),
+            [],
+            [],
+            (0,),
+            (None,),
+            (None,),
+            (None,),
+            (0,),
+            (0,),
+            None,
+            [],
+        ])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.outbox_status_command(message)
+
+        self.assertEqual(conn.cursor_obj.queries[0][0], "SELECT NOW() AT TIME ZONE 'UTC'")
+
+    async def test_outbox_status_text_shows_retry_and_no_negative_age(self):
+        now = datetime(2026, 7, 29, 13, 16)
+        next_retry = now + timedelta(minutes=9)
+        conn = FakeConnection(fetches=[
+            (now,),
+            [("pending", 1), ("failed", 1)],
+            [("free_lesson", "failed", 1)],
+            (0,),
+            (next_retry,),
+            (next_retry,),
+            (next_retry,),
+            (2,),
+            (0,),
+            None,
+            [],
+        ])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.outbox_status_command(message)
+
+        text = message.answers[0][0]
+        self.assertIn("oldest unresolved age: 0 мин.", text)
+        self.assertIn("next retry in: 9 мин.", text)
+        self.assertIn("nearest next_attempt_at: 29.07.2026 13:25", text)
+        self.assertNotIn("-", text)
+        self.assertLess(len(text), 4096)
+
+    async def test_outbox_status_due_or_empty_retry_text_is_none(self):
+        now = datetime(2026, 7, 29, 13, 16)
+        for oldest_unresolved, next_retry_at, expected_age in ((now - timedelta(minutes=3), None, "3 мин."), (None, None, "нет")):
+            with self.subTest(oldest_unresolved=oldest_unresolved):
+                conn = FakeConnection(fetches=[
+                    (now,),
+                    [],
+                    [],
+                    (0,),
+                    (oldest_unresolved,),
+                    (next_retry_at,),
+                    (next_retry_at,),
+                    (0,),
+                    (0,),
+                    None,
+                    [],
+                ])
+                message = FakeIncomingMessage(user_id=1)
+
+                with patch.object(self.main, "get_db_conn", return_value=conn):
+                    await self.main.outbox_status_command(message)
+
+                text = message.answers[0][0]
+                self.assertIn(f"oldest unresolved age: {expected_age}", text)
+                self.assertIn("next retry in: нет", text)
+                self.assertIn("nearest next_attempt_at: нет", text)
+                self.assertLess(len(text), 4096)
 
     async def test_message_delivery_invalid_payload_does_not_stop_batch(self):
         connections = [FakeConnection(), FakeConnection(), FakeConnection()]

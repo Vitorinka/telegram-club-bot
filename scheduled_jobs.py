@@ -82,14 +82,17 @@ def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=No
             claimed_at = EXCLUDED.claimed_at,
             lease_until = EXCLUDED.lease_until,
             last_error = NULL
-        WHERE message_delivery_events.status IN ('failed')
+        WHERE (
+                message_delivery_events.status = 'failed'
+                AND COALESCE(message_delivery_events.next_attempt_at, %s) <= %s
+              )
            OR (
                 message_delivery_events.status = 'processing'
                 AND message_delivery_events.lease_until < %s
            )
         RETURNING delivery_key
         """,
-        (delivery_key, int(telegram_id), delivery_type, now, lease_until, now),
+        (delivery_key, int(telegram_id), delivery_type, now, lease_until, now, now, now),
     )
     if cur.fetchone():
         return "claimed"
