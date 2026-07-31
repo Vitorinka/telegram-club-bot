@@ -848,6 +848,112 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             event_id=event_id,
         )
 
+    async def run_checkout_identity_webhook(self, client_reference_id="123", metadata_telegram_id="123", notify_side_effect=None):
+        session_payload = {
+            "id": f"cs_identity_{client_reference_id if client_reference_id not in (None, '') else 'empty'}_{metadata_telegram_id if metadata_telegram_id not in (None, '') else 'empty'}",
+            "mode": "payment",
+            "payment_status": "paid",
+            "customer": "cus_identity",
+            "subscription": None,
+            "amount_total": 1000,
+            "currency": "usd",
+            "metadata": {"days": "7"},
+        }
+        if client_reference_id is not None:
+            session_payload["client_reference_id"] = client_reference_id
+        if metadata_telegram_id is not None:
+            session_payload["metadata"]["telegram_id"] = metadata_telegram_id
+        event_id = f"evt_identity_{client_reference_id if client_reference_id not in (None, '') else 'empty'}_{metadata_telegram_id if metadata_telegram_id not in (None, '') else 'empty'}"
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        payload = json.dumps({
+            "id": event_id,
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {"object": session_payload},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        notify = AsyncMock(side_effect=notify_side_effect)
+        release = AsyncMock()
+        mark_processed = AsyncMock()
+        conn = FakeConnection(fetches=[(False, None, False)])
+        get_db_conn = Mock(return_value=conn)
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "notify_admins", notify), \
+             patch.object(self.main, "claim_trial_redemption", return_value=True), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main, "get_db_conn", get_db_conn):
+            response = await self.main.stripe_webhook(request)
+
+        return SimpleNamespace(
+            response=response,
+            notify=notify,
+            release=release,
+            mark_processed=mark_processed,
+            conn=conn,
+            get_db_conn=get_db_conn,
+            event_id=event_id,
+        )
+
+    async def test_checkout_identity_accepts_client_reference_metadata_and_matching_sources(self):
+        cases = (
+            ("123", None),
+            (None, "123"),
+            ("123", "123"),
+            ("", "123"),
+        )
+        for client_reference_id, metadata_telegram_id in cases:
+            with self.subTest(client_reference_id=client_reference_id, metadata_telegram_id=metadata_telegram_id):
+                result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
+
+                self.assertEqual(result.response.status, 200)
+                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.release.assert_not_awaited()
+                result.notify.assert_not_awaited()
+                sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+                self.assertIn("INSERT INTO users", sql)
+                self.assertIn("INSERT INTO payment_events", sql)
+                self.assertIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_identity_missing_invalid_or_conflicting_sources_fail_closed(self):
+        cases = (
+            (None, None),
+            ("abc", "-1"),
+            ("123", "456"),
+        )
+        for client_reference_id, metadata_telegram_id in cases:
+            with self.subTest(client_reference_id=client_reference_id, metadata_telegram_id=metadata_telegram_id):
+                result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
+
+                self.assertEqual(result.response.status, 500)
+                result.release.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_not_awaited()
+                result.get_db_conn.assert_not_called()
+                result.notify.assert_awaited_once()
+                self.assertTrue(result.notify.await_args.kwargs["alert_key"].startswith("checkout_invalid_identity:"))
+                self.assertEqual(result.notify.await_args.kwargs["severity"], "CRITICAL")
+                alert_text = result.notify.await_args.args[0]
+                self.assertIn("client_reference_id/metadata.telegram_id missing, invalid, or conflicting", alert_text)
+                self.assertIn("access_granted: false", alert_text)
+                self.assertNotIn(result.event_id, alert_text)
+                self.assertNotIn("cs_identity", alert_text)
+
+    async def test_checkout_identity_notify_failure_still_releases_claim_and_returns_500(self):
+        result = await self.run_checkout_identity_webhook(None, None, notify_side_effect=RuntimeError("notify down"))
+
+        self.assertEqual(result.response.status, 500)
+        result.release.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_not_awaited()
+        result.get_db_conn.assert_not_called()
+
     async def test_checkout_invalid_days_missing_empty_text_zero_and_negative_fail_closed(self):
         for days_marker in ("missing", "", "abc", "0", "-30"):
             with self.subTest(days_marker=days_marker):

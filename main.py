@@ -887,6 +887,23 @@ def parse_checkout_days(metadata):
     return days if days > 0 else None
 
 
+def positive_int_or_none(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def resolve_checkout_telegram_id(session):
+    client_reference_id = positive_int_or_none(stripe_value(session, "client_reference_id"))
+    metadata_telegram_id = positive_int_or_none(stripe_value(session, "metadata", "telegram_id"))
+
+    if client_reference_id and metadata_telegram_id and client_reference_id != metadata_telegram_id:
+        return None
+    return client_reference_id or metadata_telegram_id
+
+
 def stripe_period_to_datetime(period_end):
     return datetime.utcfromtimestamp(period_end) if period_end else None
 
@@ -7593,25 +7610,52 @@ async def stripe_webhook(request):
         # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
         if event_type == 'checkout.session.completed':
             session = event_object
-            user_id = getattr(session, 'client_reference_id', None)
+            user_id = resolve_checkout_telegram_id(session)
             metadata_obj = stripe_value(session, 'metadata') or {}
             metadata_keys = list(metadata_obj.keys()) if isinstance(metadata_obj, dict) else []
             logging.info(
                 "Stripe checkout.session.completed data: "
                 f"event_id={safe_log_id(event_id)}, session_id={safe_log_id(stripe_value(session, 'id'))}, "
-                f"user_id={user_id}, metadata_telegram_id={stripe_value(session, 'metadata', 'telegram_id')}, "
+                f"user_id={user_id}, client_reference_id_present={bool(stripe_value(session, 'client_reference_id'))}, "
+                f"metadata_telegram_id_present={bool(stripe_value(session, 'metadata', 'telegram_id'))}, "
                 f"metadata_keys={metadata_keys}, "
                 f"mode={stripe_value(session, 'mode')}, payment_status={stripe_value(session, 'payment_status')}, "
                 f"customer_id={safe_log_id(stripe_object_id(stripe_value(session, 'customer')))}, "
                 f"customer_email={safe_log_email(stripe_value(session, 'customer_details', 'email') or stripe_value(session, 'customer_email'))}"
             )
             if not user_id:
+                session_id = stripe_value(session, 'id')
+                alert_key = f"checkout_invalid_identity:{safe_delivery_hash(event_id or session_id)}"
                 logging.error(
-                    f"checkout.session.completed пропущен: client_reference_id отсутствует, "
-                    f"event_id={safe_log_id(event_id)}, session_id={safe_log_id(stripe_value(session, 'id'))}"
+                    "CHECKOUT_INVALID_IDENTITY: event_id=%s, session_id=%s, "
+                    "client_reference_id_present=%s, metadata_telegram_id_present=%s, metadata_keys=%s. Access not granted.",
+                    safe_log_id(event_id),
+                    safe_log_id(session_id),
+                    bool(stripe_value(session, 'client_reference_id')),
+                    bool(stripe_value(session, 'metadata', 'telegram_id')),
+                    metadata_keys,
                 )
-                await mark_event_processed(event_id)
-                return web.Response(status=200)
+                try:
+                    await notify_admins(
+                        "CRITICAL: checkout.session.completed без валидной Telegram identity.\n\n"
+                        f"event_id: {safe_log_id(event_id)}\n"
+                        f"session_id: {safe_log_id(session_id)}\n"
+                        "reason: client_reference_id/metadata.telegram_id missing, invalid, or conflicting\n"
+                        "access_granted: false",
+                        alert_key=alert_key,
+                        severity="CRITICAL",
+                    )
+                except Exception as alert_error:
+                    logging.error(
+                        "CHECKOUT_INVALID_IDENTITY_ALERT_FAILED: event_id=%s, session_id=%s, error=%s",
+                        safe_log_id(event_id),
+                        safe_log_id(session_id),
+                        alert_error,
+                        exc_info=True,
+                    )
+                finally:
+                    await release_event_processing(event_id)
+                return web.Response(status=500, text="Invalid checkout Telegram identity")
 
             sub_id = stripe_object_id(stripe_value(session, 'subscription'))
             customer_id = stripe_object_id(stripe_value(session, 'customer'))
