@@ -25,7 +25,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from postgres_fsm_storage import PostgresFSMStorage
+from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -87,6 +87,7 @@ from scheduled_jobs import (
     complete_scheduled_job,
     enqueue_message_delivery,
     fail_scheduled_job,
+    mark_delivery_cancelled,
     mark_delivery_failed,
     mark_delivery_sent,
     process_already_claimed_delivery,
@@ -182,7 +183,8 @@ CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
 CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 PAYMENT_RETRY_GRACE_HOURS = int(os.getenv("PAYMENT_RETRY_GRACE_HOURS", "48"))
-FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = int(os.getenv("FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS", "1"))
+FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = 24
+FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "open", "expired", "failed")
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
@@ -1059,55 +1061,193 @@ def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keybo
     )
 
 
-def first_purchase_recovery_delivery_key(telegram_id, payment_failed_at):
-    failed_at = payment_failed_at.strftime("%Y%m%dT%H%M%S") if payment_failed_at else "unknown"
-    return f"first_purchase_recovery:{int(telegram_id)}:{failed_at}"
+def first_purchase_recovery_delivery_key(telegram_id):
+    return f"first_purchase_recovery:{safe_delivery_hash(int(telegram_id))}"
 
 
 def first_purchase_recovery_reminder_text():
     return (
-        "Похоже, первая оплата не завершилась.\n\n"
-        "Вы можете выбрать тариф ещё раз. Если нужна помощь, напишите администратору."
+        "Похоже, оформление доступа не завершилось.\n\n"
+        "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь."
     )
+
+
+def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_key=False, count_only=False):
+    delivery_clause = """
+              AND (%s IS NULL OR md.delivery_key <> %s)
+    """ if current_delivery_key else ""
+    select_clause = "COUNT(*)" if count_only else "u.telegram_id, la.latest_attempt_at"
+    user_clause = "AND u.telegram_id = %s" if single_user else ""
+    limit_clause = "" if single_user or count_only else "ORDER BY la.latest_attempt_at ASC LIMIT %s"
+    return f"""
+        WITH attempts AS (
+            SELECT
+                telegram_id,
+                COALESCE(updated_at, created_at) AS attempt_at,
+                tariff_code
+            FROM checkout_sessions
+            WHERE telegram_id IS NOT NULL
+              AND status = ANY(%s::text[])
+            UNION ALL
+            SELECT telegram_id, attempt_at, tariff_code
+            FROM checkout_retry_events
+            WHERE telegram_id IS NOT NULL
+              AND resolved_at IS NULL
+        ),
+        latest_attempt AS (
+            SELECT DISTINCT ON (telegram_id)
+                telegram_id,
+                attempt_at AS latest_attempt_at
+            FROM attempts
+            WHERE attempt_at IS NOT NULL
+              AND COALESCE(tariff_code, '') NOT ILIKE 'test%%'
+            ORDER BY telegram_id, attempt_at DESC
+        )
+        SELECT {select_clause}
+        FROM latest_attempt la
+        JOIN users u ON u.telegram_id = la.telegram_id
+        WHERE la.latest_attempt_at <= (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour')
+          AND NOT (u.telegram_id = ANY(%s::bigint[]))
+          {user_clause}
+          AND u.paid IS NOT TRUE
+          AND (u.expiry_date IS NULL OR u.expiry_date <= (NOW() AT TIME ZONE 'UTC'))
+          AND u.first_payment_done IS NOT TRUE
+          AND u.blocked_bot IS NOT TRUE
+          AND u.stripe_subscription_id IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM payment_events pe
+              WHERE pe.telegram_id = u.telegram_id
+                AND pe.payment_status = 'succeeded'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM access_events ae
+              WHERE ae.telegram_id = u.telegram_id
+                AND ae.created_at >= la.latest_attempt_at
+                AND ae.new_expiry IS NOT NULL
+                AND ae.new_expiry > (NOW() AT TIME ZONE 'UTC')
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM checkout_sessions completed_cs
+              WHERE completed_cs.telegram_id = u.telegram_id
+                AND completed_cs.status = 'completed'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM stripe_links sl
+              WHERE sl.telegram_id = u.telegram_id
+                AND (
+                    sl.is_active IS TRUE
+                    OR sl.status IN ('active', 'trialing', 'checkout_completed')
+                    OR (sl.current_period_end IS NOT NULL AND sl.current_period_end > (NOW() AT TIME ZONE 'UTC'))
+                )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM access_events manual_ae
+              WHERE manual_ae.telegram_id = u.telegram_id
+                AND manual_ae.new_expiry IS NOT NULL
+                AND manual_ae.new_expiry > (NOW() AT TIME ZONE 'UTC')
+                AND COALESCE(manual_ae.source, '') IN ('manual', 'admin', 'out_of_band', 'manual_link')
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM message_delivery_events md
+              WHERE md.telegram_id = u.telegram_id
+                AND md.delivery_type = 'first_purchase_recovery_reminder'
+                AND md.status IN ('pending', 'processing', 'sent')
+                {delivery_clause}
+          )
+        {limit_clause}
+    """
 
 
 def fetch_due_first_purchase_recovery_users(cur, limit=100):
-    cur.execute("""
-        SELECT telegram_id, payment_failed_at
-        FROM users
-        WHERE payment_failed = TRUE
-          AND first_payment_done IS NOT TRUE
-          AND payment_failed_at IS NOT NULL
-          AND payment_failed_at <= NOW() - (%s * INTERVAL '1 hour')
-          AND (grace_period_end IS NULL OR grace_period_end > NOW())
-          AND blocked_bot IS NOT TRUE
-        ORDER BY payment_failed_at ASC
-        LIMIT %s
-    """, (FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, int(limit)))
+    params = [
+        list(FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES),
+        FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS,
+        list(ADMIN_IDS),
+        int(limit),
+    ]
+    cur.execute(first_purchase_recovery_eligibility_sql(), params)
     return cur.fetchall()
 
 
-def enqueue_first_purchase_recovery_reminder(cur, telegram_id, payment_failed_at):
-    return enqueue_message_delivery(
-        cur,
-        first_purchase_recovery_delivery_key(telegram_id, payment_failed_at),
+def count_due_first_purchase_recovery_users(cur):
+    cur.execute(
+        first_purchase_recovery_eligibility_sql(count_only=True),
+        (
+            list(FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES),
+            FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS,
+            list(ADMIN_IDS),
+        ),
+    )
+    row = cur.fetchone()
+    return row[0] if row else 0
+
+
+def fetch_first_purchase_recovery_user_if_due(cur, telegram_id, current_delivery_key=None):
+    params = [
+        list(FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES),
+        FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS,
+        list(ADMIN_IDS),
         int(telegram_id),
-        "first_purchase_recovery_reminder",
+    ]
+    if current_delivery_key is not None:
+        params.extend([current_delivery_key, current_delivery_key])
+    cur.execute(
+        first_purchase_recovery_eligibility_sql(
+            single_user=True,
+            current_delivery_key=current_delivery_key is not None,
+        ),
+        params,
+    )
+    return cur.fetchone()
+
+
+def enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at):
+    payload_json = json.dumps(
         stripe_delivery_payload(
             first_purchase_recovery_reminder_text(),
             keyboard_kind="retry_payment",
+            latest_attempt_at=latest_attempt_at.isoformat() if latest_attempt_at else None,
         ),
+        ensure_ascii=False,
+        sort_keys=True,
     )
-
-
-def first_purchase_recovery_reminder_still_due(cur, telegram_id):
     cur.execute("""
-        SELECT payment_failed, first_payment_done, blocked_bot
-        FROM users
-        WHERE telegram_id = %s
-    """, (int(telegram_id),))
-    row = cur.fetchone()
-    return bool(row and row[0] and not row[1] and not row[2])
+        INSERT INTO message_delivery_events (
+            delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
+        )
+        VALUES (%s, %s, 'first_purchase_recovery_reminder', 'pending', 0, NULL, %s, NOW())
+        ON CONFLICT (delivery_key) DO NOTHING
+        RETURNING delivery_key
+    """, (first_purchase_recovery_delivery_key(telegram_id), int(telegram_id), payload_json))
+    return cur.fetchone() is not None
+
+
+def first_purchase_recovery_reminder_still_due(cur, telegram_id, current_delivery_key=None):
+    return fetch_first_purchase_recovery_user_if_due(cur, telegram_id, current_delivery_key=current_delivery_key) is not None
+
+
+def cancel_first_purchase_recovery_delivery(cur, delivery_key, reason):
+    mark_delivery_cancelled(cur, delivery_key, reason=reason)
+
+
+def cancel_first_purchase_recovery_deliveries(cur, telegram_id, reason="first_payment_succeeded"):
+    cur.execute("""
+        UPDATE message_delivery_events
+        SET status = 'cancelled',
+            last_error = LEFT(%s, 500),
+            lease_until = NULL,
+            next_attempt_at = NULL
+        WHERE delivery_key = %s
+          AND telegram_id = %s
+          AND delivery_type = 'first_purchase_recovery_reminder'
+          AND status IN ('pending', 'failed', 'processing')
+    """, (str(reason), first_purchase_recovery_delivery_key(telegram_id), int(telegram_id)))
 
 
 def enqueue_rejoin_invite_after_payment(cur, telegram_id, expiry_date, source, stripe_event_id, stripe_subscription_id=None):
@@ -2477,8 +2617,8 @@ async def enqueue_due_first_purchase_recovery_reminders(limit=100):
     try:
         due_users = fetch_due_first_purchase_recovery_users(cur, limit=limit)
         enqueued = 0
-        for telegram_id, payment_failed_at in due_users:
-            if enqueue_first_purchase_recovery_reminder(cur, telegram_id, payment_failed_at):
+        for telegram_id, latest_attempt_at in due_users:
+            if enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at):
                 enqueued += 1
         conn.commit()
         logging.info(
@@ -6184,6 +6324,13 @@ async def outbox_status_command(message: types.Message):
         """)
         type_counts = cur.fetchall()
         cur.execute("""
+            SELECT status, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'first_purchase_recovery_reminder'
+            GROUP BY status
+        """)
+        first_purchase_recovery_counts = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute("""
             SELECT COUNT(*)
             FROM message_delivery_events
             WHERE status = 'sent'
@@ -6253,6 +6400,7 @@ async def outbox_status_command(message: types.Message):
         f"processing: {status_counts.get('processing', 0)}",
         f"failed/retry: {status_counts.get('failed', 0)}",
         f"permanently_failed: {status_counts.get('permanently_failed', 0)}",
+        f"cancelled: {status_counts.get('cancelled', 0)}",
         f"sent за 24 часа: {sent_24h}",
         f"stale processing: {stale_processing}",
         f"oldest unresolved age: {oldest_age_text}",
@@ -6264,6 +6412,14 @@ async def outbox_status_command(message: types.Message):
         "By delivery_type:",
     ]
     lines.extend([f"{delivery_type}/{status}: {count}" for delivery_type, status, count in type_counts])
+    lines.extend([
+        "",
+        "First-purchase recovery:",
+        f"pending: {first_purchase_recovery_counts.get('pending', 0)}",
+        f"sent: {first_purchase_recovery_counts.get('sent', 0)}",
+        f"cancelled: {first_purchase_recovery_counts.get('cancelled', 0)}",
+        f"permanently_failed: {first_purchase_recovery_counts.get('permanently_failed', 0)}",
+    ])
     if failed_rows:
         lines.extend(["", "Failed deliveries для retry:"])
         for delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, next_attempt_at in failed_rows:
@@ -6513,9 +6669,17 @@ async def bot_health_command(message: types.Message):
         "processing": "нет",
         "retryable_failed": "нет",
         "permanently_failed": "нет",
+        "cancelled": "нет",
         "blocked": "нет",
         "stale_processing": "нет",
         "sent_24h": "нет",
+    }
+    first_purchase_recovery_stats = {
+        "eligible_now": "нет",
+        "pending": "нет",
+        "sent_24h": "нет",
+        "cancelled": "нет",
+        "permanently_failed": "нет",
     }
     conn = None
     cur = None
@@ -6574,6 +6738,26 @@ async def bot_health_command(message: types.Message):
         outbox_stats["processing"] = delivery_status_counts.get("processing", 0)
         outbox_stats["retryable_failed"] = delivery_status_counts.get("failed", 0)
         outbox_stats["permanently_failed"] = delivery_status_counts.get("permanently_failed", 0)
+        outbox_stats["cancelled"] = delivery_status_counts.get("cancelled", 0)
+        first_purchase_recovery_stats["eligible_now"] = count_due_first_purchase_recovery_users(cur)
+        cur.execute("""
+            SELECT status, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'first_purchase_recovery_reminder'
+            GROUP BY status
+        """)
+        recovery_status_counts = {row[0]: row[1] for row in cur.fetchall()}
+        first_purchase_recovery_stats["pending"] = recovery_status_counts.get("pending", 0)
+        first_purchase_recovery_stats["cancelled"] = recovery_status_counts.get("cancelled", 0)
+        first_purchase_recovery_stats["permanently_failed"] = recovery_status_counts.get("permanently_failed", 0)
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'first_purchase_recovery_reminder'
+              AND status = 'sent'
+              AND sent_at >= NOW() - INTERVAL '24 hours'
+        """)
+        first_purchase_recovery_stats["sent_24h"] = cur.fetchone()[0]
         cur.execute("""
             SELECT COUNT(*)
             FROM message_delivery_events m
@@ -6649,9 +6833,16 @@ async def bot_health_command(message: types.Message):
         f"processing: {outbox_stats['processing']}\n"
         f"retryable_failed: {outbox_stats['retryable_failed']}\n"
         f"permanently_failed: {outbox_stats['permanently_failed']}\n"
+        f"cancelled: {outbox_stats['cancelled']}\n"
         f"blocked: {outbox_stats['blocked']}\n"
         f"stale processing: {outbox_stats['stale_processing']}\n"
         f"sent за 24 часа: {outbox_stats['sent_24h']}\n\n"
+        "First-purchase recovery:\n"
+        f"eligible now: {first_purchase_recovery_stats['eligible_now']}\n"
+        f"pending: {first_purchase_recovery_stats['pending']}\n"
+        f"sent за 24 часа: {first_purchase_recovery_stats['sent_24h']}\n"
+        f"cancelled: {first_purchase_recovery_stats['cancelled']}\n"
+        f"permanently_failed: {first_purchase_recovery_stats['permanently_failed']}\n\n"
         "Users:\n"
         f"Всего пользователей: {user_stats['total']}\n"
         f"paid=True: {user_stats['paid']}\n"
@@ -7740,6 +7931,11 @@ async def stripe_webhook(request):
                     period_start=now,
                     period_end=new_expiry,
                 )
+                cancel_first_purchase_recovery_deliveries(
+                    cur,
+                    user_id,
+                    reason="checkout_session_completed",
+                )
                 cur.execute("""
                     INSERT INTO access_events (
                         telegram_id, event_type, source, old_expiry, new_expiry,
@@ -8423,6 +8619,12 @@ async def stripe_webhook(request):
                     period_end=period_end or new_expiry,
                     recovered_after_failure=was_payment_failed,
                 )
+                if payment_kind == "initial_subscription":
+                    cancel_first_purchase_recovery_deliveries(
+                        cur,
+                        telegram_id,
+                        reason="initial_subscription_payment_succeeded",
+                    )
 
                 if payment_kind == "out_of_band":
                     logging.info(
@@ -10812,6 +11014,24 @@ def hourly_schedule_slot(now=None):
     return now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H")
 
 
+def daily_schedule_slot(now=None):
+    now = now or datetime.utcnow()
+    return now.strftime("%Y-%m-%d")
+
+
+async def cleanup_stale_postgres_fsm_storage():
+    return await asyncio.to_thread(cleanup_postgres_fsm_storage, get_db_conn, 30)
+
+
+async def scheduled_cleanup_stale_postgres_fsm_storage():
+    return await run_scheduled_with_lock(
+        "cleanup_stale_postgres_fsm_storage",
+        daily_schedule_slot(),
+        cleanup_stale_postgres_fsm_storage,
+        lease_minutes=30,
+    )
+
+
 async def scheduled_enqueue_first_purchase_recovery_reminders():
     return await run_scheduled_with_lock(
         "enqueue_first_purchase_recovery_reminders",
@@ -10876,14 +11096,21 @@ async def process_pending_message_deliveries(limit=25):
                 check_conn = get_db_conn()
                 check_cur = check_conn.cursor()
                 try:
-                    still_due = first_purchase_recovery_reminder_still_due(check_cur, telegram_id)
+                    still_due = first_purchase_recovery_reminder_still_due(
+                        check_cur,
+                        telegram_id,
+                        current_delivery_key=delivery_key,
+                    )
                     if not still_due:
-                        mark_delivery_sent(check_cur, delivery_key)
+                        cancel_first_purchase_recovery_delivery(
+                            check_cur,
+                            delivery_key,
+                            "first_purchase_recovery_no_longer_due",
+                        )
                         check_conn.commit()
-                        sent += 1
                         logging.info(
-                            "FIRST_PURCHASE_RECOVERY_REMINDER_SKIPPED: telegram_id=%s, delivery_key=%s",
-                            telegram_id,
+                            "FIRST_PURCHASE_RECOVERY_REMINDER_CANCELLED: user_hash=%s, delivery_key=%s",
+                            safe_delivery_hash(telegram_id),
                             safe_log_id(delivery_key),
                         )
                         continue
@@ -11220,6 +11447,16 @@ def register_scheduler_jobs_once():
         scheduled_enqueue_first_purchase_recovery_reminders,
         'cron',
         minute=45,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_cleanup_stale_postgres_fsm_storage,
+        'cron',
+        hour=4,
+        minute=10,
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1

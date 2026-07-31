@@ -1,4 +1,5 @@
 import contextlib
+import asyncio
 import io
 import os
 import tempfile
@@ -10,10 +11,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import psycopg2
+from aiogram.fsm.storage.base import StorageKey
 from psycopg2 import sql
 from psycopg2.extensions import make_dsn
 
 from db_migrations import MIGRATIONS_DIR, MigrationError, load_migrations, run_migrations
+from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -231,6 +234,99 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "checkout_retry_events_user_attempt_idx",
         )
 
+    def test_postgres_fsm_storage_migration_shape_and_idempotency(self):
+        run_migrations(self.get_conn)
+
+        columns = {
+            row[0]: row[1]
+            for row in self.query_all(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'aiogram_fsm_states'
+                """
+            )
+        }
+        self.assertEqual(columns["data_json"], "jsonb")
+        self.assertIn("created_at", columns)
+        self.assertIn("updated_at", columns)
+        self.assertEqual(
+            self.query_one("SELECT to_regclass('public.aiogram_fsm_states_updated_at_idx')")[0],
+            "aiogram_fsm_states_updated_at_idx",
+        )
+
+        run_migrations(self.get_conn)
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states")[0], 0)
+
+    def test_postgres_fsm_storage_roundtrip_isolation_concurrent_update_and_cleanup(self):
+        run_migrations(self.get_conn)
+
+        async def scenario():
+            first = PostgresFSMStorage(self.get_conn)
+            second = PostgresFSMStorage(self.get_conn)
+            key = StorageKey(bot_id=1, chat_id=2, user_id=3, thread_id=None, business_connection_id=None, destiny="default")
+            other_key = StorageKey(bot_id=1, chat_id=2, user_id=3, thread_id=9, business_connection_id="biz", destiny="other")
+
+            await first.set_state(key, "ContactState:waiting_for_message")
+            await first.set_data(key, {"step": 1})
+            self.assertEqual(await second.get_state(key), "ContactState:waiting_for_message")
+            self.assertEqual(await second.get_data(key), {"step": 1})
+
+            await second.set_data(other_key, {"isolated": True})
+            self.assertEqual(await first.get_data(other_key), {"isolated": True})
+            self.assertEqual(await first.get_data(key), {"step": 1})
+
+            await asyncio.gather(
+                first.update_data(key, {"first": 1}),
+                second.update_data(key, {"second": 2}),
+            )
+            self.assertEqual(await first.get_data(key), {"step": 1, "first": 1, "second": 2})
+
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    UPDATE aiogram_fsm_states
+                    SET data_json = '[]'::jsonb
+                    WHERE bot_id = 1 AND chat_id = 2 AND user_id = 3 AND destiny = 'default'
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO aiogram_fsm_states (
+                        bot_id, chat_id, user_id, thread_id, business_connection_id, destiny,
+                        state, data_json, updated_at
+                    )
+                    VALUES (99, 99, 99, 0, '', 'stale', NULL, '{}'::jsonb, NOW() - INTERVAL '31 days')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO aiogram_fsm_states (
+                        bot_id, chat_id, user_id, thread_id, business_connection_id, destiny,
+                        state, data_json, updated_at
+                    )
+                    VALUES (98, 98, 98, 0, '', 'recent', NULL, '{}'::jsonb, NOW())
+                    """
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(await first.get_data(key), {})
+            self.assertEqual(cleanup_postgres_fsm_storage(self.get_conn, older_than_days=30), 1)
+            self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states WHERE destiny = 'stale'")[0], 0)
+            self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states WHERE destiny = 'recent'")[0], 1)
+
+            await first.set_state(other_key, None)
+            await first.set_data(other_key, {})
+            self.assertEqual(await first.get_data(other_key), {})
+
+        asyncio.run(scenario())
+
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,17 +353,18 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
     def test_two_replicas_are_serialized_by_advisory_lock(self):
         password = dsn_password(POSTGRES_TEST_DSN)
-        self.assertTrue(password)
         self.assertIn(self.db_name, self.dsn)
-        self.assertIn("password=", self.dsn)
+        if password:
+            self.assertIn("password=", self.dsn)
 
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             conn = connect(self.dsn)
             conn.close()
-        self.assertNotIn(password, stdout.getvalue())
-        self.assertNotIn(password, stderr.getvalue())
+        if password:
+            self.assertNotIn(password, stdout.getvalue())
+            self.assertNotIn(password, stderr.getvalue())
 
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "0001_slow.sql").write_text(

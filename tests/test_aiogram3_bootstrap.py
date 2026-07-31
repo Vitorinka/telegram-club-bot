@@ -164,6 +164,10 @@ class FakeConnection:
         self.closed = True
 
 
+def adapted_json_value(value):
+    return getattr(value, "adapted", value)
+
+
 class FakeIncomingMessage:
     def __init__(self, user_id=123):
         self.from_user = SimpleNamespace(id=user_id)
@@ -297,6 +301,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("class PostgresFSMStorage", source)
         self.assertIs(self.main.PostgresFSMStorage, postgres_fsm_storage.PostgresFSMStorage)
 
+    async def test_postgres_fsm_storage_decodes_dict_string_null_and_invalid_data(self):
+        from postgres_fsm_storage import decode_fsm_data
+
+        self.assertEqual(decode_fsm_data({"step": 1}), {"step": 1})
+        self.assertEqual(decode_fsm_data('{"step":1}'), {"step": 1})
+        self.assertEqual(decode_fsm_data(None), {})
+        self.assertEqual(decode_fsm_data(""), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data("{bad-json"), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data("[1,2]"), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data(["unexpected"]), {})
+
     async def test_postgres_fsm_storage_round_trip_and_clear(self):
         from aiogram.fsm.storage.base import StorageKey
         from postgres_fsm_storage import PostgresFSMStorage
@@ -312,14 +330,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 normalized = " ".join(query.split())
                 key = params[:6]
                 if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.state" in normalized:
-                    records.setdefault(key, {"state": None, "data_json": "{}"})["state"] = params[6]
+                    records.setdefault(key, {"state": None, "data_json": {}})["state"] = params[6]
                     return
                 if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.data_json" in normalized:
-                    records.setdefault(key, {"state": None, "data_json": "{}"})["data_json"] = params[6]
+                    records.setdefault(key, {"state": None, "data_json": {}})["data_json"] = adapted_json_value(params[6])
                     return
                 if normalized.startswith("DELETE FROM aiogram_fsm_states"):
                     record = records.get(key)
-                    if record and record["state"] is None and record["data_json"] == "{}":
+                    if record and record["state"] is None and record["data_json"] == {}:
                         records.pop(key)
                     return
                 if normalized.startswith("SELECT state"):
@@ -391,29 +409,29 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 if normalized.startswith("INSERT INTO aiogram_fsm_states"):
                     key = params[:6]
                     with record_lock:
-                        records.setdefault(key, {"state": None, "data_json": "{}"})
+                        records.setdefault(key, {"state": None, "data_json": {}})
                     return
                 if normalized.startswith("SELECT data_json") and "FOR UPDATE" in normalized:
                     key = params[:6]
                     record_lock.acquire()
                     self.lock_held = True
-                    record = records.get(key, {"data_json": "{}"})
+                    record = records.get(key, {"data_json": {}})
                     self.row = (record["data_json"],)
                     return
                 if normalized.startswith("SELECT data_json"):
                     key = params[:6]
-                    record = records.get(key, {"data_json": "{}"})
+                    record = records.get(key, {"data_json": {}})
                     self.row = (record["data_json"],)
                     return
                 if normalized.startswith("UPDATE aiogram_fsm_states"):
-                    data_json = params[0]
+                    data_json = adapted_json_value(params[0])
                     key = params[1:7]
-                    records.setdefault(key, {"state": None, "data_json": "{}"})["data_json"] = data_json
+                    records.setdefault(key, {"state": None, "data_json": {}})["data_json"] = data_json
                     return
                 if normalized.startswith("DELETE FROM aiogram_fsm_states"):
                     key = params[:6]
                     record = records.get(key)
-                    if record and record["state"] is None and record["data_json"] == "{}":
+                    if record and record["state"] is None and record["data_json"] == {}:
                         records.pop(key)
 
             def fetchone(self):
@@ -456,7 +474,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_purchase_recovery_delivery_skips_when_no_longer_due(self):
         delivery = (
-            "first_purchase_recovery:123:20260731T100000",
+            self.main.first_purchase_recovery_delivery_key(123),
             123,
             "first_purchase_recovery_reminder",
             json.dumps({"text": "retry", "keyboard_kind": "retry_payment"}),
@@ -464,21 +482,106 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         claim_conn = FakeConnection(fetches=[[delivery]])
-        check_conn = FakeConnection(fetches=[(False, True, False)])
+        check_conn = FakeConnection(fetches=[None])
         conns = iter([claim_conn, check_conn])
 
         with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
             result = await self.main.process_pending_message_deliveries(limit=1)
 
-        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["sent"], 0)
         self.assertEqual(result["retryable_failed"], 0)
         send_message.assert_not_awaited()
         self.assertTrue(claim_conn.closed)
         self.assertTrue(check_conn.closed)
         sql = "\n".join(query for query, _ in check_conn.cursor_obj.queries)
-        self.assertIn("SELECT payment_failed, first_payment_done, blocked_bot", sql)
+        self.assertIn("checkout_sessions", sql)
+        self.assertIn("checkout_retry_events", sql)
+        self.assertIn("status = 'cancelled'", sql)
         self.assertIn("UPDATE message_delivery_events", sql)
+
+    async def test_first_purchase_recovery_delay_is_fixed_twenty_four_hours(self):
+        self.assertEqual(self.main.FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, 24)
+
+    async def test_first_purchase_recovery_key_is_hashed_and_stable(self):
+        first = self.main.first_purchase_recovery_delivery_key(123456789)
+        second = self.main.first_purchase_recovery_delivery_key(123456789)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("first_purchase_recovery:"))
+        self.assertNotIn("123456789", first)
+        self.assertNotIn("payment_failed_at", first)
+
+    async def test_first_purchase_recovery_due_query_uses_checkout_attempts_and_not_payment_failed(self):
+        conn = FakeConnection(fetches=[[(123, datetime(2026, 7, 30, 10, 0))]])
+
+        due = self.main.fetch_due_first_purchase_recovery_users(conn.cursor_obj, limit=10)
+
+        self.assertEqual(due, [(123, datetime(2026, 7, 30, 10, 0))])
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("FROM checkout_sessions", sql)
+        self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("status = ANY", sql)
+        self.assertIn("NOW() AT TIME ZONE 'UTC'", sql)
+        self.assertIn("payment_events", sql)
+        self.assertIn("access_events", sql)
+        self.assertIn("stripe_links", sql)
+        self.assertIn("completed_cs.status = 'completed'", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
+
+    async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
+        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+
+        row = self.main.fetch_first_purchase_recovery_user_if_due(conn.cursor_obj, 123)
+
+        self.assertEqual(row, (123, datetime(2026, 7, 30, 10, 0)))
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("checkout_retry_events", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
+
+    async def test_first_purchase_recovery_attempt_statuses_are_real_checkout_states(self):
+        self.assertEqual(
+            self.main.FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES,
+            ("creating", "creation_unknown", "open", "expired", "failed"),
+        )
+
+    async def test_first_purchase_recovery_enqueue_uses_retry_payment_keyboard_and_one_delivery(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        created = self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+        )
+
+        self.assertTrue(created)
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("ON CONFLICT (delivery_key) DO NOTHING", query)
+        self.assertIn("first_purchase_recovery_reminder", query)
+        self.assertNotIn("123456789", params[0])
+        payload = json.loads(params[2])
+        self.assertEqual(payload["text"], self.main.first_purchase_recovery_reminder_text())
+        self.assertEqual(payload["keyboard_kind"], "retry_payment")
+
+    async def test_first_purchase_recovery_success_cancels_pending_failed_processing(self):
+        conn = FakeConnection()
+
+        self.main.cancel_first_purchase_recovery_deliveries(conn.cursor_obj, 123456789, reason="paid")
+
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("status = 'cancelled'", query)
+        self.assertIn("status IN ('pending', 'failed', 'processing')", query)
+        self.assertNotIn("123456789", params[1])
+        self.assertEqual(params[2], 123456789)
+
+    async def test_first_purchase_recovery_recheck_excludes_current_processing_delivery(self):
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+
+        self.assertTrue(self.main.first_purchase_recovery_reminder_still_due(conn.cursor_obj, 123, delivery_key))
+
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("md.delivery_key <> %s", query)
+        self.assertEqual(params[-2:], [delivery_key, delivery_key])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 52)
@@ -1259,6 +1362,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             (now,),
             [],
             [],
+            [],
             (0,),
             (None,),
             (None,),
@@ -1364,6 +1468,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             (now,),
             [("pending", 1), ("failed", 1)],
             [("free_lesson", "failed", 1)],
+            [("pending", 1), ("cancelled", 2)],
             (0,),
             (next_retry,),
             (next_retry,),
@@ -1382,7 +1487,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("oldest unresolved age: 0 мин.", text)
         self.assertIn("next retry in: 9 мин.", text)
         self.assertIn("nearest next_attempt_at: 29.07.2026 13:25", text)
-        self.assertNotIn("-", text)
+        self.assertIn("First-purchase recovery:", text)
+        self.assertIn("cancelled: 2", text)
+        self.assertNotIn("oldest unresolved age: -", text)
+        self.assertNotIn("next retry in: -", text)
         self.assertLess(len(text), 4096)
 
     async def test_outbox_status_due_or_empty_retry_text_is_none(self):
@@ -1391,6 +1499,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(oldest_unresolved=oldest_unresolved):
                 conn = FakeConnection(fetches=[
                     (now,),
+                    [],
                     [],
                     [],
                     (0,),
@@ -2027,7 +2136,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 7)
+        self.assertEqual(len(fake_scheduler.jobs), 8)
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):

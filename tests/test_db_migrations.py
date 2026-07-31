@@ -122,6 +122,7 @@ class DbMigrationTests(unittest.TestCase):
             "destiny",
             "state",
             "data_json",
+            "created_at",
             "updated_at",
         ):
             self.assertIn(column, columns)
@@ -132,6 +133,15 @@ class DbMigrationTests(unittest.TestCase):
         self.assertTrue((root / "migrations" / "0004_postgres_fsm_storage.sql").exists())
         old_name = "0004_" + "aiogram_fsm_storage.sql"
         self.assertFalse((root / "migrations" / old_name).exists())
+
+    def test_postgres_fsm_storage_migration_uses_jsonb_and_cleanup_columns(self):
+        root = Path(__file__).resolve().parents[1]
+        migration_sql = (root / "migrations" / "0004_postgres_fsm_storage.sql").read_text()
+
+        self.assertIn("data_json JSONB NOT NULL DEFAULT '{}'::jsonb", migration_sql)
+        self.assertIn("created_at TIMESTAMP NOT NULL DEFAULT NOW()", migration_sql)
+        self.assertIn("updated_at TIMESTAMP NOT NULL DEFAULT NOW()", migration_sql)
+        self.assertIn("aiogram_fsm_states_updated_at_idx", migration_sql)
 
     def test_empty_schema_applies_numbered_migrations(self):
         with tempfile.TemporaryDirectory() as tmp:

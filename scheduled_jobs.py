@@ -174,6 +174,20 @@ def mark_delivery_sent(cur, delivery_key):
     )
 
 
+def mark_delivery_cancelled(cur, delivery_key, reason="cancelled"):
+    cur.execute(
+        """
+        UPDATE message_delivery_events
+        SET status = 'cancelled',
+            last_error = LEFT(%s, 500),
+            lease_until = NULL,
+            next_attempt_at = NULL
+        WHERE delivery_key = %s
+        """,
+        (str(reason), delivery_key),
+    )
+
+
 def mark_delivery_failed(cur, delivery_key, error_text, retry_delay_minutes=15, permanently_failed=False):
     status = "permanently_failed" if permanently_failed else "failed"
     next_attempt_sql = "NULL" if permanently_failed else "NOW() + (%s * INTERVAL '1 minute')"

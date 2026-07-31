@@ -266,6 +266,7 @@ MIGRATION_BASELINE_REQUIREMENTS = {
                 "destiny",
                 "state",
                 "data_json",
+                "created_at",
                 "updated_at",
             ),
         },
@@ -307,6 +308,7 @@ BASELINE_REQUIRED_COLUMNS = {
         "user_id",
         "state",
         "data_json",
+        "created_at",
     ),
 }
 

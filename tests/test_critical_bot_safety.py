@@ -41,6 +41,7 @@ from scheduled_jobs import (
     claim_pending_message_deliveries,
     claim_scheduled_job,
     enqueue_message_delivery,
+    mark_delivery_cancelled,
     mark_delivery_failed,
     process_claimed_delivery,
 )
@@ -268,6 +269,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')", sql)
         self.assertIn("payload_json", sql)
 
+    def test_message_delivery_cancelled_is_terminal_status(self):
+        cur = FakeCursor()
+        mark_delivery_cancelled(cur, "first_purchase_recovery:key", "no_longer_due")
+
+        sql, params = cur.queries[-1]
+        self.assertIn("status = 'cancelled'", sql)
+        self.assertIn("next_attempt_at = NULL", sql)
+        self.assertEqual(params, ("no_longer_due", "first_purchase_recovery:key"))
+
     def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
         cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None)]])
         rows = claim_pending_message_deliveries(cur, limit=5)
@@ -305,21 +315,28 @@ class CriticalBotSafetyTests(unittest.TestCase):
             MAIN_SOURCE.index("def first_purchase_recovery_delivery_key"):
             MAIN_SOURCE.index("def enqueue_rejoin_invite_after_payment")
         ]
-        self.assertIn('return f"first_purchase_recovery:{int(telegram_id)}:{failed_at}"', source)
-        self.assertIn("enqueue_message_delivery", source)
-        self.assertIn('"first_purchase_recovery_reminder"', source)
+        self.assertIn('return f"first_purchase_recovery:{safe_delivery_hash(int(telegram_id))}"', source)
+        self.assertIn("ON CONFLICT (delivery_key) DO NOTHING", source)
+        self.assertIn("first_purchase_recovery_reminder", source)
         self.assertIn('keyboard_kind="retry_payment"', source)
 
     def test_first_purchase_recovery_due_query_is_first_purchase_only(self):
         source = MAIN_SOURCE[
-            MAIN_SOURCE.index("def fetch_due_first_purchase_recovery_users"):
+            MAIN_SOURCE.index("def first_purchase_recovery_eligibility_sql"):
             MAIN_SOURCE.index("def enqueue_first_purchase_recovery_reminder")
         ]
         sql = source
-        self.assertIn("payment_failed = TRUE", sql)
+        self.assertIn("FROM checkout_sessions", sql)
+        self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("status = ANY", sql)
         self.assertIn("first_payment_done IS NOT TRUE", sql)
-        self.assertIn("payment_failed_at <= NOW() - (%s * INTERVAL '1 hour')", sql)
+        self.assertIn("payment_events", sql)
+        self.assertIn("access_events", sql)
+        self.assertIn("stripe_links", sql)
+        self.assertIn("completed_cs.status = 'completed'", sql)
+        self.assertIn("md.status IN ('pending', 'processing', 'sent')", sql)
         self.assertIn("blocked_bot IS NOT TRUE", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
 
     def test_stripe_webhook_user_notifications_are_outbox_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
@@ -392,9 +409,16 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ]
         self.assertIn('"enqueue_first_purchase_recovery_reminders"', reminder_source)
         self.assertIn("hourly_schedule_slot()", reminder_source)
+        cleanup_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def scheduled_cleanup_stale_postgres_fsm_storage"):
+            MAIN_SOURCE.index("async def scheduled_enqueue_first_purchase_recovery_reminders")
+        ]
+        self.assertIn('"cleanup_stale_postgres_fsm_storage"', cleanup_source)
+        self.assertIn("daily_schedule_slot()", cleanup_source)
         startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
         self.assertIn("scheduled_process_message_deliveries", startup)
         self.assertIn("scheduled_enqueue_first_purchase_recovery_reminders", source)
+        self.assertIn("scheduled_cleanup_stale_postgres_fsm_storage", source)
 
     def test_aiogram3_commands_use_command_object_for_args(self):
         self.assertIn("CommandObject", MAIN_SOURCE)
