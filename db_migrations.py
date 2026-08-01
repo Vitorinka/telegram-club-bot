@@ -254,10 +254,29 @@ MIGRATION_BASELINE_REQUIREMENTS = {
         ),
         "requires_stripe_identity_clean": True,
     },
+    "0004_postgres_fsm_storage": {
+        "tables": ("aiogram_fsm_states",),
+        "columns": {
+            "aiogram_fsm_states": (
+                "bot_id",
+                "chat_id",
+                "user_id",
+                "thread_id",
+                "business_connection_id",
+                "destiny",
+                "state",
+                "data_json",
+                "created_at",
+                "updated_at",
+            ),
+        },
+        "indexes": ("aiogram_fsm_states_updated_at_idx",),
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
     "stripe_identity_conflicts",
+    "aiogram_fsm_states",
 )
 
 BASELINE_REQUIRED_COLUMNS = {
@@ -282,6 +301,14 @@ BASELINE_REQUIRED_COLUMNS = {
         "telegram_id",
         "delivery_type",
         "status",
+    ),
+    "aiogram_fsm_states": (
+        "bot_id",
+        "chat_id",
+        "user_id",
+        "state",
+        "data_json",
+        "created_at",
     ),
 }
 

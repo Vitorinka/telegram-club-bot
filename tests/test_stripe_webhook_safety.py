@@ -228,6 +228,7 @@ def install_aiogram_import_stubs():
     new_exceptions_module.TelegramForbiddenError = _FakeTelegramForbiddenError
     new_exceptions_module.TelegramNetworkError = type("TelegramNetworkError", (_FakeTelegramError,), {})
     new_exceptions_module.TelegramRetryAfter = _FakeTelegramRetryAfter
+    new_exceptions_module.DataNotDictLikeError = type("DataNotDictLikeError", (TypeError,), {})
 
     filters_module = types.ModuleType("aiogram.filters")
     filters_module.Command = type("Command", (), {"__init__": lambda self, *args, **kwargs: None})
@@ -240,6 +241,10 @@ def install_aiogram_import_stubs():
     fsm_state_module = types.ModuleType("aiogram.fsm.state")
     fsm_state_module.State = _FakeState
     fsm_state_module.StatesGroup = _FakeStatesGroup
+    fsm_storage_base_module = types.ModuleType("aiogram.fsm.storage.base")
+    fsm_storage_base_module.BaseStorage = object
+    fsm_storage_base_module.StorageKey = object
+    fsm_storage_base_module.StateType = object
     fsm_storage_memory_module = types.ModuleType("aiogram.fsm.storage.memory")
     fsm_storage_memory_module.MemoryStorage = type("MemoryStorage", (), {"__init__": lambda self, *args, **kwargs: None})
 
@@ -263,6 +268,7 @@ def install_aiogram_import_stubs():
         "aiogram.fsm.context": fsm_context_module,
         "aiogram.fsm.state": fsm_state_module,
         "aiogram.fsm.storage": types.ModuleType("aiogram.fsm.storage"),
+        "aiogram.fsm.storage.base": fsm_storage_base_module,
         "aiogram.fsm.storage.memory": fsm_storage_memory_module,
         "aiogram.webhook": types.ModuleType("aiogram.webhook"),
         "aiogram.webhook.aiohttp_server": webhook_module,

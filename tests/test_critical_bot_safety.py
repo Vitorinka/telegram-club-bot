@@ -28,6 +28,7 @@ from checkout_safety import (
     stable_checkout_idempotency_key,
     subscription_status_action,
 )
+from db_migrations import MIGRATION_BASELINE_REQUIREMENTS
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -40,6 +41,7 @@ from scheduled_jobs import (
     claim_pending_message_deliveries,
     claim_scheduled_job,
     enqueue_message_delivery,
+    mark_delivery_cancelled,
     mark_delivery_failed,
     process_claimed_delivery,
 )
@@ -51,6 +53,7 @@ from stripe_invoice_rules import (
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_SOURCE = (ROOT / "main.py").read_text()
+CHECKOUT_SAFETY_SOURCE = (ROOT / "checkout_safety.py").read_text()
 
 
 class Obj:
@@ -176,19 +179,20 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertEqual(subscription_status_action("active", count=2), "duplicate_subscriptions")
 
     def test_trial_and_checkout_migrations_exist(self):
+        migration_source = str(MIGRATION_BASELINE_REQUIREMENTS)
         for needle in (
-            "CREATE TABLE IF NOT EXISTS checkout_sessions",
+            "checkout_sessions",
             "checkout_sessions_one_open_tariff",
-            "CREATE TABLE IF NOT EXISTS trial_redemptions",
-            "CREATE TABLE IF NOT EXISTS stripe_identity_conflicts",
+            "trial_redemptions",
+            "stripe_identity_conflicts",
         ):
-            self.assertIn(needle, MAIN_SOURCE)
+            self.assertIn(needle, migration_source)
 
-    def test_init_db_uses_versioned_migration_runner_before_legacy_ddl(self):
+    def test_init_db_uses_only_versioned_migration_runner(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("def init_db"):MAIN_SOURCE.index("# Идемпотентность вебхуков")]
         self.assertIn("run_migrations(get_db_conn)", source)
-        self.assertLess(source.index("run_migrations(get_db_conn)"), source.index("return"))
-        self.assertLess(source.index("return"), source.index("CREATE TABLE IF NOT EXISTS users"))
+        self.assertNotIn("CREATE TABLE", source)
+        self.assertNotIn("ALTER TABLE", source)
 
     def test_process_payment_uses_db_claim_and_stripe_idempotency_key(self):
         self.assertIn("claim_checkout_session_record", MAIN_SOURCE)
@@ -265,6 +269,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("WHERE message_delivery_events.status NOT IN ('sent', 'permanently_failed')", sql)
         self.assertIn("payload_json", sql)
 
+    def test_message_delivery_cancelled_is_terminal_status(self):
+        cur = FakeCursor()
+        mark_delivery_cancelled(cur, "first_purchase_recovery:key", "no_longer_due")
+
+        sql, params = cur.queries[-1]
+        self.assertIn("status = 'cancelled'", sql)
+        self.assertIn("next_attempt_at = NULL", sql)
+        self.assertEqual(params, ("no_longer_due", "first_purchase_recovery:key"))
+
     def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
         cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None)]])
         rows = claim_pending_message_deliveries(cur, limit=5)
@@ -295,6 +308,41 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("blocked_bot = TRUE", source)
         self.assertLess(source.index("try:"), source.index("payload = json.loads"))
         self.assertIn("stripe_delivery_reply_markup", source)
+        self.assertIn("first_purchase_recovery_reminder_still_due", source)
+
+    def test_first_purchase_recovery_reminder_uses_durable_outbox(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def first_purchase_recovery_delivery_key"):
+            MAIN_SOURCE.index("def enqueue_rejoin_invite_after_payment")
+        ]
+        self.assertIn('return f"first_purchase_recovery:{safe_delivery_hash(int(telegram_id))}"', source)
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", source)
+        self.assertIn("WHERE message_delivery_events.status = 'cancelled'", source)
+        self.assertIn("first_purchase_recovery_reminder", source)
+        self.assertIn('keyboard_kind="retry_payment"', source)
+
+    def test_first_purchase_recovery_due_query_is_first_purchase_only(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def first_purchase_recovery_eligibility_sql"):
+            MAIN_SOURCE.index("def enqueue_first_purchase_recovery_reminder")
+        ]
+        sql = source
+        self.assertIn("FROM checkout_sessions", sql)
+        self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("status = ANY", sql)
+        self.assertIn("first_payment_done IS NOT TRUE", sql)
+        self.assertIn("payment_events", sql)
+        self.assertIn("access_events", sql)
+        self.assertIn("stripe_links", sql)
+        self.assertNotIn("completed_cs.status = 'completed'", sql)
+        self.assertNotIn("FROM checkout_sessions completed_cs", sql)
+        self.assertIn("md.status IN ('pending', 'processing', 'sent')", sql)
+        self.assertIn("blocked_bot IS NOT TRUE", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
+        self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
+        self.assertNotIn("checkout_completed", sql)
+        self.assertNotIn("sl.current_period_end IS NOT NULL", sql)
+        self.assertNotIn("sl.current_period_end >", sql)
 
     def test_stripe_webhook_user_notifications_are_outbox_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
@@ -360,8 +408,23 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("run_scheduled_with_lock", source)
         self.assertIn('"process_message_deliveries"', source)
         self.assertIn("five_minute_schedule_slot()", source)
+        self.assertIn("async def scheduled_enqueue_first_purchase_recovery_reminders", MAIN_SOURCE)
+        reminder_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def scheduled_enqueue_first_purchase_recovery_reminders"):
+            MAIN_SOURCE.index("async def scheduled_check_auto_free_lessons")
+        ]
+        self.assertIn('"enqueue_first_purchase_recovery_reminders"', reminder_source)
+        self.assertIn("hourly_schedule_slot()", reminder_source)
+        cleanup_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def scheduled_cleanup_stale_postgres_fsm_storage"):
+            MAIN_SOURCE.index("async def scheduled_enqueue_first_purchase_recovery_reminders")
+        ]
+        self.assertIn('"cleanup_stale_postgres_fsm_storage"', cleanup_source)
+        self.assertIn("daily_schedule_slot()", cleanup_source)
         startup = MAIN_SOURCE[MAIN_SOURCE.index("async def on_startup"):]
         self.assertIn("scheduled_process_message_deliveries", startup)
+        self.assertIn("scheduled_enqueue_first_purchase_recovery_reminders", source)
+        self.assertIn("scheduled_cleanup_stale_postgres_fsm_storage", source)
 
     def test_aiogram3_commands_use_command_object_for_args(self):
         self.assertIn("CommandObject", MAIN_SOURCE)
@@ -406,21 +469,37 @@ class CriticalBotSafetyTests(unittest.TestCase):
             self.assertIn(name, MAIN_SOURCE)
 
     def test_db_pool_uses_timeouts_and_threaded_pool(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("class PooledDbConnection"):MAIN_SOURCE.index("def init_db")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("class TrackedThreadedConnectionPool"):MAIN_SOURCE.index("def init_db")]
         self.assertIn("ThreadedConnectionPool", source)
         self.assertIn("connect_timeout=DB_CONNECT_TIMEOUT_SECONDS", source)
         self.assertIn("statement_timeout", source)
         self.assertIn("putconn(self._raw_conn)", source)
         self.assertIn("putconn(self._raw_conn, close=True)", source)
-        self.assertIn("DB_POOL_CONNECTION_ERRORS", source)
+        self.assertIn("DB_POOL_DOUBLE_PUT_IGNORED", source)
 
     def test_db_pool_health_and_shutdown_are_exposed(self):
         self.assertIn("def db_pool_health", MAIN_SOURCE)
         self.assertIn("pool_available", MAIN_SOURCE)
         self.assertIn("pool_used", MAIN_SOURCE)
         self.assertIn("connection_errors", MAIN_SOURCE)
+        health_source = MAIN_SOURCE[MAIN_SOURCE.index("def db_pool_health"):MAIN_SOURCE.index("def init_db")]
+        self.assertNotIn('"_used"', health_source)
+        self.assertNotIn('"_pool"', health_source)
         self.assertIn("close_db_pool()", MAIN_SOURCE[MAIN_SOURCE.index("async def on_shutdown"):])
         self.assertIn("app.router.add_get('/health', health)", MAIN_SOURCE)
+
+    def test_admin_error_responses_use_safe_reference_helper(self):
+        self.assertIn("def safe_admin_error_reference", MAIN_SOURCE)
+        forbidden_fragments = (
+            "await notify_admins(f\"❌ Непредвиденная ошибка бэкапа: {e}",
+            "f\"Ошибка: {e}",
+            "f\"❌ Ошибка отправки тестового урока: {e}",
+            "f\"❌ Ошибка /unlinked_stripe: {e}",
+            "f\"❌ Ошибка /stripe_links: {e}",
+            "f\"❌ Не удалось получить Stripe subscription: {e}",
+        )
+        for fragment in forbidden_fragments:
+            self.assertNotIn(fragment, MAIN_SOURCE)
 
     def test_backup_config_decision(self):
         self.assertEqual(backup_decision({})["telegram_enabled"], False)
@@ -705,9 +784,11 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("telegram_status_error", source)
 
     def test_subscription_removal_has_durable_lease_table(self):
-        self.assertIn("CREATE TABLE IF NOT EXISTS subscription_removal_events", MAIN_SOURCE)
-        self.assertIn("telegram_removed_at TIMESTAMP", MAIN_SOURCE)
-        self.assertIn("db_finalized_at TIMESTAMP", MAIN_SOURCE)
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]
+        self.assertIn("subscription_removal_events", migration["tables"])
+        columns = migration["columns"]["subscription_removal_events"]
+        self.assertIn("telegram_removed_at", columns)
+        self.assertIn("db_finalized_at", columns)
         source = MAIN_SOURCE[MAIN_SOURCE.index("def claim_subscription_removal"):MAIN_SOURCE.index("def mark_subscription_removal_status")]
         self.assertIn("FOR UPDATE", source)
         self.assertIn("current_lease_until < now", source)
@@ -747,7 +828,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("active_or_resumable_subscriptions", source)
 
     def test_bot_invite_links_migration_and_revoke_command(self):
-        self.assertIn("CREATE TABLE IF NOT EXISTS bot_invite_links", MAIN_SOURCE)
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]
+        self.assertIn("bot_invite_links", migration["tables"])
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def revoke_invite_links_command"):MAIN_SOURCE.index("@router.message(Command('resolve_checkout')")]
         self.assertIn("load_active_bot_invite_links", source)
         self.assertIn("make_action_request", source)
@@ -804,10 +886,12 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertEqual(cur.queries[-1][1][0], "failed")
 
     def test_checkout_unique_index_includes_creation_unknown(self):
-        self.assertIn("WHERE status IN ('creating', 'creation_unknown', 'open')", MAIN_SOURCE)
+        self.assertIn('CHECKOUT_OPEN_STATUSES = ("creating", "creation_unknown", "open")', CHECKOUT_SAFETY_SOURCE)
+        self.assertIn("status IN ('creating', 'creation_unknown', 'open')", CHECKOUT_SAFETY_SOURCE)
 
     def test_checkout_retry_events_persist_attempts_for_restart_and_replicas(self):
-        self.assertIn("CREATE TABLE IF NOT EXISTS checkout_retry_events", MAIN_SOURCE)
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]
+        self.assertIn("checkout_retry_events", migration["tables"])
         source = MAIN_SOURCE[MAIN_SOURCE.index("def register_checkout_attempt"):MAIN_SOURCE.index("async def notify_admins_about_checkout_retry")]
         self.assertIn("INSERT INTO checkout_retry_events", source)
         self.assertIn("SELECT COUNT(*)", source)
@@ -1009,11 +1093,10 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertEqual(result["record"]["id"], 12)
 
     def test_identity_conflicts_are_upserted_not_duplicated(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("CREATE TABLE IF NOT EXISTS stripe_identity_conflicts"):MAIN_SOURCE.index("if identity_conflicts:")]
-        self.assertIn("updated_at TIMESTAMP DEFAULT NOW()", source)
-        self.assertIn("stripe_identity_conflicts_active_unique", source)
-        self.assertIn("ON CONFLICT (conflict_type, stripe_id, telegram_ids)", source)
-        self.assertIn("DO UPDATE SET", source)
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0003_stripe_identity_guards"]
+        self.assertIn("stripe_identity_conflicts", migration["tables"])
+        self.assertIn("updated_at", migration["columns"]["stripe_identity_conflicts"])
+        self.assertIn("stripe_identity_conflicts_active_unique", migration["indexes"])
 
     def test_literal_cur_execute_placeholder_counts_match_literal_params(self):
         tree = ast.parse(MAIN_SOURCE)

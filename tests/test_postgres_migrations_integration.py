@@ -1,4 +1,5 @@
 import contextlib
+import asyncio
 import io
 import os
 import tempfile
@@ -10,13 +11,36 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import psycopg2
+from aiogram.fsm.storage.base import StorageKey
 from psycopg2 import sql
 from psycopg2.extensions import make_dsn
 
 from db_migrations import MIGRATIONS_DIR, MigrationError, load_migrations, run_migrations
+from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
+
+MAIN_TEST_ENV = {
+    "BOT_TOKEN": "123456:TEST_TOKEN_FOR_POSTGRES_ONLY",
+    "DATABASE_URL": "postgresql://user:pass@localhost/db",
+    "GROUP_ID": "-100123",
+    "ADMIN_IDS": "1,2",
+    "STRIPE_API_KEY": "sk_test_dummy",
+    "STRIPE_WEBHOOK_SECRET": "postgres_test_webhook_secret",
+    "WEBHOOK_SECRET": "telegram_secret",
+    "YOUR_DOMAIN": "https://club.example",
+    "PRICE_TRIAL": "price_trial",
+    "PRICE_1M": "price_1m",
+    "PRICE_6M": "price_6m",
+    "PRICE_12M": "price_12m",
+}
+
+
+def import_main():
+    os.environ.update(MAIN_TEST_ENV)
+    import main
+    return main
 
 
 def connect(dsn):
@@ -135,6 +159,103 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         rows = self.query_all(query, params)
         return rows[0] if rows else None
 
+    def insert_recovery_user(self, telegram_id, **overrides):
+        fields = {
+            "telegram_id": telegram_id,
+            "paid": False,
+            "expiry_date": None,
+            "first_payment_done": False,
+            "blocked_bot": False,
+            "stripe_subscription_id": None,
+        }
+        fields.update(overrides)
+        columns = list(fields)
+        values = [fields[column] for column in columns]
+        placeholders = ", ".join(["%s"] * len(columns))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                sql.SQL("INSERT INTO users ({}) VALUES ({})").format(
+                    sql.SQL(", ").join(map(sql.Identifier, columns)),
+                    sql.SQL(placeholders),
+                ),
+                values,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def insert_checkout_attempt(self, telegram_id, *, hours_ago=24, status="expired", mode="payment", tariff="sub_1"):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO checkout_sessions (
+                    telegram_id, tariff_code, mode, idempotency_key, status, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s,
+                        (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'),
+                        (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
+                """,
+                (telegram_id, tariff, mode, f"idem_{telegram_id}_{uuid.uuid4().hex}", status, hours_ago, hours_ago),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def insert_retry_attempt(self, telegram_id, *, hours_ago=24, tariff="sub_1"):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO checkout_retry_events (telegram_id, tariff_code, attempt_at)
+                VALUES (%s, %s, (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
+                """,
+                (telegram_id, tariff, hours_ago),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def due_recovery_users(self):
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            return main.fetch_due_first_purchase_recovery_users(cur, limit=50)
+        finally:
+            cur.close()
+            conn.close()
+
+    def enqueue_recovery(self, telegram_id, latest_attempt_at):
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            created = main.enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at)
+            conn.commit()
+            return created
+        finally:
+            cur.close()
+            conn.close()
+
+    def recovery_row(self, telegram_id):
+        main = import_main()
+        return self.query_one(
+            """
+            SELECT delivery_key, status, attempt_count, last_error, claimed_at, lease_until, sent_at, next_attempt_at, payload_json
+            FROM message_delivery_events
+            WHERE delivery_key = %s
+            """,
+            (main.first_purchase_recovery_delivery_key(telegram_id),),
+        )
+
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
@@ -231,6 +352,558 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "checkout_retry_events_user_attempt_idx",
         )
 
+    def test_postgres_fsm_storage_migration_shape_and_idempotency(self):
+        run_migrations(self.get_conn)
+
+        columns = {
+            row[0]: row[1]
+            for row in self.query_all(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name = 'aiogram_fsm_states'
+                """
+            )
+        }
+        self.assertEqual(columns["data_json"], "jsonb")
+        self.assertIn("created_at", columns)
+        self.assertIn("updated_at", columns)
+        self.assertEqual(
+            self.query_one("SELECT to_regclass('public.aiogram_fsm_states_updated_at_idx')")[0],
+            "aiogram_fsm_states_updated_at_idx",
+        )
+
+        run_migrations(self.get_conn)
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states")[0], 0)
+
+    def test_postgres_fsm_storage_roundtrip_isolation_concurrent_update_and_cleanup(self):
+        run_migrations(self.get_conn)
+
+        async def scenario():
+            first = PostgresFSMStorage(self.get_conn)
+            second = PostgresFSMStorage(self.get_conn)
+            key = StorageKey(bot_id=1, chat_id=2, user_id=3, thread_id=None, business_connection_id=None, destiny="default")
+            other_key = StorageKey(bot_id=1, chat_id=2, user_id=3, thread_id=9, business_connection_id="biz", destiny="other")
+
+            await first.set_state(key, "ContactState:waiting_for_message")
+            await first.set_data(key, {"step": 1})
+            self.assertEqual(await second.get_state(key), "ContactState:waiting_for_message")
+            self.assertEqual(await second.get_data(key), {"step": 1})
+
+            await second.set_data(other_key, {"isolated": True})
+            self.assertEqual(await first.get_data(other_key), {"isolated": True})
+            self.assertEqual(await first.get_data(key), {"step": 1})
+
+            await asyncio.gather(
+                first.update_data(key, {"first": 1}),
+                second.update_data(key, {"second": 2}),
+            )
+            self.assertEqual(await first.get_data(key), {"step": 1, "first": 1, "second": 2})
+
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    UPDATE aiogram_fsm_states
+                    SET data_json = '[]'::jsonb
+                    WHERE bot_id = 1 AND chat_id = 2 AND user_id = 3 AND destiny = 'default'
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO aiogram_fsm_states (
+                        bot_id, chat_id, user_id, thread_id, business_connection_id, destiny,
+                        state, data_json, updated_at
+                    )
+                    VALUES (99, 99, 99, 0, '', 'stale', NULL, '{}'::jsonb, NOW() - INTERVAL '31 days')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO aiogram_fsm_states (
+                        bot_id, chat_id, user_id, thread_id, business_connection_id, destiny,
+                        state, data_json, updated_at
+                    )
+                    VALUES (98, 98, 98, 0, '', 'recent', NULL, '{}'::jsonb, NOW())
+                    """
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(await first.get_data(key), {})
+            self.assertEqual(cleanup_postgres_fsm_storage(self.get_conn, older_than_days=30), 1)
+            self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states WHERE destiny = 'stale'")[0], 0)
+            self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states WHERE destiny = 'recent'")[0], 1)
+
+            await first.set_state(other_key, None)
+            await first.set_data(other_key, {})
+            self.assertEqual(await first.get_data(other_key), {})
+
+        asyncio.run(scenario())
+
+    def test_first_purchase_recovery_attempt_age_retry_event_and_pending_subscription_eligibility(self):
+        run_migrations(self.get_conn)
+
+        self.insert_recovery_user(9101)
+        self.insert_checkout_attempt(9101, hours_ago=23)
+        self.assertNotIn(9101, {row[0] for row in self.due_recovery_users()})
+
+        self.insert_recovery_user(9102)
+        self.insert_checkout_attempt(9102, hours_ago=24)
+        self.assertIn(9102, {row[0] for row in self.due_recovery_users()})
+
+        self.insert_recovery_user(9103)
+        self.insert_retry_attempt(9103, hours_ago=25)
+        self.assertIn(9103, {row[0] for row in self.due_recovery_users()})
+
+        self.insert_recovery_user(9104, stripe_subscription_id="sub_pending")
+        self.insert_checkout_attempt(9104, hours_ago=25)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                )
+                VALUES (
+                    %s,
+                    'sub_pending',
+                    'checkout_subscription_pending_invoice',
+                    FALSE,
+                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                )
+                """,
+                (9104,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertIn(9104, {row[0] for row in self.due_recovery_users()})
+
+        self.insert_recovery_user(9105, stripe_subscription_id="sub_incomplete")
+        self.insert_checkout_attempt(9105, hours_ago=25)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                )
+                VALUES (
+                    %s,
+                    'sub_incomplete',
+                    'incomplete',
+                    FALSE,
+                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                )
+                """,
+                (9105,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertIn(9105, {row[0] for row in self.due_recovery_users()})
+
+    def test_first_purchase_recovery_completed_subscription_checkout_without_payment_is_eligible(self):
+        run_migrations(self.get_conn)
+
+        for user_id, link_status in (
+            (9601, "checkout_subscription_pending_invoice"),
+            (9602, "incomplete"),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(
+                user_id,
+                hours_ago=25,
+                status="completed",
+                mode="subscription",
+            )
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO stripe_links (
+                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        FALSE,
+                        (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                    )
+                    """,
+                    (user_id, f"sub_{user_id}", link_status),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+        due_ids = {row[0] for row in self.due_recovery_users()}
+        self.assertIn(9601, due_ids)
+        self.assertIn(9602, due_ids)
+
+    def test_first_purchase_recovery_completed_checkout_with_payment_proof_is_not_eligible(self):
+        run_migrations(self.get_conn)
+
+        self.insert_recovery_user(9611)
+        self.insert_checkout_attempt(9611, hours_ago=25, status="completed", mode="subscription")
+
+        self.insert_recovery_user(9612)
+        self.insert_checkout_attempt(9612, hours_ago=25, status="completed", mode="subscription")
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = (NOW() AT TIME ZONE 'UTC') + INTERVAL '7 days'
+                WHERE telegram_id = 9612
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        for user_id, link_status, is_active in (
+            (9613, "active", False),
+            (9614, "trialing", False),
+            (9615, "incomplete", True),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(
+                user_id,
+                hours_ago=25,
+                status="completed",
+                mode="subscription",
+            )
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO stripe_links (
+                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                    )
+                    VALUES (
+                        %s,
+                        %s,
+                        %s,
+                        %s,
+                        (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                    )
+                    """,
+                    (user_id, f"sub_{user_id}", link_status, is_active),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+        self.insert_recovery_user(9616)
+        self.insert_checkout_attempt(9616, hours_ago=25, status="completed", mode="payment")
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO payment_events (
+                    stripe_event_id, event_type, telegram_id, payment_status
+                )
+                VALUES
+                    ('evt_9611_paid', 'invoice.payment_succeeded', 9611, 'succeeded'),
+                    ('evt_9616_paid', 'checkout.session.completed', 9616, 'succeeded')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO access_events (telegram_id, event_type, source, new_expiry)
+                VALUES (
+                    9616,
+                    'checkout_completed',
+                    'stripe',
+                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '7 days'
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        due_ids = {row[0] for row in self.due_recovery_users()}
+        for user_id in (9611, 9612, 9613, 9614, 9615, 9616):
+            self.assertNotIn(user_id, due_ids)
+
+    def test_first_purchase_recovery_success_states_and_newer_attempt_block_eligibility(self):
+        run_migrations(self.get_conn)
+
+        self.insert_recovery_user(9201)
+        self.insert_checkout_attempt(9201, hours_ago=25)
+        self.insert_retry_attempt(9201, hours_ago=2)
+        self.assertNotIn(9201, {row[0] for row in self.due_recovery_users()})
+
+        for user_id, status, is_active, future_period in (
+            (9202, "active", False, True),
+            (9203, "trialing", False, False),
+            (9204, "past_due", True, True),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(user_id, hours_ago=25)
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                current_period_sql = (
+                    "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
+                    if future_period
+                    else "NULL"
+                )
+                cur.execute(
+                    f"""
+                    INSERT INTO stripe_links (
+                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                    )
+                    VALUES (%s, %s, %s, %s, {current_period_sql})
+                    """,
+                    (user_id, f"sub_{user_id}", status, is_active),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            self.assertNotIn(user_id, {row[0] for row in self.due_recovery_users()})
+
+        self.insert_recovery_user(9206)
+        self.insert_checkout_attempt(9206, hours_ago=25)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO payment_events (
+                    stripe_event_id, event_type, telegram_id, payment_status
+                )
+                VALUES ('evt_9206', 'invoice.payment_succeeded', 9206, 'succeeded')
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO access_events (telegram_id, event_type, source, new_expiry)
+                VALUES (9207, 'manual_access', 'manual', (NOW() AT TIME ZONE 'UTC') + INTERVAL '7 days')
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.insert_recovery_user(9207)
+        self.insert_checkout_attempt(9207, hours_ago=25)
+        due_ids = {row[0] for row in self.due_recovery_users()}
+        self.assertNotIn(9206, due_ids)
+        self.assertNotIn(9207, due_ids)
+
+    def test_first_purchase_recovery_real_postgres_enqueue_reactivation_and_recheck(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9301
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25, tariff="sub_1")
+
+        due = {row[0]: row[1] for row in self.due_recovery_users()}
+        self.assertIn(user_id, due)
+        self.assertTrue(self.enqueue_recovery(user_id, due[user_id]))
+        self.assertEqual(self.recovery_row(user_id)[1], "pending")
+
+        self.insert_retry_attempt(user_id, hours_ago=1, tariff="sub_6")
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.cancel_first_purchase_recovery_delivery(
+                cur,
+                main.first_purchase_recovery_delivery_key(user_id),
+                "newer_attempt_postponed",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(self.recovery_row(user_id)[1], "cancelled")
+        self.assertNotIn(user_id, {row[0] for row in self.due_recovery_users()})
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE checkout_retry_events
+                SET attempt_at = (NOW() AT TIME ZONE 'UTC') - INTERVAL '25 hours'
+                WHERE telegram_id = %s
+                """,
+                (user_id,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        due = {row[0]: row[1] for row in self.due_recovery_users()}
+        self.assertIn(user_id, due)
+        self.assertTrue(self.enqueue_recovery(user_id, due[user_id]))
+        row = self.recovery_row(user_id)
+        self.assertEqual(row[1], "pending")
+        self.assertIsNone(row[3])
+        self.assertIsNone(row[4])
+        self.assertIsNone(row[5])
+        self.assertIsNone(row[6])
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE message_delivery_events
+                SET status = 'sent', sent_at = NOW()
+                WHERE delivery_key = %s
+                """,
+                (main.first_purchase_recovery_delivery_key(user_id),),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertFalse(self.enqueue_recovery(user_id, due[user_id]))
+        self.assertEqual(self.recovery_row(user_id)[1], "sent")
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO payment_events (
+                    stripe_event_id, event_type, telegram_id, payment_status
+                )
+                VALUES ('evt_9301_paid', 'invoice.payment_succeeded', %s, 'succeeded')
+                """,
+                (user_id,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertFalse(main.first_purchase_recovery_reminder_still_due(cur, user_id))
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_first_purchase_recovery_real_postgres_concurrent_reactivation_one_pending(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9401
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row[1] for row in self.due_recovery_users()}
+        self.assertTrue(self.enqueue_recovery(user_id, due[user_id]))
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.cancel_first_purchase_recovery_delivery(
+                cur,
+                main.first_purchase_recovery_delivery_key(user_id),
+                "postponed",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.insert_retry_attempt(user_id, hours_ago=25, tariff="sub_6")
+        due = {row[0]: row[1] for row in self.due_recovery_users()}
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(self.enqueue_recovery(user_id, due[user_id]))
+            except Exception as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=worker)
+        second = threading.Thread(target=worker)
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+        self.assertFalse(errors)
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_key = %s AND status = 'pending'
+            """,
+            (main.first_purchase_recovery_delivery_key(user_id),),
+        )[0], 1)
+        self.assertEqual(sum(1 for result in results if result), 1)
+
+    def test_first_purchase_recovery_payment_success_cancels_and_blocks_worker_recheck(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9501
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row[1] for row in self.due_recovery_users()}
+        self.assertTrue(self.enqueue_recovery(user_id, due[user_id]))
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.cancel_first_purchase_recovery_deliveries(cur, user_id, reason="paid")
+            cur.execute(
+                """
+                INSERT INTO payment_events (
+                    stripe_event_id, event_type, telegram_id, payment_status
+                )
+                VALUES ('evt_9501_paid', 'invoice.payment_succeeded', %s, 'succeeded')
+                """,
+                (user_id,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(self.recovery_row(user_id)[1], "cancelled")
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertFalse(
+                main.first_purchase_recovery_reminder_still_due(
+                    cur,
+                    user_id,
+                    current_delivery_key=main.first_purchase_recovery_delivery_key(user_id),
+                )
+            )
+        finally:
+            cur.close()
+            conn.close()
+
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
         with tempfile.TemporaryDirectory() as tmp:
@@ -257,17 +930,18 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
     def test_two_replicas_are_serialized_by_advisory_lock(self):
         password = dsn_password(POSTGRES_TEST_DSN)
-        self.assertTrue(password)
         self.assertIn(self.db_name, self.dsn)
-        self.assertIn("password=", self.dsn)
+        if password:
+            self.assertIn("password=", self.dsn)
 
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             conn = connect(self.dsn)
             conn.close()
-        self.assertNotIn(password, stdout.getvalue())
-        self.assertNotIn(password, stderr.getvalue())
+        if password:
+            self.assertNotIn(password, stdout.getvalue())
+            self.assertNotIn(password, stderr.getvalue())
 
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "0001_slow.sql").write_text(

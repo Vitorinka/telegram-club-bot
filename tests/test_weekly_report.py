@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from db_migrations import MIGRATION_BASELINE_REQUIREMENTS
 from weekly_report import (
     build_payments_csv,
     build_weekly_report_text,
@@ -230,8 +231,10 @@ class WeeklyReportTest(unittest.TestCase):
     def test_main_has_weekly_tables_scheduler_and_event_writes(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
-        self.assertIn("CREATE TABLE IF NOT EXISTS payment_events", source)
-        self.assertIn("CREATE TABLE IF NOT EXISTS weekly_report_runs", source)
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0001_initial_schema"]
+        self.assertIn("payment_events", migration["tables"])
+        self.assertIn("weekly_report_runs", migration["tables"])
+        self.assertIn("updated_at", migration["columns"]["weekly_report_runs"])
         self.assertIn("payment_history_started_at", source)
         self.assertIn("timezone=MOSCOW_TZ", source)
         self.assertIn("misfire_grace_time=3600", source)
@@ -239,7 +242,6 @@ class WeeklyReportTest(unittest.TestCase):
         self.assertIn("subscription_auto_renew_disabled", source)
         self.assertIn("group_member_joined", source)
         self.assertIn("weekly_csv:", source)
-        self.assertIn("ALTER TABLE weekly_report_runs ADD COLUMN IF NOT EXISTS updated_at", source)
 
     def test_source_payment_event_requirements(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"

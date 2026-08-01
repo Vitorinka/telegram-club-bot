@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -104,8 +105,13 @@ class FakeMessage:
 
 
 class FakeCallback:
-    def __init__(self):
+    def __init__(self, user_id=123):
         self.message = FakeMessage()
+        self.from_user = SimpleNamespace(id=user_id)
+        self.answers = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
 
 
 class FakeState:
@@ -156,6 +162,10 @@ class FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+def adapted_json_value(value):
+    return getattr(value, "adapted", value)
 
 
 class FakeIncomingMessage:
@@ -275,14 +285,371 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
-        from aiogram.fsm.storage.memory import MemoryStorage
+        from postgres_fsm_storage import PostgresFSMStorage
 
         app = self.main.create_app()
 
         self.assertIsInstance(self.main.bot, Bot)
         self.assertIsInstance(self.main.dp, Dispatcher)
-        self.assertIsInstance(self.main.storage, MemoryStorage)
+        self.assertIsInstance(self.main.storage, PostgresFSMStorage)
         self.assertIsInstance(app, web.Application)
+
+    async def test_postgres_fsm_storage_module_imports_independently(self):
+        import postgres_fsm_storage
+
+        source = Path(self.main.__file__).read_text()
+        self.assertNotIn("class PostgresFSMStorage", source)
+        self.assertIs(self.main.PostgresFSMStorage, postgres_fsm_storage.PostgresFSMStorage)
+
+    async def test_postgres_fsm_storage_decodes_dict_string_null_and_invalid_data(self):
+        from postgres_fsm_storage import decode_fsm_data
+
+        self.assertEqual(decode_fsm_data({"step": 1}), {"step": 1})
+        self.assertEqual(decode_fsm_data('{"step":1}'), {"step": 1})
+        self.assertEqual(decode_fsm_data(None), {})
+        self.assertEqual(decode_fsm_data(""), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data("{bad-json"), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data("[1,2]"), {})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(decode_fsm_data(["unexpected"]), {})
+
+    async def test_postgres_fsm_storage_round_trip_and_clear(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        records = {}
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                key = params[:6]
+                if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.state" in normalized:
+                    records.setdefault(key, {"state": None, "data_json": {}})["state"] = params[6]
+                    return
+                if normalized.startswith("INSERT INTO aiogram_fsm_states") and "EXCLUDED.data_json" in normalized:
+                    records.setdefault(key, {"state": None, "data_json": {}})["data_json"] = adapted_json_value(params[6])
+                    return
+                if normalized.startswith("DELETE FROM aiogram_fsm_states"):
+                    record = records.get(key)
+                    if record and record["state"] is None and record["data_json"] == {}:
+                        records.pop(key)
+                    return
+                if normalized.startswith("SELECT state"):
+                    record = records.get(key)
+                    self.row = (record["state"],) if record else None
+                    return
+                if normalized.startswith("SELECT data_json"):
+                    record = records.get(key)
+                    self.row = (record["data_json"],) if record else None
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                pass
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+                self.closed = False
+                self.commits = 0
+                self.rollbacks = 0
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                self.closed = True
+
+        storage = PostgresFSMStorage(FsmConnection)
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+
+        await storage.set_state(key, self.main.ContactState.waiting_for_message)
+        await storage.set_data(key, {"reply_to_user": 42, "text": "hello"})
+
+        self.assertEqual(await storage.get_state(key), self.main.ContactState.waiting_for_message.state)
+        self.assertEqual(await storage.get_data(key), {"reply_to_user": 42, "text": "hello"})
+
+        await storage.set_state(key, None)
+        self.assertEqual(await storage.get_data(key), {"reply_to_user": 42, "text": "hello"})
+        await storage.set_data(key, {})
+
+        self.assertIsNone(await storage.get_state(key))
+        self.assertEqual(await storage.get_data(key), {})
+        self.assertEqual(records, {})
+
+    async def test_postgres_fsm_storage_concurrent_update_data_keeps_all_fields(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        records = {}
+        record_lock = threading.Lock()
+        connections = []
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+                self.lock_held = False
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                if normalized.startswith("INSERT INTO aiogram_fsm_states"):
+                    key = params[:6]
+                    with record_lock:
+                        records.setdefault(key, {"state": None, "data_json": {}})
+                    return
+                if normalized.startswith("SELECT data_json") and "FOR UPDATE" in normalized:
+                    key = params[:6]
+                    record_lock.acquire()
+                    self.lock_held = True
+                    record = records.get(key, {"data_json": {}})
+                    self.row = (record["data_json"],)
+                    return
+                if normalized.startswith("SELECT data_json"):
+                    key = params[:6]
+                    record = records.get(key, {"data_json": {}})
+                    self.row = (record["data_json"],)
+                    return
+                if normalized.startswith("UPDATE aiogram_fsm_states"):
+                    data_json = adapted_json_value(params[0])
+                    key = params[1:7]
+                    records.setdefault(key, {"state": None, "data_json": {}})["data_json"] = data_json
+                    return
+                if normalized.startswith("DELETE FROM aiogram_fsm_states"):
+                    key = params[:6]
+                    record = records.get(key)
+                    if record and record["state"] is None and record["data_json"] == {}:
+                        records.pop(key)
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                if self.lock_held:
+                    self.lock_held = False
+                    record_lock.release()
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+                self.closed = False
+                connections.append(self)
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+        first = PostgresFSMStorage(FsmConnection)
+        second = PostgresFSMStorage(FsmConnection)
+
+        await asyncio.gather(
+            first.update_data(key, {"first": 1}),
+            second.update_data(key, {"second": 2}),
+        )
+
+        self.assertEqual(await first.get_data(key), {"first": 1, "second": 2})
+        self.assertTrue(all(conn.closed for conn in connections))
+
+    async def test_first_purchase_recovery_delivery_skips_when_no_longer_due(self):
+        delivery = (
+            self.main.first_purchase_recovery_delivery_key(123),
+            123,
+            "first_purchase_recovery_reminder",
+            json.dumps({"text": "retry", "keyboard_kind": "retry_payment"}),
+            1,
+            None,
+        )
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[None])
+        conns = iter([claim_conn, check_conn])
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["retryable_failed"], 0)
+        send_message.assert_not_awaited()
+        self.assertTrue(claim_conn.closed)
+        self.assertTrue(check_conn.closed)
+        sql = "\n".join(query for query, _ in check_conn.cursor_obj.queries)
+        self.assertIn("checkout_sessions", sql)
+        self.assertIn("checkout_retry_events", sql)
+        self.assertIn("status = 'cancelled'", sql)
+        self.assertIn("UPDATE message_delivery_events", sql)
+
+    async def test_first_purchase_recovery_delay_is_fixed_twenty_four_hours(self):
+        self.assertEqual(self.main.FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, 24)
+
+    async def test_first_purchase_recovery_key_is_hashed_and_stable(self):
+        first = self.main.first_purchase_recovery_delivery_key(123456789)
+        second = self.main.first_purchase_recovery_delivery_key(123456789)
+
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("first_purchase_recovery:"))
+        self.assertNotIn("123456789", first)
+        self.assertNotIn("payment_failed_at", first)
+
+    async def test_first_purchase_recovery_due_query_uses_checkout_attempts_and_not_payment_failed(self):
+        conn = FakeConnection(fetches=[[(123, datetime(2026, 7, 30, 10, 0))]])
+
+        due = self.main.fetch_due_first_purchase_recovery_users(conn.cursor_obj, limit=10)
+
+        self.assertEqual(due, [(123, datetime(2026, 7, 30, 10, 0))])
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("FROM checkout_sessions", sql)
+        self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("status = ANY", sql)
+        self.assertIn("NOW() AT TIME ZONE 'UTC'", sql)
+        self.assertIn("payment_events", sql)
+        self.assertIn("access_events", sql)
+        self.assertIn("stripe_links", sql)
+        self.assertNotIn("completed_cs.status = 'completed'", sql)
+        self.assertNotIn("FROM checkout_sessions completed_cs", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
+        self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
+        self.assertNotIn("checkout_completed", sql)
+        self.assertNotIn("sl.current_period_end IS NOT NULL", sql)
+        self.assertNotIn("sl.current_period_end >", sql)
+
+    async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
+        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+
+        row = self.main.fetch_first_purchase_recovery_user_if_due(conn.cursor_obj, 123)
+
+        self.assertEqual(row, (123, datetime(2026, 7, 30, 10, 0)))
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("checkout_retry_events", sql)
+        self.assertNotIn("payment_failed = TRUE", sql)
+
+    async def test_first_purchase_recovery_attempt_statuses_are_real_checkout_states(self):
+        self.assertEqual(
+            self.main.FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES,
+            ("creating", "creation_unknown", "open", "expired", "failed", "completed"),
+        )
+
+    async def test_first_purchase_recovery_enqueue_uses_retry_payment_keyboard_and_one_delivery(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        created = self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+        )
+
+        self.assertTrue(created)
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", query)
+        self.assertIn("WHERE message_delivery_events.status = 'cancelled'", query)
+        self.assertIn("sent_at = NULL", query)
+        self.assertIn("first_purchase_recovery_reminder", query)
+        self.assertNotIn("123456789", params[0])
+        payload = json.loads(params[2])
+        self.assertEqual(payload["text"], self.main.first_purchase_recovery_reminder_text())
+        self.assertEqual(payload["keyboard_kind"], "retry_payment")
+
+    async def test_first_purchase_recovery_success_cancels_pending_failed_processing(self):
+        conn = FakeConnection()
+
+        self.main.cancel_first_purchase_recovery_deliveries(conn.cursor_obj, 123456789, reason="paid")
+
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("status = 'cancelled'", query)
+        self.assertIn("status IN ('pending', 'failed', 'processing')", query)
+        self.assertNotIn("123456789", params[1])
+        self.assertEqual(params[2], 123456789)
+
+    async def test_first_purchase_recovery_recheck_excludes_current_processing_delivery(self):
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+
+        self.assertTrue(self.main.first_purchase_recovery_reminder_still_due(conn.cursor_obj, 123, delivery_key))
+
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIn("md.delivery_key <> %s", query)
+        self.assertEqual(params[-2:], [delivery_key, delivery_key])
+
+    async def test_stats_command_closes_db_before_reply(self):
+        conn = FakeConnection(fetches=[(10,), (4,), (6,), (2,), (1,), (0,), (0,), (1,), (0,)])
+        message = FakeIncomingMessage(user_id=1)
+        closed_during_answer = []
+
+        async def answer_after_close(*args, **kwargs):
+            closed_during_answer.append(conn.closed)
+
+        message.answer = AsyncMock(side_effect=answer_after_close)
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.stats_command(message)
+
+        self.assertEqual(closed_during_answer, [True])
+
+    async def test_test_grace_closes_db_before_telegram_awaits(self):
+        conn = FakeConnection()
+        message = FakeIncomingMessage(user_id=1)
+        command = SimpleNamespace(args="123")
+        closed_during_reply = []
+        closed_during_send = []
+
+        async def reply_after_close(*args, **kwargs):
+            closed_during_reply.append(conn.closed)
+
+        async def send_after_close(*args, **kwargs):
+            closed_during_send.append(conn.closed)
+
+        message.reply = AsyncMock(side_effect=reply_after_close)
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_close)):
+            await self.main.test_grace(message, command)
+
+        self.assertEqual(closed_during_reply, [True])
+        self.assertEqual(closed_during_send, [True])
+
+    async def test_test_followup_closes_setup_db_before_delivery_and_reply(self):
+        setup_conn = FakeConnection()
+        delivery_conns = [
+            FakeConnection(fetches=[("free_lesson_followup:123",), (1,)]),
+            FakeConnection(),
+        ]
+        all_conns = [setup_conn] + delivery_conns
+        message = FakeIncomingMessage(user_id=1)
+        command = SimpleNamespace(args="123")
+        closed_before_delivery = []
+        closed_during_reply = []
+
+        async def send_after_setup_close(*args, **kwargs):
+            closed_before_delivery.append(setup_conn.closed)
+
+        async def answer_after_close(*args, **kwargs):
+            closed_during_reply.append(setup_conn.closed)
+
+        message.answer = AsyncMock(side_effect=answer_after_close)
+        with patch.object(self.main, "get_db_conn", side_effect=all_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_setup_close)):
+            await self.main.test_followup_command(message, command)
+
+        self.assertEqual(closed_before_delivery, [True])
+        self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 52)
@@ -371,6 +738,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("dp.callback_query_handler =", source)
         self.assertNotIn("get_new_configured_app", source)
         self.assertNotIn("Dispatcher(bot", source)
+        self.assertNotIn("MemoryStorage", source)
         self.assertNotIn("BotBlocked", source)
         self.assertNotIn("aiogram.utils.exceptions", source)
         self.assertNotIn("await state.finish()", source)
@@ -848,6 +1216,112 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             event_id=event_id,
         )
 
+    async def run_checkout_identity_webhook(self, client_reference_id="123", metadata_telegram_id="123", notify_side_effect=None):
+        session_payload = {
+            "id": f"cs_identity_{client_reference_id if client_reference_id not in (None, '') else 'empty'}_{metadata_telegram_id if metadata_telegram_id not in (None, '') else 'empty'}",
+            "mode": "payment",
+            "payment_status": "paid",
+            "customer": "cus_identity",
+            "subscription": None,
+            "amount_total": 1000,
+            "currency": "usd",
+            "metadata": {"days": "7"},
+        }
+        if client_reference_id is not None:
+            session_payload["client_reference_id"] = client_reference_id
+        if metadata_telegram_id is not None:
+            session_payload["metadata"]["telegram_id"] = metadata_telegram_id
+        event_id = f"evt_identity_{client_reference_id if client_reference_id not in (None, '') else 'empty'}_{metadata_telegram_id if metadata_telegram_id not in (None, '') else 'empty'}"
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        payload = json.dumps({
+            "id": event_id,
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {"object": session_payload},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        notify = AsyncMock(side_effect=notify_side_effect)
+        release = AsyncMock()
+        mark_processed = AsyncMock()
+        conn = FakeConnection(fetches=[(False, None, False)])
+        get_db_conn = Mock(return_value=conn)
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "notify_admins", notify), \
+             patch.object(self.main, "claim_trial_redemption", return_value=True), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main, "get_db_conn", get_db_conn):
+            response = await self.main.stripe_webhook(request)
+
+        return SimpleNamespace(
+            response=response,
+            notify=notify,
+            release=release,
+            mark_processed=mark_processed,
+            conn=conn,
+            get_db_conn=get_db_conn,
+            event_id=event_id,
+        )
+
+    async def test_checkout_identity_accepts_client_reference_metadata_and_matching_sources(self):
+        cases = (
+            ("123", None),
+            (None, "123"),
+            ("123", "123"),
+            ("", "123"),
+        )
+        for client_reference_id, metadata_telegram_id in cases:
+            with self.subTest(client_reference_id=client_reference_id, metadata_telegram_id=metadata_telegram_id):
+                result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
+
+                self.assertEqual(result.response.status, 200)
+                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.release.assert_not_awaited()
+                result.notify.assert_not_awaited()
+                sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+                self.assertIn("INSERT INTO users", sql)
+                self.assertIn("INSERT INTO payment_events", sql)
+                self.assertIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_identity_missing_invalid_or_conflicting_sources_fail_closed(self):
+        cases = (
+            (None, None),
+            ("abc", "-1"),
+            ("123", "456"),
+        )
+        for client_reference_id, metadata_telegram_id in cases:
+            with self.subTest(client_reference_id=client_reference_id, metadata_telegram_id=metadata_telegram_id):
+                result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
+
+                self.assertEqual(result.response.status, 500)
+                result.release.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_not_awaited()
+                result.get_db_conn.assert_not_called()
+                result.notify.assert_awaited_once()
+                self.assertTrue(result.notify.await_args.kwargs["alert_key"].startswith("checkout_invalid_identity:"))
+                self.assertEqual(result.notify.await_args.kwargs["severity"], "CRITICAL")
+                alert_text = result.notify.await_args.args[0]
+                self.assertIn("client_reference_id/metadata.telegram_id missing, invalid, or conflicting", alert_text)
+                self.assertIn("access_granted: false", alert_text)
+                self.assertNotIn(result.event_id, alert_text)
+                self.assertNotIn("cs_identity", alert_text)
+
+    async def test_checkout_identity_notify_failure_still_releases_claim_and_returns_500(self):
+        result = await self.run_checkout_identity_webhook(None, None, notify_side_effect=RuntimeError("notify down"))
+
+        self.assertEqual(result.response.status, 500)
+        result.release.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_not_awaited()
+        result.get_db_conn.assert_not_called()
+
     async def test_checkout_invalid_days_missing_empty_text_zero_and_negative_fail_closed(self):
         for days_marker in ("missing", "", "abc", "0", "-30"):
             with self.subTest(days_marker=days_marker):
@@ -956,6 +1430,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             (now,),
             [],
             [],
+            [],
             (0,),
             (None,),
             (None,),
@@ -972,6 +1447,88 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(conn.cursor_obj.queries[0][0], "SELECT NOW() AT TIME ZONE 'UTC'")
 
+    async def test_feedback_join_closes_db_before_telegram_replies(self):
+        conn = FakeConnection(fetches=[(False, False)])
+        callback = FakeCallback(user_id=123)
+        state = FakeState()
+        answer_checks = []
+
+        async def answer_after_close(*args, **kwargs):
+            answer_checks.append(conn.closed)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            callback.message.answer = AsyncMock(side_effect=answer_after_close)
+            callback.answer = AsyncMock(side_effect=lambda *args, **kwargs: answer_checks.append(conn.closed))
+            await self.main.feedback_join(callback, state)
+
+        self.assertEqual(answer_checks, [True, True])
+        self.assertEqual(state.states, [self.main.RegistrationStates.choice])
+        self.assertEqual(conn.commits, 1)
+
+    async def test_feedback_think_closes_db_before_telegram_replies(self):
+        conn = FakeConnection()
+        callback = FakeCallback(user_id=123)
+        state = FakeState()
+        answer_checks = []
+
+        async def answer_after_close(*args, **kwargs):
+            answer_checks.append(conn.closed)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            callback.message.answer = AsyncMock(side_effect=answer_after_close)
+            callback.answer = AsyncMock(side_effect=lambda *args, **kwargs: answer_checks.append(conn.closed))
+            await self.main.feedback_think(callback, state)
+
+        self.assertEqual(answer_checks, [True, True])
+        self.assertEqual(state.clear_calls, 1)
+        self.assertEqual(conn.commits, 1)
+
+    def test_tracked_db_pool_concurrent_accounting_and_double_put_guard(self):
+        class RawPool:
+            def __init__(self, *args, **kwargs):
+                self.lock = threading.Lock()
+                self.next_id = 0
+                self.puts = []
+
+            def getconn(self):
+                with self.lock:
+                    self.next_id += 1
+                    return SimpleNamespace(id=self.next_id)
+
+            def putconn(self, conn, close=False):
+                with self.lock:
+                    self.puts.append((conn.id, close))
+
+            def closeall(self):
+                pass
+
+        with patch.object(self.main.psycopg2_pool, "ThreadedConnectionPool", RawPool):
+            pool = self.main.TrackedThreadedConnectionPool(1, 5, "postgresql://example")
+            errors = []
+
+            def worker():
+                try:
+                    conn = pool.getconn()
+                    self.assertGreaterEqual(pool.health()["pool_used"], 1)
+                    pool.putconn(conn)
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(pool.health()["pool_used"], 0)
+            self.assertEqual(pool.health()["pool_available"], 5)
+            raw_conn = pool.getconn()
+            pool.putconn(raw_conn)
+            pool.putconn(raw_conn)
+            self.assertEqual(pool.health()["pool_used"], 0)
+            self.assertEqual(len(pool._pool.puts), 9)
+
     async def test_outbox_status_text_shows_retry_and_no_negative_age(self):
         now = datetime(2026, 7, 29, 13, 16)
         next_retry = now + timedelta(minutes=9)
@@ -979,6 +1536,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             (now,),
             [("pending", 1), ("failed", 1)],
             [("free_lesson", "failed", 1)],
+            [("pending", 1), ("cancelled", 2)],
             (0,),
             (next_retry,),
             (next_retry,),
@@ -997,7 +1555,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("oldest unresolved age: 0 мин.", text)
         self.assertIn("next retry in: 9 мин.", text)
         self.assertIn("nearest next_attempt_at: 29.07.2026 13:25", text)
-        self.assertNotIn("-", text)
+        self.assertIn("First-purchase recovery:", text)
+        self.assertIn("cancelled: 2", text)
+        self.assertNotIn("oldest unresolved age: -", text)
+        self.assertNotIn("next retry in: -", text)
         self.assertLess(len(text), 4096)
 
     async def test_outbox_status_due_or_empty_retry_text_is_none(self):
@@ -1006,6 +1567,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(oldest_unresolved=oldest_unresolved):
                 conn = FakeConnection(fetches=[
                     (now,),
+                    [],
                     [],
                     [],
                     (0,),
@@ -1642,7 +2204,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 6)
+        self.assertEqual(len(fake_scheduler.jobs), 8)
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):
