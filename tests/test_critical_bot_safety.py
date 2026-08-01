@@ -18,6 +18,7 @@ from admin_security import (
 from checkout_safety import (
     active_or_resumable_subscriptions,
     backup_decision,
+    BLOCKING_SUBSCRIPTION_STATUSES,
     build_pg_dump_command,
     CHECKOUT_AMBIGUOUS_AUTO_RETRY_HOURS,
     classify_invoice_collection_risk,
@@ -1310,11 +1311,23 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertTrue(is_terminal_subscription_status("canceled"))
         self.assertTrue(is_terminal_subscription_status("incomplete_expired"))
         self.assertFalse(is_terminal_subscription_status("active"))
-        self.assertTrue(stripe_link_active_for_status("active"))
-        self.assertTrue(stripe_link_active_for_status("trialing"))
-        self.assertTrue(stripe_link_active_for_status("past_due"))
-        self.assertFalse(stripe_link_active_for_status("canceled"))
-        self.assertFalse(stripe_link_active_for_status("incomplete_expired"))
+        expected = {
+            "active": True,
+            "trialing": True,
+            "incomplete": False,
+            "past_due": False,
+            "unpaid": False,
+            "paused": False,
+            "canceled": False,
+            "incomplete_expired": False,
+            None: False,
+        }
+        for status, is_active in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(stripe_link_active_for_status(status), is_active)
+        self.assertTrue({"incomplete", "past_due", "unpaid"}.issubset(BLOCKING_SUBSCRIPTION_STATUSES))
+        self.assertTrue(active_or_resumable_subscriptions([{"status": "incomplete"}]))
+        self.assertFalse(stripe_link_active_for_status("incomplete"))
 
     def test_failed_invoice_subscription_guard(self):
         self.assertFalse(should_apply_failed_invoice_to_user(None, None))

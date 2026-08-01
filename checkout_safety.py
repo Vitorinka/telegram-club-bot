@@ -160,7 +160,7 @@ def is_terminal_subscription_status(status):
 
 
 def stripe_link_active_for_status(status):
-    return status in BLOCKING_SUBSCRIPTION_STATUSES and not is_terminal_subscription_status(status)
+    return status in ("active", "trialing")
 
 
 def subscription_status_action(status, count=1):

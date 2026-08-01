@@ -224,6 +224,29 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.close()
             conn.close()
 
+    def insert_stripe_link(self, telegram_id, *, status, is_active, subscription_id=None, future_period=True):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            current_period_sql = (
+                "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
+                if future_period
+                else "NULL"
+            )
+            cur.execute(
+                f"""
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                )
+                VALUES (%s, %s, %s, %s, {current_period_sql})
+                """,
+                (telegram_id, subscription_id or f"sub_{telegram_id}", status, is_active),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
     def due_recovery_users(self):
         main = import_main()
         conn = self.get_conn()
@@ -580,54 +603,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         self.insert_recovery_user(9104, stripe_subscription_id="sub_pending")
         self.insert_checkout_attempt(9104, hours_ago=25)
-        conn = self.get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                """
-                INSERT INTO stripe_links (
-                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                )
-                VALUES (
-                    %s,
-                    'sub_pending',
-                    'checkout_subscription_pending_invoice',
-                    FALSE,
-                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                )
-                """,
-                (9104,),
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+        self.insert_stripe_link(
+            9104,
+            subscription_id="sub_pending",
+            status="checkout_subscription_pending_invoice",
+            is_active=False,
+        )
         self.assertIn(9104, {row[0] for row in self.due_recovery_users()})
 
         self.insert_recovery_user(9105, stripe_subscription_id="sub_incomplete")
         self.insert_checkout_attempt(9105, hours_ago=25)
-        conn = self.get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                """
-                INSERT INTO stripe_links (
-                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                )
-                VALUES (
-                    %s,
-                    'sub_incomplete',
-                    'incomplete',
-                    FALSE,
-                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                )
-                """,
-                (9105,),
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+        self.insert_stripe_link(9105, subscription_id="sub_incomplete", status="incomplete", is_active=False)
         self.assertIn(9105, {row[0] for row in self.due_recovery_users()})
 
     def test_first_purchase_recovery_completed_subscription_checkout_without_payment_is_eligible(self):
@@ -671,6 +657,72 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn(9601, due_ids)
         self.assertIn(9602, due_ids)
 
+    def test_first_purchase_recovery_unpaid_subscription_links_remain_eligible(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        for user_id, link_status in (
+            (9621, "incomplete"),
+            (9622, "past_due"),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+            self.insert_stripe_link(
+                user_id,
+                status=link_status,
+                is_active=main.stripe_link_active_for_status(link_status),
+            )
+
+        for user_id, link_status in (
+            (9623, "active"),
+            (9624, "trialing"),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+            self.insert_stripe_link(
+                user_id,
+                status=link_status,
+                is_active=main.stripe_link_active_for_status(link_status),
+            )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for user_id, link_status in (
+                (9625, "incomplete"),
+                (9626, "active"),
+            ):
+                main.upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=f"cus_{user_id}",
+                    stripe_subscription_id=f"sub_updated_{user_id}",
+                    status=link_status,
+                    current_period_end=int(time.time()) + 86400,
+                    is_active=main.stripe_link_active_for_status(link_status),
+                    source="customer.subscription.updated",
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        due_ids = {row[0] for row in self.due_recovery_users()}
+        self.assertIn(9621, due_ids)
+        self.assertIn(9622, due_ids)
+        self.assertNotIn(9623, due_ids)
+        self.assertNotIn(9624, due_ids)
+        link_states = dict(self.query_all(
+            """
+            SELECT status, is_active
+            FROM stripe_links
+            WHERE stripe_subscription_id IN ('sub_updated_9625', 'sub_updated_9626')
+            ORDER BY stripe_subscription_id
+            """
+        ))
+        self.assertFalse(link_states["incomplete"])
+        self.assertTrue(link_states["active"])
+
     def test_first_purchase_recovery_completed_checkout_with_payment_proof_is_not_eligible(self):
         run_migrations(self.get_conn)
 
@@ -696,9 +748,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         for user_id, link_status, is_active in (
-            (9613, "active", False),
-            (9614, "trialing", False),
-            (9615, "incomplete", True),
+            (9613, "active", True),
+            (9614, "trialing", True),
         ):
             self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
             self.insert_checkout_attempt(
@@ -707,28 +758,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 status="completed",
                 mode="subscription",
             )
-            conn = self.get_conn()
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO stripe_links (
-                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                    )
-                    """,
-                    (user_id, f"sub_{user_id}", link_status, is_active),
-                )
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
+            self.insert_stripe_link(user_id, status=link_status, is_active=is_active)
 
         self.insert_recovery_user(9616)
         self.insert_checkout_attempt(9616, hours_ago=25, status="completed", mode="payment")
@@ -763,7 +793,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         due_ids = {row[0] for row in self.due_recovery_users()}
-        for user_id in (9611, 9612, 9613, 9614, 9615, 9616):
+        for user_id in (9611, 9612, 9613, 9614, 9616):
             self.assertNotIn(user_id, due_ids)
 
     def test_first_purchase_recovery_success_states_and_newer_attempt_block_eligibility(self):
@@ -775,33 +805,12 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn(9201, {row[0] for row in self.due_recovery_users()})
 
         for user_id, status, is_active, future_period in (
-            (9202, "active", False, True),
-            (9203, "trialing", False, False),
-            (9204, "past_due", True, True),
+            (9202, "active", True, True),
+            (9203, "trialing", True, False),
         ):
             self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
             self.insert_checkout_attempt(user_id, hours_ago=25)
-            conn = self.get_conn()
-            cur = conn.cursor()
-            try:
-                current_period_sql = (
-                    "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
-                    if future_period
-                    else "NULL"
-                )
-                cur.execute(
-                    f"""
-                    INSERT INTO stripe_links (
-                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                    )
-                    VALUES (%s, %s, %s, %s, {current_period_sql})
-                    """,
-                    (user_id, f"sub_{user_id}", status, is_active),
-                )
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
+            self.insert_stripe_link(user_id, status=status, is_active=is_active, future_period=future_period)
             self.assertNotIn(user_id, {row[0] for row in self.due_recovery_users()})
 
         self.insert_recovery_user(9206)
