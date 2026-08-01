@@ -470,7 +470,13 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 INSERT INTO stripe_links (
                     telegram_id, stripe_subscription_id, status, is_active, current_period_end
                 )
-                VALUES (%s, 'sub_pending', 'checkout_subscription_pending_invoice', FALSE, NULL)
+                VALUES (
+                    %s,
+                    'sub_pending',
+                    'checkout_subscription_pending_invoice',
+                    FALSE,
+                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                )
                 """,
                 (9104,),
             )
@@ -490,7 +496,13 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 INSERT INTO stripe_links (
                     telegram_id, stripe_subscription_id, status, is_active, current_period_end
                 )
-                VALUES (%s, 'sub_incomplete', 'incomplete', FALSE, NULL)
+                VALUES (
+                    %s,
+                    'sub_incomplete',
+                    'incomplete',
+                    FALSE,
+                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                )
                 """,
                 (9105,),
             )
@@ -508,11 +520,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.insert_retry_attempt(9201, hours_ago=2)
         self.assertNotIn(9201, {row[0] for row in self.due_recovery_users()})
 
-        for user_id, status, is_active, period_hours in (
-            (9202, "active", False, None),
-            (9203, "trialing", False, None),
-            (9204, "incomplete", False, -24),
-            (9205, "past_due", True, None),
+        for user_id, status, is_active, future_period in (
+            (9202, "active", False, True),
+            (9203, "trialing", False, False),
+            (9204, "past_due", True, True),
         ):
             self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
             self.insert_checkout_attempt(user_id, hours_ago=25)
@@ -521,7 +532,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             try:
                 current_period_sql = (
                     "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
-                    if period_hours
+                    if future_period
                     else "NULL"
                 )
                 cur.execute(

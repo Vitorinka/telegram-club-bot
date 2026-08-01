@@ -340,6 +340,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("payment_failed = TRUE", sql)
         self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
         self.assertNotIn("checkout_completed", sql)
+        self.assertNotIn("sl.current_period_end IS NOT NULL", sql)
+        self.assertNotIn("sl.current_period_end >", sql)
 
     def test_stripe_webhook_user_notifications_are_outbox_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]

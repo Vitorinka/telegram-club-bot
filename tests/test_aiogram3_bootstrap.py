@@ -530,6 +530,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payment_failed = TRUE", sql)
         self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
         self.assertNotIn("checkout_completed", sql)
+        self.assertNotIn("sl.current_period_end IS NOT NULL", sql)
+        self.assertNotIn("sl.current_period_end >", sql)
 
     async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
         conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])

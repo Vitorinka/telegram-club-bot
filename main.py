@@ -1140,7 +1140,6 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
                 AND (
                     sl.is_active IS TRUE
                     OR sl.status IN ('active', 'trialing')
-                    OR (sl.current_period_end IS NOT NULL AND sl.current_period_end > (NOW() AT TIME ZONE 'UTC'))
                 )
           )
           AND NOT EXISTS (
