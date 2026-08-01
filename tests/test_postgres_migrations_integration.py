@@ -27,7 +27,7 @@ MAIN_TEST_ENV = {
     "GROUP_ID": "-100123",
     "ADMIN_IDS": "1,2",
     "STRIPE_API_KEY": "sk_test_dummy",
-    "STRIPE_WEBHOOK_SECRET": "whsec_postgres_test",
+    "STRIPE_WEBHOOK_SECRET": "postgres_test_webhook_secret",
     "WEBHOOK_SECRET": "telegram_secret",
     "YOUR_DOMAIN": "https://club.example",
     "PRICE_TRIAL": "price_trial",
