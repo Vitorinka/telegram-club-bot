@@ -184,7 +184,7 @@ CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
 PAYMENT_RETRY_GRACE_HOURS = int(os.getenv("PAYMENT_RETRY_GRACE_HOURS", "48"))
 FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = 24
-FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "open", "expired", "failed")
+FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "open", "expired", "failed", "completed")
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
@@ -1126,12 +1126,6 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
                 AND ae.created_at >= la.latest_attempt_at
                 AND ae.new_expiry IS NOT NULL
                 AND ae.new_expiry > (NOW() AT TIME ZONE 'UTC')
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM checkout_sessions completed_cs
-              WHERE completed_cs.telegram_id = u.telegram_id
-                AND completed_cs.status = 'completed'
           )
           AND NOT EXISTS (
               SELECT 1

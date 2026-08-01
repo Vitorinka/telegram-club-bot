@@ -526,7 +526,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("payment_events", sql)
         self.assertIn("access_events", sql)
         self.assertIn("stripe_links", sql)
-        self.assertIn("completed_cs.status = 'completed'", sql)
+        self.assertNotIn("completed_cs.status = 'completed'", sql)
+        self.assertNotIn("FROM checkout_sessions completed_cs", sql)
         self.assertNotIn("payment_failed = TRUE", sql)
         self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
         self.assertNotIn("checkout_completed", sql)
@@ -546,7 +547,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_purchase_recovery_attempt_statuses_are_real_checkout_states(self):
         self.assertEqual(
             self.main.FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES,
-            ("creating", "creation_unknown", "open", "expired", "failed"),
+            ("creating", "creation_unknown", "open", "expired", "failed", "completed"),
         )
 
     async def test_first_purchase_recovery_enqueue_uses_retry_payment_keyboard_and_one_delivery(self):
