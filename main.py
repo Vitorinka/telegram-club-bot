@@ -1113,7 +1113,6 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
           AND (u.expiry_date IS NULL OR u.expiry_date <= (NOW() AT TIME ZONE 'UTC'))
           AND u.first_payment_done IS NOT TRUE
           AND u.blocked_bot IS NOT TRUE
-          AND u.stripe_subscription_id IS NULL
           AND NOT EXISTS (
               SELECT 1
               FROM payment_events pe
@@ -1140,7 +1139,7 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
               WHERE sl.telegram_id = u.telegram_id
                 AND (
                     sl.is_active IS TRUE
-                    OR sl.status IN ('active', 'trialing', 'checkout_completed')
+                    OR sl.status IN ('active', 'trialing')
                     OR (sl.current_period_end IS NOT NULL AND sl.current_period_end > (NOW() AT TIME ZONE 'UTC'))
                 )
           )
@@ -1222,7 +1221,15 @@ def enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at
             delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
         )
         VALUES (%s, %s, 'first_purchase_recovery_reminder', 'pending', 0, NULL, %s, NOW())
-        ON CONFLICT (delivery_key) DO NOTHING
+        ON CONFLICT (delivery_key) DO UPDATE SET
+            status = 'pending',
+            last_error = NULL,
+            payload_json = EXCLUDED.payload_json,
+            claimed_at = NULL,
+            lease_until = NULL,
+            sent_at = NULL,
+            next_attempt_at = NOW()
+        WHERE message_delivery_events.status = 'cancelled'
         RETURNING delivery_key
     """, (first_purchase_recovery_delivery_key(telegram_id), int(telegram_id), payload_json))
     return cur.fetchone() is not None
@@ -7153,6 +7160,8 @@ async def test_followup_command(message: types.Message, command: CommandObject):
 
     conn = get_db_conn()
     cur = conn.cursor()
+    db_ok = False
+    error_text = None
 
     try:
         cur.execute("""
@@ -7160,29 +7169,35 @@ async def test_followup_command(message: types.Message, command: CommandObject):
             VALUES (%s, FALSE)
             ON CONFLICT (telegram_id) DO NOTHING
         """, (target_user_id,))
-
-        await send_free_lesson_followup(target_user_id, cur)
         conn.commit()
-
-        await message.answer(f"✅ Тестовый follow-up отправлен пользователю {target_user_id}.")
-
-    except TelegramForbiddenError:
-        cur.execute(
-            "UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s",
-            (target_user_id,)
-        )
-        conn.commit()
-        await message.answer("⚠️ Пользователь заблокировал бота.")
+        db_ok = True
 
     except Exception as e:
         conn.rollback()
         logging.error(f"Ошибка test_followup для {target_user_id}: {e}")
         error_ref = safe_admin_error_reference("test_followup", e)
-        await message.answer(f"❌ Ошибка отправки тестового follow-up. ref: {error_ref}")
+        error_text = f"❌ Ошибка отправки тестового follow-up. ref: {error_ref}"
 
     finally:
         cur.close()
         conn.close()
+
+    if not db_ok:
+        await message.answer(error_text)
+        return
+
+    try:
+        was_sent = await send_free_lesson_followup(target_user_id)
+    except Exception as e:
+        logging.error(f"Ошибка test_followup delivery для {target_user_id}: {e}")
+        error_ref = safe_admin_error_reference("test_followup_delivery", e)
+        await message.answer(f"❌ Ошибка отправки тестового follow-up. ref: {error_ref}")
+        return
+
+    if was_sent:
+        await message.answer(f"✅ Тестовый follow-up отправлен пользователю {target_user_id}.")
+    else:
+        await message.answer("⚠️ Follow-up не отправлен. Проверьте outbox delivery status.")
 
 @router.message(Command('help'), StateFilter('*'))
 async def help_command(message: types.Message):
@@ -7249,16 +7264,16 @@ async def stats_command(message: types.Message):
             f"🧯 Истекли, но еще paid=True: {expired_but_paid}"
         )
 
-        await message.answer(text)
-
     except Exception as e:
         logging.error(f"Ошибка stats: {e}")
         error_ref = safe_admin_error_reference("stats", e)
-        await message.answer(f"❌ Ошибка получения статистики. ref: {error_ref}")
+        text = f"❌ Ошибка получения статистики. ref: {error_ref}"
 
     finally:
         cur.close()
         conn.close()
+
+    await message.answer(text)
 
 
 @router.message(Command('weekly_report'), StateFilter('*'))
@@ -7379,6 +7394,8 @@ async def test_grace(message: types.Message, command: CommandObject):
     user_id = args[0]
     conn = get_db_conn()
     cur = conn.cursor()
+    success = False
+    error_text = None
     try:
         cur.execute("""
             UPDATE users
@@ -7388,16 +7405,22 @@ async def test_grace(message: types.Message, command: CommandObject):
             WHERE telegram_id = %s
         """, (int(user_id),))
         conn.commit()
-        await message.reply(f"✅ Установлен grace period для {user_id} на 24 часа.")
-        # Отправим уведомление пользователю
-        await bot.send_message(int(user_id), "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
+        success = True
     except Exception as e:
+        conn.rollback()
         logging.exception("TEST_GRACE_FAILED")
         error_ref = safe_admin_error_reference("test_grace", e)
-        await message.reply(f"Ошибка выполнения. ref: {error_ref}")
+        error_text = f"Ошибка выполнения. ref: {error_ref}"
     finally:
         cur.close()
         conn.close()
+
+    if not success:
+        await message.reply(error_text)
+        return
+
+    await message.reply(f"✅ Установлен grace period для {user_id} на 24 часа.")
+    await bot.send_message(int(user_id), "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
 
 async def stripe_webhook(request):
     payload = await request.read()

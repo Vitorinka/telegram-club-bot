@@ -316,7 +316,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
             MAIN_SOURCE.index("def enqueue_rejoin_invite_after_payment")
         ]
         self.assertIn('return f"first_purchase_recovery:{safe_delivery_hash(int(telegram_id))}"', source)
-        self.assertIn("ON CONFLICT (delivery_key) DO NOTHING", source)
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", source)
+        self.assertIn("WHERE message_delivery_events.status = 'cancelled'", source)
         self.assertIn("first_purchase_recovery_reminder", source)
         self.assertIn('keyboard_kind="retry_payment"', source)
 
@@ -337,6 +338,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("md.status IN ('pending', 'processing', 'sent')", sql)
         self.assertIn("blocked_bot IS NOT TRUE", sql)
         self.assertNotIn("payment_failed = TRUE", sql)
+        self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
+        self.assertNotIn("checkout_completed", sql)
 
     def test_stripe_webhook_user_notifications_are_outbox_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]

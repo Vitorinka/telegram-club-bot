@@ -528,6 +528,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("stripe_links", sql)
         self.assertIn("completed_cs.status = 'completed'", sql)
         self.assertNotIn("payment_failed = TRUE", sql)
+        self.assertNotIn("u.stripe_subscription_id IS NULL", sql)
+        self.assertNotIn("checkout_completed", sql)
 
     async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
         conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
@@ -555,7 +557,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(created)
         query, params = conn.cursor_obj.queries[0]
-        self.assertIn("ON CONFLICT (delivery_key) DO NOTHING", query)
+        self.assertIn("ON CONFLICT (delivery_key) DO UPDATE", query)
+        self.assertIn("WHERE message_delivery_events.status = 'cancelled'", query)
+        self.assertIn("sent_at = NULL", query)
         self.assertIn("first_purchase_recovery_reminder", query)
         self.assertNotIn("123456789", params[0])
         payload = json.loads(params[2])
@@ -582,6 +586,67 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         query, params = conn.cursor_obj.queries[0]
         self.assertIn("md.delivery_key <> %s", query)
         self.assertEqual(params[-2:], [delivery_key, delivery_key])
+
+    async def test_stats_command_closes_db_before_reply(self):
+        conn = FakeConnection(fetches=[(10,), (4,), (6,), (2,), (1,), (0,), (0,), (1,), (0,)])
+        message = FakeIncomingMessage(user_id=1)
+        closed_during_answer = []
+
+        async def answer_after_close(*args, **kwargs):
+            closed_during_answer.append(conn.closed)
+
+        message.answer = AsyncMock(side_effect=answer_after_close)
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.stats_command(message)
+
+        self.assertEqual(closed_during_answer, [True])
+
+    async def test_test_grace_closes_db_before_telegram_awaits(self):
+        conn = FakeConnection()
+        message = FakeIncomingMessage(user_id=1)
+        command = SimpleNamespace(args="123")
+        closed_during_reply = []
+        closed_during_send = []
+
+        async def reply_after_close(*args, **kwargs):
+            closed_during_reply.append(conn.closed)
+
+        async def send_after_close(*args, **kwargs):
+            closed_during_send.append(conn.closed)
+
+        message.reply = AsyncMock(side_effect=reply_after_close)
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_close)):
+            await self.main.test_grace(message, command)
+
+        self.assertEqual(closed_during_reply, [True])
+        self.assertEqual(closed_during_send, [True])
+
+    async def test_test_followup_closes_setup_db_before_delivery_and_reply(self):
+        setup_conn = FakeConnection()
+        delivery_conns = [
+            FakeConnection(fetches=[("free_lesson_followup:123",), (1,)]),
+            FakeConnection(),
+        ]
+        all_conns = [setup_conn] + delivery_conns
+        message = FakeIncomingMessage(user_id=1)
+        command = SimpleNamespace(args="123")
+        closed_before_delivery = []
+        closed_during_reply = []
+
+        async def send_after_setup_close(*args, **kwargs):
+            closed_before_delivery.append(setup_conn.closed)
+
+        async def answer_after_close(*args, **kwargs):
+            closed_during_reply.append(setup_conn.closed)
+
+        message.answer = AsyncMock(side_effect=answer_after_close)
+        with patch.object(self.main, "get_db_conn", side_effect=all_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_setup_close)):
+            await self.main.test_followup_command(message, command)
+
+        self.assertEqual(closed_before_delivery, [True])
+        self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 52)
