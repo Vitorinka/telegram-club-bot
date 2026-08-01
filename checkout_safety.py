@@ -15,6 +15,7 @@ BLOCKING_SUBSCRIPTION_STATUSES = {
     "incomplete",
     "paused",
 }
+TERMINAL_SUBSCRIPTION_STATUSES = {"canceled", "incomplete_expired"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
@@ -154,6 +155,14 @@ def active_or_resumable_subscriptions(subscriptions):
     return [sub for sub in data if stripe_value(sub, "status") in BLOCKING_SUBSCRIPTION_STATUSES]
 
 
+def is_terminal_subscription_status(status):
+    return status in TERMINAL_SUBSCRIPTION_STATUSES
+
+
+def stripe_link_active_for_status(status):
+    return status in BLOCKING_SUBSCRIPTION_STATUSES and not is_terminal_subscription_status(status)
+
+
 def subscription_status_action(status, count=1):
     if count > 1:
         return "duplicate_subscriptions"
@@ -259,6 +268,42 @@ def manual_link_access_decision(status, current_period_end, cancel_at_period_end
         "auto_renew": bool(auto_renew),
         "stripe_expiry": stripe_expiry,
     }
+
+
+def is_out_of_band_access(payment_kind=None, access_source=None, manual_sync_at=None):
+    del manual_sync_at
+    return payment_kind == "out_of_band" or access_source in {
+        "manual_give_access",
+        "manual_set_expiry",
+        "out_of_band",
+    }
+
+
+def classify_invoice_collection_risk(
+    status,
+    collection_method=None,
+    amount_remaining=0,
+    next_payment_attempt=None,
+):
+    if status in ("paid", "void", "uncollectible"):
+        return status
+    try:
+        remaining = int(amount_remaining or 0)
+    except (TypeError, ValueError):
+        remaining = 0
+    if status == "open" and remaining > 0 and next_payment_attempt:
+        return "scheduled_retry"
+    if status == "open" and remaining > 0 and collection_method == "send_invoice":
+        return "manual_only_collectible"
+    if status == "open" and remaining > 0:
+        return "open_collectible"
+    return "not_collectible"
+
+
+def should_apply_failed_invoice_to_user(existing_subscription_id, event_subscription_id):
+    if not event_subscription_id:
+        return False
+    return existing_subscription_id in (None, "", event_subscription_id)
 
 
 def has_active_access(paid, expiry_date, payment_failed=False, grace_period_end=None, now=None):

@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -255,6 +256,123 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """,
             (main.first_purchase_recovery_delivery_key(telegram_id),),
         )
+
+    def test_failed_invoice_customer_fallback_conflict_guard_real_postgres(self):
+        run_migrations(self.get_conn)
+        self.insert_recovery_user(
+            9701,
+            paid=True,
+            expiry_date=datetime.utcnow() + timedelta(days=10),
+            stripe_customer_id="cus_conflict",
+            stripe_subscription_id="sub_current",
+        )
+        self.assertFalse(import_main().should_apply_failed_invoice_to_user("sub_current", "sub_old"))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                    grace_period_end = GREATEST(
+                        COALESCE(grace_period_end, NOW()),
+                        NOW() + (48 * INTERVAL '1 hour')
+                    ),
+                    stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                WHERE stripe_customer_id = %s
+                  AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)
+                RETURNING telegram_id
+                """,
+                ("sub_old", "cus_conflict", "cus_conflict", "sub_old"),
+            )
+            self.assertIsNone(cur.fetchone())
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        row = self.query_one(
+            """
+            SELECT stripe_subscription_id, payment_failed, grace_period_end, paid, expiry_date
+            FROM users
+            WHERE telegram_id = 9701
+            """
+        )
+        self.assertEqual(row[0], "sub_current")
+        self.assertFalse(row[1])
+        self.assertIsNone(row[2])
+        self.assertTrue(row[3])
+        self.assertGreater(row[4], datetime.utcnow())
+
+    def test_failed_invoice_exact_subscription_match_real_postgres(self):
+        run_migrations(self.get_conn)
+        self.insert_recovery_user(
+            9702,
+            stripe_customer_id="cus_exact",
+            stripe_subscription_id="sub_exact",
+        )
+        self.assertTrue(import_main().should_apply_failed_invoice_to_user("sub_exact", "sub_exact"))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                    grace_period_end = GREATEST(
+                        COALESCE(grace_period_end, NOW()),
+                        NOW() + (48 * INTERVAL '1 hour')
+                    ),
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                WHERE stripe_subscription_id = %s
+                RETURNING telegram_id, payment_failed, grace_period_end
+                """,
+                ("cus_exact", "sub_exact"),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(row[0], 9702)
+        self.assertTrue(row[1])
+        self.assertIsNotNone(row[2])
+
+    def test_terminal_stripe_link_deactivation_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_customer_id, stripe_subscription_id, status, is_active
+                )
+                VALUES
+                    (9703, 'cus_terminal', 'sub_terminal', 'active', TRUE),
+                    (9703, 'cus_terminal', 'sub_other', 'active', TRUE)
+                """
+            )
+            main.mark_stripe_link_subscription_terminal(cur, "sub_terminal", "canceled")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        rows = self.query_all(
+            """
+            SELECT stripe_subscription_id, status, is_active
+            FROM stripe_links
+            WHERE telegram_id = 9703
+            ORDER BY stripe_subscription_id
+            """
+        )
+        self.assertEqual(rows, [
+            ("sub_other", "active", True),
+            ("sub_terminal", "canceled", False),
+        ])
 
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
