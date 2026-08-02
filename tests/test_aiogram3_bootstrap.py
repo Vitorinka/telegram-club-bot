@@ -836,7 +836,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payment_failed_at", first)
 
     async def test_first_purchase_recovery_due_query_uses_checkout_attempts_and_not_payment_failed(self):
-        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session")
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session", "checkout.session.expired")
         conn = FakeConnection(fetches=[[row]])
 
         due = self.main.fetch_due_first_purchase_recovery_users(conn.cursor_obj, limit=10)
@@ -847,6 +847,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FROM checkout_retry_events", sql)
         self.assertIn("attempt_status", sql)
         self.assertIn("attempt_source", sql)
+        self.assertIn("attempt_error_context", sql)
         self.assertIn("status = ANY", sql)
         self.assertIn("NOW() AT TIME ZONE 'UTC'", sql)
         self.assertIn("payment_events", sql)
@@ -861,7 +862,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sl.current_period_end >", sql)
 
     async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
-        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "checkout_retry_unresolved", "checkout_retry_event")
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "checkout_retry_unresolved", "checkout_retry_event", None)
         conn = FakeConnection(fetches=[row])
 
         row = self.main.fetch_first_purchase_recovery_user_if_due(conn.cursor_obj, 123)
@@ -925,7 +926,85 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["tariff_code"], "sub_1")
         self.assertEqual(payload["attempt_status"], "expired")
         self.assertEqual(payload["attempt_source"], "checkout_session")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
         self.assertNotIn("123456789", payload["safe_ref"])
+
+    async def test_first_purchase_recovery_context_priority_uses_allowlisted_error_tokens(self):
+        cases = [
+            ("failed", "checkout.session.async_payment_failed", "checkout_async_payment_failed"),
+            ("expired", "checkout.session.expired", "checkout_expired"),
+            ("completed", "invoice_payment_failed", "invoice_payment_failed"),
+            ("completed", "invoice_payment_failed:card_declined", "card_declined"),
+            ("completed", "invoice_payment_failed:insufficient_funds", "insufficient_funds"),
+            ("completed", "invoice_payment_failed:authentication_required", "authentication_required"),
+            ("completed", None, "payment_confirmation_pending"),
+        ]
+
+        for status, error_context, category in cases:
+            with self.subTest(status=status, error_context=error_context):
+                result, _ = self.main.classify_first_purchase_recovery_context(
+                    attempt_status=status,
+                    attempt_source="checkout_session",
+                    attempt_error_context=error_context,
+                )
+                self.assertEqual(result, category)
+
+    async def test_first_purchase_recovery_failed_without_safe_context_does_not_guess_creation_failure(self):
+        category, _ = self.main.classify_first_purchase_recovery_context(
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context="raw Stripe exception with invoice in_123 customer cus_123",
+        )
+
+        self.assertEqual(category, "unknown_payment_error")
+
+    async def test_invoice_payment_failed_recovery_context_token_uses_safe_codes_only(self):
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token(None),
+            "invoice_payment_failed",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("card_declined"),
+            "invoice_payment_failed:card_declined",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("insufficient_funds"),
+            "invoice_payment_failed:insufficient_funds",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("authentication_required"),
+            "invoice_payment_failed:authentication_required",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("do_not_guess_card_declined"),
+            "invoice_payment_failed",
+        )
+
+    async def test_first_purchase_recovery_payload_never_copies_raw_checkout_last_error(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        context = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context="raw Stripe exception customer cus_real invoice in_real email person@example.com",
+        )
+
+        self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            context,
+        )
+
+        payload_text = conn.cursor_obj.queries[0][1][2]
+        payload = json.loads(payload_text)
+        self.assertEqual(payload["reason_category"], "unknown_payment_error")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
+        self.assertNotIn("cus_real", payload_text)
+        self.assertNotIn("in_real", payload_text)
+        self.assertNotIn("person@example.com", payload_text)
 
     async def test_first_purchase_recovery_admin_sent_notices_are_per_admin_and_stable(self):
         recovery_key = self.main.first_purchase_recovery_delivery_key(123456789)
@@ -961,8 +1040,42 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             admin_payload = json.loads(params[3])
             self.assertEqual(admin_payload["category"], "first_purchase_recovery_sent")
             self.assertEqual(admin_payload["severity"], "INFO")
-            self.assertIn("Напоминание о незавершённой первой оплате отправлено", admin_payload["text"])
+            self.assertIn("🔁 Повторная попытка оплаты предложена", admin_payload["text"])
+            self.assertIn("Напоминание: отправлено", admin_payload["text"])
             self.assertNotIn("123456789", params[0])
+
+    async def test_first_purchase_recovery_admin_sent_text_formats_attempt_time_and_invalid_date(self):
+        text = self.main.build_first_purchase_recovery_admin_sent_text(
+            123456789,
+            {
+                "attempted_at": "2026-07-30T10:15:00+03:00",
+                "stage_label": "ошибка invoice",
+                "reason_label": "банк отклонил карту",
+                "tariff_code": "unknown",
+                "safe_ref": "first_purchase_recovery:safe",
+            },
+        )
+
+        self.assertIn("🔁 Повторная попытка оплаты предложена", text)
+        self.assertIn("Последняя попытка: 30.07.2026 07:15 UTC", text)
+        self.assertIn("Напоминание: отправлено", text)
+        self.assertIn("Тариф: не определён", text)
+        self.assertIn("Reference: first_purchase_recovery:safe", text)
+        self.assertNotIn("2026-07-30T10:15:00+03:00", text)
+
+        invalid_text = self.main.build_first_purchase_recovery_admin_sent_text(
+            123456789,
+            {
+                "attempted_at": "not-a-date with raw_error",
+                "stage_label": "Checkout",
+                "reason_label": "оплата не завершилась",
+                "tariff_code": None,
+                "safe_ref": "first_purchase_recovery:safe",
+            },
+        )
+        self.assertIn("Последняя попытка: не определена", invalid_text)
+        self.assertNotIn("not-a-date", invalid_text)
+        self.assertNotIn("raw_error", invalid_text)
 
     async def test_first_purchase_recovery_success_enqueues_admin_after_user_send_and_closes_db_before_await(self):
         delivery_key = self.main.first_purchase_recovery_delivery_key(123)
@@ -976,7 +1089,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         })
         delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
         claim_conn = FakeConnection(fetches=[[delivery]])
-        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session")])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session", None)])
         sent_conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
         conns = iter([claim_conn, check_conn, sent_conn])
         closed_before_send = []
@@ -1004,7 +1117,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         payload = json.dumps({"text": "retry", "keyboard_kind": "retry_payment"})
         delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
         claim_conn = FakeConnection(fetches=[[delivery]])
-        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), None, None, None)])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), None, None, None, None)])
         fail_conn = FakeConnection()
         conns = iter([claim_conn, check_conn, fail_conn])
 

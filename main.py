@@ -1467,11 +1467,17 @@ def first_purchase_recovery_reminder_text():
 
 
 FIRST_PURCHASE_RECOVERY_REASON_LABELS = {
+    "checkout_async_payment_failed": "асинхронная оплата не прошла",
     "checkout_expired": "ссылка оплаты истекла",
+    "card_declined": "банк отклонил карту",
+    "insufficient_funds": "недостаточно средств",
+    "authentication_required": "требуется подтверждение оплаты",
+    "invoice_payment_failed": "Stripe сообщил об ошибке оплаты",
     "checkout_creation_failed": "не удалось создать ссылку оплаты",
-    "checkout_not_completed": "оформление доступа не завершилось",
+    "checkout_not_completed": "успешная оплата не была подтверждена; точная причина не определена",
     "payment_confirmation_pending": "Checkout завершён, но успешная оплата не подтверждена",
     "checkout_retry_unresolved": "предыдущая попытка оплаты осталась незавершённой",
+    "stripe_api_unavailable": "Stripe API временно недоступен",
     "unknown_payment_error": "оплата не завершилась",
 }
 
@@ -1479,18 +1485,93 @@ FIRST_PURCHASE_RECOVERY_STAGE_LABELS = {
     "checkout_creation": "создание Checkout",
     "checkout": "Checkout",
     "payment_confirmation": "подтверждение оплаты",
+    "checkout_async_payment_failed": "асинхронная оплата Checkout",
+    "checkout_expired": "Checkout истёк",
+    "invoice_payment_failed": "ошибка invoice",
 }
 
 
-def classify_first_purchase_recovery_attempt(attempt_status=None, attempt_source=None):
+FIRST_PURCHASE_RECOVERY_ALLOWED_ERROR_CONTEXTS = {
+    "checkout.session.async_payment_failed",
+    "checkout.session.expired",
+    "invoice_payment_failed",
+    "invoice_payment_failed:card_declined",
+    "invoice_payment_failed:insufficient_funds",
+    "invoice_payment_failed:authentication_required",
+    "stripe_api_unavailable",
+}
+
+
+def normalize_first_purchase_recovery_error_context(value):
+    if not value:
+        return None
+    token = str(value).strip().lower()
+    if token in FIRST_PURCHASE_RECOVERY_ALLOWED_ERROR_CONTEXTS:
+        return token
+    return None
+
+
+def invoice_payment_failed_recovery_context_token(failure_code=None):
+    problem = classify_payment_problem(event_type="invoice.payment_failed", stripe_code=failure_code)
+    category = problem["category"]
+    if category in ("card_declined", "insufficient_funds", "authentication_required"):
+        return f"invoice_payment_failed:{category}"
+    return "invoice_payment_failed"
+
+
+def persist_first_purchase_recovery_invoice_failure_context(cur, telegram_id, stripe_subscription_id, failure_code=None):
+    token = invoice_payment_failed_recovery_context_token(failure_code)
+    cur.execute("""
+        UPDATE checkout_sessions
+        SET last_error = %s
+        WHERE id = (
+            SELECT id
+            FROM checkout_sessions
+            WHERE telegram_id = %s
+              AND mode = 'subscription'
+              AND (
+                    stripe_subscription_id = %s
+                    OR stripe_subscription_id IS NULL
+                  )
+              AND status = ANY(%s::text[])
+            ORDER BY COALESCE(updated_at, created_at) DESC
+            LIMIT 1
+        )
+    """, (
+        token,
+        int(telegram_id),
+        stripe_subscription_id,
+        list(FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES),
+    ))
+    return token
+
+
+def classify_first_purchase_recovery_context(attempt_status=None, attempt_source=None, attempt_error_context=None):
     status = (attempt_status or "").lower()
     source = (attempt_source or "").lower()
+    error_context = normalize_first_purchase_recovery_error_context(attempt_error_context)
+    if error_context == "checkout.session.async_payment_failed":
+        return "checkout_async_payment_failed", "checkout_async_payment_failed"
+    if error_context == "checkout.session.expired":
+        return "checkout_expired", "checkout_expired"
+    if error_context == "invoice_payment_failed:card_declined":
+        return "card_declined", "invoice_payment_failed"
+    if error_context == "invoice_payment_failed:insufficient_funds":
+        return "insufficient_funds", "invoice_payment_failed"
+    if error_context == "invoice_payment_failed:authentication_required":
+        return "authentication_required", "invoice_payment_failed"
+    if error_context == "invoice_payment_failed":
+        return "invoice_payment_failed", "invoice_payment_failed"
+    if error_context == "stripe_api_unavailable":
+        return "stripe_api_unavailable", "checkout_creation"
     if source == "checkout_retry_event":
         return "checkout_retry_unresolved", "checkout_creation"
     if status == "expired":
         return "checkout_expired", "checkout"
-    if status in ("failed", "creation_unknown"):
+    if status == "creation_unknown":
         return "checkout_creation_failed", "checkout_creation"
+    if status == "failed":
+        return "unknown_payment_error", "checkout"
     if status == "completed":
         return "payment_confirmation_pending", "payment_confirmation"
     if status in ("creating", "open"):
@@ -1504,8 +1585,13 @@ def first_purchase_recovery_context(
     tariff_code=None,
     attempt_status=None,
     attempt_source=None,
+    attempt_error_context=None,
 ):
-    reason_category, stage = classify_first_purchase_recovery_attempt(attempt_status, attempt_source)
+    reason_category, stage = classify_first_purchase_recovery_context(
+        attempt_status=attempt_status,
+        attempt_source=attempt_source,
+        attempt_error_context=attempt_error_context,
+    )
     attempted_at = latest_attempt_at.isoformat() if latest_attempt_at else None
     safe_ref = safe_admin_context_reference(
         "first_purchase_recovery",
@@ -1514,6 +1600,7 @@ def first_purchase_recovery_context(
         tariff_code,
         attempt_status,
         attempt_source,
+        normalize_first_purchase_recovery_error_context(attempt_error_context),
         reason_category,
     )
     return {
@@ -1527,6 +1614,7 @@ def first_purchase_recovery_context(
         "tariff_code": tariff_code or "unknown",
         "attempt_status": attempt_status or "unknown",
         "attempt_source": attempt_source or "unknown",
+        "attempt_error_context": normalize_first_purchase_recovery_error_context(attempt_error_context) or "unknown",
         "attempted_at": attempted_at,
         "safe_ref": safe_ref,
     }
@@ -1540,17 +1628,46 @@ def first_purchase_recovery_row_context(row):
     tariff_code = row[2] if len(row) > 2 else None
     attempt_status = row[3] if len(row) > 3 else None
     attempt_source = row[4] if len(row) > 4 else None
+    attempt_error_context = row[5] if len(row) > 5 else None
     return first_purchase_recovery_context(
         telegram_id,
         latest_attempt_at,
         tariff_code=tariff_code,
         attempt_status=attempt_status,
         attempt_source=attempt_source,
+        attempt_error_context=attempt_error_context,
     )
 
 
 def first_purchase_recovery_admin_sent_delivery_key(recovery_delivery_key, admin_id):
     return f"first_purchase_recovery_admin_sent:{safe_delivery_hash(recovery_delivery_key)}:{int(admin_id)}"
+
+
+def parse_first_purchase_recovery_attempted_at(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    parsed = normalize_utc_naive(parsed)
+    return parsed
+
+
+def format_first_purchase_recovery_attempted_at(value):
+    parsed = parse_first_purchase_recovery_attempted_at(value)
+    if not parsed:
+        return "не определена"
+    return f"{parsed.strftime('%d.%m.%Y %H:%M')} UTC"
+
+
+def first_purchase_recovery_tariff_label(value):
+    if value is None:
+        return "не определён"
+    text = str(value).strip()
+    if not text or text.lower() in ("none", "unknown"):
+        return "не определён"
+    return text
 
 
 def build_first_purchase_recovery_admin_sent_text(telegram_id, payload):
@@ -1560,12 +1677,14 @@ def build_first_purchase_recovery_admin_sent_text(telegram_id, payload):
         payload.get("attempted_at") or payload.get("latest_attempt_at"),
     )
     return (
-        "✅ Напоминание о незавершённой первой оплате отправлено\n\n"
+        "🔁 Повторная попытка оплаты предложена\n\n"
         f"Пользователь: {telegram_id}\n"
+        f"Последняя попытка: {format_first_purchase_recovery_attempted_at(payload.get('attempted_at'))}\n"
         f"Этап: {payload.get('stage_label') or 'не определён'}\n"
         f"Причина: {payload.get('reason_label') or 'не определена'}\n"
-        f"Тариф: {payload.get('tariff_code') or 'unknown'}\n"
-        f"Attempt ref: {safe_ref}"
+        f"Тариф: {first_purchase_recovery_tariff_label(payload.get('tariff_code'))}\n"
+        "Напоминание: отправлено\n"
+        f"Reference: {safe_ref}"
     )
 
 
@@ -1610,7 +1729,7 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
               AND (%s IS NULL OR md.delivery_key <> %s)
     """ if current_delivery_key else ""
     select_clause = "COUNT(*)" if count_only else (
-        "u.telegram_id, la.latest_attempt_at, la.tariff_code, la.attempt_status, la.attempt_source"
+        "u.telegram_id, la.latest_attempt_at, la.tariff_code, la.attempt_status, la.attempt_source, la.attempt_error_context"
     )
     user_clause = "AND u.telegram_id = %s" if single_user else ""
     limit_clause = "" if single_user or count_only else "ORDER BY la.latest_attempt_at ASC LIMIT %s"
@@ -1621,7 +1740,8 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
                 COALESCE(updated_at, created_at) AS attempt_at,
                 tariff_code,
                 status AS attempt_status,
-                'checkout_session' AS attempt_source
+                'checkout_session' AS attempt_source,
+                last_error AS attempt_error_context
             FROM checkout_sessions
             WHERE telegram_id IS NOT NULL
               AND status = ANY(%s::text[])
@@ -1631,7 +1751,8 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
                 attempt_at,
                 tariff_code,
                 'checkout_retry_unresolved' AS attempt_status,
-                'checkout_retry_event' AS attempt_source
+                'checkout_retry_event' AS attempt_source,
+                NULL AS attempt_error_context
             FROM checkout_retry_events
             WHERE telegram_id IS NOT NULL
               AND resolved_at IS NULL
@@ -1642,7 +1763,8 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
                 attempt_at AS latest_attempt_at,
                 tariff_code,
                 attempt_status,
-                attempt_source
+                attempt_source,
+                attempt_error_context
             FROM attempts
             WHERE attempt_at IS NOT NULL
               AND COALESCE(tariff_code, '') NOT ILIKE 'test%%'
@@ -9959,6 +10081,12 @@ async def stripe_webhook(request):
                 if row:
                     failed_period_start, failed_period_end = invoice_line_period_datetimes(invoice)
                     failed_kind = invoice_payment_kind(billing_reason, "process_payment")
+                    persist_first_purchase_recovery_invoice_failure_context(
+                        cur,
+                        row[0],
+                        sub_id,
+                        failure_code=failure_code,
+                    )
                     insert_payment_event(
                         cur,
                         event_id,

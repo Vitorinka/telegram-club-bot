@@ -190,20 +190,41 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.close()
             conn.close()
 
-    def insert_checkout_attempt(self, telegram_id, *, hours_ago=24, status="expired", mode="payment", tariff="sub_1"):
+    def insert_checkout_attempt(
+        self,
+        telegram_id,
+        *,
+        hours_ago=24,
+        status="expired",
+        mode="payment",
+        tariff="sub_1",
+        stripe_subscription_id=None,
+        last_error=None,
+    ):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
             cur.execute(
                 """
                 INSERT INTO checkout_sessions (
-                    telegram_id, tariff_code, mode, idempotency_key, status, created_at, updated_at
+                    telegram_id, tariff_code, mode, stripe_subscription_id,
+                    idempotency_key, status, last_error, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s,
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'),
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
                 """,
-                (telegram_id, tariff, mode, f"idem_{telegram_id}_{uuid.uuid4().hex}", status, hours_ago, hours_ago),
+                (
+                    telegram_id,
+                    tariff,
+                    mode,
+                    stripe_subscription_id,
+                    f"idem_{telegram_id}_{uuid.uuid4().hex}",
+                    status,
+                    last_error,
+                    hours_ago,
+                    hours_ago,
+                ),
             )
             conn.commit()
         finally:
@@ -1520,6 +1541,132 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["tariff_code"], "sub_1")
         self.assertNotIn("9702", payload["safe_ref"])
 
+    def test_first_purchase_recovery_scheduler_payload_uses_safe_checkout_error_contexts(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        for user_id, status, last_error, expected_category in (
+            (9710, "failed", "checkout.session.async_payment_failed", "checkout_async_payment_failed"),
+            (9711, "expired", "checkout.session.expired", "checkout_expired"),
+            (9712, "failed", "raw Stripe exception cus_raw in_raw person@example.com", "unknown_payment_error"),
+        ):
+            self.insert_recovery_user(user_id)
+            self.insert_checkout_attempt(
+                user_id,
+                hours_ago=25,
+                status=status,
+                mode="subscription",
+                last_error=last_error,
+            )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 3, "enqueued": 3})
+        for user_id, expected_category in (
+            (9710, "checkout_async_payment_failed"),
+            (9711, "checkout_expired"),
+            (9712, "unknown_payment_error"),
+        ):
+            payload = json.loads(self.recovery_row(user_id)[8])
+            self.assertEqual(payload["reason_category"], expected_category)
+            self.assertNotIn("cus_raw", json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("in_raw", json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("person@example.com", json.dumps(payload, ensure_ascii=False))
+
+    def test_first_purchase_recovery_invoice_failure_context_tokens_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        cases = (
+            (9720, None, "invoice_payment_failed", "invoice_payment_failed"),
+            (9721, "card_declined", "invoice_payment_failed:card_declined", "card_declined"),
+            (9722, "insufficient_funds", "invoice_payment_failed:insufficient_funds", "insufficient_funds"),
+            (9723, "authentication_required", "invoice_payment_failed:authentication_required", "authentication_required"),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for user_id, failure_code, token, _ in cases:
+                self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+                self.insert_checkout_attempt(
+                    user_id,
+                    hours_ago=25,
+                    status="completed",
+                    mode="subscription",
+                    stripe_subscription_id=f"sub_{user_id}",
+                )
+                self.assertEqual(
+                    main.persist_first_purchase_recovery_invoice_failure_context(
+                        cur,
+                        user_id,
+                        f"sub_{user_id}",
+                        failure_code=failure_code,
+                    ),
+                    token,
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 4, "enqueued": 4})
+        for user_id, _, token, expected_category in cases:
+            checkout_error = self.query_one(
+                "SELECT last_error FROM checkout_sessions WHERE telegram_id = %s",
+                (user_id,),
+            )[0]
+            self.assertEqual(checkout_error, token)
+            payload = json.loads(self.recovery_row(user_id)[8])
+            self.assertEqual(payload["attempt_error_context"], token)
+            self.assertEqual(payload["reason_category"], expected_category)
+
+    def test_first_purchase_recovery_stale_invoice_does_not_change_context_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9724
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_current")
+        self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_current",
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO access_events (
+                    telegram_id, event_type, source, stripe_event_id, stripe_subscription_id, notes
+                )
+                VALUES (%s, 'ignored_stale_negative_event', 'invoice.payment_failed', %s, %s, %s)
+                """,
+                (user_id, "evt_stale_context", "sub_old", "stale invoice ignored before recovery context update"),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertIsNone(self.query_one(
+            "SELECT last_error FROM checkout_sessions WHERE telegram_id = %s",
+            (user_id,),
+        )[0])
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 1, "enqueued": 1})
+        payload = json.loads(self.recovery_row(user_id)[8])
+        self.assertEqual(payload["reason_category"], "payment_confirmation_pending")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
+
     def test_first_purchase_recovery_worker_success_creates_user_and_admin_deliveries_once(self):
         run_migrations(self.get_conn)
         main = import_main()
@@ -1561,7 +1708,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             payload = json.loads(payload_json)
             self.assertEqual(payload["category"], "first_purchase_recovery_sent")
             self.assertEqual(payload["severity"], "INFO")
-            self.assertIn("Напоминание о незавершённой первой оплате отправлено", payload["text"])
+            self.assertIn("🔁 Повторная попытка оплаты предложена", payload["text"])
+            self.assertIn("Последняя попытка:", payload["text"])
+            self.assertIn("Напоминание: отправлено", payload["text"])
             self.assertNotIn(str(user_id), delivery_key)
 
     def test_first_purchase_recovery_retryable_failure_does_not_create_admin_sent_notice(self):
