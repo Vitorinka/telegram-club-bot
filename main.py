@@ -1327,18 +1327,109 @@ def enqueue_admin_payment_problem(
     )
 
 
-async def enqueue_admin_payment_problem_now(**kwargs):
-    conn = get_db_conn()
-    cur = conn.cursor()
+def admin_recovery_reminder_status(
+    immediate_retry_enqueued=False,
+    durable_24h_enqueued=False,
+    scheduler_will_check=False,
+):
+    if durable_24h_enqueued:
+        return "запланировано"
+    if scheduler_will_check:
+        return "будет проверено через 24 часа"
+    if immediate_retry_enqueued:
+        return "не применимо"
+    return "неизвестно"
+
+
+def log_admin_payment_enqueue_failure(purpose=None, category=None, safe_ref=None):
+    logging.warning(
+        "ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED: purpose=%s, category=%s, safe_ref=%s",
+        purpose or "unknown",
+        category or "unknown",
+        safe_ref or "none",
+    )
+
+
+def enqueue_admin_payment_notification_savepoint(cur, enqueue_func, purpose=None, category=None, safe_ref=None):
+    cur.execute("SAVEPOINT admin_payment_notification")
     try:
+        result = enqueue_func()
+        cur.execute("RELEASE SAVEPOINT admin_payment_notification")
+        return result
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT admin_payment_notification")
+        cur.execute("RELEASE SAVEPOINT admin_payment_notification")
+        log_admin_payment_enqueue_failure(purpose=purpose, category=category, safe_ref=safe_ref)
+        return 0
+
+
+def enqueue_admin_payment_success_safely(
+    cur,
+    event_id,
+    purpose,
+    telegram_id,
+    tariff,
+    amount,
+    currency,
+    effective_expiry,
+    payment_ref,
+):
+    return enqueue_admin_payment_notification_savepoint(
+        cur,
+        lambda: enqueue_admin_payment_success(
+            cur,
+            event_id,
+            purpose,
+            telegram_id,
+            tariff,
+            amount,
+            currency,
+            effective_expiry,
+            payment_ref,
+        ),
+        purpose=purpose,
+        category=purpose,
+        safe_ref=payment_ref,
+    )
+
+
+def enqueue_admin_payment_problem_safely(cur, **kwargs):
+    return enqueue_admin_payment_notification_savepoint(
+        cur,
+        lambda: enqueue_admin_payment_problem(cur, **kwargs),
+        purpose=kwargs.get("purpose"),
+        category=kwargs.get("category"),
+        safe_ref=kwargs.get("safe_ref"),
+    )
+
+
+async def try_enqueue_admin_payment_problem_now(**kwargs):
+    conn = None
+    cur = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
         enqueue_admin_payment_problem(cur, **kwargs)
         conn.commit()
+        return True
     except Exception:
-        conn.rollback()
-        raise
+        if conn:
+            conn.rollback()
+        log_admin_payment_enqueue_failure(
+            purpose=kwargs.get("purpose"),
+            category=kwargs.get("category"),
+            safe_ref=kwargs.get("safe_ref"),
+        )
+        return False
     finally:
-        cur.close()
-        conn.close()
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+async def enqueue_admin_payment_problem_now(**kwargs):
+    return await try_enqueue_admin_payment_problem_now(**kwargs)
 
 
 def enqueue_user_payment_success_message(cur, event_id, telegram_id, purpose, expiry_date, keyboard_kind=None):
@@ -8371,7 +8462,7 @@ async def stripe_webhook(request):
                             new_expiry,
                             keyboard_kind="cancel_subscription" if has_subscription else None,
                         )
-                        enqueue_admin_payment_success(
+                        enqueue_admin_payment_success_safely(
                             cur,
                             event_id,
                             purpose,
@@ -8414,7 +8505,7 @@ async def stripe_webhook(request):
                             new_expiry,
                             keyboard_kind="cancel_subscription" if has_subscription else None,
                         )
-                        enqueue_admin_payment_success(
+                        enqueue_admin_payment_success_safely(
                             cur,
                             event_id,
                             purpose,
@@ -8776,11 +8867,11 @@ async def stripe_webhook(request):
                         f"invoice.payment_succeeded: у subscription нет current_period_end. "
                         f"subscription_id={sub_id}, customer_id={customer_id}, invoice_id={invoice_id}, event={event_id}"
                     )
-                    enqueue_admin_payment_problem(
+                    enqueue_admin_payment_problem_safely(
                         cur,
-                        event_id,
-                        "missing_subscription_period",
-                        "invoice_payment_succeeded",
+                        event_id=event_id,
+                        purpose="missing_subscription_period",
+                        stage="invoice_payment_succeeded",
                         telegram_id=None,
                         category="missing_subscription_period",
                         stripe_retry="нет",
@@ -9267,7 +9358,7 @@ async def stripe_webhook(request):
                     effective_expiry,
                     keyboard_kind="cancel_subscription",
                 )
-                enqueue_admin_payment_success(
+                enqueue_admin_payment_success_safely(
                     cur,
                     event_id,
                     delivery_purpose,
@@ -9582,11 +9673,11 @@ async def stripe_webhook(request):
                             customer_id_for_db,
                         ),
                     )
-                    enqueue_admin_payment_problem(
+                    enqueue_admin_payment_problem_safely(
                         cur,
-                        event_id,
-                        "stale_historical_invoice",
-                        "invoice_payment_failed",
+                        event_id=event_id,
+                        purpose="stale_historical_invoice",
+                        stage="invoice_payment_failed",
                         telegram_id=None,
                         category="stale_historical_invoice",
                         stripe_retry="нет",
@@ -9753,16 +9844,16 @@ async def stripe_webhook(request):
                         f"⚠️ Не удалось списать оплату за подписку. У вас есть {PAYMENT_RETRY_GRACE_HOURS} часов, чтобы пополнить карту или связаться с администратором.\n"
                         "После устранения проблемы доступ восстановится автоматически.",
                     )
-                    enqueue_admin_payment_problem(
+                    enqueue_admin_payment_problem_safely(
                         cur,
-                        event_id,
-                        "invoice_payment_failed",
-                        "invoice_payment_failed",
+                        event_id=event_id,
+                        purpose="invoice_payment_failed",
+                        stage="invoice_payment_failed",
                         telegram_id=telegram_id,
                         category="invoice_payment_failed",
                         stripe_code=failure_code,
                         stripe_retry=stripe_retry_text,
-                        recovery_reminder="запланировано",
+                        recovery_reminder=admin_recovery_reminder_status(immediate_retry_enqueued=True),
                         safe_ref=safe_admin_context_reference("invoice_payment_failed", event_id, invoice_id, sub_id),
                         note=(
                             f"next_payment_attempt: {'известен' if next_payment_attempt else 'отсутствует'}\n"
@@ -9783,16 +9874,16 @@ async def stripe_webhook(request):
                         invoice_status,
                         billing_reason,
                     )
-                    enqueue_admin_payment_problem(
+                    enqueue_admin_payment_problem_safely(
                         cur,
-                        event_id,
-                        "invoice_payment_failed_unlinked",
-                        "invoice_payment_failed",
+                        event_id=event_id,
+                        purpose="invoice_payment_failed_unlinked",
+                        stage="invoice_payment_failed",
                         telegram_id=None,
                         category="invoice_payment_failed",
                         stripe_code=failure_code,
                         stripe_retry=stripe_retry_text,
-                        recovery_reminder="неизвестно",
+                        recovery_reminder=admin_recovery_reminder_status(),
                         safe_ref=safe_admin_context_reference("invoice_payment_failed_unlinked", event_id, invoice_id, sub_id),
                         note="Пользователь не найден; user payment_failed message не поставлен.",
                     )
@@ -10259,17 +10350,20 @@ async def stripe_webhook(request):
                         "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь.",
                         keyboard_kind="retry_payment",
                     )
-                enqueue_admin_payment_problem(
+                enqueue_admin_payment_problem_safely(
                     cur,
-                    event_id,
-                    "checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
-                    "checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
+                    event_id=event_id,
+                    purpose="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
+                    stage="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
                     telegram_id=user_id,
                     category="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
                     stripe_retry="нет",
-                    recovery_reminder="запланировано" if user_id else "неизвестно",
+                    recovery_reminder=admin_recovery_reminder_status(
+                        immediate_retry_enqueued=bool(user_id),
+                        scheduler_will_check=bool(user_id),
+                    ),
                     safe_ref=safe_admin_context_reference(event_type, event_id, session_id, user_id),
-                    note="Пользователю поставлено напоминание retry_payment в outbox." if user_id else "telegram_id не определён.",
+                    note="Немедленное сообщение retry_payment поставлено в outbox." if user_id else "telegram_id не определён.",
                 )
                 conn.commit()
             finally:

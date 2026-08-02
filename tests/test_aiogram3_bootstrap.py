@@ -164,6 +164,24 @@ class FakeConnection:
         self.closed = True
 
 
+class ExecuteFailingCursor(FakeCursor):
+    def __init__(self, fetches=None, error=None):
+        super().__init__(fetches=fetches)
+        self.error = error or RuntimeError("execute failed")
+
+    def execute(self, query, params=None):
+        super().execute(query, params)
+        raise self.error
+
+
+class ExecuteFailingConnection(FakeConnection):
+    def __init__(self, error=None):
+        self.cursor_obj = ExecuteFailingCursor(error=error)
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+
 def adapted_json_value(value):
     return getattr(value, "adapted", value)
 
@@ -501,6 +519,45 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
         self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
         self.assertTrue(any("Тип: восстановление после ошибки" in payload["text"] for payload in admin_payloads))
+
+    async def test_admin_success_formatting_error_does_not_rollback_payment_flow(self):
+        event_id = "evt_invoice_admin_formatting_failure"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "build_admin_payment_success_text", side_effect=ValueError("raw admin format secret")), \
+             patch.object(self.main, "get_db_conn", return_value=conn), \
+             self.assertLogs(level="WARNING") as logs:
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(conn.rollbacks, 0)
+        self.assertEqual(conn.commits, 1)
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO payment_events", sql)
+        self.assertIn("INSERT INTO access_events", sql)
+        self.assertIn("SAVEPOINT admin_payment_notification", sql)
+        self.assertIn("ROLLBACK TO SAVEPOINT admin_payment_notification", sql)
+        deliveries = self.delivery_map(conn)
+        self.assertIn("stripe:%s:renewal_success" % event_id, deliveries)
+        self.assertFalse(self.admin_delivery_inserts(conn))
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertNotIn("raw admin format secret", log_output)
 
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
@@ -2019,6 +2076,179 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(payload["category"] == "card_declined" for payload in payloads))
         self.assertTrue(all("банк отклонил карту" in payload["text"] for payload in payloads))
         self.assertTrue(all("None" not in payload["text"] for payload in payloads))
+
+    async def test_admin_payment_problem_now_db_error_is_best_effort_and_sanitized(self):
+        conn = ExecuteFailingConnection(error=RuntimeError("raw admin db secret"))
+
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             self.assertLogs(level="WARNING") as logs:
+            result = await self.main.try_enqueue_admin_payment_problem_now(
+                event_id="evt_admin_now",
+                purpose="checkout_creation_failed",
+                stage="checkout_creation",
+                telegram_id=123,
+                category="checkout_creation_failed",
+                stripe_retry="неизвестно",
+                recovery_reminder="неизвестно",
+                safe_ref="checkout_creation_failed:safe-ref",
+                note="safe note",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(conn.rollbacks, 1)
+        self.assertEqual(conn.commits, 0)
+        self.assertTrue(conn.closed)
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertIn("checkout_creation_failed", log_output)
+        self.assertIn("checkout_creation_failed:safe-ref", log_output)
+        self.assertNotIn("raw admin db secret", log_output)
+
+    async def test_checkout_creation_admin_outbox_error_still_answers_callback(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        admin_conn = ExecuteFailingConnection(error=RuntimeError("raw checkout admin secret"))
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow())), \
+             patch.object(self.main, "claim_checkout_session_record", side_effect=RuntimeError("claim failed")), \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, admin_conn]), \
+             self.assertLogs(level="WARNING") as logs:
+            await self.main.process_payment(callback, state)
+
+        self.assertEqual(callback.answers[-1][0], "Техническая ошибка. Попробуйте позже или напишите @re_tasha")
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+        self.assertTrue(initial_conn.closed)
+        self.assertTrue(claim_conn.closed)
+        self.assertTrue(admin_conn.closed)
+        self.assertEqual(admin_conn.rollbacks, 1)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", "\n".join(logs.output))
+        self.assertNotIn("raw checkout admin secret", "\n".join(logs.output))
+
+    async def test_webhook_error_path_admin_outbox_error_still_releases_claim(self):
+        event_id = "evt_checkout_expired_db_error"
+        session_payload = {"id": "cs_expired_db_error", "client_reference_id": "123"}
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.expired",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": session_payload}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "get_db_conn", side_effect=[
+                 RuntimeError("primary checkout expired failure"),
+                 RuntimeError("raw admin webhook secret"),
+             ]), \
+             self.assertLogs(level="WARNING") as logs:
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        release.assert_awaited_once_with(event_id)
+        mark_processed.assert_not_awaited()
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertNotIn("raw admin webhook secret", log_output)
+
+    async def test_admin_recovery_reminder_status_uses_durable_proof(self):
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(immediate_retry_enqueued=True),
+            "не применимо",
+        )
+        self.assertNotEqual(
+            self.main.admin_recovery_reminder_status(immediate_retry_enqueued=True),
+            "запланировано",
+        )
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(durable_24h_enqueued=True),
+            "запланировано",
+        )
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(scheduler_will_check=True),
+            "будет проверено через 24 часа",
+        )
+        self.assertEqual(self.main.admin_recovery_reminder_status(), "неизвестно")
+
+    async def test_checkout_expired_admin_alert_separates_retry_payment_from_24h_reminder(self):
+        event_id = "evt_checkout_expired_retry_note"
+        session_payload = {"id": "cs_expired_retry_note", "client_reference_id": "123"}
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.expired",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": session_payload}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        conn = FakeConnection(fetches=[
+            ("stripe:%s:checkout_expired" % event_id,),
+            ("stripe-admin:%s:checkout_expired:1" % event_id,),
+            ("stripe-admin:%s:checkout_expired:2" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        user_payload = json.loads(adapted_json_value(self.user_delivery_inserts(conn)[0][3]))
+        self.assertEqual(user_payload["keyboard_kind"], "retry_payment")
+        admin_payload = json.loads(adapted_json_value(self.admin_delivery_inserts(conn)[0][3]))
+        self.assertIn("Напоминание через 24 часа: будет проверено через 24 часа", admin_payload["text"])
+        self.assertIn("Немедленное сообщение retry_payment поставлено в outbox", admin_payload["text"])
+        self.assertNotIn("Напоминание через 24 часа: запланировано", admin_payload["text"])
+
+    async def test_invoice_payment_failed_admin_alert_does_not_claim_24h_reminder(self):
+        event_id = "evt_invoice_failed_retry_status"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        event.type = "invoice.payment_failed"
+        invoice = event.data.object
+        invoice.status = "open"
+        invoice.amount_paid = 0
+        invoice.amount_due = 1000
+        invoice.next_payment_attempt = int((datetime.utcnow() + timedelta(hours=6)).timestamp())
+        subscription.status = "past_due"
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            None,
+            (123, True, datetime.utcnow() + timedelta(days=14), datetime.utcnow(), datetime.utcnow() + timedelta(hours=24)),
+            ("stripe:%s:payment_failed" % event_id,),
+            ("stripe-admin:%s:invoice_payment_failed:1" % event_id,),
+            ("stripe-admin:%s:invoice_payment_failed:2" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        admin_payload = json.loads(adapted_json_value(self.admin_delivery_inserts(conn)[0][3]))
+        self.assertIn("Напоминание через 24 часа: не применимо", admin_payload["text"])
+        self.assertNotIn("Напоминание через 24 часа: запланировано", admin_payload["text"])
+        self.assertIn("payment_failed message: поставлено в outbox", admin_payload["text"])
 
     async def test_payment_problem_classification_event_types_and_unknown_fallback(self):
         self.assertEqual(
