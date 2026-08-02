@@ -1068,6 +1068,61 @@ def stripe_delivery_payload(text, keyboard_kind=None, parse_mode=None, **extra):
     return payload
 
 
+def format_user_access_date(expiry_date):
+    if not expiry_date:
+        return None
+    return expiry_date.strftime("%d.%m.%Y")
+
+
+def build_user_payment_success_message(action, expiry_date):
+    expiry_text = format_user_access_date(expiry_date)
+    if not expiry_text:
+        return (
+            "Оплата прошла успешно 🤍\n\n"
+            "Доступ к клубу открыт.\n\n"
+            "Мы дополнительно проверяем дату окончания подписки."
+        )
+    if action == "renewal_success":
+        return (
+            "Подписка успешно продлена 🤍\n\n"
+            f"Доступ к клубу сохранён до {expiry_text}.\n\n"
+            "Спасибо, что остаётесь с нами."
+        )
+    if action == "payment_recovered":
+        return (
+            "Оплата прошла успешно 🤍\n\n"
+            f"Подписка снова активна, а доступ к клубу продлён до {expiry_text}.\n\n"
+            "Спасибо, что всё получилось. Все материалы уже доступны в меню."
+        )
+    if action == "payment_success":
+        return (
+            "Оплата прошла успешно 🤍\n\n"
+            f"Доступ к клубу открыт до {expiry_text}.\n\n"
+            "Спасибо, что присоединились. Все материалы уже доступны в меню."
+        )
+    raise ValueError(f"unknown payment success action: {action}")
+
+
+def payment_success_purpose(payment_kind, was_payment_failed=False):
+    if was_payment_failed:
+        return "payment_recovered"
+    if payment_kind == "recurring":
+        return "renewal_success"
+    return "payment_success"
+
+
+def enqueue_user_payment_success_message(cur, event_id, telegram_id, purpose, expiry_date, keyboard_kind=None):
+    return enqueue_stripe_user_message(
+        cur,
+        event_id,
+        telegram_id,
+        purpose,
+        build_user_payment_success_message(purpose, expiry_date),
+        keyboard_kind=keyboard_kind,
+        new_expiry=expiry_date.isoformat() if expiry_date else None,
+    )
+
+
 def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keyboard_kind=None, parse_mode=None, delivery_type=None, **extra):
     return enqueue_message_delivery(
         cur,
@@ -1270,9 +1325,7 @@ def cancel_first_purchase_recovery_deliveries(cur, telegram_id, reason="first_pa
 def enqueue_rejoin_invite_after_payment(cur, telegram_id, expiry_date, source, stripe_event_id, stripe_subscription_id=None):
     expiry_text = expiry_date.strftime("%d.%m.%Y") if expiry_date else "активен"
     text = (
-        "✅ Оплата прошла успешно, доступ восстановлен.\n\n"
-        f"Ваш доступ активен до {expiry_text}.\n\n"
-        "Вот новая ссылка для входа в клуб:\n"
+        f"Ссылка для входа в клуб активна до {expiry_text}.\n\n"
         "{invite_link}"
     )
     return enqueue_stripe_user_message(
@@ -8017,6 +8070,24 @@ async def stripe_webhook(request):
                 ))
 
                 if checkout_access_confirmed:
+                    if is_trial and not has_subscription:
+                        enqueue_stripe_user_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            "trial_success",
+                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
+                            "Все материалы уже доступны в меню.",
+                        )
+                    else:
+                        enqueue_user_payment_success_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            "payment_success",
+                            new_expiry,
+                            keyboard_kind="cancel_subscription" if has_subscription else None,
+                        )
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         user_id,
@@ -8026,23 +8097,25 @@ async def stripe_webhook(request):
                         stripe_subscription_id=sub_id,
                     )
                 else:
-                    msg = f"✅ Ваша подписка продлена до {new_expiry.strftime('%d.%m.%Y')}. Спасибо! ❤️"
-
-                    if has_subscription:
-                        msg += (
-                            "\n\nОплата будет списываться автоматически до момента, пока вы не отмените подписку.\n\n"
-                            "Вы можете отменить автопродление в любой момент по кнопке ниже или через /profile."
-                        )
-
                     purpose = "trial_success" if is_trial and not has_subscription else "payment_success"
-                    enqueue_stripe_user_message(
-                        cur,
-                        event_id,
-                        user_id,
-                        purpose,
-                        msg,
-                        keyboard_kind="cancel_subscription" if has_subscription else None,
-                    )
+                    if purpose == "trial_success":
+                        enqueue_stripe_user_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            purpose,
+                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
+                            "Все материалы уже доступны в меню.",
+                        )
+                    else:
+                        enqueue_user_payment_success_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            purpose,
+                            new_expiry,
+                            keyboard_kind="cancel_subscription" if has_subscription else None,
+                        )
                 conn.commit()
                 logging.info(
                     f"Checkout Session marked completed: user_id={user_id}, "
@@ -8818,10 +8891,6 @@ async def stripe_webhook(request):
                         event_id,
                         stripe_subscription_id=sub_id,
                     )
-                    conn.commit()
-                    reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
-                    await mark_event_processed(event_id)
-                    return web.Response(status=200)
 
                 if payment_kind == "out_of_band":
                     logging.info(
@@ -8854,34 +8923,19 @@ async def stripe_webhook(request):
                     f"customer_id={safe_log_id(customer_id)}; invoice_id={safe_log_id(invoice_id)}; period_source={period_source}",
                 ))
 
-                if payment_kind == "initial_subscription":
-                    message_text = (
-                        f"✅ Оплата прошла успешно! Доступ активен до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
-                        "Оплата будет списываться автоматически до момента, пока вы не отмените подписку.\n\n"
-                        "Вы можете отменить автопродление в любой момент по кнопке ниже или через /profile."
-                    )
+                delivery_purpose = payment_success_purpose(payment_kind, was_payment_failed)
+                if delivery_purpose == "payment_success":
                     notice_marker = "INITIAL_SUBSCRIPTION_NOTICE_SENT"
-                    delivery_purpose = "payment_recovered" if was_payment_failed else "payment_success"
-                elif payment_kind == "recurring":
-                    message_text = (
-                        f"✅ Автопродление успешно! Доступ продлен до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
-                        "Оплата будет списываться автоматически до момента, пока вы не отмените подписку."
-                    )
+                elif delivery_purpose == "renewal_success":
                     notice_marker = "AUTO_RENEW_NOTICE_SENT"
-                    delivery_purpose = "payment_recovered" if was_payment_failed else "renewal_success"
                 else:
-                    message_text = (
-                        f"✅ Оплата прошла успешно! Доступ активен до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
-                        "Спасибо! ❤️"
-                    )
-                    notice_marker = "SUBSCRIPTION_PAYMENT_NOTICE_SENT"
-                    delivery_purpose = "payment_recovered" if was_payment_failed else "payment_success"
-                enqueue_stripe_user_message(
+                    notice_marker = "PAYMENT_RECOVERY_NOTICE_SENT"
+                enqueue_user_payment_success_message(
                     cur,
                     event_id,
                     telegram_id,
                     delivery_purpose,
-                    message_text,
+                    new_expiry,
                     keyboard_kind="cancel_subscription",
                 )
                 conn.commit()

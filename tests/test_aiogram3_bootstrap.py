@@ -202,7 +202,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 return route.handler
         self.fail(f"route not found: {method} {path}")
 
-    def invoice_payment_event(self, event_id, *, period_end=None, paid_out_of_band=False):
+    def invoice_payment_event(self, event_id, *, period_end=None, paid_out_of_band=False, billing_reason="subscription_cycle"):
         period_end = period_end or int((datetime.utcnow() + timedelta(days=30)).timestamp())
         period_start = int((datetime.utcnow() - timedelta(days=1)).timestamp())
         payment = SimpleNamespace(
@@ -218,7 +218,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             amount_paid=1000,
             amount_due=1000,
             currency="rub",
-            billing_reason="subscription_cycle",
+            billing_reason=billing_reason,
             status="paid",
             paid_out_of_band=paid_out_of_band,
             metadata={},
@@ -257,8 +257,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         return payload, event, subscription
 
-    async def run_invoice_webhook_with_future_expiry(self, event_id, *, paid_out_of_band=False):
-        payload, event, subscription = self.invoice_payment_event(event_id, paid_out_of_band=paid_out_of_band)
+    async def run_invoice_webhook_with_future_expiry(self, event_id, *, paid_out_of_band=False, billing_reason="subscription_cycle"):
+        payload, event, subscription = self.invoice_payment_event(
+            event_id,
+            paid_out_of_band=paid_out_of_band,
+            billing_reason=billing_reason,
+        )
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             (123, datetime.utcnow() + timedelta(days=14), False),
@@ -283,6 +287,102 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
         return enqueue_params
 
+    async def test_invoice_subscription_create_enqueues_initial_success_and_rejoin_separately(self):
+        event_id = "evt_invoice_initial_success"
+        payload, event, subscription = self.invoice_payment_event(event_id, billing_reason="subscription_create")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (123, None, False),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:payment_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        enqueue_params = [
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        ]
+        deliveries = {params[0]: params for params in enqueue_params}
+        self.assertIn("stripe:%s:payment_success" % event_id, deliveries)
+        self.assertIn("stripe:%s:rejoin_invite" % event_id, deliveries)
+        payment_payload = json.loads(adapted_json_value(deliveries["stripe:%s:payment_success" % event_id][3]))
+        self.assertIn("Оплата прошла успешно 🤍", payment_payload["text"])
+        self.assertIn("Спасибо, что присоединились", payment_payload["text"])
+        self.assertNotIn("Подписка успешно продлена", payment_payload["text"])
+
+    async def test_invoice_webhook_enqueues_renewal_success_with_new_expiry(self):
+        event_id = "evt_invoice_renewal_success"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() + timedelta(days=14), False),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        enqueue_params = [
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        ]
+        deliveries = {params[0]: params for params in enqueue_params}
+        payload_json = adapted_json_value(deliveries["stripe:%s:renewal_success" % event_id][3])
+        payload_data = json.loads(payload_json)
+        self.assertEqual(deliveries["stripe:%s:renewal_success" % event_id][2], "stripe_user_message")
+        self.assertIn("Подписка успешно продлена 🤍", payload_data["text"])
+        self.assertIn(datetime.utcfromtimestamp(subscription.current_period_end).strftime("%d.%m.%Y"), payload_data["text"])
+        self.assertNotIn("None", payload_data["text"])
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:%s:rejoin_invite" % event_id][3]))
+        self.assertNotIn("Подписка успешно продлена", rejoin_payload["text"])
+
+    async def test_invoice_webhook_enqueues_recovery_success_and_clears_failure_state(self):
+        event_id = "evt_invoice_recovered_success"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() - timedelta(days=1), True),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:payment_recovered" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        update_sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("payment_failed = FALSE", update_sql)
+        self.assertIn("payment_failed_at = NULL", update_sql)
+        self.assertIn("grace_period_end = NULL", update_sql)
+        enqueue_params = [
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        ]
+        deliveries = {params[0]: params for params in enqueue_params}
+        payload_data = json.loads(adapted_json_value(deliveries["stripe:%s:payment_recovered" % event_id][3]))
+        self.assertIn("Подписка снова активна", payload_data["text"])
+        self.assertIn(datetime.utcfromtimestamp(subscription.current_period_end).strftime("%d.%m.%Y"), payload_data["text"])
+
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
         from postgres_fsm_storage import PostgresFSMStorage
@@ -293,6 +393,43 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.main.dp, Dispatcher)
         self.assertIsInstance(self.main.storage, PostgresFSMStorage)
         self.assertIsInstance(app, web.Application)
+
+    async def test_payment_success_message_renderer_formats_confirmed_date(self):
+        expiry = datetime(2026, 9, 1, 12, 30)
+        self.assertEqual(
+            self.main.build_user_payment_success_message("payment_success", expiry),
+            "Оплата прошла успешно 🤍\n\n"
+            "Доступ к клубу открыт до 01.09.2026.\n\n"
+            "Спасибо, что присоединились. Все материалы уже доступны в меню.",
+        )
+        self.assertEqual(
+            self.main.build_user_payment_success_message("renewal_success", expiry),
+            "Подписка успешно продлена 🤍\n\n"
+            "Доступ к клубу сохранён до 01.09.2026.\n\n"
+            "Спасибо, что остаётесь с нами.",
+        )
+        self.assertEqual(
+            self.main.build_user_payment_success_message("payment_recovered", expiry),
+            "Оплата прошла успешно 🤍\n\n"
+            "Подписка снова активна, а доступ к клубу продлён до 01.09.2026.\n\n"
+            "Спасибо, что всё получилось. Все материалы уже доступны в меню.",
+        )
+        for action in ("payment_success", "renewal_success", "payment_recovered"):
+            message = self.main.build_user_payment_success_message(action, expiry)
+            self.assertIn("01.09.2026", message)
+            self.assertNotIn("12:30", message)
+            self.assertNotIn("+", message)
+
+    async def test_payment_success_message_missing_expiry_uses_safe_fallback(self):
+        message = self.main.build_user_payment_success_message("payment_success", None)
+        self.assertNotIn("None", message)
+        self.assertNotIn("01.09.2026", message)
+        self.assertEqual(
+            message,
+            "Оплата прошла успешно 🤍\n\n"
+            "Доступ к клубу открыт.\n\n"
+            "Мы дополнительно проверяем дату окончания подписки.",
+        )
 
     async def test_postgres_fsm_storage_module_imports_independently(self):
         import postgres_fsm_storage
@@ -1975,12 +2112,21 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         get_member.assert_not_awaited()
         self.assertTrue(conn.closed)
         queries = [query for query, _ in conn.cursor_obj.queries]
-        enqueue_index = next(i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query)
+        enqueue_indices = [i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query]
         access_index = next(i for i, query in enumerate(queries) if "INSERT INTO users" in query)
-        self.assertLess(access_index, enqueue_index)
-        enqueue_params = next(params for query, params in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query)
-        self.assertEqual(enqueue_params[0], "stripe:evt_checkout_boundary:rejoin_invite")
-        self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
+        self.assertTrue(all(access_index < enqueue_index for enqueue_index in enqueue_indices))
+        enqueue_params = [
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        ]
+        deliveries = {params[0]: params for params in enqueue_params}
+        self.assertEqual(deliveries["stripe:evt_checkout_boundary:payment_success"][2], "stripe_user_message")
+        payment_payload = json.loads(adapted_json_value(deliveries["stripe:evt_checkout_boundary:payment_success"][3]))
+        self.assertIn("Оплата прошла успешно 🤍", payment_payload["text"])
+        self.assertIn("Доступ к клубу открыт до", payment_payload["text"])
+        self.assertEqual(deliveries["stripe:evt_checkout_boundary:rejoin_invite"][2], "stripe_rejoin_check")
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:evt_checkout_boundary:rejoin_invite"][3]))
+        self.assertNotIn("Оплата прошла успешно", rejoin_payload["text"])
         self.assertEqual(conn.commits, 1)
 
     async def test_subscription_checkout_link_only_does_not_enqueue_rejoin_check(self):
@@ -2095,7 +2241,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         get_member.assert_not_awaited()
         self.assertTrue(conn.closed)
         enqueue_queries = [query for query, _ in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
-        self.assertEqual(len(enqueue_queries), 1)
+        self.assertEqual(len(enqueue_queries), 2)
         self.assertEqual(conn.rollbacks, 0)
 
     async def test_invoice_future_expiry_kicked_user_gets_rejoin_task_and_link(self):

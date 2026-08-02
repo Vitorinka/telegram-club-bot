@@ -1,6 +1,7 @@
 import contextlib
 import asyncio
 import io
+import json
 import os
 import tempfile
 import threading
@@ -279,6 +280,179 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """,
             (main.first_purchase_recovery_delivery_key(telegram_id),),
         )
+
+    def payment_delivery_payload(self, delivery_key):
+        row = self.query_one(
+            """
+            SELECT delivery_type, payload_json
+            FROM message_delivery_events
+            WHERE delivery_key = %s
+            """,
+            (delivery_key,),
+        )
+        return row[0], json.loads(row[1])
+
+    def test_payment_success_message_initial_state_update_and_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9801)
+        new_expiry = datetime(2026, 9, 1, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    first_payment_done = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9801),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_initial",
+                9801,
+                "payment_success",
+                confirmed_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        delivery_type, payload = self.payment_delivery_payload("stripe:evt_pg_initial:payment_success")
+        self.assertEqual(delivery_type, "stripe_user_message")
+        self.assertIn("Оплата прошла успешно 🤍", payload["text"])
+        self.assertIn("01.09.2026", payload["text"])
+        self.assertNotIn("None", payload["text"])
+        self.assertEqual(payload["new_expiry"], "2026-09-01T00:00:00")
+
+    def test_payment_success_message_renewal_and_duplicate_dedupe_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9802, paid=True, expiry_date=datetime(2026, 8, 1), first_payment_done=True)
+        new_expiry = datetime(2026, 10, 1, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET expiry_date = %s,
+                    paid = TRUE
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9802),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            self.assertTrue(main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_renewal",
+                9802,
+                "renewal_success",
+                confirmed_expiry,
+            ))
+            self.assertTrue(main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_renewal",
+                9802,
+                "renewal_success",
+                confirmed_expiry,
+            ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key = %s",
+            ("stripe:evt_pg_renewal:renewal_success",),
+        )[0], 1)
+        delivery_type, payload = self.payment_delivery_payload("stripe:evt_pg_renewal:renewal_success")
+        self.assertEqual(delivery_type, "stripe_user_message")
+        self.assertIn("Подписка успешно продлена 🤍", payload["text"])
+        self.assertIn("01.10.2026", payload["text"])
+        self.assertNotIn("01.08.2026", payload["text"])
+
+    def test_payment_recovered_cleans_failure_state_and_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(
+            9803,
+            payment_failed=True,
+            payment_failed_at=datetime(2026, 8, 1),
+            grace_period_end=datetime(2026, 8, 3),
+        )
+        new_expiry = datetime(2026, 9, 15, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9803),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_recovered",
+                9803,
+                "payment_recovered",
+                confirmed_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_state = self.query_one(
+            "SELECT payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (9803,),
+        )
+        self.assertEqual(user_state, (False, None, None))
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_recovered:payment_recovered")
+        self.assertIn("Подписка снова активна", payload["text"])
+        self.assertIn("15.09.2026", payload["text"])
+
+    def test_payment_success_message_missing_expiry_fallback_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9804)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_missing_expiry",
+                9804,
+                "payment_success",
+                None,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_missing_expiry:payment_success")
+        self.assertNotIn("None", payload["text"])
+        self.assertNotIn("01.09.2026", payload["text"])
+        self.assertIn("Мы дополнительно проверяем дату окончания подписки", payload["text"])
 
     def test_failed_invoice_customer_fallback_conflict_guard_real_postgres(self):
         run_migrations(self.get_conn)

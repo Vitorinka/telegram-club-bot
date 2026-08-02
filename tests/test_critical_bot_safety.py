@@ -388,12 +388,19 @@ class CriticalBotSafetyTests(unittest.TestCase):
         webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
         notification_blocks = (
             webhook_source[webhook_source.index('purpose = "trial_success"'):],
-            webhook_source[webhook_source.index('notice_marker = "INITIAL_SUBSCRIPTION_NOTICE_SENT"'):],
+            webhook_source[webhook_source.index("enqueue_user_payment_success_message("):],
             webhook_source[webhook_source.index('"PAYMENT_FAILED_MARKED: telegram_id=%s'):],
             webhook_source[webhook_source.index("if user_id:\n                    enqueue_stripe_user_message"):],
         )
         for block in notification_blocks:
-            self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
+            enqueue_index = min(
+                index for index in (
+                    block.find("enqueue_stripe_user_message"),
+                    block.find("enqueue_user_payment_success_message"),
+                )
+                if index >= 0
+            )
+            self.assertLess(enqueue_index, block.index("conn.commit()"))
 
         rejoin_blocks = (
             webhook_source[webhook_source.index("if checkout_access_confirmed:"):],
