@@ -487,6 +487,12 @@ def safe_admin_error_reference(context, exception):
     return f"{context}:{fingerprint}"
 
 
+def safe_admin_context_reference(context, *parts):
+    material = "|".join(str(part) for part in parts if part is not None)
+    fingerprint = hashlib.sha256(f"{context}:{material}".encode("utf-8")).hexdigest()[:12]
+    return f"{context}:{fingerprint}"
+
+
 def critical_alert_fingerprint(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
 
@@ -1111,6 +1117,230 @@ def payment_success_purpose(payment_kind, was_payment_failed=False):
     return "payment_success"
 
 
+PAYMENT_PROBLEM_LABELS = {
+    "checkout_creation_failed": "не удалось создать ссылку оплаты",
+    "checkout_expired": "ссылка оплаты истекла",
+    "checkout_async_payment_failed": "асинхронная оплата не прошла",
+    "card_declined": "банк отклонил карту",
+    "insufficient_funds": "недостаточно средств",
+    "authentication_required": "требуется подтверждение оплаты",
+    "invoice_payment_failed": "Stripe сообщил об ошибке оплаты invoice",
+    "stale_historical_invoice": "старый invoice безопасно проигнорирован",
+    "customer_subscription_conflict": "конфликт Stripe customer/subscription",
+    "missing_subscription_identity": "не найдена Stripe subscription identity",
+    "invalid_checkout_metadata": "некорректные данные Checkout",
+    "missing_subscription_period": "не найден срок периода подписки",
+    "stripe_api_unavailable": "Stripe API временно недоступен",
+    "webhook_processing_failed": "ошибка обработки Stripe webhook",
+    "unknown_payment_error": "неизвестная ошибка оплаты",
+}
+
+PAYMENT_STAGE_LABELS = {
+    "checkout_creation": "создание Checkout",
+    "checkout_completed": "завершение Checkout",
+    "checkout_expired": "Checkout истёк",
+    "checkout_async_payment_failed": "асинхронная оплата Checkout",
+    "invoice_payment_succeeded": "успешный invoice",
+    "invoice_payment_failed": "ошибка invoice",
+    "webhook": "Stripe webhook",
+}
+
+
+def classify_payment_problem(category=None, stripe_code=None, exception=None, event_type=None):
+    if stripe_code == "card_declined":
+        category = "card_declined"
+    elif stripe_code == "insufficient_funds":
+        category = "insufficient_funds"
+    elif stripe_code in ("authentication_required", "payment_intent_authentication_failure"):
+        category = "authentication_required"
+    elif exception is not None:
+        exc_name = type(exception).__name__.lower()
+        if "api" in exc_name or "connection" in exc_name or "timeout" in exc_name:
+            category = "stripe_api_unavailable"
+    elif event_type == "checkout.session.expired":
+        category = "checkout_expired"
+    elif event_type == "checkout.session.async_payment_failed":
+        category = "checkout_async_payment_failed"
+    elif event_type == "invoice.payment_failed":
+        category = "invoice_payment_failed"
+    category = category or "unknown_payment_error"
+    return {
+        "category": category,
+        "label": PAYMENT_PROBLEM_LABELS.get(category, PAYMENT_PROBLEM_LABELS["unknown_payment_error"]),
+    }
+
+
+def format_admin_amount(amount, currency):
+    if amount is None:
+        return "не определена"
+    try:
+        value = int(amount)
+    except (TypeError, ValueError):
+        return "не определена"
+    currency_text = (currency or "").upper() or "не определена"
+    return f"{value / 100:.2f} {currency_text}"
+
+
+def admin_access_date(expiry_date):
+    return expiry_date.strftime("%d.%m.%Y") if expiry_date else "не определён"
+
+
+def admin_payment_kind_label(purpose):
+    if purpose == "payment_recovered":
+        return "восстановление после ошибки"
+    if purpose == "renewal_success":
+        return "продление"
+    return "первая оплата"
+
+
+def tariff_code_from_checkout_days(days):
+    return {
+        7: "sub_trial",
+        30: "sub_1",
+        180: "sub_6",
+        365: "sub_12",
+    }.get(days, "не определён")
+
+
+def stripe_failure_code_from_invoice(invoice):
+    candidates = (
+        stripe_value(invoice, 'last_payment_error', 'decline_code'),
+        stripe_value(invoice, 'last_payment_error', 'code'),
+        stripe_value(invoice, 'payment_intent', 'last_payment_error', 'decline_code'),
+        stripe_value(invoice, 'payment_intent', 'last_payment_error', 'code'),
+    )
+    return next((code for code in candidates if code), None)
+
+
+def build_admin_payment_success_text(purpose, telegram_id, tariff, amount, currency, effective_expiry, payment_ref):
+    return (
+        "✅ Оплата подтверждена\n\n"
+        f"Тип: {admin_payment_kind_label(purpose)}\n"
+        f"Пользователь: {telegram_id if telegram_id is not None else 'не определён'}\n"
+        f"Тариф: {tariff or 'не определён'}\n"
+        f"Сумма: {format_admin_amount(amount, currency)}\n"
+        f"Доступ до: {admin_access_date(effective_expiry)}\n"
+        f"Payment ref: {payment_ref}"
+    )
+
+
+def build_admin_payment_problem_text(
+    stage,
+    telegram_id,
+    problem,
+    stripe_retry="неизвестно",
+    recovery_reminder="неизвестно",
+    safe_ref=None,
+    note=None,
+):
+    text = (
+        "⚠️ Оплата не завершена\n\n"
+        f"Этап: {PAYMENT_STAGE_LABELS.get(stage, stage)}\n"
+        f"Пользователь: {telegram_id if telegram_id is not None else 'не определён'}\n"
+        f"Причина: {problem['label']}\n"
+        f"Автоматический повтор Stripe: {stripe_retry}\n"
+        f"Напоминание через 24 часа: {recovery_reminder}\n"
+        f"Error ref: {safe_ref or 'не определён'}"
+    )
+    if note:
+        text += f"\n\n{note}"
+    return text
+
+
+def stripe_admin_event_key(event_id, context_ref):
+    return str(event_id) if event_id else f"ctx:{safe_delivery_hash(context_ref)}"
+
+
+def enqueue_stripe_admin_message(cur, event_id, purpose, text, severity="WARNING", category=None, safe_ref=None):
+    count = 0
+    event_key = stripe_admin_event_key(event_id, safe_ref or purpose)
+    for admin_id in ADMIN_IDS:
+        if enqueue_message_delivery(
+            cur,
+            f"stripe-admin:{event_key}:{purpose}:{admin_id}",
+            int(admin_id),
+            "stripe_admin_message",
+            stripe_delivery_payload(
+                text,
+                severity=severity,
+                category=category,
+                safe_ref=safe_ref,
+            ),
+        ):
+            count += 1
+    return count
+
+
+def enqueue_admin_payment_success(cur, event_id, purpose, telegram_id, tariff, amount, currency, effective_expiry, payment_ref):
+    return enqueue_stripe_admin_message(
+        cur,
+        event_id,
+        purpose,
+        build_admin_payment_success_text(
+            purpose,
+            telegram_id,
+            tariff,
+            amount,
+            currency,
+            effective_expiry,
+            payment_ref,
+        ),
+        severity="INFO",
+        category=purpose,
+        safe_ref=payment_ref,
+    )
+
+
+def enqueue_admin_payment_problem(
+    cur,
+    event_id,
+    purpose,
+    stage,
+    telegram_id=None,
+    category=None,
+    stripe_code=None,
+    exception=None,
+    stripe_retry="неизвестно",
+    recovery_reminder="неизвестно",
+    safe_ref=None,
+    note=None,
+    severity="WARNING",
+):
+    problem = classify_payment_problem(category=category, stripe_code=stripe_code, exception=exception)
+    safe_ref = safe_ref or safe_admin_context_reference(purpose, event_id, telegram_id, category, stripe_code, type(exception).__name__ if exception else None)
+    return enqueue_stripe_admin_message(
+        cur,
+        event_id,
+        purpose,
+        build_admin_payment_problem_text(
+            stage,
+            telegram_id,
+            problem,
+            stripe_retry=stripe_retry,
+            recovery_reminder=recovery_reminder,
+            safe_ref=safe_ref,
+            note=note,
+        ),
+        severity=severity,
+        category=problem["category"],
+        safe_ref=safe_ref,
+    )
+
+
+async def enqueue_admin_payment_problem_now(**kwargs):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        enqueue_admin_payment_problem(cur, **kwargs)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def enqueue_user_payment_success_message(cur, event_id, telegram_id, purpose, expiry_date, keyboard_kind=None):
     return enqueue_stripe_user_message(
         cur,
@@ -1511,18 +1741,22 @@ async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, s
     name_text = " ".join(part for part in name_parts if part) or "нет"
     attempt_time_text = attempt_dt.strftime("%d.%m.%Y %H:%M:%S UTC")
 
-    await notify_admins(
-        "Возможная проблема с оплатой\n\n"
-        "Пользователь несколько раз открыл оплату, но успешной оплаты пока нет.\n\n"
-        f"Telegram ID: {user_id}\n"
-        f"Username: {username_text}\n"
-        f"Имя: {name_text}\n"
-        f"Тариф: {sub_type}\n"
-        f"Попыток за последние 5 минут: {attempt_count}\n"
-        f"Последняя session_id: {session_id}\n"
-        f"Время последней попытки: {attempt_time_text}\n\n"
-        "Возможная причина: Stripe Checkout сбрасывается во встроенном браузере Telegram. "
-        "Пользователю отправлена инструкция открыть оплату во внешнем браузере."
+    await enqueue_admin_payment_problem_now(
+        event_id=None,
+        purpose="checkout_retry_issue",
+        stage="checkout_creation",
+        telegram_id=user_id,
+        category="checkout_creation_failed",
+        stripe_retry="неизвестно",
+        recovery_reminder="неизвестно",
+        safe_ref=safe_admin_context_reference("checkout_retry_issue", user_id, sub_type, session_id),
+        note=(
+            "Пользователь несколько раз открыл оплату, но успешной оплаты пока нет.\n"
+            f"Тариф: {sub_type}\n"
+            f"Попыток за последние 5 минут: {attempt_count}\n"
+            f"Время последней попытки: {attempt_time_text}\n"
+            "Возможная причина: Stripe Checkout сбрасывается во встроенном браузере Telegram."
+        ),
     )
     logging.info(
         f"Admin checkout issue alert sent: user_id={user_id}, sub_type={sub_type}, "
@@ -4900,12 +5134,16 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     safe_log_id(stripe_customer_id),
                     len(blocking_subscriptions),
                 )
-                await notify_admins(
-                    "Критично: у Stripe customer найдено несколько незавершённых подписок.\n\n"
-                    f"telegram_id: {user_id}\n"
-                    f"customer_id: {stripe_customer_id}\n"
-                    f"subscriptions: {', '.join(getattr(sub, 'id', '') for sub in blocking_subscriptions)}\n\n"
-                    "Новый Checkout НЕ создан. Проверьте вручную."
+                await enqueue_admin_payment_problem_now(
+                    event_id=None,
+                    purpose="customer_subscription_conflict",
+                    stage="checkout_creation",
+                    telegram_id=user_id,
+                    category="customer_subscription_conflict",
+                    stripe_retry="неизвестно",
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_context_reference("customer_subscription_conflict", user_id, stripe_customer_id, len(blocking_subscriptions)),
+                    note="Новый Checkout НЕ создан. Проверьте Stripe Dashboard вручную.",
                 )
                 cur.close()
                 conn.close()
@@ -4960,14 +5198,16 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             )
             cur.close()
             conn.close()
-            error_ref = safe_admin_error_reference("checkout_customer_subscriptions_check", e)
-            await notify_admins(
-                "Не удалось проверить Stripe subscription перед созданием Checkout.\n\n"
-                f"telegram_id: {user_id}\n"
-                f"customer_id: {safe_log_id(stripe_customer_id)}\n"
-                f"subscription_id: {safe_log_id(stripe_subscription_id)}\n"
-                f"Ошибка: проверка не выполнена. ref: {error_ref}\n\n"
-                "Новый subscription Checkout НЕ создан. Пользователю предложено повторить позже."
+            await enqueue_admin_payment_problem_now(
+                event_id=None,
+                purpose="checkout_customer_subscriptions_check_failed",
+                stage="checkout_creation",
+                telegram_id=user_id,
+                exception=e,
+                stripe_retry="неизвестно",
+                recovery_reminder="неизвестно",
+                safe_ref=safe_admin_error_reference("checkout_customer_subscriptions_check", e),
+                note="Новый subscription Checkout НЕ создан. Пользователю предложено повторить позже.",
             )
             await callback.message.answer(
                 "Сейчас не получается безопасно проверить вашу подписку в Stripe.\n"
@@ -5157,14 +5397,16 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             logging.error(f"Не удалось проверить Stripe перед Checkout для пользователя {user_id}: {e}")
             cur.close()
             conn.close()
-            error_ref = safe_admin_error_reference("checkout_existing_subscription_guard", e)
-            await notify_admins(
-                "Не удалось проверить сохранённую Stripe subscription перед созданием Checkout.\n\n"
-                f"telegram_id: {user_id}\n"
-                f"customer_id: {safe_log_id(stripe_customer_id)}\n"
-                f"subscription_id: {safe_log_id(stripe_subscription_id)}\n"
-                f"Ошибка: проверка не выполнена. ref: {error_ref}\n\n"
-                "Новый subscription Checkout НЕ создан. Пользователю предложено повторить позже."
+            await enqueue_admin_payment_problem_now(
+                event_id=None,
+                purpose="checkout_existing_subscription_guard_failed",
+                stage="checkout_creation",
+                telegram_id=user_id,
+                exception=e,
+                stripe_retry="неизвестно",
+                recovery_reminder="неизвестно",
+                safe_ref=safe_admin_error_reference("checkout_existing_subscription_guard", e),
+                note="Новый subscription Checkout НЕ создан. Пользователю предложено повторить позже.",
             )
             await callback.message.answer(
                 "Сейчас не получается безопасно проверить вашу подписку в Stripe.\n"
@@ -5275,14 +5517,21 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 mode,
                 safe_log_id(checkout_record.get("stripe_session_id")),
             )
-            await notify_admins(
-                "Checkout требует ручной проверки перед повторной выдачей ссылки.\n\n"
-                f"record_id: {checkout_record.get('id')}\n"
-                f"telegram_id: {user_id}\n"
-                f"tariff: {sub_type}\n"
-                f"mode: {mode}\n"
-                f"session_id: {safe_log_id(checkout_record.get('stripe_session_id'))}\n\n"
-                "Проверьте Stripe Dashboard и используйте /resolve_checkout <record_id> <failed|expired>."
+            await enqueue_admin_payment_problem_now(
+                event_id=None,
+                purpose="checkout_manual_review_required",
+                stage="checkout_creation",
+                telegram_id=user_id,
+                category="checkout_creation_failed",
+                stripe_retry="неизвестно",
+                recovery_reminder="неизвестно",
+                safe_ref=safe_admin_context_reference("checkout_manual_review_required", checkout_record.get("id"), user_id, sub_type),
+                note=(
+                    f"record_id: {checkout_record.get('id')}\n"
+                    f"tariff: {sub_type}\n"
+                    f"mode: {mode}\n"
+                    "Проверьте Stripe Dashboard и используйте /resolve_checkout <record_id> <failed|expired>."
+                ),
             )
             await callback.message.answer(
                 "Предыдущая попытка оплаты требует ручной проверки. "
@@ -5418,6 +5667,18 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         logging.exception(
             f"Ошибка создания или отправки Stripe Checkout: user_id={user_id}, "
             f"sub_type={sub_type}, mode={mode}: {e}"
+        )
+        await enqueue_admin_payment_problem_now(
+            event_id=None,
+            purpose="checkout_creation_failed",
+            stage="checkout_creation",
+            telegram_id=user_id,
+            category="checkout_creation_failed",
+            exception=e,
+            stripe_retry="неизвестно",
+            recovery_reminder="неизвестно",
+            safe_ref=safe_admin_error_reference("checkout_creation", e),
+            note=f"Тариф: {sub_type}. Пользователь получил безопасное сообщение.",
         )
         await callback.answer(
             "Техническая ошибка. Попробуйте позже или напишите @re_tasha",
@@ -7685,20 +7946,24 @@ async def stripe_webhook(request):
             lines_data = stripe_value(invoice, 'lines', 'data') or []
             first_line = lines_data[0] if lines_data else None
             period_end = period_end_override or stripe_value(first_line, 'period', 'end')
-            await notify_admins(
-                "Оплата Stripe прошла, но пользователь не найден в БД. Нужно вручную связать "
-                "Stripe customer/subscription с Telegram ID.\n\n"
-                f"invoice_id: {invoice_id}\n"
-                f"event_id: {event_id}\n"
-                f"subscription_id: {subscription_id or 'нет'}\n"
-                f"billing_reason: {billing_reason}\n"
-                f"customer_id: {customer_id}\n"
-                f"customer_email: {customer_email}\n"
-                f"amount_paid: {amount_paid if amount_paid is not None else 'нет'}\n"
-                f"period_end: {period_end or 'нет'}\n"
-                f"Пустые subscription-поля: {empty_subscription_fields_text(invoice)}\n\n"
-                "Доступ автоматически НЕ выдан. Используйте команду:\n"
-                "/link_stripe_user <telegram_id> <customer_id> <subscription_id>"
+            await enqueue_admin_payment_problem_now(
+                event_id=event_id,
+                purpose="invoice_payment_succeeded_unlinked",
+                stage="invoice_payment_succeeded",
+                telegram_id=None,
+                category="missing_subscription_identity",
+                stripe_retry="неизвестно",
+                recovery_reminder="не применимо",
+                safe_ref=safe_admin_context_reference("invoice_payment_succeeded_unlinked", event_id, invoice_id, subscription_id, customer_id),
+                note=(
+                    "Доступ автоматически НЕ выдан.\n"
+                    f"subscription_id: {safe_log_id(subscription_id)}\n"
+                    f"billing_reason: {billing_reason}\n"
+                    f"amount_paid: {amount_paid if amount_paid is not None else 'нет'}\n"
+                    f"period_end: {period_end or 'нет'}\n"
+                    f"Пустые subscription-поля: {empty_subscription_fields_text(invoice)}\n"
+                    "Используйте /link_stripe_user <telegram_id> <customer_id> <subscription_id>."
+                ),
             )
 
         # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
@@ -7730,13 +7995,16 @@ async def stripe_webhook(request):
                     metadata_keys,
                 )
                 try:
-                    await notify_admins(
-                        "CRITICAL: checkout.session.completed без валидной Telegram identity.\n\n"
-                        f"event_id: {safe_log_id(event_id)}\n"
-                        f"session_id: {safe_log_id(session_id)}\n"
-                        "reason: client_reference_id/metadata.telegram_id missing, invalid, or conflicting\n"
-                        "access_granted: false",
-                        alert_key=alert_key,
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_invalid_identity",
+                        stage="checkout_completed",
+                        telegram_id=None,
+                        category="missing_subscription_identity",
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=alert_key,
+                        note="client_reference_id/metadata.telegram_id missing, invalid, or conflicting\naccess_granted: false",
                         severity="CRITICAL",
                     )
                 except Exception as alert_error:
@@ -7834,13 +8102,16 @@ async def stripe_webhook(request):
                             user_id,
                             safe_log_id(customer_id),
                         )
-                        await notify_admins(
-                            "Stripe Checkout subscription завершился без subscription_id.\n\n"
-                            f"user_id: {user_id}\n"
-                            f"event_id: {event_id}\n"
-                            f"session_id: {session_id or 'нет'}\n"
-                            f"customer_id: {customer_id or 'нет'}\n\n"
-                            "Доступ НЕ выдан. Webhook вернул 500, Stripe повторит событие."
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="checkout_missing_subscription_id",
+                            stage="checkout_completed",
+                            telegram_id=user_id,
+                            category="missing_subscription_identity",
+                            stripe_retry="да",
+                            recovery_reminder="неизвестно",
+                            safe_ref=safe_admin_context_reference("checkout_missing_subscription_id", event_id, session_id, customer_id),
+                            note="Доступ НЕ выдан. Webhook вернул 500, Stripe повторит событие.",
                         )
                         await release_event_processing(event_id)
                         return web.Response(status=500)
@@ -7897,13 +8168,17 @@ async def stripe_webhook(request):
                         safe_log_id(sub_id),
                         e,
                     )
-                    error_ref = safe_admin_error_reference("checkout_subscription_link", e)
-                    await notify_admins(
-                        f"Ошибка связывания подписочного Checkout.\n\n"
-                        f"user_id: {user_id}\n"
-                        f"event_id: {safe_log_id(event_id)}\n"
-                        f"subscription_id: {sub_id or 'нет'}\n"
-                        f"Ошибка: операция не выполнена. ref: {error_ref}"
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_subscription_link_failed",
+                        stage="checkout_completed",
+                        telegram_id=user_id,
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference("checkout_subscription_link", e),
+                        note="Подписочный Checkout не связан. Операция не выполнена.",
                     )
                     await release_event_processing(event_id)
                     return web.Response(status=500)
@@ -7925,14 +8200,16 @@ async def stripe_webhook(request):
                     metadata_keys,
                 )
                 try:
-                    await notify_admins(
-                        "CRITICAL: checkout.session.completed без валидного metadata.days.\n\n"
-                        f"event_id: {safe_log_id(event_id)}\n"
-                        f"session_id: {safe_log_id(session_id)}\n"
-                        f"user_id: {user_id}\n"
-                        "reason: metadata.days missing or invalid\n"
-                        "access_granted: false",
-                        alert_key=alert_key,
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="invalid_checkout_metadata",
+                        stage="checkout_completed",
+                        telegram_id=user_id,
+                        category="invalid_checkout_metadata",
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=alert_key,
+                        note="metadata.days missing or invalid\naccess_granted: false",
                         severity="CRITICAL",
                     )
                 except Exception as alert_error:
@@ -7984,12 +8261,16 @@ async def stripe_webhook(request):
                             safe_log_id(event_id),
                             safe_log_id(stripe_value(session, 'id')),
                         )
-                        await notify_admins(
-                            "Повторная trial Checkout session после уже использованного trial.\n\n"
-                            f"telegram_id: {user_id}\n"
-                            f"event_id: {event_id}\n"
-                            f"session_id: {stripe_value(session, 'id') or 'нет'}\n\n"
-                            "Доступ и payment_event не созданы. Проверьте, нужен ли ручной refund."
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="duplicate_trial_checkout",
+                            stage="checkout_completed",
+                            telegram_id=user_id,
+                            category="invalid_checkout_metadata",
+                            stripe_retry="нет",
+                            recovery_reminder="не применимо",
+                            safe_ref=safe_admin_context_reference("duplicate_trial_checkout", event_id, stripe_value(session, 'id'), user_id),
+                            note="Доступ и payment_event не созданы. Проверьте, нужен ли ручной refund.",
                         )
                         await mark_event_processed(event_id)
                         return web.Response(status=200)
@@ -8090,6 +8371,17 @@ async def stripe_webhook(request):
                             new_expiry,
                             keyboard_kind="cancel_subscription" if has_subscription else None,
                         )
+                        enqueue_admin_payment_success(
+                            cur,
+                            event_id,
+                            purpose,
+                            user_id,
+                            tariff_code_from_checkout_days(days_to_add),
+                            stripe_value(session, 'amount_total'),
+                            stripe_value(session, 'currency'),
+                            new_expiry,
+                            safe_log_id(event_id or stripe_value(session, 'id')),
+                        )
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         user_id,
@@ -8122,6 +8414,17 @@ async def stripe_webhook(request):
                             new_expiry,
                             keyboard_kind="cancel_subscription" if has_subscription else None,
                         )
+                        enqueue_admin_payment_success(
+                            cur,
+                            event_id,
+                            purpose,
+                            user_id,
+                            tariff_code_from_checkout_days(days_to_add),
+                            stripe_value(session, 'amount_total'),
+                            stripe_value(session, 'currency'),
+                            new_expiry,
+                            safe_log_id(event_id or stripe_value(session, 'id')),
+                        )
                 conn.commit()
                 logging.info(
                     f"Checkout Session marked completed: user_id={user_id}, "
@@ -8146,12 +8449,17 @@ async def stripe_webhook(request):
                     f"Ошибка обработки checkout.session.completed: event_id={safe_log_id(event_id)}, "
                     f"user_id={user_id}, session_id={safe_log_id(stripe_value(session, 'id'))}: {e}"
                 )
-                error_ref = safe_admin_error_reference("checkout_completed_processing", e)
-                await notify_admins(
-                    f"Ошибка обработки checkout.session.completed.\n\n"
-                    f"user_id: {user_id}\n"
-                    f"event_id: {safe_log_id(event_id)}\n"
-                    f"Ошибка: операция не выполнена. ref: {error_ref}"
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="checkout_completed_processing_failed",
+                    stage="checkout_completed",
+                    telegram_id=user_id,
+                    category="webhook_processing_failed",
+                    exception=e,
+                    stripe_retry="да",
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_error_reference("checkout_completed_processing", e),
+                    note="Операция не выполнена. Webhook вернул 500.",
                 )
                 await release_event_processing(event_id)
                 return web.Response(status=500)
@@ -8264,15 +8572,17 @@ async def stripe_webhook(request):
                             safe_log_id(sub_id),
                             e,
                         )
-                        error_ref = safe_admin_error_reference("invoice_payment_records_check", e)
-                        await notify_admins(
-                            "Stripe прислал успешный invoice, но бот не смог проверить payment records.\n\n"
-                            f"event_id: {safe_log_id(event_id)}\n"
-                            f"invoice_id: {safe_log_id(invoice_id)}\n"
-                            f"subscription_id: {safe_log_id(sub_id)}\n"
-                            f"customer_id: {safe_log_id(customer_id)}\n"
-                            f"Ошибка: проверка не выполнена. ref: {error_ref}\n\n"
-                            "Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся."
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="invoice_payment_records_check_failed",
+                            stage="invoice_payment_succeeded",
+                            telegram_id=None,
+                            category="stripe_api_unavailable",
+                            exception=e,
+                            stripe_retry="да",
+                            recovery_reminder="не применимо",
+                            safe_ref=safe_admin_error_reference("invoice_payment_records_check", e),
+                            note="Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся.",
                         )
                         conn.rollback()
                         await release_event_processing(event_id)
@@ -8466,13 +8776,17 @@ async def stripe_webhook(request):
                         f"invoice.payment_succeeded: у subscription нет current_period_end. "
                         f"subscription_id={sub_id}, customer_id={customer_id}, invoice_id={invoice_id}, event={event_id}"
                     )
-                    await notify_admins(
-                        "Stripe прислал успешную оплату, но у подписки нет current_period_end.\n\n"
-                        f"event_id: {event_id}\n"
-                        f"subscription_id: {sub_id}\n"
-                        f"customer_id: {customer_id or 'нет'}\n"
-                        f"invoice_id: {invoice_id}\n\n"
-                        "Webhook не упал, но доступ автоматически не обновлен. Проверьте подписку вручную."
+                    enqueue_admin_payment_problem(
+                        cur,
+                        event_id,
+                        "missing_subscription_period",
+                        "invoice_payment_succeeded",
+                        telegram_id=None,
+                        category="missing_subscription_period",
+                        stripe_retry="нет",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("missing_subscription_period", event_id, sub_id, invoice_id),
+                        note="Webhook не упал, но доступ автоматически не обновлен. Проверьте подписку вручную.",
                     )
                     conn.commit()
                     await mark_event_processed(event_id)
@@ -8953,6 +9267,17 @@ async def stripe_webhook(request):
                     effective_expiry,
                     keyboard_kind="cancel_subscription",
                 )
+                enqueue_admin_payment_success(
+                    cur,
+                    event_id,
+                    delivery_purpose,
+                    telegram_id,
+                    tariff_code_from_invoice(invoice),
+                    amount_paid,
+                    stripe_value(invoice, 'currency'),
+                    effective_expiry,
+                    safe_log_id(invoice_id or event_id),
+                )
                 conn.commit()
                 reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
                 logging.info(
@@ -8969,12 +9294,17 @@ async def stripe_webhook(request):
                     f"Ошибка invoice.payment_succeeded: event_id={safe_log_id(event_id)}, "
                     f"subscription_id={safe_log_id(sub_id)}, customer_id={safe_log_id(customer_id)}: {e}"
                 )
-                error_ref = safe_admin_error_reference("invoice_payment_succeeded", e)
-                await notify_admins(
-                    f"Ошибка обработки успешной оплаты Stripe.\n\n"
-                    f"subscription_id: {safe_log_id(sub_id)}\n"
-                    f"event_id: {safe_log_id(event_id)}\n"
-                    f"Ошибка: операция не выполнена. ref: {error_ref}"
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="invoice_payment_succeeded_processing_failed",
+                    stage="invoice_payment_succeeded",
+                    telegram_id=None,
+                    category="webhook_processing_failed",
+                    exception=e,
+                    stripe_retry="да",
+                    recovery_reminder="не применимо",
+                    safe_ref=safe_admin_error_reference("invoice_payment_succeeded", e),
+                    note="Webhook вернул 500, Stripe повторит событие. Операция не выполнена.",
                 )
                 await release_event_processing(event_id)
                 return web.Response(status=500)
@@ -9000,6 +9330,9 @@ async def stripe_webhook(request):
             )
             billing_reason = stripe_value(invoice, 'billing_reason') or "нет"
             invoice_status = stripe_value(invoice, 'status') or "нет"
+            next_payment_attempt = stripe_value(invoice, 'next_payment_attempt')
+            stripe_retry_text = "да" if next_payment_attempt else "нет"
+            failure_code = stripe_failure_code_from_invoice(invoice)
 
             if not sub_id:
                 logging.error(
@@ -9014,12 +9347,16 @@ async def stripe_webhook(request):
                     invoice_status,
                     billing_reason,
                 )
-                await notify_admins(
-                    "Stripe прислал ошибку оплаты, но subscription_id не найден.\n\n"
-                    f"event_id: {event_id}\n"
-                    f"invoice_id: {invoice_id}\n"
-                    f"customer_id: {customer_id}\n\n"
-                    "payment_failed в БД не обновлен. Проверьте вручную."
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="invoice_payment_failed_missing_subscription",
+                    stage="invoice_payment_failed",
+                    telegram_id=None,
+                    category="missing_subscription_identity",
+                    stripe_retry=stripe_retry_text,
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_context_reference("invoice_payment_failed_missing_subscription", event_id, invoice_id, customer_id),
+                    note="payment_failed в БД не обновлен. Проверьте вручную.",
                 )
                 await mark_event_processed(event_id)
                 return web.Response(status=200)
@@ -9039,14 +9376,16 @@ async def stripe_webhook(request):
                         safe_log_id(customer_id),
                         e,
                     )
-                    await notify_admins(
-                        "Stripe прислал ошибку оплаты, но бот не смог проверить актуальный статус подписки.\n\n"
-                        f"event_id: {safe_log_id(event_id)}\n"
-                        f"invoice_id: {safe_log_id(invoice_id)}\n"
-                        f"subscription_id: {safe_log_id(sub_id)}\n"
-                        f"customer_id: {safe_log_id(customer_id)}\n"
-                        f"Ошибка: проверка не выполнена. ref: {safe_admin_error_reference('payment_failed_subscription_retrieve', e)}\n\n"
-                        "Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся."
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="invoice_payment_failed_subscription_retrieve",
+                        stage="invoice_payment_failed",
+                        telegram_id=None,
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference('payment_failed_subscription_retrieve', e),
+                        note="Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся.",
                     )
                     await release_event_processing(event_id)
                     return web.Response(status=500)
@@ -9157,16 +9496,17 @@ async def stripe_webhook(request):
                             safe_log_id(customer_id),
                             e,
                         )
-                        await notify_admins(
-                            "Stripe прислал ошибку оплаты по старому invoice, подписка сейчас trialing, "
-                            "но бот не смог синхронизировать trial в БД.\n\n"
-                            f"event_id: {safe_log_id(event_id)}\n"
-                            f"invoice_id: {safe_log_id(invoice_id)}\n"
-                            f"subscription_id: {safe_log_id(sub_id)}\n"
-                            f"customer_id: {safe_log_id(customer_id)}\n"
-                            f"trial_end: {trial_end}\n"
-                            f"Ошибка: операция не выполнена. ref: {safe_admin_error_reference('payment_failed_trial_sync', e)}\n\n"
-                            "Webhook вернул 500, Stripe повторит событие."
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="payment_failed_trial_sync_failed",
+                            stage="invoice_payment_failed",
+                            telegram_id=None,
+                            category="stale_historical_invoice",
+                            exception=e,
+                            stripe_retry="да",
+                            recovery_reminder="не применимо",
+                            safe_ref=safe_admin_error_reference('payment_failed_trial_sync', e),
+                            note="Webhook вернул 500, Stripe повторит событие. Trial sync не выполнен.",
                         )
                         await release_event_processing(event_id)
                         return web.Response(status=500)
@@ -9240,6 +9580,22 @@ async def stripe_webhook(request):
                             sub_id,
                             customer_id_for_db,
                             customer_id_for_db,
+                        ),
+                    )
+                    enqueue_admin_payment_problem(
+                        cur,
+                        event_id,
+                        "stale_historical_invoice",
+                        "invoice_payment_failed",
+                        telegram_id=None,
+                        category="stale_historical_invoice",
+                        stripe_retry="нет",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("stale_historical_invoice", event_id, sub_id, customer_id_for_db),
+                        note=(
+                            "Текущая активная подписка не изменена.\n"
+                            "payment_failed пользователю не установлен.\n"
+                            "Старый invoice проигнорирован безопасно."
                         ),
                     )
                     conn.commit()
@@ -9397,6 +9753,23 @@ async def stripe_webhook(request):
                         f"⚠️ Не удалось списать оплату за подписку. У вас есть {PAYMENT_RETRY_GRACE_HOURS} часов, чтобы пополнить карту или связаться с администратором.\n"
                         "После устранения проблемы доступ восстановится автоматически.",
                     )
+                    enqueue_admin_payment_problem(
+                        cur,
+                        event_id,
+                        "invoice_payment_failed",
+                        "invoice_payment_failed",
+                        telegram_id=telegram_id,
+                        category="invoice_payment_failed",
+                        stripe_code=failure_code,
+                        stripe_retry=stripe_retry_text,
+                        recovery_reminder="запланировано",
+                        safe_ref=safe_admin_context_reference("invoice_payment_failed", event_id, invoice_id, sub_id),
+                        note=(
+                            f"next_payment_attempt: {'известен' if next_payment_attempt else 'отсутствует'}\n"
+                            f"grace period: {'создан' if grace_until else 'не создан'}\n"
+                            "payment_failed message: поставлено в outbox"
+                        ),
+                    )
                 else:
                     logging.warning(
                         "PAYMENT_FAILED_UNLINKED: event_id=%s, event.type=%s, customer_id=%s, email=%s, "
@@ -9410,13 +9783,37 @@ async def stripe_webhook(request):
                         invoice_status,
                         billing_reason,
                     )
+                    enqueue_admin_payment_problem(
+                        cur,
+                        event_id,
+                        "invoice_payment_failed_unlinked",
+                        "invoice_payment_failed",
+                        telegram_id=None,
+                        category="invoice_payment_failed",
+                        stripe_code=failure_code,
+                        stripe_retry=stripe_retry_text,
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_context_reference("invoice_payment_failed_unlinked", event_id, invoice_id, sub_id),
+                        note="Пользователь не найден; user payment_failed message не поставлен.",
+                    )
                 conn.commit()
                 cur.close()
                 conn.close()
                 if stale_payment_failed_alert:
-                    await notify_admins(
-                        stale_payment_failed_alert,
-                        alert_key=stale_payment_failed_alert_key,
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="stale_historical_invoice",
+                        stage="invoice_payment_failed",
+                        telegram_id=None,
+                        category="stale_historical_invoice",
+                        stripe_retry="нет",
+                        recovery_reminder="не применимо",
+                        safe_ref=stale_payment_failed_alert_key,
+                        note=(
+                            "Текущая активная подписка не изменена.\n"
+                            "payment_failed пользователю не установлен.\n"
+                            "Старый invoice проигнорирован безопасно."
+                        ),
                     )
 
         # ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ ПОДПИСКУ (customer.subscription.deleted) ----------
@@ -9750,15 +10147,24 @@ async def stripe_webhook(request):
                             status,
                             current_period_end,
                         )
-                        await notify_admins(
-                            "Stripe subscription active/trialing, но пользователь не найден в БД.\n\n"
-                            f"event_id: {event_id}\n"
-                            f"customer_id: {customer_id or 'нет'}\n"
-                            f"subscription_id: {sub_id or 'нет'}\n"
-                            f"status: {status or 'нет'}\n"
-                            f"current_period_end: {current_period_end or 'нет'}\n\n"
-                            "Нужно вручную связать Stripe с Telegram ID:\n"
-                            "/link_stripe_user <telegram_id> <customer_id> <subscription_id>"
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="subscription_active_state_unlinked",
+                            stage="webhook",
+                            category="missing_subscription_identity",
+                            stripe_retry="нет",
+                            recovery_reminder="нет",
+                            safe_ref=safe_admin_context_reference(
+                                "subscription_active_state_unlinked",
+                                event_id,
+                                customer_id,
+                                sub_id,
+                                status,
+                            ),
+                            note=(
+                                "Stripe subscription active/trialing, но пользователь не найден в БД. "
+                                "Нужно вручную связать Stripe с Telegram ID через /link_stripe_user."
+                            ),
                         )
                 else:
                     conn = get_db_conn()
@@ -9853,6 +10259,18 @@ async def stripe_webhook(request):
                         "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь.",
                         keyboard_kind="retry_payment",
                     )
+                enqueue_admin_payment_problem(
+                    cur,
+                    event_id,
+                    "checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
+                    "checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
+                    telegram_id=user_id,
+                    category="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
+                    stripe_retry="нет",
+                    recovery_reminder="запланировано" if user_id else "неизвестно",
+                    safe_ref=safe_admin_context_reference(event_type, event_id, session_id, user_id),
+                    note="Пользователю поставлено напоминание retry_payment в outbox." if user_id else "telegram_id не определён.",
+                )
                 conn.commit()
             finally:
                 cur.close()
@@ -9870,6 +10288,18 @@ async def stripe_webhook(request):
             safe_log_id(event_id),
             event_type,
             e,
+        )
+        await enqueue_admin_payment_problem_now(
+            event_id=event_id,
+            purpose="webhook_processing_failed",
+            stage="webhook",
+            telegram_id=None,
+            category="webhook_processing_failed",
+            exception=e,
+            stripe_retry="да",
+            recovery_reminder="неизвестно",
+            safe_ref=safe_admin_error_reference("stripe_webhook", e),
+            note="Webhook вернул 500, Stripe может повторить событие.",
         )
         return web.Response(status=500)
 
@@ -11486,6 +11916,18 @@ async def process_pending_message_deliveries(limit=25):
                         reply_markup=stripe_delivery_reply_markup(payload),
                         parse_mode=payload.get("parse_mode"),
                     )
+            elif delivery_type == "stripe_admin_message":
+                if int(telegram_id) not in ADMIN_IDS:
+                    raise ValueError("invalid_stripe_admin_message_recipient")
+                text = payload.get("text")
+                if not text:
+                    raise ValueError("invalid_stripe_admin_message_payload")
+                sending_user_message = True
+                await bot.send_message(
+                    int(telegram_id),
+                    text,
+                    parse_mode=payload.get("parse_mode"),
+                )
             else:
                 text = payload.get("text")
                 if not text:
@@ -11540,12 +11982,30 @@ async def process_pending_message_deliveries(limit=25):
                 sent_conn.close()
             sent += 1
         except Exception as e:
-            decision = classify_delivery_error(e, attempt_count=attempt_count, sending_user_message=sending_user_message)
+            if delivery_type == "stripe_admin_message" and isinstance(e, ValueError):
+                decision = {
+                    "blocked": False,
+                    "retryable": False,
+                    "permanently_failed": True,
+                    "retry_delay_minutes": None,
+                    "reason": str(e),
+                }
+            else:
+                decision = classify_delivery_error(e, attempt_count=attempt_count, sending_user_message=sending_user_message)
+                if delivery_type == "stripe_admin_message" and decision.get("blocked"):
+                    decision = {
+                        **decision,
+                        "blocked": False,
+                        "retryable": False,
+                        "permanently_failed": True,
+                        "retry_delay_minutes": None,
+                        "reason": "admin_recipient_unreachable",
+                    }
             log_outbox_delivery_failure(delivery_key, delivery_type, attempt_count, e, decision)
             fail_conn = get_db_conn()
             fail_cur = fail_conn.cursor()
             try:
-                if decision.get("blocked"):
+                if decision.get("blocked") and delivery_type != "stripe_admin_message":
                     fail_cur.execute("UPDATE users SET blocked_bot = TRUE WHERE telegram_id = %s", (int(telegram_id),))
                 retry_delay = decision.get("retry_delay_minutes")
                 if retry_delay is None and not decision.get("permanently_failed", False):

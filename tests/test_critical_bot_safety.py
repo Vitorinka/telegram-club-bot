@@ -384,6 +384,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rejoin_helper)
 
+    def test_stripe_webhook_admin_notifications_are_outbox_only(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        self.assertNotIn("await notify_admins", source)
+        self.assertIn("enqueue_admin_payment_success", source)
+        self.assertIn("enqueue_admin_payment_problem", source)
+        self.assertIn("enqueue_admin_payment_problem_now", source)
+        self.assertIn('"stripe_admin_message"', MAIN_SOURCE)
+        self.assertIn("delivery_type == \"stripe_admin_message\"", MAIN_SOURCE)
+
     def test_stripe_webhook_enqueues_user_notifications_before_transaction_commit(self):
         webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
         notification_blocks = (
@@ -1185,7 +1194,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_process_payment_manual_review_path_does_not_create_stripe_session(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index('if claim_result["action"] == "manual_review_required"'):MAIN_SOURCE.index('if claim_result["action"] == "reuse_open"')]
-        self.assertIn("notify_admins", source)
+        self.assertIn("enqueue_admin_payment_problem_now", source)
         self.assertIn("/resolve_checkout <record_id> <failed|expired>", source)
         self.assertNotIn("stripe.checkout.Session.create", source)
 
@@ -1355,7 +1364,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("SELECT telegram_id, stripe_subscription_id", source)
         self.assertIn("len(customer_matches) == 1", source)
         self.assertIn("ignored_stale_invoice_payment_failed", source)
-        self.assertIn("alert_key=stale_payment_failed_alert_key", source)
+        self.assertIn("safe_ref=stale_payment_failed_alert_key", source)
+        self.assertIn("await enqueue_admin_payment_problem_now", source)
 
     def test_subscription_deleted_marks_stripe_link_terminal(self):
         source = MAIN_SOURCE[

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -333,6 +334,75 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn("01.09.2026", payload["text"])
         self.assertNotIn("None", payload["text"])
         self.assertEqual(payload["new_expiry"], "2026-09-01T00:00:00")
+
+    def test_admin_payment_notifications_are_durable_and_deduplicated_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            with mock.patch.object(main, "ADMIN_IDS", [901001, 901002]):
+                self.assertEqual(
+                    main.enqueue_admin_payment_success(
+                        cur,
+                        "evt_pg_admin_success",
+                        "payment_success",
+                        9809,
+                        "sub_1",
+                        150000,
+                        "rub",
+                        datetime(2026, 9, 1, 0, 0),
+                        "evt_pg_admin_success",
+                    ),
+                    2,
+                )
+                self.assertEqual(
+                    main.enqueue_admin_payment_success(
+                        cur,
+                        "evt_pg_admin_success",
+                        "payment_success",
+                        9809,
+                        "sub_1",
+                        150000,
+                        "rub",
+                        datetime(2026, 9, 1, 0, 0),
+                        "evt_pg_admin_success",
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    main.enqueue_admin_payment_problem(
+                        cur,
+                        "evt_pg_admin_failed",
+                        "invoice_payment_failed",
+                        "invoice_payment_failed",
+                        telegram_id=9809,
+                        stripe_code="card_declined",
+                        safe_ref="invoice_payment_failed:pgsafe",
+                    ),
+                    2,
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        rows = self.query_all(
+            """
+            SELECT delivery_key, telegram_id, delivery_type, status, payload_json
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            ORDER BY delivery_key
+            """
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row[1] for row in rows}, {901001, 901002})
+        self.assertEqual({row[2] for row in rows}, {"stripe_admin_message"})
+        self.assertEqual({row[3] for row in rows}, {"pending"})
+        payloads = [json.loads(row[4]) for row in rows]
+        self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in payloads))
+        self.assertTrue(any("банк отклонил карту" in payload["text"] for payload in payloads))
+        self.assertTrue(all("None" not in payload["text"] for payload in payloads))
 
     def test_payment_success_message_renewal_and_duplicate_dedupe_real_postgres(self):
         run_migrations(self.get_conn)
