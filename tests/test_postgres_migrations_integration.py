@@ -382,6 +382,125 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn("01.10.2026", payload["text"])
         self.assertNotIn("01.08.2026", payload["text"])
 
+    def test_invoice_effective_expiry_case_update_drives_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        telegram_id = 9812
+        old_expiry = datetime(2026, 11, 1, 0, 0)
+        stripe_period_expiry = datetime(2026, 10, 1, 0, 0)
+        self.insert_recovery_user(
+            telegram_id,
+            paid=True,
+            expiry_date=old_expiry,
+            first_payment_done=True,
+            stripe_subscription_id="sub_effective_exact",
+            stripe_customer_id="cus_effective_exact",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                    FROM users
+                    WHERE stripe_subscription_id = %s
+                )
+                UPDATE users
+                SET expiry_date = CASE
+                        WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                        ELSE %s
+                    END,
+                    paid = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                FROM target
+                WHERE users.telegram_id = target.telegram_id
+                RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
+                """,
+                ("sub_effective_exact", stripe_period_expiry, stripe_period_expiry),
+            )
+            row = cur.fetchone()
+            self.assertEqual(row, (telegram_id, old_expiry, False, old_expiry))
+            effective_expiry = row[3]
+            main.insert_payment_event(
+                cur,
+                "evt_pg_effective_expiry",
+                "invoice.payment_succeeded",
+                "succeeded",
+                telegram_id=telegram_id,
+                invoice_id="in_effective_expiry",
+                stripe_customer_id="cus_effective_exact",
+                stripe_subscription_id="sub_effective_exact",
+                payment_kind="recurring",
+                billing_reason="subscription_cycle",
+                tariff_code="sub_1",
+                amount_paid=1000,
+                amount_due=1000,
+                currency="rub",
+                period_start=datetime(2026, 9, 1, 0, 0),
+                period_end=stripe_period_expiry,
+            )
+            cur.execute(
+                """
+                INSERT INTO access_events (
+                    telegram_id, event_type, source, old_expiry, new_expiry,
+                    stripe_event_id, stripe_subscription_id, notes
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    telegram_id,
+                    "stripe_invoice_paid",
+                    "stripe_webhook",
+                    old_expiry,
+                    effective_expiry,
+                    "evt_pg_effective_expiry",
+                    "sub_effective_exact",
+                    "period_source=subscription.current_period_end",
+                ),
+            )
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_effective_expiry",
+                telegram_id,
+                "renewal_success",
+                effective_expiry,
+            )
+            main.enqueue_rejoin_invite_after_payment(
+                cur,
+                telegram_id,
+                effective_expiry,
+                "invoice.payment_succeeded",
+                "evt_pg_effective_expiry",
+                stripe_subscription_id="sub_effective_exact",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_expiry = self.query_one("SELECT expiry_date FROM users WHERE telegram_id = %s", (telegram_id,))[0]
+        self.assertEqual(user_expiry, old_expiry)
+        payment_period_end = self.query_one(
+            "SELECT period_end FROM payment_events WHERE stripe_event_id = %s",
+            ("evt_pg_effective_expiry",),
+        )[0]
+        access_new_expiry = self.query_one(
+            "SELECT new_expiry FROM access_events WHERE stripe_event_id = %s",
+            ("evt_pg_effective_expiry",),
+        )[0]
+        self.assertEqual(payment_period_end, stripe_period_expiry)
+        self.assertEqual(access_new_expiry, old_expiry)
+        _, renewal_payload = self.payment_delivery_payload("stripe:evt_pg_effective_expiry:renewal_success")
+        _, rejoin_payload = self.payment_delivery_payload("stripe:evt_pg_effective_expiry:rejoin_invite")
+        self.assertIn("01.11.2026", renewal_payload["text"])
+        self.assertIn("01.11.2026", rejoin_payload["text"])
+        self.assertEqual(renewal_payload["new_expiry"], "2026-11-01T00:00:00")
+        self.assertNotIn("01.10.2026", renewal_payload["text"])
+        self.assertNotIn("01.10.2026", rejoin_payload["text"])
+
     def test_payment_recovered_cleans_failure_state_and_outbox_payload_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
@@ -429,6 +548,70 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         _, payload = self.payment_delivery_payload("stripe:evt_pg_recovered:payment_recovered")
         self.assertIn("Подписка снова активна", payload["text"])
         self.assertIn("15.09.2026", payload["text"])
+
+    def test_checkout_recovery_cleanup_and_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        telegram_id = 9813
+        new_expiry = datetime(2026, 9, 20, 0, 0)
+        self.insert_recovery_user(
+            telegram_id,
+            payment_failed=True,
+            payment_failed_at=datetime(2026, 8, 20, 0, 0),
+            grace_period_end=datetime(2026, 8, 23, 0, 0),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id, payment_failed AS was_payment_failed
+                    FROM users
+                    WHERE telegram_id = %s
+                )
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    first_payment_done = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL,
+                    last_payment_succeeded_at = NOW()
+                FROM target
+                WHERE users.telegram_id = target.telegram_id
+                RETURNING users.expiry_date, target.was_payment_failed
+                """,
+                (telegram_id, new_expiry),
+            )
+            effective_expiry, was_payment_failed = cur.fetchone()
+            purpose = main.payment_success_purpose("initial_subscription", was_payment_failed)
+            self.assertEqual(purpose, "payment_recovered")
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_checkout_recovered",
+                telegram_id,
+                purpose,
+                effective_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_state = self.query_one(
+            "SELECT paid, expiry_date, first_payment_done, payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (telegram_id,),
+        )
+        self.assertEqual(user_state, (True, new_expiry, True, False, None, None))
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_checkout_recovered:payment_recovered")
+        self.assertIn("Подписка снова активна", payload["text"])
+        self.assertIn("20.09.2026", payload["text"])
+        self.assertEqual(payload["new_expiry"], "2026-09-20T00:00:00")
+        self.assertIsNone(self.query_one(
+            "SELECT delivery_key FROM message_delivery_events WHERE delivery_key = %s",
+            ("stripe:evt_pg_checkout_recovered:payment_success",),
+        ))
 
     def test_payment_success_message_missing_expiry_fallback_real_postgres(self):
         run_migrations(self.get_conn)

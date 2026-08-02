@@ -469,7 +469,7 @@ class StripeInvoiceRulesTest(unittest.TestCase):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
         source = main_py.read_text()
         self.assertIn(
-            "should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, new_expiry)",
+            "should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, effective_expiry)",
             source,
         )
         self.assertNotIn("if old_expiry and old_expiry >= new_expiry:", source)

@@ -387,7 +387,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
     def test_stripe_webhook_enqueues_user_notifications_before_transaction_commit(self):
         webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
         notification_blocks = (
-            webhook_source[webhook_source.index('purpose = "trial_success"'):],
+            webhook_source[webhook_source.index('if purpose == "trial_success"'):],
             webhook_source[webhook_source.index("enqueue_user_payment_success_message("):],
             webhook_source[webhook_source.index('"PAYMENT_FAILED_MARKED: telegram_id=%s'):],
             webhook_source[webhook_source.index("if user_id:\n                    enqueue_stripe_user_message"):],

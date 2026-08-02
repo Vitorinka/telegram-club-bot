@@ -7952,10 +7952,11 @@ async def stripe_webhook(request):
             conn = get_db_conn()
             cur = conn.cursor()
             try:
-                cur.execute("SELECT paid, expiry_date, first_payment_done FROM users WHERE telegram_id = %s", (int(user_id),))
+                cur.execute("SELECT paid, expiry_date, first_payment_done, payment_failed FROM users WHERE telegram_id = %s", (int(user_id),))
                 row = cur.fetchone()
                 now = datetime.utcnow()
                 old_expiry = row[1] if row else None
+                checkout_was_payment_failed = bool(row[3]) if row and len(row) > 3 else False
 
                 if row and row[0] and row[1] and row[1] > now:
                     new_expiry = row[1] + timedelta(days=days_to_add)
@@ -8080,11 +8081,12 @@ async def stripe_webhook(request):
                             "Все материалы уже доступны в меню.",
                         )
                     else:
+                        purpose = payment_success_purpose("initial_subscription", checkout_was_payment_failed)
                         enqueue_user_payment_success_message(
                             cur,
                             event_id,
                             user_id,
-                            "payment_success",
+                            purpose,
                             new_expiry,
                             keyboard_kind="cancel_subscription" if has_subscription else None,
                         )
@@ -8097,7 +8099,11 @@ async def stripe_webhook(request):
                         stripe_subscription_id=sub_id,
                     )
                 else:
-                    purpose = "trial_success" if is_trial and not has_subscription else "payment_success"
+                    purpose = (
+                        "trial_success"
+                        if is_trial and not has_subscription
+                        else payment_success_purpose("initial_subscription", checkout_was_payment_failed)
+                    )
                     if purpose == "trial_success":
                         enqueue_stripe_user_message(
                             cur,
@@ -8472,8 +8478,9 @@ async def stripe_webhook(request):
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
 
-                new_expiry = datetime.utcfromtimestamp(current_period_end)
+                stripe_period_expiry = datetime.utcfromtimestamp(current_period_end)
                 old_expiry = None
+                effective_expiry = None
                 row = None
                 was_payment_failed = False
                 metadata_telegram_id = (
@@ -8520,11 +8527,11 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         metadata_telegram_id,
-                        new_expiry,
-                        new_expiry,
+                        stripe_period_expiry,
+                        stripe_period_expiry,
                         sub_id,
                         customer_id,
                         event_created_at,
@@ -8536,6 +8543,7 @@ async def stripe_webhook(request):
                     if row:
                         old_expiry = row[1]
                         was_payment_failed = row[2]
+                        effective_expiry = row[3]
 
                 if not row:
                     cur.execute("""
@@ -8567,11 +8575,11 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         sub_id,
-                        new_expiry,
-                        new_expiry,
+                        stripe_period_expiry,
+                        stripe_period_expiry,
                         sub_id,
                         customer_id,
                         event_created_at,
@@ -8583,6 +8591,7 @@ async def stripe_webhook(request):
                     if row:
                         old_expiry = row[1]
                         was_payment_failed = row[2]
+                        effective_expiry = row[3]
 
                 if not row and customer_id:
                     cur.execute("""
@@ -8614,11 +8623,11 @@ async def stripe_webhook(request):
                             first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         customer_id,
-                        new_expiry,
-                        new_expiry,
+                        stripe_period_expiry,
+                        stripe_period_expiry,
                         sub_id,
                         customer_id,
                         event_created_at,
@@ -8630,6 +8639,7 @@ async def stripe_webhook(request):
                     if row:
                         old_expiry = row[1]
                         was_payment_failed = row[2]
+                        effective_expiry = row[3]
 
                 if not row:
                     linked_telegram_id, link_source = find_telegram_id_for_stripe(
@@ -8667,11 +8677,11 @@ async def stripe_webhook(request):
                                 first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
                             FROM target
                             WHERE users.telegram_id = target.telegram_id
-                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed
+                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                         """, (
                             linked_telegram_id,
-                            new_expiry,
-                            new_expiry,
+                            stripe_period_expiry,
+                            stripe_period_expiry,
                             sub_id,
                             customer_id,
                             event_created_at,
@@ -8682,6 +8692,7 @@ async def stripe_webhook(request):
                         if row:
                             old_expiry = row[1]
                             was_payment_failed = row[2]
+                            effective_expiry = row[3]
                             logging.info(
                                 "STRIPE_USER_RESOLVED_VIA_LINK: event_id=%s, event.type=%s, telegram_id=%s, "
                                 "source=%s, customer_id=%s, subscription_id=%s",
@@ -8752,7 +8763,7 @@ async def stripe_webhook(request):
                     amount_due=amount_due,
                     currency=stripe_value(invoice, 'currency'),
                     period_start=period_start,
-                    period_end=period_end or new_expiry,
+                    period_end=period_end or stripe_period_expiry,
                     recovered_after_failure=was_payment_failed,
                 )
                 if payment_kind == "initial_subscription":
@@ -8766,7 +8777,7 @@ async def stripe_webhook(request):
                     logging.info(
                         "MANUAL_OUT_OF_BAND_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
                         "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
-                        "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                        "amount_paid=%s, amount_due=%s, invoice_status=%s, stripe_period_expiry=%s, effective_expiry=%s",
                         safe_log_id(event_id),
                         event_type,
                         safe_log_id(invoice_id),
@@ -8777,13 +8788,14 @@ async def stripe_webhook(request):
                         amount_paid,
                         amount_due,
                         invoice_status,
-                        new_expiry,
+                        stripe_period_expiry,
+                        effective_expiry,
                     )
                 elif payment_kind == "initial_subscription":
                     logging.info(
                         "INITIAL_SUBSCRIPTION_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
                         "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
-                        "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                        "amount_paid=%s, amount_due=%s, invoice_status=%s, stripe_period_expiry=%s, effective_expiry=%s",
                         safe_log_id(event_id),
                         event_type,
                         safe_log_id(invoice_id),
@@ -8794,13 +8806,14 @@ async def stripe_webhook(request):
                         amount_paid,
                         amount_due,
                         invoice_status,
-                        new_expiry,
+                        stripe_period_expiry,
+                        effective_expiry,
                     )
                 elif payment_kind == "recurring":
                     logging.info(
                         "REAL_RECURRING_PAYMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
                         "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
-                        "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                        "amount_paid=%s, amount_due=%s, invoice_status=%s, stripe_period_expiry=%s, effective_expiry=%s",
                         safe_log_id(event_id),
                         event_type,
                         safe_log_id(invoice_id),
@@ -8811,13 +8824,14 @@ async def stripe_webhook(request):
                         amount_paid,
                         amount_due,
                         invoice_status,
-                        new_expiry,
+                        stripe_period_expiry,
+                        effective_expiry,
                     )
                 else:
                     logging.info(
                         "SUBSCRIPTION_PAYMENT_ADJUSTMENT_PROCESSED: event_id=%s, event.type=%s, invoice_id=%s, "
                         "telegram_id=%s, subscription_id=%s, customer_id=%s, billing_reason=%s, "
-                        "amount_paid=%s, amount_due=%s, invoice_status=%s, new_expiry=%s",
+                        "amount_paid=%s, amount_due=%s, invoice_status=%s, stripe_period_expiry=%s, effective_expiry=%s",
                         safe_log_id(event_id),
                         event_type,
                         safe_log_id(invoice_id),
@@ -8828,7 +8842,8 @@ async def stripe_webhook(request):
                         amount_paid,
                         amount_due,
                         invoice_status,
-                        new_expiry,
+                        stripe_period_expiry,
+                        effective_expiry,
                     )
                 logging.info(
                     "User access activated: source=invoice.payment_succeeded, event_id=%s, "
@@ -8843,36 +8858,36 @@ async def stripe_webhook(request):
                     safe_log_id(sub_id),
                     invoice_status,
                     billing_reason,
-                    new_expiry,
+                    effective_expiry,
                 )
                 if was_payment_failed:
                     logging.info(
                         "PAYMENT_RECOVERED_AFTER_FAILURE: telegram_id=%s, customer_id=%s, email=%s, "
-                        "subscription_id=%s, invoice_id=%s, new_expiry_date=%s",
+                        "subscription_id=%s, invoice_id=%s, effective_expiry_date=%s",
                         telegram_id,
                         safe_log_id(customer_id),
                         safe_log_email(customer_email),
                         safe_log_id(sub_id),
                         safe_log_id(invoice_id),
-                        new_expiry,
+                        effective_expiry,
                     )
 
                 invoice_access_confirmed = bool(
                     row is not None
                     and telegram_id is not None
-                    and new_expiry is not None
+                    and effective_expiry is not None
                 )
 
-                if should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, new_expiry):
+                if should_skip_invoice_notice_for_current_expiry(payment_kind, old_expiry, effective_expiry):
                     logging.info(
                         f"invoice.payment_succeeded: срок уже актуален, пропускаю повторное уведомление. "
-                        f"telegram_id={telegram_id}, old_expiry={old_expiry}, new_expiry={new_expiry}, event={safe_log_id(event_id)}"
+                        f"telegram_id={telegram_id}, old_expiry={old_expiry}, effective_expiry={effective_expiry}, event={safe_log_id(event_id)}"
                     )
                     if invoice_access_confirmed:
                         enqueue_rejoin_invite_after_payment(
                             cur,
                             telegram_id,
-                            new_expiry,
+                            effective_expiry,
                             "invoice.payment_succeeded",
                             event_id,
                             stripe_subscription_id=sub_id,
@@ -8886,7 +8901,7 @@ async def stripe_webhook(request):
                     enqueue_rejoin_invite_after_payment(
                         cur,
                         telegram_id,
-                        new_expiry,
+                        effective_expiry,
                         "invoice.payment_succeeded",
                         event_id,
                         stripe_subscription_id=sub_id,
@@ -8895,11 +8910,11 @@ async def stripe_webhook(request):
                 if payment_kind == "out_of_band":
                     logging.info(
                         "AUTO_RENEW_NOTICE_SKIPPED_OUT_OF_BAND: telegram_id=%s, invoice_id=%s, "
-                        "event_id=%s, new_expiry=%s",
+                        "event_id=%s, effective_expiry=%s",
                         telegram_id,
                         safe_log_id(invoice_id),
                         safe_log_id(event_id),
-                        new_expiry,
+                        effective_expiry,
                     )
                     conn.commit()
                     reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
@@ -8917,7 +8932,7 @@ async def stripe_webhook(request):
                     "stripe_invoice_paid",
                     "stripe_webhook",
                     old_expiry,
-                    new_expiry,
+                    effective_expiry,
                     event_id,
                     sub_id,
                     f"customer_id={safe_log_id(customer_id)}; invoice_id={safe_log_id(invoice_id)}; period_source={period_source}",
@@ -8935,17 +8950,17 @@ async def stripe_webhook(request):
                     event_id,
                     telegram_id,
                     delivery_purpose,
-                    new_expiry,
+                    effective_expiry,
                     keyboard_kind="cancel_subscription",
                 )
                 conn.commit()
                 reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
                 logging.info(
-                    "%s_ENQUEUED: telegram_id=%s, invoice_id=%s, new_expiry=%s",
+                    "%s_ENQUEUED: telegram_id=%s, invoice_id=%s, effective_expiry=%s",
                     notice_marker,
                     telegram_id,
                     safe_log_id(invoice_id),
-                    new_expiry,
+                    effective_expiry,
                 )
 
             except Exception as e:
