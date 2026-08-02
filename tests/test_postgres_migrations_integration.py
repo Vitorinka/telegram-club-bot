@@ -341,7 +341,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
-            with mock.patch.object(main, "ADMIN_IDS", [901001, 901002]):
+            admin_ids = [111, 222]
+            with mock.patch.object(main, "ADMIN_IDS", admin_ids):
                 self.assertEqual(
                     main.enqueue_admin_payment_success(
                         cur,
@@ -356,20 +357,27 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     ),
                     2,
                 )
-                self.assertEqual(
-                    main.enqueue_admin_payment_success(
-                        cur,
-                        "evt_pg_admin_success",
-                        "payment_success",
-                        9809,
-                        "sub_1",
-                        150000,
-                        "rub",
-                        datetime(2026, 9, 1, 0, 0),
-                        "evt_pg_admin_success",
-                    ),
-                    0,
+                duplicate_result = main.enqueue_admin_payment_success(
+                    cur,
+                    "evt_pg_admin_success",
+                    "payment_success",
+                    9809,
+                    "sub_1",
+                    150000,
+                    "rub",
+                    datetime(2026, 9, 1, 0, 0),
+                    "evt_pg_admin_success",
                 )
+                self.assertEqual(duplicate_result, len(admin_ids))
+                cur.execute(
+                    """
+                    SELECT COUNT(*), COUNT(DISTINCT telegram_id), COUNT(DISTINCT delivery_key)
+                    FROM message_delivery_events
+                    WHERE delivery_type = 'stripe_admin_message'
+                      AND delivery_key LIKE 'stripe-admin:evt_pg_admin_success:payment_success:%'
+                    """
+                )
+                self.assertEqual(cur.fetchone(), (2, 2, 2))
                 self.assertEqual(
                     main.enqueue_admin_payment_problem(
                         cur,
@@ -396,9 +404,37 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """
         )
         self.assertEqual(len(rows), 4)
-        self.assertEqual({row[1] for row in rows}, {901001, 901002})
+        self.assertEqual({row[1] for row in rows}, {111, 222})
         self.assertEqual({row[2] for row in rows}, {"stripe_admin_message"})
         self.assertEqual({row[3] for row in rows}, {"pending"})
+        self.assertEqual(
+            [row[0] for row in rows],
+            [
+                "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:111",
+                "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:222",
+                "stripe-admin:evt_pg_admin_success:payment_success:111",
+                "stripe-admin:evt_pg_admin_success:payment_success:222",
+            ],
+        )
+        row_counts = self.query_all(
+            """
+            SELECT telegram_id, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            GROUP BY telegram_id
+            ORDER BY telegram_id
+            """
+        )
+        self.assertEqual(row_counts, [(111, 2), (222, 2)])
+        key_counts = self.query_all(
+            """
+            SELECT delivery_key, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            GROUP BY delivery_key
+            """
+        )
+        self.assertTrue(all(count == 1 for _, count in key_counts))
         payloads = [json.loads(row[4]) for row in rows]
         self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in payloads))
         self.assertTrue(any("банк отклонил карту" in payload["text"] for payload in payloads))

@@ -1920,6 +1920,40 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "TelegramForbiddenError", None, True)])
         self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
 
+    async def test_stripe_admin_message_blocked_admin_does_not_stop_other_admin(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        failed_calls = []
+        sent_calls = []
+
+        async def fake_send_message(chat_id, text, parse_mode=None):
+            if chat_id == 1:
+                raise TelegramForbiddenError(method=None, message="bot blocked")
+            sent_calls.append((chat_id, text, parse_mode))
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        connections = [FakeConnection(), FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin 1"}', 1, None),
+                 ("stripe-admin:evt_admin:payment_success:2", 2, "stripe_admin_message", '{"text":"admin 2"}', 1, None),
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=fake_send_message)) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
+        self.assertEqual(send_message.await_count, 2)
+        self.assertEqual(sent_calls, [(2, "admin 2", None)])
+        self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "TelegramForbiddenError", None, True)])
+        mark_sent.assert_called_once()
+        self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+
     async def test_stripe_admin_message_network_error_is_retryable(self):
         from aiogram.exceptions import TelegramNetworkError
 
