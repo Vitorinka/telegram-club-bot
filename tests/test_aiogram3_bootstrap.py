@@ -937,6 +937,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ("completed", "invoice_payment_failed:card_declined", "card_declined"),
             ("completed", "invoice_payment_failed:insufficient_funds", "insufficient_funds"),
             ("completed", "invoice_payment_failed:authentication_required", "authentication_required"),
+            ("creation_unknown", "stripe_api_unavailable", "stripe_api_unavailable"),
+            ("failed", "checkout_creation_failed", "checkout_creation_failed"),
             ("completed", None, "payment_confirmation_pending"),
         ]
 
@@ -979,6 +981,62 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.main.invoice_payment_failed_recovery_context_token("do_not_guess_card_declined"),
             "invoice_payment_failed",
         )
+
+    async def test_checkout_creation_recovery_error_token_uses_only_safe_contexts(self):
+        class APIConnectionError(Exception):
+            pass
+
+        class InvalidRequestError(Exception):
+            pass
+
+        api_token = self.main.checkout_creation_recovery_error_token(
+            APIConnectionError("timeout talking to customer cus_raw")
+        )
+        invalid_token = self.main.checkout_creation_recovery_error_token(
+            InvalidRequestError("No such price: price_raw")
+        )
+        unknown_token = self.main.checkout_creation_recovery_error_token(
+            RuntimeError("unexpected customer cus_raw invoice in_raw person@example.com")
+        )
+
+        self.assertEqual(api_token, "stripe_api_unavailable")
+        self.assertEqual(invalid_token, "checkout_creation_failed")
+        self.assertEqual(unknown_token, "checkout_creation_failed")
+        for token, expected_category in (
+            (api_token, "stripe_api_unavailable"),
+            (invalid_token, "checkout_creation_failed"),
+            (unknown_token, "checkout_creation_failed"),
+        ):
+            with self.subTest(token=token):
+                category, stage = self.main.classify_first_purchase_recovery_context(
+                    attempt_status="failed",
+                    attempt_source="checkout_session",
+                    attempt_error_context=token,
+                )
+                self.assertEqual(category, expected_category)
+                self.assertEqual(stage, "checkout_creation")
+
+        payload = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context=unknown_token,
+        )
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(payload["attempt_error_context"], "checkout_creation_failed")
+        self.assertNotIn("cus_raw", payload_text)
+        self.assertNotIn("in_raw", payload_text)
+        self.assertNotIn("person@example.com", payload_text)
+
+    async def test_process_payment_checkout_failure_persists_token_not_raw_exception(self):
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("recovery_error_token = checkout_creation_recovery_error_token(e)", source)
+        self.assertIn("mark_checkout_failed(\n                        failed_cur,", source)
+        self.assertIn("recovery_error_token,\n                        status=failed_status,", source)
+        self.assertNotIn('mark_checkout_failed(failed_cur, checkout_record["id"], e', source)
 
     async def test_first_purchase_recovery_payload_never_copies_raw_checkout_last_error(self):
         conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])

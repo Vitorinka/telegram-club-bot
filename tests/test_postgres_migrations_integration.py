@@ -213,6 +213,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 VALUES (%s, %s, %s, %s, %s, %s, %s,
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'),
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
+                RETURNING id
                 """,
                 (
                     telegram_id,
@@ -226,7 +227,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     hours_ago,
                 ),
             )
+            row = cur.fetchone()
             conn.commit()
+            return row[0]
         finally:
             cur.close()
             conn.close()
@@ -1596,15 +1599,16 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     mode="subscription",
                     stripe_subscription_id=f"sub_{user_id}",
                 )
-                self.assertEqual(
+                persisted_token, updated_checkout_id = (
                     main.persist_first_purchase_recovery_invoice_failure_context(
                         cur,
                         user_id,
                         f"sub_{user_id}",
                         failure_code=failure_code,
-                    ),
-                    token,
+                    )
                 )
+                self.assertEqual(persisted_token, token)
+                self.assertIsNotNone(updated_checkout_id)
             conn.commit()
         finally:
             cur.close()
@@ -1623,6 +1627,150 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             payload = json.loads(self.recovery_row(user_id)[8])
             self.assertEqual(payload["attempt_error_context"], token)
             self.assertEqual(payload["reason_category"], expected_category)
+
+    def test_invoice_failure_context_prefers_exact_subscription_over_newer_null_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9725
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_exact_priority")
+        exact_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_exact_priority",
+        )
+        null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_exact_priority",
+                failure_code="card_declined",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed:card_declined")
+        self.assertEqual(updated_id, exact_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (exact_id, null_id),
+        )
+        self.assertEqual(dict(rows)[exact_id], "invoice_payment_failed:card_declined")
+        self.assertIsNone(dict(rows)[null_id])
+
+    def test_invoice_failure_context_uses_latest_null_when_no_exact_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9726
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_missing_exact")
+        older_null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+        latest_null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_missing_exact",
+                failure_code=None,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed")
+        self.assertEqual(updated_id, latest_null_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (older_null_id, latest_null_id),
+        )
+        self.assertIsNone(dict(rows)[older_null_id])
+        self.assertEqual(dict(rows)[latest_null_id], "invoice_payment_failed")
+
+    def test_invoice_failure_context_does_not_update_other_non_null_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9727
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_missing_exact")
+        other_sub_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_other",
+        )
+        null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_missing_exact",
+                failure_code="insufficient_funds",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed:insufficient_funds")
+        self.assertEqual(updated_id, null_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (other_sub_id, null_id),
+        )
+        self.assertIsNone(dict(rows)[other_sub_id])
+        self.assertEqual(dict(rows)[null_id], "invoice_payment_failed:insufficient_funds")
 
     def test_first_purchase_recovery_stale_invoice_does_not_change_context_real_postgres(self):
         run_migrations(self.get_conn)

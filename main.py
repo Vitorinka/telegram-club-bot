@@ -1494,6 +1494,7 @@ FIRST_PURCHASE_RECOVERY_STAGE_LABELS = {
 FIRST_PURCHASE_RECOVERY_ALLOWED_ERROR_CONTEXTS = {
     "checkout.session.async_payment_failed",
     "checkout.session.expired",
+    "checkout_creation_failed",
     "invoice_payment_failed",
     "invoice_payment_failed:card_declined",
     "invoice_payment_failed:insufficient_funds",
@@ -1519,6 +1520,13 @@ def invoice_payment_failed_recovery_context_token(failure_code=None):
     return "invoice_payment_failed"
 
 
+def checkout_creation_recovery_error_token(exception):
+    problem = classify_payment_problem(exception=exception)
+    if problem["category"] == "stripe_api_unavailable":
+        return "stripe_api_unavailable"
+    return "checkout_creation_failed"
+
+
 def persist_first_purchase_recovery_invoice_failure_context(cur, telegram_id, stripe_subscription_id, failure_code=None):
     token = invoice_payment_failed_recovery_context_token(failure_code)
     cur.execute("""
@@ -1534,16 +1542,21 @@ def persist_first_purchase_recovery_invoice_failure_context(cur, telegram_id, st
                     OR stripe_subscription_id IS NULL
                   )
               AND status = ANY(%s::text[])
-            ORDER BY COALESCE(updated_at, created_at) DESC
+            ORDER BY
+                CASE WHEN stripe_subscription_id = %s THEN 0 ELSE 1 END,
+                COALESCE(updated_at, created_at) DESC
             LIMIT 1
         )
+        RETURNING id
     """, (
         token,
         int(telegram_id),
         stripe_subscription_id,
         list(FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES),
+        stripe_subscription_id,
     ))
-    return token
+    row = cur.fetchone()
+    return token, row[0] if row else None
 
 
 def classify_first_purchase_recovery_context(attempt_status=None, attempt_source=None, attempt_error_context=None):
@@ -1564,6 +1577,8 @@ def classify_first_purchase_recovery_context(attempt_status=None, attempt_source
         return "invoice_payment_failed", "invoice_payment_failed"
     if error_context == "stripe_api_unavailable":
         return "stripe_api_unavailable", "checkout_creation"
+    if error_context == "checkout_creation_failed":
+        return "checkout_creation_failed", "checkout_creation"
     if source == "checkout_retry_event":
         return "checkout_retry_unresolved", "checkout_creation"
     if status == "expired":
@@ -6012,7 +6027,13 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 failed_cur = failed_conn.cursor()
                 try:
                     failed_status = "failed" if e.__class__.__name__ == "InvalidRequestError" else "creation_unknown"
-                    mark_checkout_failed(failed_cur, checkout_record["id"], e, status=failed_status)
+                    recovery_error_token = checkout_creation_recovery_error_token(e)
+                    mark_checkout_failed(
+                        failed_cur,
+                        checkout_record["id"],
+                        recovery_error_token,
+                        status=failed_status,
+                    )
                     failed_conn.commit()
                 finally:
                     failed_cur.close()
