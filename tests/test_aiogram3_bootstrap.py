@@ -164,6 +164,24 @@ class FakeConnection:
         self.closed = True
 
 
+class ExecuteFailingCursor(FakeCursor):
+    def __init__(self, fetches=None, error=None):
+        super().__init__(fetches=fetches)
+        self.error = error or RuntimeError("execute failed")
+
+    def execute(self, query, params=None):
+        super().execute(query, params)
+        raise self.error
+
+
+class ExecuteFailingConnection(FakeConnection):
+    def __init__(self, error=None):
+        self.cursor_obj = ExecuteFailingCursor(error=error)
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+
 def adapted_json_value(value):
     return getattr(value, "adapted", value)
 
@@ -202,9 +220,36 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 return route.handler
         self.fail(f"route not found: {method} {path}")
 
-    def invoice_payment_event(self, event_id, *, period_end=None, paid_out_of_band=False):
-        period_end = period_end or int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    def delivery_inserts(self, conn):
+        return [
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        ]
+
+    def delivery_map(self, conn):
+        return {params[0]: params for params in self.delivery_inserts(conn)}
+
+    def admin_delivery_inserts(self, conn):
+        return [params for params in self.delivery_inserts(conn) if params[2] == "stripe_admin_message"]
+
+    def user_delivery_inserts(self, conn):
+        return [params for params in self.delivery_inserts(conn) if params[2] != "stripe_admin_message"]
+
+    def invoice_payment_event(
+        self,
+        event_id,
+        *,
+        period_end=None,
+        paid_out_of_band=False,
+        billing_reason="subscription_cycle",
+        include_line_period=True,
+    ):
+        if period_end is None and include_line_period:
+            period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
         period_start = int((datetime.utcnow() - timedelta(days=1)).timestamp())
+        line_period = {"start": period_start}
+        if include_line_period:
+            line_period["end"] = period_end
         payment = SimpleNamespace(
             status="paid",
             amount_paid=1000,
@@ -218,7 +263,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             amount_paid=1000,
             amount_due=1000,
             currency="rub",
-            billing_reason="subscription_cycle",
+            billing_reason=billing_reason,
             status="paid",
             paid_out_of_band=paid_out_of_band,
             metadata={},
@@ -226,7 +271,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             lines=SimpleNamespace(data=[
                 SimpleNamespace(
                     subscription="sub_rejoin",
-                    period=SimpleNamespace(start=period_start, end=period_end),
+                    period=SimpleNamespace(**line_period),
                     price=SimpleNamespace(id="price_1m"),
                 )
             ]),
@@ -257,11 +302,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         return payload, event, subscription
 
-    async def run_invoice_webhook_with_future_expiry(self, event_id, *, paid_out_of_band=False):
-        payload, event, subscription = self.invoice_payment_event(event_id, paid_out_of_band=paid_out_of_band)
+    async def run_invoice_webhook_with_future_expiry(self, event_id, *, paid_out_of_band=False, billing_reason="subscription_cycle"):
+        payload, event, subscription = self.invoice_payment_event(
+            event_id,
+            paid_out_of_band=paid_out_of_band,
+            billing_reason=billing_reason,
+        )
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
-            (123, datetime.utcnow() + timedelta(days=14), False),
+            (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
             ("stripe:%s:rejoin_invite" % event_id,),
         ])
 
@@ -283,6 +333,232 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
         return enqueue_params
 
+    async def test_invoice_subscription_create_enqueues_initial_success_and_rejoin_separately(self):
+        event_id = "evt_invoice_initial_success"
+        payload, event, subscription = self.invoice_payment_event(event_id, billing_reason="subscription_create")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+        conn = FakeConnection(fetches=[
+            (123, None, False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:payment_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        deliveries = self.delivery_map(conn)
+        self.assertIn("stripe:%s:payment_success" % event_id, deliveries)
+        self.assertIn("stripe:%s:rejoin_invite" % event_id, deliveries)
+        payment_payload = json.loads(adapted_json_value(deliveries["stripe:%s:payment_success" % event_id][3]))
+        self.assertIn("Оплата прошла успешно 🤍", payment_payload["text"])
+        self.assertIn("Спасибо, что присоединились", payment_payload["text"])
+        self.assertNotIn("Подписка успешно продлена", payment_payload["text"])
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in admin_payloads))
+        self.assertTrue(all("None" not in payload["text"] for payload in admin_payloads))
+
+    async def test_invoice_webhook_enqueues_renewal_success_with_new_expiry(self):
+        event_id = "evt_invoice_renewal_success"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        deliveries = self.delivery_map(conn)
+        payload_json = adapted_json_value(deliveries["stripe:%s:renewal_success" % event_id][3])
+        payload_data = json.loads(payload_json)
+        self.assertEqual(deliveries["stripe:%s:renewal_success" % event_id][2], "stripe_user_message")
+        self.assertIn("Подписка успешно продлена 🤍", payload_data["text"])
+        self.assertIn(datetime.utcfromtimestamp(subscription.current_period_end).strftime("%d.%m.%Y"), payload_data["text"])
+        self.assertNotIn("None", payload_data["text"])
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:%s:rejoin_invite" % event_id][3]))
+        self.assertNotIn("Подписка успешно продлена", rejoin_payload["text"])
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(any("Тип: продление" in payload["text"] for payload in admin_payloads))
+
+    async def test_invoice_exact_subscription_uses_effective_db_expiry_for_notices(self):
+        event_id = "evt_invoice_effective_exact"
+        stripe_period_ts = int(datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc).timestamp())
+        stripe_period_expiry = datetime.utcfromtimestamp(stripe_period_ts)
+        effective_expiry = datetime(2026, 11, 1, 0, 0)
+        payload, event, subscription = self.invoice_payment_event(
+            event_id,
+            period_end=stripe_period_ts,
+        )
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            (123, effective_expiry, False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        deliveries = self.delivery_map(conn)
+        renewal_payload = json.loads(adapted_json_value(deliveries["stripe:%s:renewal_success" % event_id][3]))
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:%s:rejoin_invite" % event_id][3]))
+        self.assertIn("01.11.2026", renewal_payload["text"])
+        self.assertNotIn("01.10.2026", renewal_payload["text"])
+        self.assertEqual(renewal_payload["new_expiry"], "2026-11-01T00:00:00")
+        self.assertIn("01.11.2026", rejoin_payload["text"])
+        self.assertNotIn("01.10.2026", rejoin_payload["text"])
+        payment_params = next(
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO payment_events" in query
+        )
+        access_params = next(
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO access_events" in query
+        )
+        self.assertEqual(payment_params[15], stripe_period_expiry)
+        self.assertEqual(access_params[4], effective_expiry)
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertTrue(any("Доступ до: 01.11.2026" in payload["text"] for payload in admin_payloads))
+        self.assertFalse(any("01.10.2026" in payload["text"] for payload in admin_payloads))
+
+    async def test_invoice_customer_fallback_uses_effective_db_expiry_for_notices(self):
+        event_id = "evt_invoice_effective_customer"
+        stripe_period_ts = int(datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc).timestamp())
+        stripe_period_expiry = datetime.utcfromtimestamp(stripe_period_ts)
+        effective_expiry = datetime(2026, 11, 1, 0, 0)
+        payload, event, subscription = self.invoice_payment_event(
+            event_id,
+            period_end=stripe_period_ts,
+        )
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            None,
+            (123, effective_expiry, False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        deliveries = self.delivery_map(conn)
+        renewal_payload = json.loads(adapted_json_value(deliveries["stripe:%s:renewal_success" % event_id][3]))
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:%s:rejoin_invite" % event_id][3]))
+        self.assertIn("01.11.2026", renewal_payload["text"])
+        self.assertEqual(renewal_payload["new_expiry"], "2026-11-01T00:00:00")
+        self.assertIn("01.11.2026", rejoin_payload["text"])
+        payment_params = next(
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO payment_events" in query
+        )
+        access_params = next(
+            params for query, params in conn.cursor_obj.queries
+            if "INSERT INTO access_events" in query
+        )
+        self.assertEqual(payment_params[15], stripe_period_expiry)
+        self.assertEqual(access_params[4], effective_expiry)
+
+    async def test_invoice_webhook_enqueues_recovery_success_and_clears_failure_state(self):
+        event_id = "evt_invoice_recovered_success"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() - timedelta(days=1), True, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:payment_recovered" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        update_sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("payment_failed = FALSE", update_sql)
+        self.assertIn("payment_failed_at = NULL", update_sql)
+        self.assertIn("grace_period_end = NULL", update_sql)
+        deliveries = self.delivery_map(conn)
+        payload_data = json.loads(adapted_json_value(deliveries["stripe:%s:payment_recovered" % event_id][3]))
+        self.assertIn("Подписка снова активна", payload_data["text"])
+        self.assertIn(datetime.utcfromtimestamp(subscription.current_period_end).strftime("%d.%m.%Y"), payload_data["text"])
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(any("Тип: восстановление после ошибки" in payload["text"] for payload in admin_payloads))
+
+    async def test_admin_success_formatting_error_does_not_rollback_payment_flow(self):
+        event_id = "evt_invoice_admin_formatting_failure"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
+        conn = FakeConnection(fetches=[
+            (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            ("stripe:%s:rejoin_invite" % event_id,),
+            ("stripe:%s:renewal_success" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "build_admin_payment_success_text", side_effect=ValueError("raw admin format secret")), \
+             patch.object(self.main, "get_db_conn", return_value=conn), \
+             self.assertLogs(level="WARNING") as logs:
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(conn.rollbacks, 0)
+        self.assertEqual(conn.commits, 1)
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO payment_events", sql)
+        self.assertIn("INSERT INTO access_events", sql)
+        self.assertIn("SAVEPOINT admin_payment_notification", sql)
+        self.assertIn("ROLLBACK TO SAVEPOINT admin_payment_notification", sql)
+        deliveries = self.delivery_map(conn)
+        self.assertIn("stripe:%s:renewal_success" % event_id, deliveries)
+        self.assertFalse(self.admin_delivery_inserts(conn))
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertNotIn("raw admin format secret", log_output)
+
     async def test_bot_dispatcher_storage_and_app_are_created(self):
         from aiogram import Bot, Dispatcher
         from postgres_fsm_storage import PostgresFSMStorage
@@ -293,6 +569,43 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.main.dp, Dispatcher)
         self.assertIsInstance(self.main.storage, PostgresFSMStorage)
         self.assertIsInstance(app, web.Application)
+
+    async def test_payment_success_message_renderer_formats_confirmed_date(self):
+        expiry = datetime(2026, 9, 1, 12, 30)
+        self.assertEqual(
+            self.main.build_user_payment_success_message("payment_success", expiry),
+            "Оплата прошла успешно 🤍\n\n"
+            "Доступ к клубу открыт до 01.09.2026.\n\n"
+            "Спасибо, что присоединились. Все материалы уже доступны в меню.",
+        )
+        self.assertEqual(
+            self.main.build_user_payment_success_message("renewal_success", expiry),
+            "Подписка успешно продлена 🤍\n\n"
+            "Доступ к клубу сохранён до 01.09.2026.\n\n"
+            "Спасибо, что остаётесь с нами.",
+        )
+        self.assertEqual(
+            self.main.build_user_payment_success_message("payment_recovered", expiry),
+            "Оплата прошла успешно 🤍\n\n"
+            "Подписка снова активна, а доступ к клубу продлён до 01.09.2026.\n\n"
+            "Спасибо, что всё получилось. Все материалы уже доступны в меню.",
+        )
+        for action in ("payment_success", "renewal_success", "payment_recovered"):
+            message = self.main.build_user_payment_success_message(action, expiry)
+            self.assertIn("01.09.2026", message)
+            self.assertNotIn("12:30", message)
+            self.assertNotIn("+", message)
+
+    async def test_payment_success_message_missing_expiry_uses_safe_fallback(self):
+        message = self.main.build_user_payment_success_message("payment_success", None)
+        self.assertNotIn("None", message)
+        self.assertNotIn("01.09.2026", message)
+        self.assertEqual(
+            message,
+            "Оплата прошла успешно 🤍\n\n"
+            "Доступ к клубу открыт.\n\n"
+            "Мы дополнительно проверяем дату окончания подписки.",
+        )
 
     async def test_postgres_fsm_storage_module_imports_independently(self):
         import postgres_fsm_storage
@@ -503,6 +816,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_purchase_recovery_delay_is_fixed_twenty_four_hours(self):
         self.assertEqual(self.main.FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, 24)
 
+    async def test_first_purchase_recovery_user_text_is_final_retry_offer(self):
+        self.assertEqual(
+            self.main.first_purchase_recovery_reminder_text(),
+            (
+                "Похоже, вчера оформление доступа не завершилось.\n\n"
+                "Мы всё проверили — сейчас можно попробовать ещё раз 🤍\n\n"
+                "Если снова что-то не получится, просто напишите нам, и мы поможем."
+            ),
+        )
+
     async def test_first_purchase_recovery_key_is_hashed_and_stable(self):
         first = self.main.first_purchase_recovery_delivery_key(123456789)
         second = self.main.first_purchase_recovery_delivery_key(123456789)
@@ -513,14 +836,18 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payment_failed_at", first)
 
     async def test_first_purchase_recovery_due_query_uses_checkout_attempts_and_not_payment_failed(self):
-        conn = FakeConnection(fetches=[[(123, datetime(2026, 7, 30, 10, 0))]])
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session", "checkout.session.expired")
+        conn = FakeConnection(fetches=[[row]])
 
         due = self.main.fetch_due_first_purchase_recovery_users(conn.cursor_obj, limit=10)
 
-        self.assertEqual(due, [(123, datetime(2026, 7, 30, 10, 0))])
+        self.assertEqual(due, [row])
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("FROM checkout_sessions", sql)
         self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("attempt_status", sql)
+        self.assertIn("attempt_source", sql)
+        self.assertIn("attempt_error_context", sql)
         self.assertIn("status = ANY", sql)
         self.assertIn("NOW() AT TIME ZONE 'UTC'", sql)
         self.assertIn("payment_events", sql)
@@ -535,11 +862,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sl.current_period_end >", sql)
 
     async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
-        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "checkout_retry_unresolved", "checkout_retry_event", None)
+        conn = FakeConnection(fetches=[row])
 
         row = self.main.fetch_first_purchase_recovery_user_if_due(conn.cursor_obj, 123)
 
-        self.assertEqual(row, (123, datetime(2026, 7, 30, 10, 0)))
+        self.assertEqual(row[0], 123)
+        self.assertEqual(row[3], "checkout_retry_unresolved")
+        self.assertEqual(row[4], "checkout_retry_event")
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("checkout_retry_events", sql)
         self.assertNotIn("payment_failed = TRUE", sql)
@@ -568,6 +898,296 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(params[2])
         self.assertEqual(payload["text"], self.main.first_purchase_recovery_reminder_text())
         self.assertEqual(payload["keyboard_kind"], "retry_payment")
+        self.assertEqual(payload["reason_category"], "unknown_payment_error")
+        self.assertEqual(payload["stage"], "checkout")
+        self.assertNotIn("123456789", payload["safe_ref"])
+
+    async def test_first_purchase_recovery_enqueue_stores_safe_attempt_context(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        context = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="expired",
+            attempt_source="checkout_session",
+        )
+
+        self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            context,
+        )
+
+        payload = json.loads(conn.cursor_obj.queries[0][1][2])
+        self.assertEqual(payload["reason_category"], "checkout_expired")
+        self.assertEqual(payload["reason_label"], "ссылка оплаты истекла")
+        self.assertEqual(payload["stage_label"], "Checkout")
+        self.assertEqual(payload["tariff_code"], "sub_1")
+        self.assertEqual(payload["attempt_status"], "expired")
+        self.assertEqual(payload["attempt_source"], "checkout_session")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
+        self.assertNotIn("123456789", payload["safe_ref"])
+
+    async def test_first_purchase_recovery_context_priority_uses_allowlisted_error_tokens(self):
+        cases = [
+            ("failed", "checkout.session.async_payment_failed", "checkout_async_payment_failed"),
+            ("expired", "checkout.session.expired", "checkout_expired"),
+            ("completed", "invoice_payment_failed", "invoice_payment_failed"),
+            ("completed", "invoice_payment_failed:card_declined", "card_declined"),
+            ("completed", "invoice_payment_failed:insufficient_funds", "insufficient_funds"),
+            ("completed", "invoice_payment_failed:authentication_required", "authentication_required"),
+            ("creation_unknown", "stripe_api_unavailable", "stripe_api_unavailable"),
+            ("failed", "checkout_creation_failed", "checkout_creation_failed"),
+            ("completed", None, "payment_confirmation_pending"),
+        ]
+
+        for status, error_context, category in cases:
+            with self.subTest(status=status, error_context=error_context):
+                result, _ = self.main.classify_first_purchase_recovery_context(
+                    attempt_status=status,
+                    attempt_source="checkout_session",
+                    attempt_error_context=error_context,
+                )
+                self.assertEqual(result, category)
+
+    async def test_first_purchase_recovery_failed_without_safe_context_does_not_guess_creation_failure(self):
+        category, _ = self.main.classify_first_purchase_recovery_context(
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context="raw Stripe exception with invoice in_123 customer cus_123",
+        )
+
+        self.assertEqual(category, "unknown_payment_error")
+
+    async def test_invoice_payment_failed_recovery_context_token_uses_safe_codes_only(self):
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token(None),
+            "invoice_payment_failed",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("card_declined"),
+            "invoice_payment_failed:card_declined",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("insufficient_funds"),
+            "invoice_payment_failed:insufficient_funds",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("authentication_required"),
+            "invoice_payment_failed:authentication_required",
+        )
+        self.assertEqual(
+            self.main.invoice_payment_failed_recovery_context_token("do_not_guess_card_declined"),
+            "invoice_payment_failed",
+        )
+
+    async def test_checkout_creation_recovery_error_token_uses_only_safe_contexts(self):
+        class APIConnectionError(Exception):
+            pass
+
+        class InvalidRequestError(Exception):
+            pass
+
+        api_token = self.main.checkout_creation_recovery_error_token(
+            APIConnectionError("timeout talking to customer cus_raw")
+        )
+        invalid_token = self.main.checkout_creation_recovery_error_token(
+            InvalidRequestError("No such price: price_raw")
+        )
+        unknown_token = self.main.checkout_creation_recovery_error_token(
+            RuntimeError("unexpected customer cus_raw invoice in_raw person@example.com")
+        )
+
+        self.assertEqual(api_token, "stripe_api_unavailable")
+        self.assertEqual(invalid_token, "checkout_creation_failed")
+        self.assertEqual(unknown_token, "checkout_creation_failed")
+        for token, expected_category in (
+            (api_token, "stripe_api_unavailable"),
+            (invalid_token, "checkout_creation_failed"),
+            (unknown_token, "checkout_creation_failed"),
+        ):
+            with self.subTest(token=token):
+                category, stage = self.main.classify_first_purchase_recovery_context(
+                    attempt_status="failed",
+                    attempt_source="checkout_session",
+                    attempt_error_context=token,
+                )
+                self.assertEqual(category, expected_category)
+                self.assertEqual(stage, "checkout_creation")
+
+        payload = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context=unknown_token,
+        )
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(payload["attempt_error_context"], "checkout_creation_failed")
+        self.assertNotIn("cus_raw", payload_text)
+        self.assertNotIn("in_raw", payload_text)
+        self.assertNotIn("person@example.com", payload_text)
+
+    async def test_process_payment_checkout_failure_persists_token_not_raw_exception(self):
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("recovery_error_token = checkout_creation_recovery_error_token(e)", source)
+        self.assertIn("mark_checkout_failed(\n                        failed_cur,", source)
+        self.assertIn("recovery_error_token,\n                        status=failed_status,", source)
+        self.assertNotIn('mark_checkout_failed(failed_cur, checkout_record["id"], e', source)
+
+    async def test_first_purchase_recovery_payload_never_copies_raw_checkout_last_error(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        context = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="failed",
+            attempt_source="checkout_session",
+            attempt_error_context="raw Stripe exception customer cus_real invoice in_real email person@example.com",
+        )
+
+        self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            context,
+        )
+
+        payload_text = conn.cursor_obj.queries[0][1][2]
+        payload = json.loads(payload_text)
+        self.assertEqual(payload["reason_category"], "unknown_payment_error")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
+        self.assertNotIn("cus_real", payload_text)
+        self.assertNotIn("in_real", payload_text)
+        self.assertNotIn("person@example.com", payload_text)
+
+    async def test_first_purchase_recovery_admin_sent_notices_are_per_admin_and_stable(self):
+        recovery_key = self.main.first_purchase_recovery_delivery_key(123456789)
+        conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
+        payload = self.main.stripe_delivery_payload(
+            self.main.first_purchase_recovery_reminder_text(),
+            reason_label="ссылка оплаты истекла",
+            stage_label="Checkout",
+            tariff_code="sub_1",
+            safe_ref="first_purchase_recovery:abc123",
+        )
+
+        created = self.main.enqueue_first_purchase_recovery_admin_sent_notices(
+            conn.cursor_obj,
+            recovery_key,
+            123456789,
+            payload,
+        )
+
+        self.assertEqual(created, 2)
+        keys = [params[0] for query, params in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
+        self.assertEqual(
+            keys,
+            [
+                self.main.first_purchase_recovery_admin_sent_delivery_key(recovery_key, 1),
+                self.main.first_purchase_recovery_admin_sent_delivery_key(recovery_key, 2),
+            ],
+        )
+        for query, params in conn.cursor_obj.queries:
+            if "INSERT INTO message_delivery_events" not in query:
+                continue
+            self.assertEqual(params[2], "stripe_admin_message")
+            admin_payload = json.loads(params[3])
+            self.assertEqual(admin_payload["category"], "first_purchase_recovery_sent")
+            self.assertEqual(admin_payload["severity"], "INFO")
+            self.assertIn("🔁 Повторная попытка оплаты предложена", admin_payload["text"])
+            self.assertIn("Напоминание: отправлено", admin_payload["text"])
+            self.assertNotIn("123456789", params[0])
+
+    async def test_first_purchase_recovery_admin_sent_text_formats_attempt_time_and_invalid_date(self):
+        text = self.main.build_first_purchase_recovery_admin_sent_text(
+            123456789,
+            {
+                "attempted_at": "2026-07-30T10:15:00+03:00",
+                "stage_label": "ошибка invoice",
+                "reason_label": "банк отклонил карту",
+                "tariff_code": "unknown",
+                "safe_ref": "first_purchase_recovery:safe",
+            },
+        )
+
+        self.assertIn("🔁 Повторная попытка оплаты предложена", text)
+        self.assertIn("Последняя попытка: 30.07.2026 07:15 UTC", text)
+        self.assertIn("Напоминание: отправлено", text)
+        self.assertIn("Тариф: не определён", text)
+        self.assertIn("Reference: first_purchase_recovery:safe", text)
+        self.assertNotIn("2026-07-30T10:15:00+03:00", text)
+
+        invalid_text = self.main.build_first_purchase_recovery_admin_sent_text(
+            123456789,
+            {
+                "attempted_at": "not-a-date with raw_error",
+                "stage_label": "Checkout",
+                "reason_label": "оплата не завершилась",
+                "tariff_code": None,
+                "safe_ref": "first_purchase_recovery:safe",
+            },
+        )
+        self.assertIn("Последняя попытка: не определена", invalid_text)
+        self.assertNotIn("not-a-date", invalid_text)
+        self.assertNotIn("raw_error", invalid_text)
+
+    async def test_first_purchase_recovery_success_enqueues_admin_after_user_send_and_closes_db_before_await(self):
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        payload = json.dumps({
+            "text": self.main.first_purchase_recovery_reminder_text(),
+            "keyboard_kind": "retry_payment",
+            "reason_label": "ссылка оплаты истекла",
+            "stage_label": "Checkout",
+            "tariff_code": "sub_1",
+            "safe_ref": "first_purchase_recovery:test",
+        })
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session", None)])
+        sent_conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
+        conns = iter([claim_conn, check_conn, sent_conn])
+        closed_before_send = []
+
+        async def send_after_close(*args, **kwargs):
+            closed_before_send.append((claim_conn.closed, check_conn.closed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_close)) as send_message:
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(closed_before_send, [(True, True)])
+        send_message.assert_awaited_once()
+        sql = "\n".join(query for query, _ in sent_conn.cursor_obj.queries)
+        self.assertIn("SAVEPOINT admin_payment_notification", sql)
+        delivery_keys = [params[0] for query, params in sent_conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
+        self.assertTrue(all(key.startswith("first_purchase_recovery_admin_sent:") for key in delivery_keys))
+        self.assertEqual(sent_conn.commits, 1)
+
+    async def test_first_purchase_recovery_user_failure_does_not_enqueue_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        payload = json.dumps({"text": "retry", "keyboard_kind": "retry_payment"})
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), None, None, None, None)])
+        fail_conn = FakeConnection()
+        conns = iter([claim_conn, check_conn, fail_conn])
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["retryable_failed"], 1)
+        sql = "\n".join(query for query, _ in fail_conn.cursor_obj.queries)
+        self.assertIn("UPDATE message_delivery_events", sql)
+        self.assertNotIn("first_purchase_recovery_admin_sent", sql)
 
     async def test_first_purchase_recovery_success_cancels_pending_failed_processing(self):
         conn = FakeConnection()
@@ -1197,7 +1817,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock(side_effect=notify_side_effect)
         release = AsyncMock()
         mark_processed = AsyncMock()
-        get_db_conn = Mock(side_effect=AssertionError("invalid checkout days must not open DB"))
+        conn = FakeConnection()
+        get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
              patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
@@ -1213,6 +1834,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             release=release,
             mark_processed=mark_processed,
             get_db_conn=get_db_conn,
+            conn=conn,
             event_id=event_id,
         )
 
@@ -1249,7 +1871,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
         mark_processed = AsyncMock()
         conn = FakeConnection(fetches=[(False, None, False)])
-        get_db_conn = Mock(return_value=conn)
+        get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
              patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
@@ -1304,11 +1926,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.response.status, 500)
                 result.release.assert_awaited_once_with(result.event_id)
                 result.mark_processed.assert_not_awaited()
-                result.get_db_conn.assert_not_called()
-                result.notify.assert_awaited_once()
-                self.assertTrue(result.notify.await_args.kwargs["alert_key"].startswith("checkout_invalid_identity:"))
-                self.assertEqual(result.notify.await_args.kwargs["severity"], "CRITICAL")
-                alert_text = result.notify.await_args.args[0]
+                result.get_db_conn.assert_called_once()
+                result.notify.assert_not_awaited()
+                self.assertFalse(any(
+                    params[2] != "stripe_admin_message"
+                    for params in self.delivery_inserts(result.conn)
+                ))
+                admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(result.conn)]
+                self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+                self.assertTrue(all(payload["severity"] == "CRITICAL" for payload in admin_payloads))
+                alert_text = admin_payloads[0]["text"]
                 self.assertIn("client_reference_id/metadata.telegram_id missing, invalid, or conflicting", alert_text)
                 self.assertIn("access_granted: false", alert_text)
                 self.assertNotIn(result.event_id, alert_text)
@@ -1320,7 +1947,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response.status, 500)
         result.release.assert_awaited_once_with(result.event_id)
         result.mark_processed.assert_not_awaited()
-        result.get_db_conn.assert_not_called()
+        result.get_db_conn.assert_called_once()
 
     async def test_checkout_invalid_days_missing_empty_text_zero_and_negative_fail_closed(self):
         for days_marker in ("missing", "", "abc", "0", "-30"):
@@ -1330,11 +1957,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.response.status, 500)
                 result.release.assert_awaited_once_with(result.event_id)
                 result.mark_processed.assert_not_awaited()
-                result.get_db_conn.assert_not_called()
-                result.notify.assert_awaited_once()
-                self.assertTrue(result.notify.await_args.kwargs["alert_key"].startswith("checkout_invalid_days:"))
-                self.assertEqual(result.notify.await_args.kwargs["severity"], "CRITICAL")
-                alert_text = result.notify.await_args.args[0]
+                result.get_db_conn.assert_called_once()
+                result.notify.assert_not_awaited()
+                self.assertFalse(any(
+                    params[2] != "stripe_admin_message"
+                    for params in self.delivery_inserts(result.conn)
+                ))
+                admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(result.conn)]
+                self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+                self.assertTrue(all(payload["severity"] == "CRITICAL" for payload in admin_payloads))
+                alert_text = admin_payloads[0]["text"]
                 self.assertIn("metadata.days missing or invalid", alert_text)
                 self.assertIn("access_granted: false", alert_text)
                 self.assertNotIn(result.event_id, alert_text)
@@ -1345,7 +1977,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response.status, 500)
         result.release.assert_awaited_once_with(result.event_id)
         result.mark_processed.assert_not_awaited()
-        result.get_db_conn.assert_not_called()
+        result.get_db_conn.assert_called_once()
 
     async def test_checkout_days_seven_success_path_still_processes(self):
         event = SimpleNamespace(
@@ -1612,6 +2244,336 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"sent": 1, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
         self.assertEqual(failed_calls, [("bad_payload", "JSONDecodeError", False)])
         send_message.assert_awaited_once()
+
+    async def test_stripe_admin_message_delivery_sends_to_admin_without_user_blocking(self):
+        send_message = AsyncMock()
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin ok"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        send_message.assert_awaited_once_with(1, "admin ok", parse_mode=None)
+        mark_sent.assert_called_once()
+
+    async def test_stripe_admin_message_forbidden_is_terminal_without_user_block(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        connections = [FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="bot blocked"))), \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "TelegramForbiddenError", None, True)])
+        self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+
+    async def test_stripe_admin_message_blocked_admin_does_not_stop_other_admin(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        failed_calls = []
+        sent_calls = []
+
+        async def fake_send_message(chat_id, text, parse_mode=None):
+            if chat_id == 1:
+                raise TelegramForbiddenError(method=None, message="bot blocked")
+            sent_calls.append((chat_id, text, parse_mode))
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        connections = [FakeConnection(), FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin 1"}', 1, None),
+                 ("stripe-admin:evt_admin:payment_success:2", 2, "stripe_admin_message", '{"text":"admin 2"}', 1, None),
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=fake_send_message)) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
+        self.assertEqual(send_message.await_count, 2)
+        self.assertEqual(sent_calls, [(2, "admin 2", None)])
+        self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "TelegramForbiddenError", None, True)])
+        mark_sent.assert_called_once()
+        self.assertFalse(any("blocked_bot = TRUE" in query for conn in connections for query, _ in conn.cursor_obj.queries))
+
+    async def test_stripe_admin_message_network_error_is_retryable(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "TelegramNetworkError", 5, False)])
+
+    async def test_stripe_admin_message_invalid_payload_is_terminal(self):
+        failed_calls = []
+
+        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+            failed_calls.append((delivery_key, str(exc), retry_delay_minutes, permanently_failed))
+
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{}', 1, None)
+             ]), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
+             patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 1, "blocked": 0})
+        self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "invalid_stripe_admin_message_payload", None, True)])
+        send_message.assert_not_awaited()
+
+    async def test_admin_payment_helpers_enqueue_all_admins_and_sanitize_problem_text(self):
+        conn = FakeConnection(fetches=[("admin-1",), ("admin-2",)])
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]):
+            created = self.main.enqueue_admin_payment_problem(
+                conn.cursor_obj,
+                "evt_problem",
+                "invoice_payment_failed",
+                "invoice_payment_failed",
+                telegram_id=123,
+                stripe_code="card_declined",
+                safe_ref="invoice_problem:abc123",
+                note="payment_failed message: поставлено в outbox",
+            )
+
+        self.assertEqual(created, 2)
+        deliveries = self.admin_delivery_inserts(conn)
+        self.assertEqual([params[0] for params in deliveries], [
+            "stripe-admin:evt_problem:invoice_payment_failed:1",
+            "stripe-admin:evt_problem:invoice_payment_failed:2",
+        ])
+        payloads = [json.loads(adapted_json_value(params[3])) for params in deliveries]
+        self.assertTrue(all(payload["category"] == "card_declined" for payload in payloads))
+        self.assertTrue(all("банк отклонил карту" in payload["text"] for payload in payloads))
+        self.assertTrue(all("None" not in payload["text"] for payload in payloads))
+
+    async def test_admin_payment_problem_now_db_error_is_best_effort_and_sanitized(self):
+        conn = ExecuteFailingConnection(error=RuntimeError("raw admin db secret"))
+
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             self.assertLogs(level="WARNING") as logs:
+            result = await self.main.try_enqueue_admin_payment_problem_now(
+                event_id="evt_admin_now",
+                purpose="checkout_creation_failed",
+                stage="checkout_creation",
+                telegram_id=123,
+                category="checkout_creation_failed",
+                stripe_retry="неизвестно",
+                recovery_reminder="неизвестно",
+                safe_ref="checkout_creation_failed:safe-ref",
+                note="safe note",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(conn.rollbacks, 1)
+        self.assertEqual(conn.commits, 0)
+        self.assertTrue(conn.closed)
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertIn("checkout_creation_failed", log_output)
+        self.assertIn("checkout_creation_failed:safe-ref", log_output)
+        self.assertNotIn("raw admin db secret", log_output)
+
+    async def test_checkout_creation_admin_outbox_error_still_answers_callback(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        admin_conn = ExecuteFailingConnection(error=RuntimeError("raw checkout admin secret"))
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow())), \
+             patch.object(self.main, "claim_checkout_session_record", side_effect=RuntimeError("claim failed")), \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, admin_conn]), \
+             self.assertLogs(level="WARNING") as logs:
+            await self.main.process_payment(callback, state)
+
+        self.assertEqual(callback.answers[-1][0], "Техническая ошибка. Попробуйте позже или напишите @re_tasha")
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+        self.assertTrue(initial_conn.closed)
+        self.assertTrue(claim_conn.closed)
+        self.assertTrue(admin_conn.closed)
+        self.assertEqual(admin_conn.rollbacks, 1)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", "\n".join(logs.output))
+        self.assertNotIn("raw checkout admin secret", "\n".join(logs.output))
+
+    async def test_webhook_error_path_admin_outbox_error_still_releases_claim(self):
+        event_id = "evt_checkout_expired_db_error"
+        session_payload = {"id": "cs_expired_db_error", "client_reference_id": "123"}
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.expired",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": session_payload}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "get_db_conn", side_effect=[
+                 RuntimeError("primary checkout expired failure"),
+                 RuntimeError("raw admin webhook secret"),
+             ]), \
+             self.assertLogs(level="WARNING") as logs:
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        release.assert_awaited_once_with(event_id)
+        mark_processed.assert_not_awaited()
+        log_output = "\n".join(logs.output)
+        self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
+        self.assertNotIn("raw admin webhook secret", log_output)
+
+    async def test_admin_recovery_reminder_status_uses_durable_proof(self):
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(immediate_retry_enqueued=True),
+            "не применимо",
+        )
+        self.assertNotEqual(
+            self.main.admin_recovery_reminder_status(immediate_retry_enqueued=True),
+            "запланировано",
+        )
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(durable_24h_enqueued=True),
+            "запланировано",
+        )
+        self.assertEqual(
+            self.main.admin_recovery_reminder_status(scheduler_will_check=True),
+            "будет проверено через 24 часа",
+        )
+        self.assertEqual(self.main.admin_recovery_reminder_status(), "неизвестно")
+
+    async def test_checkout_expired_admin_alert_separates_retry_payment_from_24h_reminder(self):
+        event_id = "evt_checkout_expired_retry_note"
+        session_payload = {"id": "cs_expired_retry_note", "client_reference_id": "123"}
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.expired",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": session_payload}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        conn = FakeConnection(fetches=[
+            ("stripe:%s:checkout_expired" % event_id,),
+            ("stripe-admin:%s:checkout_expired:1" % event_id,),
+            ("stripe-admin:%s:checkout_expired:2" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        user_payload = json.loads(adapted_json_value(self.user_delivery_inserts(conn)[0][3]))
+        self.assertEqual(user_payload["keyboard_kind"], "retry_payment")
+        admin_payload = json.loads(adapted_json_value(self.admin_delivery_inserts(conn)[0][3]))
+        self.assertIn("Напоминание через 24 часа: будет проверено через 24 часа", admin_payload["text"])
+        self.assertIn("Немедленное сообщение retry_payment поставлено в outbox", admin_payload["text"])
+        self.assertNotIn("Напоминание через 24 часа: запланировано", admin_payload["text"])
+
+    async def test_invoice_payment_failed_admin_alert_does_not_claim_24h_reminder(self):
+        event_id = "evt_invoice_failed_retry_status"
+        payload, event, subscription = self.invoice_payment_event(event_id)
+        event.type = "invoice.payment_failed"
+        invoice = event.data.object
+        invoice.status = "open"
+        invoice.amount_paid = 0
+        invoice.amount_due = 1000
+        invoice.next_payment_attempt = int((datetime.utcnow() + timedelta(hours=6)).timestamp())
+        subscription.status = "past_due"
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[
+            None,
+            (123, True, datetime.utcnow() + timedelta(days=14), datetime.utcnow(), datetime.utcnow() + timedelta(hours=24)),
+            ("stripe:%s:payment_failed" % event_id,),
+            ("stripe-admin:%s:invoice_payment_failed:1" % event_id,),
+            ("stripe-admin:%s:invoice_payment_failed:2" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        admin_payload = json.loads(adapted_json_value(self.admin_delivery_inserts(conn)[0][3]))
+        self.assertIn("Напоминание через 24 часа: не применимо", admin_payload["text"])
+        self.assertNotIn("Напоминание через 24 часа: запланировано", admin_payload["text"])
+        self.assertIn("payment_failed message: поставлено в outbox", admin_payload["text"])
+
+    async def test_payment_problem_classification_event_types_and_unknown_fallback(self):
+        self.assertEqual(
+            self.main.classify_payment_problem(event_type="checkout.session.expired")["category"],
+            "checkout_expired",
+        )
+        self.assertEqual(
+            self.main.classify_payment_problem(event_type="checkout.session.async_payment_failed")["category"],
+            "checkout_async_payment_failed",
+        )
+        self.assertEqual(
+            self.main.classify_payment_problem(event_type="invoice.payment_failed")["category"],
+            "invoice_payment_failed",
+        )
+        self.assertEqual(
+            self.main.classify_payment_problem()["category"],
+            "unknown_payment_error",
+        )
 
     async def test_rejoin_delivery_reuses_saved_invite_after_restart(self):
         send_message = AsyncMock()
@@ -1916,6 +2878,74 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("evt_full_secret_identifier_123456789", log_text)
         self.assertIn("stripe:evt_***invite", log_text)
 
+    async def run_checkout_payment_message_webhook(self, event_id, *, days="30", payment_failed=False, duplicate=False):
+        payload = json.dumps(
+            {
+                "id": event_id,
+                "object": "event",
+                "type": "checkout.session.completed",
+                "created": 1720000000,
+                "data": {
+                    "object": {
+                        "id": "cs_%s" % event_id[-10:],
+                        "object": "checkout.session",
+                        "client_reference_id": "123",
+                        "metadata": {"days": days},
+                        "mode": "payment",
+                        "payment_status": "paid",
+                        "customer": "cus_checkout_recovery",
+                        "subscription": None,
+                        "amount_total": 1000,
+                        "currency": "usd",
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_%s" % event_id[-10:],
+                client_reference_id="123",
+                metadata={"days": days},
+                mode="payment",
+                payment_status="paid",
+                customer="cus_checkout_recovery",
+                subscription=None,
+                amount_total=1000,
+                currency="usd",
+            )),
+        )
+        if days == "7":
+            success_key = "stripe:%s:trial_success" % event_id
+        elif payment_failed:
+            success_key = "stripe:%s:payment_recovered" % event_id
+        else:
+            success_key = "stripe:%s:payment_success" % event_id
+        conn = FakeConnection(fetches=[
+            (True, datetime.utcnow() - timedelta(days=1), True, payment_failed),
+            (success_key,),
+            ("stripe:%s:rejoin_invite" % event_id,),
+        ])
+        claim_results = ["claimed", "duplicate"] if duplicate else ["claimed"]
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=claim_results)), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()), \
+             patch.object(self.main, "release_event_processing", AsyncMock()), \
+             patch.object(self.main, "claim_trial_redemption", return_value=True), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock()) as get_member, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response1 = await self.main.stripe_webhook(request)
+            response2 = await self.main.stripe_webhook(request) if duplicate else None
+
+        get_member.assert_not_awaited()
+        return SimpleNamespace(conn=conn, response=response1, duplicate_response=response2)
+
     async def test_checkout_webhook_enqueues_durable_rejoin_check_without_telegram_membership_call(self):
         payload = json.dumps(
             {
@@ -1975,13 +3005,100 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         get_member.assert_not_awaited()
         self.assertTrue(conn.closed)
         queries = [query for query, _ in conn.cursor_obj.queries]
-        enqueue_index = next(i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query)
+        enqueue_indices = [i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query]
         access_index = next(i for i, query in enumerate(queries) if "INSERT INTO users" in query)
-        self.assertLess(access_index, enqueue_index)
-        enqueue_params = next(params for query, params in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query)
-        self.assertEqual(enqueue_params[0], "stripe:evt_checkout_boundary:rejoin_invite")
-        self.assertEqual(enqueue_params[2], "stripe_rejoin_check")
+        self.assertTrue(all(access_index < enqueue_index for enqueue_index in enqueue_indices))
+        deliveries = self.delivery_map(conn)
+        self.assertEqual(deliveries["stripe:evt_checkout_boundary:payment_success"][2], "stripe_user_message")
+        payment_payload = json.loads(adapted_json_value(deliveries["stripe:evt_checkout_boundary:payment_success"][3]))
+        self.assertIn("Оплата прошла успешно 🤍", payment_payload["text"])
+        self.assertIn("Доступ к клубу открыт до", payment_payload["text"])
+        self.assertEqual(deliveries["stripe:evt_checkout_boundary:rejoin_invite"][2], "stripe_rejoin_check")
+        rejoin_payload = json.loads(adapted_json_value(deliveries["stripe:evt_checkout_boundary:rejoin_invite"][3]))
+        self.assertNotIn("Оплата прошла успешно", rejoin_payload["text"])
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in admin_payloads))
         self.assertEqual(conn.commits, 1)
+
+    async def test_checkout_payment_failed_user_gets_recovered_success_delivery(self):
+        result = await self.run_checkout_payment_message_webhook(
+            "evt_checkout_payment_recovered",
+            payment_failed=True,
+        )
+
+        self.assertEqual(result.response.status, 200)
+        queries = [query for query, _ in result.conn.cursor_obj.queries]
+        deliveries = self.delivery_map(result.conn)
+        self.assertIn("stripe:evt_checkout_payment_recovered:payment_recovered", deliveries)
+        self.assertNotIn("stripe:evt_checkout_payment_recovered:payment_success", deliveries)
+        payload_data = json.loads(adapted_json_value(
+            deliveries["stripe:evt_checkout_payment_recovered:payment_recovered"][3]
+        ))
+        self.assertIn("Подписка снова активна", payload_data["text"])
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(result.conn)]
+        self.assertTrue(any("Тип: восстановление после ошибки" in payload["text"] for payload in admin_payloads))
+        update_sql = "\n".join(queries)
+        self.assertIn("payment_failed = FALSE", update_sql)
+        self.assertIn("payment_failed_at = NULL", update_sql)
+        self.assertIn("grace_period_end = NULL", update_sql)
+        cleanup_index = next(i for i, query in enumerate(queries) if "payment_failed = FALSE" in query)
+        enqueue_index = next(i for i, query in enumerate(queries) if "INSERT INTO message_delivery_events" in query)
+        self.assertLess(cleanup_index, enqueue_index)
+        self.assertEqual(result.conn.commits, 1)
+
+    async def test_checkout_non_failed_user_gets_payment_success_delivery(self):
+        result = await self.run_checkout_payment_message_webhook(
+            "evt_checkout_payment_success",
+            payment_failed=False,
+        )
+
+        self.assertEqual(result.response.status, 200)
+        deliveries = self.delivery_map(result.conn)
+        self.assertIn("stripe:evt_checkout_payment_success:payment_success", deliveries)
+        self.assertNotIn("stripe:evt_checkout_payment_success:payment_recovered", deliveries)
+        payload_data = json.loads(adapted_json_value(
+            deliveries["stripe:evt_checkout_payment_success:payment_success"][3]
+        ))
+        self.assertIn("Спасибо, что присоединились", payload_data["text"])
+
+    async def test_checkout_recovery_duplicate_webhook_creates_one_recovered_delivery(self):
+        result = await self.run_checkout_payment_message_webhook(
+            "evt_checkout_recovery_duplicate",
+            payment_failed=True,
+            duplicate=True,
+        )
+
+        self.assertEqual(result.response.status, 200)
+        self.assertEqual(result.duplicate_response.status, 200)
+        recovered_deliveries = [
+            params for query, params in result.conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+            and params[0] == "stripe:evt_checkout_recovery_duplicate:payment_recovered"
+        ]
+        payment_success_deliveries = [
+            params for query, params in result.conn.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+            and params[0] == "stripe:evt_checkout_recovery_duplicate:payment_success"
+        ]
+        self.assertEqual(len(recovered_deliveries), 1)
+        self.assertEqual(payment_success_deliveries, [])
+
+    async def test_trial_checkout_stays_trial_success_even_after_payment_failed_state(self):
+        result = await self.run_checkout_payment_message_webhook(
+            "evt_checkout_trial_stays_trial",
+            days="7",
+            payment_failed=True,
+        )
+
+        self.assertEqual(result.response.status, 200)
+        deliveries = self.delivery_map(result.conn)
+        self.assertIn("stripe:evt_checkout_trial_stays_trial:trial_success", deliveries)
+        self.assertNotIn("stripe:evt_checkout_trial_stays_trial:payment_recovered", deliveries)
+        trial_payload = json.loads(adapted_json_value(
+            deliveries["stripe:evt_checkout_trial_stays_trial:trial_success"][3]
+        ))
+        self.assertIn("Пробная неделя активирована", trial_payload["text"])
 
     async def test_subscription_checkout_link_only_does_not_enqueue_rejoin_check(self):
         payload = json.dumps(
@@ -2094,8 +3211,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response2.status, 200)
         get_member.assert_not_awaited()
         self.assertTrue(conn.closed)
-        enqueue_queries = [query for query, _ in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
-        self.assertEqual(len(enqueue_queries), 1)
+        self.assertEqual(len(self.user_delivery_inserts(conn)), 2)
+        self.assertEqual(len(self.admin_delivery_inserts(conn)), len(self.main.ADMIN_IDS))
         self.assertEqual(conn.rollbacks, 0)
 
     async def test_invoice_future_expiry_kicked_user_gets_rejoin_task_and_link(self):
@@ -2177,8 +3294,41 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertTrue(conn.closed)
         queries = [query for query, _ in conn.cursor_obj.queries]
-        self.assertFalse(any("INSERT INTO message_delivery_events" in query for query in queries))
+        self.assertFalse(any(params[2] != "stripe_admin_message" for params in self.delivery_inserts(conn)))
+        self.assertEqual(len(self.admin_delivery_inserts(conn)), len(self.main.ADMIN_IDS))
         self.assertTrue(any("INSERT INTO unlinked_stripe_events" in query for query in queries))
+
+    async def test_invoice_missing_period_does_not_update_access_or_enqueue_user_delivery(self):
+        payload, event, subscription = self.invoice_payment_event(
+            "evt_invoice_missing_period",
+            period_end=None,
+            include_line_period=False,
+        )
+        subscription.current_period_end = None
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection()
+        notify_admins = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "notify_admins", notify_admins), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with("evt_invoice_missing_period")
+        notify_admins.assert_not_awaited()
+        queries = [query for query, _ in conn.cursor_obj.queries]
+        self.assertFalse(any("UPDATE users" in query for query in queries))
+        self.assertFalse(any("INSERT INTO access_events" in query for query in queries))
+        self.assertFalse(any(params[2] != "stripe_admin_message" for params in self.delivery_inserts(conn)))
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(any("не найден срок периода подписки" in payload["text"] for payload in admin_payloads))
+        self.assertTrue(all("None" not in payload["text"] for payload in admin_payloads))
+        self.assertEqual(conn.commits, 1)
 
     async def test_webhook_and_stripe_routes_are_registered_once_and_do_not_conflict(self):
         app = self.main.create_app()

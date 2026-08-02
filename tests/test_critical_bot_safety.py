@@ -18,14 +18,20 @@ from admin_security import (
 from checkout_safety import (
     active_or_resumable_subscriptions,
     backup_decision,
+    BLOCKING_SUBSCRIPTION_STATUSES,
     build_pg_dump_command,
     CHECKOUT_AMBIGUOUS_AUTO_RETRY_HOURS,
+    classify_invoice_collection_risk,
     has_active_access,
+    is_out_of_band_access,
+    is_terminal_subscription_status,
     live_subscription_is_paid,
     manual_link_access_decision,
     parse_moscow_expiry,
+    should_apply_failed_invoice_to_user,
     should_apply_negative_event,
     stable_checkout_idempotency_key,
+    stripe_link_active_for_status,
     subscription_status_action,
 )
 from db_migrations import MIGRATION_BASELINE_REQUIREMENTS
@@ -378,16 +384,32 @@ class CriticalBotSafetyTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rejoin_helper)
 
+    def test_stripe_webhook_admin_notifications_are_outbox_only(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
+        self.assertNotIn("await notify_admins", source)
+        self.assertIn("enqueue_admin_payment_success", source)
+        self.assertIn("enqueue_admin_payment_problem", source)
+        self.assertIn("enqueue_admin_payment_problem_now", source)
+        self.assertIn('"stripe_admin_message"', MAIN_SOURCE)
+        self.assertIn("delivery_type == \"stripe_admin_message\"", MAIN_SOURCE)
+
     def test_stripe_webhook_enqueues_user_notifications_before_transaction_commit(self):
         webhook_source = MAIN_SOURCE[MAIN_SOURCE.index("async def stripe_webhook"):MAIN_SOURCE.index("@router.message(Command('test_auto_lesson')")]
         notification_blocks = (
-            webhook_source[webhook_source.index('purpose = "trial_success"'):],
-            webhook_source[webhook_source.index('notice_marker = "INITIAL_SUBSCRIPTION_NOTICE_SENT"'):],
+            webhook_source[webhook_source.index('if purpose == "trial_success"'):],
+            webhook_source[webhook_source.index("enqueue_user_payment_success_message("):],
             webhook_source[webhook_source.index('"PAYMENT_FAILED_MARKED: telegram_id=%s'):],
             webhook_source[webhook_source.index("if user_id:\n                    enqueue_stripe_user_message"):],
         )
         for block in notification_blocks:
-            self.assertLess(block.index("enqueue_stripe_user_message"), block.index("conn.commit()"))
+            enqueue_index = min(
+                index for index in (
+                    block.find("enqueue_stripe_user_message"),
+                    block.find("enqueue_user_payment_success_message"),
+                )
+                if index >= 0
+            )
+            self.assertLess(enqueue_index, block.index("conn.commit()"))
 
         rejoin_blocks = (
             webhook_source[webhook_source.index("if checkout_access_confirmed:"):],
@@ -1172,7 +1194,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_process_payment_manual_review_path_does_not_create_stripe_session(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index('if claim_result["action"] == "manual_review_required"'):MAIN_SOURCE.index('if claim_result["action"] == "reuse_open"')]
-        self.assertIn("notify_admins", source)
+        self.assertIn("enqueue_admin_payment_problem_now", source)
         self.assertIn("/resolve_checkout <record_id> <failed|expired>", source)
         self.assertNotIn("stripe.checkout.Session.create", source)
 
@@ -1271,6 +1293,108 @@ class CriticalBotSafetyTests(unittest.TestCase):
         joined = "\n".join(query for _, query in checkout_safety.stripe_identity_conflict_queries())
         self.assertIn("array_agg(telegram_id ORDER BY telegram_id)", joined)
         self.assertIn("array_agg(DISTINCT telegram_id ORDER BY telegram_id)", joined)
+
+    def test_manual_sync_timestamp_is_not_out_of_band_by_itself(self):
+        self.assertFalse(is_out_of_band_access(manual_sync_at=datetime.utcnow()))
+        self.assertFalse(is_out_of_band_access(payment_kind="recurring", manual_sync_at=datetime.utcnow()))
+        self.assertTrue(is_out_of_band_access(payment_kind="out_of_band"))
+        self.assertTrue(is_out_of_band_access(access_source="manual_give_access"))
+        self.assertTrue(is_out_of_band_access(access_source="manual_set_expiry"))
+        self.assertTrue(is_out_of_band_access(access_source="out_of_band"))
+
+    def test_invoice_collection_risk_matrix(self):
+        self.assertEqual(
+            classify_invoice_collection_risk("open", "charge_automatically", 5000, 1780000000),
+            "scheduled_retry",
+        )
+        self.assertEqual(
+            classify_invoice_collection_risk("open", "send_invoice", 5000, None),
+            "manual_only_collectible",
+        )
+        self.assertEqual(
+            classify_invoice_collection_risk("open", "charge_automatically", 5000, None),
+            "open_collectible",
+        )
+        self.assertEqual(classify_invoice_collection_risk("paid", "charge_automatically", 0, None), "paid")
+        self.assertEqual(classify_invoice_collection_risk("void", "charge_automatically", 5000, None), "void")
+        self.assertEqual(
+            classify_invoice_collection_risk("uncollectible", "send_invoice", 5000, None),
+            "uncollectible",
+        )
+        self.assertEqual(classify_invoice_collection_risk("draft", "send_invoice", 5000, None), "not_collectible")
+
+    def test_terminal_subscription_status_and_link_active_rules(self):
+        self.assertTrue(is_terminal_subscription_status("canceled"))
+        self.assertTrue(is_terminal_subscription_status("incomplete_expired"))
+        self.assertFalse(is_terminal_subscription_status("active"))
+        expected = {
+            "active": True,
+            "trialing": True,
+            "incomplete": False,
+            "past_due": False,
+            "unpaid": False,
+            "paused": False,
+            "canceled": False,
+            "incomplete_expired": False,
+            None: False,
+        }
+        for status, is_active in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(stripe_link_active_for_status(status), is_active)
+        self.assertTrue({"incomplete", "past_due", "unpaid"}.issubset(BLOCKING_SUBSCRIPTION_STATUSES))
+        self.assertTrue(active_or_resumable_subscriptions([{"status": "incomplete"}]))
+        self.assertFalse(stripe_link_active_for_status("incomplete"))
+
+    def test_failed_invoice_subscription_guard(self):
+        self.assertFalse(should_apply_failed_invoice_to_user(None, None))
+        self.assertFalse(should_apply_failed_invoice_to_user("sub_current", None))
+        self.assertTrue(should_apply_failed_invoice_to_user(None, "sub_old"))
+        self.assertTrue(should_apply_failed_invoice_to_user("", "sub_old"))
+        self.assertTrue(should_apply_failed_invoice_to_user("sub_old", "sub_old"))
+        self.assertFalse(should_apply_failed_invoice_to_user("sub_current", "sub_old"))
+
+    def test_invoice_payment_failed_customer_fallback_is_subscription_guarded(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("elif event_type == 'invoice.payment_failed'"):
+            MAIN_SOURCE.index("# ---------- 4. ПОЛЬЗОВАТЕЛЬ ОТМЕНИЛ")
+        ]
+        self.assertIn("should_apply_failed_invoice_to_user", source)
+        self.assertIn("PAYMENT_FAILED_CUSTOMER_FALLBACK_BLOCKED", source)
+        self.assertIn("AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)", source)
+        self.assertIn("SELECT telegram_id, stripe_subscription_id", source)
+        self.assertIn("len(customer_matches) == 1", source)
+        self.assertIn("ignored_stale_invoice_payment_failed", source)
+        self.assertIn("safe_ref=stale_payment_failed_alert_key", source)
+        self.assertIn("await enqueue_admin_payment_problem_now", source)
+
+    def test_subscription_deleted_marks_stripe_link_terminal(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("elif event_type == 'customer.subscription.deleted'"):
+            MAIN_SOURCE.index("# ---------- 4.1. ОБНОВЛЕНИЕ ПОДПИСКИ")
+        ]
+        self.assertIn("mark_stripe_link_subscription_terminal(cur, sub_id, status or \"canceled\")", source)
+        self.assertIn("WHEN expiry_date IS NOT NULL AND expiry_date > NOW() THEN paid", source)
+
+    def test_subscription_updated_terminal_status_marks_stripe_link_inactive(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("elif event_type == 'customer.subscription.updated'"):
+            MAIN_SOURCE.index("# ---------- 5. СЕССИЯ")
+        ]
+        self.assertIn("stripe_link_active_for_status(status)", source)
+        self.assertIn("is_terminal_subscription_status(status)", source)
+        self.assertIn("mark_stripe_link_subscription_terminal(cur, sub_id, status)", source)
+
+    def test_bot_health_reports_missing_customer_id_and_stale_links(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def bot_health_command"):
+            MAIN_SOURCE.index("ADMIN_MENU_SECTIONS")
+        ]
+        self.assertIn("stripe_subscription_id IS NOT NULL", source)
+        self.assertIn("stripe_customer_id IS NULL", source)
+        self.assertIn("active stripe_links с terminal status", source)
+        self.assertIn("status IN ('canceled', 'incomplete_expired')", source)
+        self.assertIn("first_purchase_recovery_stats", source)
+        self.assertIn("outbox_stats", source)
 
 
 if __name__ == "__main__":

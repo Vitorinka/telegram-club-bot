@@ -1,12 +1,15 @@
 import contextlib
 import asyncio
 import io
+import json
 import os
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -187,22 +190,46 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.close()
             conn.close()
 
-    def insert_checkout_attempt(self, telegram_id, *, hours_ago=24, status="expired", mode="payment", tariff="sub_1"):
+    def insert_checkout_attempt(
+        self,
+        telegram_id,
+        *,
+        hours_ago=24,
+        status="expired",
+        mode="payment",
+        tariff="sub_1",
+        stripe_subscription_id=None,
+        last_error=None,
+    ):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
             cur.execute(
                 """
                 INSERT INTO checkout_sessions (
-                    telegram_id, tariff_code, mode, idempotency_key, status, created_at, updated_at
+                    telegram_id, tariff_code, mode, stripe_subscription_id,
+                    idempotency_key, status, last_error, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s,
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'),
                         (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
+                RETURNING id
                 """,
-                (telegram_id, tariff, mode, f"idem_{telegram_id}_{uuid.uuid4().hex}", status, hours_ago, hours_ago),
+                (
+                    telegram_id,
+                    tariff,
+                    mode,
+                    stripe_subscription_id,
+                    f"idem_{telegram_id}_{uuid.uuid4().hex}",
+                    status,
+                    last_error,
+                    hours_ago,
+                    hours_ago,
+                ),
             )
+            row = cur.fetchone()
             conn.commit()
+            return row[0]
         finally:
             cur.close()
             conn.close()
@@ -217,6 +244,29 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 VALUES (%s, %s, (NOW() AT TIME ZONE 'UTC') - (%s * INTERVAL '1 hour'))
                 """,
                 (telegram_id, tariff, hours_ago),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def insert_stripe_link(self, telegram_id, *, status, is_active, subscription_id=None, future_period=True):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            current_period_sql = (
+                "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
+                if future_period
+                else "NULL"
+            )
+            cur.execute(
+                f"""
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
+                )
+                VALUES (%s, %s, %s, %s, {current_period_sql})
+                """,
+                (telegram_id, subscription_id or f"sub_{telegram_id}", status, is_active),
             )
             conn.commit()
         finally:
@@ -255,6 +305,584 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """,
             (main.first_purchase_recovery_delivery_key(telegram_id),),
         )
+
+    def payment_delivery_payload(self, delivery_key):
+        row = self.query_one(
+            """
+            SELECT delivery_type, payload_json
+            FROM message_delivery_events
+            WHERE delivery_key = %s
+            """,
+            (delivery_key,),
+        )
+        return row[0], json.loads(row[1])
+
+    def test_payment_success_message_initial_state_update_and_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9801)
+        new_expiry = datetime(2026, 9, 1, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    first_payment_done = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9801),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_initial",
+                9801,
+                "payment_success",
+                confirmed_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        delivery_type, payload = self.payment_delivery_payload("stripe:evt_pg_initial:payment_success")
+        self.assertEqual(delivery_type, "stripe_user_message")
+        self.assertIn("Оплата прошла успешно 🤍", payload["text"])
+        self.assertIn("01.09.2026", payload["text"])
+        self.assertNotIn("None", payload["text"])
+        self.assertEqual(payload["new_expiry"], "2026-09-01T00:00:00")
+
+    def test_admin_payment_notifications_are_durable_and_deduplicated_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            admin_ids = [111, 222]
+            with mock.patch.object(main, "ADMIN_IDS", admin_ids):
+                self.assertEqual(
+                    main.enqueue_admin_payment_success(
+                        cur,
+                        "evt_pg_admin_success",
+                        "payment_success",
+                        9809,
+                        "sub_1",
+                        150000,
+                        "rub",
+                        datetime(2026, 9, 1, 0, 0),
+                        "evt_pg_admin_success",
+                    ),
+                    2,
+                )
+                duplicate_result = main.enqueue_admin_payment_success(
+                    cur,
+                    "evt_pg_admin_success",
+                    "payment_success",
+                    9809,
+                    "sub_1",
+                    150000,
+                    "rub",
+                    datetime(2026, 9, 1, 0, 0),
+                    "evt_pg_admin_success",
+                )
+                self.assertEqual(duplicate_result, len(admin_ids))
+                cur.execute(
+                    """
+                    SELECT COUNT(*), COUNT(DISTINCT telegram_id), COUNT(DISTINCT delivery_key)
+                    FROM message_delivery_events
+                    WHERE delivery_type = 'stripe_admin_message'
+                      AND delivery_key LIKE 'stripe-admin:evt_pg_admin_success:payment_success:%'
+                    """
+                )
+                self.assertEqual(cur.fetchone(), (2, 2, 2))
+                self.assertEqual(
+                    main.enqueue_admin_payment_problem(
+                        cur,
+                        "evt_pg_admin_failed",
+                        "invoice_payment_failed",
+                        "invoice_payment_failed",
+                        telegram_id=9809,
+                        stripe_code="card_declined",
+                        safe_ref="invoice_payment_failed:pgsafe",
+                    ),
+                    2,
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        rows = self.query_all(
+            """
+            SELECT delivery_key, telegram_id, delivery_type, status, payload_json
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            ORDER BY delivery_key
+            """
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row[1] for row in rows}, {111, 222})
+        self.assertEqual({row[2] for row in rows}, {"stripe_admin_message"})
+        self.assertEqual({row[3] for row in rows}, {"pending"})
+        self.assertEqual(
+            [row[0] for row in rows],
+            [
+                "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:111",
+                "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:222",
+                "stripe-admin:evt_pg_admin_success:payment_success:111",
+                "stripe-admin:evt_pg_admin_success:payment_success:222",
+            ],
+        )
+        row_counts = self.query_all(
+            """
+            SELECT telegram_id, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            GROUP BY telegram_id
+            ORDER BY telegram_id
+            """
+        )
+        self.assertEqual(row_counts, [(111, 2), (222, 2)])
+        key_counts = self.query_all(
+            """
+            SELECT delivery_key, COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+            GROUP BY delivery_key
+            """
+        )
+        self.assertTrue(all(count == 1 for _, count in key_counts))
+        payloads = [json.loads(row[4]) for row in rows]
+        self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in payloads))
+        self.assertTrue(any("банк отклонил карту" in payload["text"] for payload in payloads))
+        self.assertTrue(all("None" not in payload["text"] for payload in payloads))
+
+    def test_payment_success_message_renewal_and_duplicate_dedupe_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9802, paid=True, expiry_date=datetime(2026, 8, 1), first_payment_done=True)
+        new_expiry = datetime(2026, 10, 1, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET expiry_date = %s,
+                    paid = TRUE
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9802),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            self.assertTrue(main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_renewal",
+                9802,
+                "renewal_success",
+                confirmed_expiry,
+            ))
+            self.assertTrue(main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_renewal",
+                9802,
+                "renewal_success",
+                confirmed_expiry,
+            ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key = %s",
+            ("stripe:evt_pg_renewal:renewal_success",),
+        )[0], 1)
+        delivery_type, payload = self.payment_delivery_payload("stripe:evt_pg_renewal:renewal_success")
+        self.assertEqual(delivery_type, "stripe_user_message")
+        self.assertIn("Подписка успешно продлена 🤍", payload["text"])
+        self.assertIn("01.10.2026", payload["text"])
+        self.assertNotIn("01.08.2026", payload["text"])
+
+    def test_invoice_effective_expiry_case_update_drives_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        telegram_id = 9812
+        old_expiry = datetime(2026, 11, 1, 0, 0)
+        stripe_period_expiry = datetime(2026, 10, 1, 0, 0)
+        self.insert_recovery_user(
+            telegram_id,
+            paid=True,
+            expiry_date=old_expiry,
+            first_payment_done=True,
+            stripe_subscription_id="sub_effective_exact",
+            stripe_customer_id="cus_effective_exact",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
+                    FROM users
+                    WHERE stripe_subscription_id = %s
+                )
+                UPDATE users
+                SET expiry_date = CASE
+                        WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                        ELSE %s
+                    END,
+                    paid = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                FROM target
+                WHERE users.telegram_id = target.telegram_id
+                RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
+                """,
+                ("sub_effective_exact", stripe_period_expiry, stripe_period_expiry),
+            )
+            row = cur.fetchone()
+            self.assertEqual(row, (telegram_id, old_expiry, False, old_expiry))
+            effective_expiry = row[3]
+            main.insert_payment_event(
+                cur,
+                "evt_pg_effective_expiry",
+                "invoice.payment_succeeded",
+                "succeeded",
+                telegram_id=telegram_id,
+                invoice_id="in_effective_expiry",
+                stripe_customer_id="cus_effective_exact",
+                stripe_subscription_id="sub_effective_exact",
+                payment_kind="recurring",
+                billing_reason="subscription_cycle",
+                tariff_code="sub_1",
+                amount_paid=1000,
+                amount_due=1000,
+                currency="rub",
+                period_start=datetime(2026, 9, 1, 0, 0),
+                period_end=stripe_period_expiry,
+            )
+            cur.execute(
+                """
+                INSERT INTO access_events (
+                    telegram_id, event_type, source, old_expiry, new_expiry,
+                    stripe_event_id, stripe_subscription_id, notes
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    telegram_id,
+                    "stripe_invoice_paid",
+                    "stripe_webhook",
+                    old_expiry,
+                    effective_expiry,
+                    "evt_pg_effective_expiry",
+                    "sub_effective_exact",
+                    "period_source=subscription.current_period_end",
+                ),
+            )
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_effective_expiry",
+                telegram_id,
+                "renewal_success",
+                effective_expiry,
+            )
+            main.enqueue_rejoin_invite_after_payment(
+                cur,
+                telegram_id,
+                effective_expiry,
+                "invoice.payment_succeeded",
+                "evt_pg_effective_expiry",
+                stripe_subscription_id="sub_effective_exact",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_expiry = self.query_one("SELECT expiry_date FROM users WHERE telegram_id = %s", (telegram_id,))[0]
+        self.assertEqual(user_expiry, old_expiry)
+        payment_period_end = self.query_one(
+            "SELECT period_end FROM payment_events WHERE stripe_event_id = %s",
+            ("evt_pg_effective_expiry",),
+        )[0]
+        access_new_expiry = self.query_one(
+            "SELECT new_expiry FROM access_events WHERE stripe_event_id = %s",
+            ("evt_pg_effective_expiry",),
+        )[0]
+        self.assertEqual(payment_period_end, stripe_period_expiry)
+        self.assertEqual(access_new_expiry, old_expiry)
+        _, renewal_payload = self.payment_delivery_payload("stripe:evt_pg_effective_expiry:renewal_success")
+        _, rejoin_payload = self.payment_delivery_payload("stripe:evt_pg_effective_expiry:rejoin_invite")
+        self.assertIn("01.11.2026", renewal_payload["text"])
+        self.assertIn("01.11.2026", rejoin_payload["text"])
+        self.assertEqual(renewal_payload["new_expiry"], "2026-11-01T00:00:00")
+        self.assertNotIn("01.10.2026", renewal_payload["text"])
+        self.assertNotIn("01.10.2026", rejoin_payload["text"])
+
+    def test_payment_recovered_cleans_failure_state_and_outbox_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(
+            9803,
+            payment_failed=True,
+            payment_failed_at=datetime(2026, 8, 1),
+            grace_period_end=datetime(2026, 8, 3),
+        )
+        new_expiry = datetime(2026, 9, 15, 0, 0)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL
+                WHERE telegram_id = %s
+                RETURNING expiry_date
+                """,
+                (new_expiry, 9803),
+            )
+            confirmed_expiry = cur.fetchone()[0]
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_recovered",
+                9803,
+                "payment_recovered",
+                confirmed_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_state = self.query_one(
+            "SELECT payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (9803,),
+        )
+        self.assertEqual(user_state, (False, None, None))
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_recovered:payment_recovered")
+        self.assertIn("Подписка снова активна", payload["text"])
+        self.assertIn("15.09.2026", payload["text"])
+
+    def test_checkout_recovery_cleanup_and_payload_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        telegram_id = 9813
+        new_expiry = datetime(2026, 9, 20, 0, 0)
+        self.insert_recovery_user(
+            telegram_id,
+            payment_failed=True,
+            payment_failed_at=datetime(2026, 8, 20, 0, 0),
+            grace_period_end=datetime(2026, 8, 23, 0, 0),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id, payment_failed AS was_payment_failed
+                    FROM users
+                    WHERE telegram_id = %s
+                )
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    first_payment_done = TRUE,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL,
+                    last_payment_succeeded_at = NOW()
+                FROM target
+                WHERE users.telegram_id = target.telegram_id
+                RETURNING users.expiry_date, target.was_payment_failed
+                """,
+                (telegram_id, new_expiry),
+            )
+            effective_expiry, was_payment_failed = cur.fetchone()
+            purpose = main.payment_success_purpose("initial_subscription", was_payment_failed)
+            self.assertEqual(purpose, "payment_recovered")
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_checkout_recovered",
+                telegram_id,
+                purpose,
+                effective_expiry,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        user_state = self.query_one(
+            "SELECT paid, expiry_date, first_payment_done, payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (telegram_id,),
+        )
+        self.assertEqual(user_state, (True, new_expiry, True, False, None, None))
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_checkout_recovered:payment_recovered")
+        self.assertIn("Подписка снова активна", payload["text"])
+        self.assertIn("20.09.2026", payload["text"])
+        self.assertEqual(payload["new_expiry"], "2026-09-20T00:00:00")
+        self.assertIsNone(self.query_one(
+            "SELECT delivery_key FROM message_delivery_events WHERE delivery_key = %s",
+            ("stripe:evt_pg_checkout_recovered:payment_success",),
+        ))
+
+    def test_payment_success_message_missing_expiry_fallback_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        self.insert_recovery_user(9804)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_user_payment_success_message(
+                cur,
+                "evt_pg_missing_expiry",
+                9804,
+                "payment_success",
+                None,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        _, payload = self.payment_delivery_payload("stripe:evt_pg_missing_expiry:payment_success")
+        self.assertNotIn("None", payload["text"])
+        self.assertNotIn("01.09.2026", payload["text"])
+        self.assertIn("Мы дополнительно проверяем дату окончания подписки", payload["text"])
+
+    def test_failed_invoice_customer_fallback_conflict_guard_real_postgres(self):
+        run_migrations(self.get_conn)
+        self.insert_recovery_user(
+            9701,
+            paid=True,
+            expiry_date=datetime.utcnow() + timedelta(days=10),
+            stripe_customer_id="cus_conflict",
+            stripe_subscription_id="sub_current",
+        )
+        self.assertFalse(import_main().should_apply_failed_invoice_to_user("sub_current", "sub_old"))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                    grace_period_end = GREATEST(
+                        COALESCE(grace_period_end, NOW()),
+                        NOW() + (48 * INTERVAL '1 hour')
+                    ),
+                    stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                WHERE stripe_customer_id = %s
+                  AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)
+                RETURNING telegram_id
+                """,
+                ("sub_old", "cus_conflict", "cus_conflict", "sub_old"),
+            )
+            self.assertIsNone(cur.fetchone())
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        row = self.query_one(
+            """
+            SELECT stripe_subscription_id, payment_failed, grace_period_end, paid, expiry_date
+            FROM users
+            WHERE telegram_id = 9701
+            """
+        )
+        self.assertEqual(row[0], "sub_current")
+        self.assertFalse(row[1])
+        self.assertIsNone(row[2])
+        self.assertTrue(row[3])
+        self.assertGreater(row[4], datetime.utcnow())
+
+    def test_failed_invoice_exact_subscription_match_real_postgres(self):
+        run_migrations(self.get_conn)
+        self.insert_recovery_user(
+            9702,
+            stripe_customer_id="cus_exact",
+            stripe_subscription_id="sub_exact",
+        )
+        self.assertTrue(import_main().should_apply_failed_invoice_to_user("sub_exact", "sub_exact"))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                    grace_period_end = GREATEST(
+                        COALESCE(grace_period_end, NOW()),
+                        NOW() + (48 * INTERVAL '1 hour')
+                    ),
+                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                WHERE stripe_subscription_id = %s
+                RETURNING telegram_id, payment_failed, grace_period_end
+                """,
+                ("cus_exact", "sub_exact"),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(row[0], 9702)
+        self.assertTrue(row[1])
+        self.assertIsNotNone(row[2])
+
+    def test_terminal_stripe_link_deactivation_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_customer_id, stripe_subscription_id, status, is_active
+                )
+                VALUES
+                    (9703, 'cus_terminal', 'sub_terminal', 'active', TRUE),
+                    (9703, 'cus_terminal', 'sub_other', 'active', TRUE)
+                """
+            )
+            main.mark_stripe_link_subscription_terminal(cur, "sub_terminal", "canceled")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        rows = self.query_all(
+            """
+            SELECT stripe_subscription_id, status, is_active
+            FROM stripe_links
+            WHERE telegram_id = 9703
+            ORDER BY stripe_subscription_id
+            """
+        )
+        self.assertEqual(rows, [
+            ("sub_other", "active", True),
+            ("sub_terminal", "canceled", False),
+        ])
 
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
@@ -462,54 +1090,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         self.insert_recovery_user(9104, stripe_subscription_id="sub_pending")
         self.insert_checkout_attempt(9104, hours_ago=25)
-        conn = self.get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                """
-                INSERT INTO stripe_links (
-                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                )
-                VALUES (
-                    %s,
-                    'sub_pending',
-                    'checkout_subscription_pending_invoice',
-                    FALSE,
-                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                )
-                """,
-                (9104,),
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+        self.insert_stripe_link(
+            9104,
+            subscription_id="sub_pending",
+            status="checkout_subscription_pending_invoice",
+            is_active=False,
+        )
         self.assertIn(9104, {row[0] for row in self.due_recovery_users()})
 
         self.insert_recovery_user(9105, stripe_subscription_id="sub_incomplete")
         self.insert_checkout_attempt(9105, hours_ago=25)
-        conn = self.get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                """
-                INSERT INTO stripe_links (
-                    telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                )
-                VALUES (
-                    %s,
-                    'sub_incomplete',
-                    'incomplete',
-                    FALSE,
-                    (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                )
-                """,
-                (9105,),
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+        self.insert_stripe_link(9105, subscription_id="sub_incomplete", status="incomplete", is_active=False)
         self.assertIn(9105, {row[0] for row in self.due_recovery_users()})
 
     def test_first_purchase_recovery_completed_subscription_checkout_without_payment_is_eligible(self):
@@ -553,6 +1144,72 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn(9601, due_ids)
         self.assertIn(9602, due_ids)
 
+    def test_first_purchase_recovery_unpaid_subscription_links_remain_eligible(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        for user_id, link_status in (
+            (9621, "incomplete"),
+            (9622, "past_due"),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+            self.insert_stripe_link(
+                user_id,
+                status=link_status,
+                is_active=main.stripe_link_active_for_status(link_status),
+            )
+
+        for user_id, link_status in (
+            (9623, "active"),
+            (9624, "trialing"),
+        ):
+            self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+            self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+            self.insert_stripe_link(
+                user_id,
+                status=link_status,
+                is_active=main.stripe_link_active_for_status(link_status),
+            )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for user_id, link_status in (
+                (9625, "incomplete"),
+                (9626, "active"),
+            ):
+                main.upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=f"cus_{user_id}",
+                    stripe_subscription_id=f"sub_updated_{user_id}",
+                    status=link_status,
+                    current_period_end=int(time.time()) + 86400,
+                    is_active=main.stripe_link_active_for_status(link_status),
+                    source="customer.subscription.updated",
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        due_ids = {row[0] for row in self.due_recovery_users()}
+        self.assertIn(9621, due_ids)
+        self.assertIn(9622, due_ids)
+        self.assertNotIn(9623, due_ids)
+        self.assertNotIn(9624, due_ids)
+        link_states = dict(self.query_all(
+            """
+            SELECT status, is_active
+            FROM stripe_links
+            WHERE stripe_subscription_id IN ('sub_updated_9625', 'sub_updated_9626')
+            ORDER BY stripe_subscription_id
+            """
+        ))
+        self.assertFalse(link_states["incomplete"])
+        self.assertTrue(link_states["active"])
+
     def test_first_purchase_recovery_completed_checkout_with_payment_proof_is_not_eligible(self):
         run_migrations(self.get_conn)
 
@@ -578,9 +1235,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         for user_id, link_status, is_active in (
-            (9613, "active", False),
-            (9614, "trialing", False),
-            (9615, "incomplete", True),
+            (9613, "active", True),
+            (9614, "trialing", True),
         ):
             self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
             self.insert_checkout_attempt(
@@ -589,28 +1245,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 status="completed",
                 mode="subscription",
             )
-            conn = self.get_conn()
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO stripe_links (
-                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                    )
-                    VALUES (
-                        %s,
-                        %s,
-                        %s,
-                        %s,
-                        (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
-                    )
-                    """,
-                    (user_id, f"sub_{user_id}", link_status, is_active),
-                )
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
+            self.insert_stripe_link(user_id, status=link_status, is_active=is_active)
 
         self.insert_recovery_user(9616)
         self.insert_checkout_attempt(9616, hours_ago=25, status="completed", mode="payment")
@@ -645,7 +1280,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         due_ids = {row[0] for row in self.due_recovery_users()}
-        for user_id in (9611, 9612, 9613, 9614, 9615, 9616):
+        for user_id in (9611, 9612, 9613, 9614, 9616):
             self.assertNotIn(user_id, due_ids)
 
     def test_first_purchase_recovery_success_states_and_newer_attempt_block_eligibility(self):
@@ -657,33 +1292,12 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn(9201, {row[0] for row in self.due_recovery_users()})
 
         for user_id, status, is_active, future_period in (
-            (9202, "active", False, True),
-            (9203, "trialing", False, False),
-            (9204, "past_due", True, True),
+            (9202, "active", True, True),
+            (9203, "trialing", True, False),
         ):
             self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
             self.insert_checkout_attempt(user_id, hours_ago=25)
-            conn = self.get_conn()
-            cur = conn.cursor()
-            try:
-                current_period_sql = (
-                    "(NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'"
-                    if future_period
-                    else "NULL"
-                )
-                cur.execute(
-                    f"""
-                    INSERT INTO stripe_links (
-                        telegram_id, stripe_subscription_id, status, is_active, current_period_end
-                    )
-                    VALUES (%s, %s, %s, %s, {current_period_sql})
-                    """,
-                    (user_id, f"sub_{user_id}", status, is_active),
-                )
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
+            self.insert_stripe_link(user_id, status=status, is_active=is_active, future_period=future_period)
             self.assertNotIn(user_id, {row[0] for row in self.due_recovery_users()})
 
         self.insert_recovery_user(9206)
@@ -903,6 +1517,431 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             cur.close()
             conn.close()
+
+    def test_first_purchase_recovery_scheduler_payload_context_boundary_and_dedupe(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        self.insert_recovery_user(9701)
+        self.insert_checkout_attempt(9701, hours_ago=23, status="expired", mode="payment")
+        self.insert_recovery_user(9702)
+        self.insert_checkout_attempt(9702, hours_ago=25, status="expired", mode="payment", tariff="sub_1")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+            second_result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 1, "enqueued": 1})
+        self.assertEqual(second_result, {"due": 0, "enqueued": 0})
+        self.assertIsNone(self.recovery_row(9701))
+        row = self.recovery_row(9702)
+        self.assertEqual(row[1], "pending")
+        payload = json.loads(row[8])
+        self.assertEqual(payload["text"], main.first_purchase_recovery_reminder_text())
+        self.assertEqual(payload["keyboard_kind"], "retry_payment")
+        self.assertEqual(payload["reason_category"], "checkout_expired")
+        self.assertEqual(payload["stage"], "checkout")
+        self.assertEqual(payload["tariff_code"], "sub_1")
+        self.assertNotIn("9702", payload["safe_ref"])
+
+    def test_first_purchase_recovery_scheduler_payload_uses_safe_checkout_error_contexts(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        for user_id, status, last_error, expected_category in (
+            (9710, "failed", "checkout.session.async_payment_failed", "checkout_async_payment_failed"),
+            (9711, "expired", "checkout.session.expired", "checkout_expired"),
+            (9712, "failed", "raw Stripe exception cus_raw in_raw person@example.com", "unknown_payment_error"),
+        ):
+            self.insert_recovery_user(user_id)
+            self.insert_checkout_attempt(
+                user_id,
+                hours_ago=25,
+                status=status,
+                mode="subscription",
+                last_error=last_error,
+            )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 3, "enqueued": 3})
+        for user_id, expected_category in (
+            (9710, "checkout_async_payment_failed"),
+            (9711, "checkout_expired"),
+            (9712, "unknown_payment_error"),
+        ):
+            payload = json.loads(self.recovery_row(user_id)[8])
+            self.assertEqual(payload["reason_category"], expected_category)
+            self.assertNotIn("cus_raw", json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("in_raw", json.dumps(payload, ensure_ascii=False))
+            self.assertNotIn("person@example.com", json.dumps(payload, ensure_ascii=False))
+
+    def test_first_purchase_recovery_invoice_failure_context_tokens_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        cases = (
+            (9720, None, "invoice_payment_failed", "invoice_payment_failed"),
+            (9721, "card_declined", "invoice_payment_failed:card_declined", "card_declined"),
+            (9722, "insufficient_funds", "invoice_payment_failed:insufficient_funds", "insufficient_funds"),
+            (9723, "authentication_required", "invoice_payment_failed:authentication_required", "authentication_required"),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for user_id, failure_code, token, _ in cases:
+                self.insert_recovery_user(user_id, stripe_subscription_id=f"sub_{user_id}")
+                self.insert_checkout_attempt(
+                    user_id,
+                    hours_ago=25,
+                    status="completed",
+                    mode="subscription",
+                    stripe_subscription_id=f"sub_{user_id}",
+                )
+                persisted_token, updated_checkout_id = (
+                    main.persist_first_purchase_recovery_invoice_failure_context(
+                        cur,
+                        user_id,
+                        f"sub_{user_id}",
+                        failure_code=failure_code,
+                    )
+                )
+                self.assertEqual(persisted_token, token)
+                self.assertIsNotNone(updated_checkout_id)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 4, "enqueued": 4})
+        for user_id, _, token, expected_category in cases:
+            checkout_error = self.query_one(
+                "SELECT last_error FROM checkout_sessions WHERE telegram_id = %s",
+                (user_id,),
+            )[0]
+            self.assertEqual(checkout_error, token)
+            payload = json.loads(self.recovery_row(user_id)[8])
+            self.assertEqual(payload["attempt_error_context"], token)
+            self.assertEqual(payload["reason_category"], expected_category)
+
+    def test_invoice_failure_context_prefers_exact_subscription_over_newer_null_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9725
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_exact_priority")
+        exact_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_exact_priority",
+        )
+        null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_exact_priority",
+                failure_code="card_declined",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed:card_declined")
+        self.assertEqual(updated_id, exact_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (exact_id, null_id),
+        )
+        self.assertEqual(dict(rows)[exact_id], "invoice_payment_failed:card_declined")
+        self.assertIsNone(dict(rows)[null_id])
+
+    def test_invoice_failure_context_uses_latest_null_when_no_exact_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9726
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_missing_exact")
+        older_null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+        latest_null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_missing_exact",
+                failure_code=None,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed")
+        self.assertEqual(updated_id, latest_null_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (older_null_id, latest_null_id),
+        )
+        self.assertIsNone(dict(rows)[older_null_id])
+        self.assertEqual(dict(rows)[latest_null_id], "invoice_payment_failed")
+
+    def test_invoice_failure_context_does_not_update_other_non_null_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9727
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_missing_exact")
+        other_sub_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_other",
+        )
+        null_id = self.insert_checkout_attempt(
+            user_id,
+            hours_ago=30,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token, updated_id = main.persist_first_purchase_recovery_invoice_failure_context(
+                cur,
+                user_id,
+                "sub_missing_exact",
+                failure_code="insufficient_funds",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(token, "invoice_payment_failed:insufficient_funds")
+        self.assertEqual(updated_id, null_id)
+        rows = self.query_all(
+            """
+            SELECT id, last_error
+            FROM checkout_sessions
+            WHERE id IN (%s, %s)
+            ORDER BY id
+            """,
+            (other_sub_id, null_id),
+        )
+        self.assertIsNone(dict(rows)[other_sub_id])
+        self.assertEqual(dict(rows)[null_id], "invoice_payment_failed:insufficient_funds")
+
+    def test_first_purchase_recovery_stale_invoice_does_not_change_context_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9724
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_current")
+        self.insert_checkout_attempt(
+            user_id,
+            hours_ago=25,
+            status="completed",
+            mode="subscription",
+            stripe_subscription_id="sub_current",
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO access_events (
+                    telegram_id, event_type, source, stripe_event_id, stripe_subscription_id, notes
+                )
+                VALUES (%s, 'ignored_stale_negative_event', 'invoice.payment_failed', %s, %s, %s)
+                """,
+                (user_id, "evt_stale_context", "sub_old", "stale invoice ignored before recovery context update"),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertIsNone(self.query_one(
+            "SELECT last_error FROM checkout_sessions WHERE telegram_id = %s",
+            (user_id,),
+        )[0])
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 1, "enqueued": 1})
+        payload = json.loads(self.recovery_row(user_id)[8])
+        self.assertEqual(payload["reason_category"], "payment_confirmation_pending")
+        self.assertEqual(payload["attempt_error_context"], "unknown")
+
+    def test_first_purchase_recovery_worker_success_creates_user_and_admin_deliveries_once(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9703
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_9703")
+        self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+        self.insert_stripe_link(
+            user_id,
+            subscription_id="sub_9703",
+            status="checkout_subscription_pending_invoice",
+            is_active=False,
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()):
+            first = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "sent")
+        admin_rows = self.query_all(
+            """
+            SELECT delivery_key, telegram_id, delivery_type, status, payload_json
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            ORDER BY telegram_id
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )
+        self.assertEqual(len(admin_rows), 2)
+        self.assertEqual([row[1] for row in admin_rows], [1, 2])
+        self.assertTrue(all(row[3] == "pending" for row in admin_rows))
+        self.assertEqual(len({row[0] for row in admin_rows}), 2)
+        for delivery_key, _, delivery_type, _, payload_json in admin_rows:
+            self.assertEqual(delivery_type, "stripe_admin_message")
+            payload = json.loads(payload_json)
+            self.assertEqual(payload["category"], "first_purchase_recovery_sent")
+            self.assertEqual(payload["severity"], "INFO")
+            self.assertIn("🔁 Повторная попытка оплаты предложена", payload["text"])
+            self.assertIn("Последняя попытка:", payload["text"])
+            self.assertIn("Напоминание: отправлено", payload["text"])
+            self.assertNotIn(str(user_id), delivery_key)
+
+    def test_first_purchase_recovery_retryable_failure_does_not_create_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9704
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row for row in self.due_recovery_users()}
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertTrue(main.enqueue_first_purchase_recovery_reminder(
+                cur,
+                user_id,
+                due[user_id][1],
+                main.first_purchase_recovery_row_context(due[user_id]),
+            ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["retryable_failed"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "failed")
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )[0], 0)
+
+    def test_first_purchase_recovery_blocked_user_does_not_create_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9705
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row for row in self.due_recovery_users()}
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_first_purchase_recovery_reminder(
+                cur,
+                user_id,
+                due[user_id][1],
+                main.first_purchase_recovery_row_context(due[user_id]),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "permanently_failed")
+        self.assertTrue(self.query_one("SELECT blocked_bot FROM users WHERE telegram_id = %s", (user_id,))[0])
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )[0], 0)
 
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
