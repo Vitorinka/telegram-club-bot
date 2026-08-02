@@ -816,6 +816,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_first_purchase_recovery_delay_is_fixed_twenty_four_hours(self):
         self.assertEqual(self.main.FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS, 24)
 
+    async def test_first_purchase_recovery_user_text_is_final_retry_offer(self):
+        self.assertEqual(
+            self.main.first_purchase_recovery_reminder_text(),
+            (
+                "Похоже, вчера оформление доступа не завершилось.\n\n"
+                "Мы всё проверили — сейчас можно попробовать ещё раз 🤍\n\n"
+                "Если снова что-то не получится, просто напишите нам, и мы поможем."
+            ),
+        )
+
     async def test_first_purchase_recovery_key_is_hashed_and_stable(self):
         first = self.main.first_purchase_recovery_delivery_key(123456789)
         second = self.main.first_purchase_recovery_delivery_key(123456789)
@@ -826,14 +836,17 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("payment_failed_at", first)
 
     async def test_first_purchase_recovery_due_query_uses_checkout_attempts_and_not_payment_failed(self):
-        conn = FakeConnection(fetches=[[(123, datetime(2026, 7, 30, 10, 0))]])
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session")
+        conn = FakeConnection(fetches=[[row]])
 
         due = self.main.fetch_due_first_purchase_recovery_users(conn.cursor_obj, limit=10)
 
-        self.assertEqual(due, [(123, datetime(2026, 7, 30, 10, 0))])
+        self.assertEqual(due, [row])
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("FROM checkout_sessions", sql)
         self.assertIn("FROM checkout_retry_events", sql)
+        self.assertIn("attempt_status", sql)
+        self.assertIn("attempt_source", sql)
         self.assertIn("status = ANY", sql)
         self.assertIn("NOW() AT TIME ZONE 'UTC'", sql)
         self.assertIn("payment_events", sql)
@@ -848,11 +861,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("sl.current_period_end >", sql)
 
     async def test_first_purchase_recovery_checkout_retry_event_without_payment_failed_is_eligible(self):
-        conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0))])
+        row = (123, datetime(2026, 7, 30, 10, 0), "sub_1", "checkout_retry_unresolved", "checkout_retry_event")
+        conn = FakeConnection(fetches=[row])
 
         row = self.main.fetch_first_purchase_recovery_user_if_due(conn.cursor_obj, 123)
 
-        self.assertEqual(row, (123, datetime(2026, 7, 30, 10, 0)))
+        self.assertEqual(row[0], 123)
+        self.assertEqual(row[3], "checkout_retry_unresolved")
+        self.assertEqual(row[4], "checkout_retry_event")
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("checkout_retry_events", sql)
         self.assertNotIn("payment_failed = TRUE", sql)
@@ -881,6 +897,126 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(params[2])
         self.assertEqual(payload["text"], self.main.first_purchase_recovery_reminder_text())
         self.assertEqual(payload["keyboard_kind"], "retry_payment")
+        self.assertEqual(payload["reason_category"], "unknown_payment_error")
+        self.assertEqual(payload["stage"], "checkout")
+        self.assertNotIn("123456789", payload["safe_ref"])
+
+    async def test_first_purchase_recovery_enqueue_stores_safe_attempt_context(self):
+        conn = FakeConnection(fetches=[("first_purchase_recovery:key",)])
+        context = self.main.first_purchase_recovery_context(
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            tariff_code="sub_1",
+            attempt_status="expired",
+            attempt_source="checkout_session",
+        )
+
+        self.main.enqueue_first_purchase_recovery_reminder(
+            conn.cursor_obj,
+            123456789,
+            datetime(2026, 7, 30, 10, 0),
+            context,
+        )
+
+        payload = json.loads(conn.cursor_obj.queries[0][1][2])
+        self.assertEqual(payload["reason_category"], "checkout_expired")
+        self.assertEqual(payload["reason_label"], "ссылка оплаты истекла")
+        self.assertEqual(payload["stage_label"], "Checkout")
+        self.assertEqual(payload["tariff_code"], "sub_1")
+        self.assertEqual(payload["attempt_status"], "expired")
+        self.assertEqual(payload["attempt_source"], "checkout_session")
+        self.assertNotIn("123456789", payload["safe_ref"])
+
+    async def test_first_purchase_recovery_admin_sent_notices_are_per_admin_and_stable(self):
+        recovery_key = self.main.first_purchase_recovery_delivery_key(123456789)
+        conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
+        payload = self.main.stripe_delivery_payload(
+            self.main.first_purchase_recovery_reminder_text(),
+            reason_label="ссылка оплаты истекла",
+            stage_label="Checkout",
+            tariff_code="sub_1",
+            safe_ref="first_purchase_recovery:abc123",
+        )
+
+        created = self.main.enqueue_first_purchase_recovery_admin_sent_notices(
+            conn.cursor_obj,
+            recovery_key,
+            123456789,
+            payload,
+        )
+
+        self.assertEqual(created, 2)
+        keys = [params[0] for query, params in conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
+        self.assertEqual(
+            keys,
+            [
+                self.main.first_purchase_recovery_admin_sent_delivery_key(recovery_key, 1),
+                self.main.first_purchase_recovery_admin_sent_delivery_key(recovery_key, 2),
+            ],
+        )
+        for query, params in conn.cursor_obj.queries:
+            if "INSERT INTO message_delivery_events" not in query:
+                continue
+            self.assertEqual(params[2], "stripe_admin_message")
+            admin_payload = json.loads(params[3])
+            self.assertEqual(admin_payload["category"], "first_purchase_recovery_sent")
+            self.assertEqual(admin_payload["severity"], "INFO")
+            self.assertIn("Напоминание о незавершённой первой оплате отправлено", admin_payload["text"])
+            self.assertNotIn("123456789", params[0])
+
+    async def test_first_purchase_recovery_success_enqueues_admin_after_user_send_and_closes_db_before_await(self):
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        payload = json.dumps({
+            "text": self.main.first_purchase_recovery_reminder_text(),
+            "keyboard_kind": "retry_payment",
+            "reason_label": "ссылка оплаты истекла",
+            "stage_label": "Checkout",
+            "tariff_code": "sub_1",
+            "safe_ref": "first_purchase_recovery:test",
+        })
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session")])
+        sent_conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
+        conns = iter([claim_conn, check_conn, sent_conn])
+        closed_before_send = []
+
+        async def send_after_close(*args, **kwargs):
+            closed_before_send.append((claim_conn.closed, check_conn.closed))
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_after_close)) as send_message:
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(closed_before_send, [(True, True)])
+        send_message.assert_awaited_once()
+        sql = "\n".join(query for query, _ in sent_conn.cursor_obj.queries)
+        self.assertIn("SAVEPOINT admin_payment_notification", sql)
+        delivery_keys = [params[0] for query, params in sent_conn.cursor_obj.queries if "INSERT INTO message_delivery_events" in query]
+        self.assertTrue(all(key.startswith("first_purchase_recovery_admin_sent:") for key in delivery_keys))
+        self.assertEqual(sent_conn.commits, 1)
+
+    async def test_first_purchase_recovery_user_failure_does_not_enqueue_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        delivery_key = self.main.first_purchase_recovery_delivery_key(123)
+        payload = json.dumps({"text": "retry", "keyboard_kind": "retry_payment"})
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        claim_conn = FakeConnection(fetches=[[delivery]])
+        check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), None, None, None)])
+        fail_conn = FakeConnection()
+        conns = iter([claim_conn, check_conn, fail_conn])
+
+        with patch.object(self.main, "get_db_conn", side_effect=lambda: next(conns)), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["retryable_failed"], 1)
+        sql = "\n".join(query for query, _ in fail_conn.cursor_obj.queries)
+        self.assertIn("UPDATE message_delivery_events", sql)
+        self.assertNotIn("first_purchase_recovery_admin_sent", sql)
 
     async def test_first_purchase_recovery_success_cancels_pending_failed_processing(self):
         conn = FakeConnection()

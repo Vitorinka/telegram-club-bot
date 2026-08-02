@@ -1494,6 +1494,158 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.close()
             conn.close()
 
+    def test_first_purchase_recovery_scheduler_payload_context_boundary_and_dedupe(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        self.insert_recovery_user(9701)
+        self.insert_checkout_attempt(9701, hours_ago=23, status="expired", mode="payment")
+        self.insert_recovery_user(9702)
+        self.insert_checkout_attempt(9702, hours_ago=25, status="expired", mode="payment", tariff="sub_1")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+            second_result = asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        self.assertEqual(result, {"due": 1, "enqueued": 1})
+        self.assertEqual(second_result, {"due": 0, "enqueued": 0})
+        self.assertIsNone(self.recovery_row(9701))
+        row = self.recovery_row(9702)
+        self.assertEqual(row[1], "pending")
+        payload = json.loads(row[8])
+        self.assertEqual(payload["text"], main.first_purchase_recovery_reminder_text())
+        self.assertEqual(payload["keyboard_kind"], "retry_payment")
+        self.assertEqual(payload["reason_category"], "checkout_expired")
+        self.assertEqual(payload["stage"], "checkout")
+        self.assertEqual(payload["tariff_code"], "sub_1")
+        self.assertNotIn("9702", payload["safe_ref"])
+
+    def test_first_purchase_recovery_worker_success_creates_user_and_admin_deliveries_once(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9703
+        self.insert_recovery_user(user_id, stripe_subscription_id="sub_9703")
+        self.insert_checkout_attempt(user_id, hours_ago=25, status="completed", mode="subscription")
+        self.insert_stripe_link(
+            user_id,
+            subscription_id="sub_9703",
+            status="checkout_subscription_pending_invoice",
+            is_active=False,
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            asyncio.run(main.enqueue_due_first_purchase_recovery_reminders(limit=50))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()):
+            first = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "sent")
+        admin_rows = self.query_all(
+            """
+            SELECT delivery_key, telegram_id, delivery_type, status, payload_json
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            ORDER BY telegram_id
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )
+        self.assertEqual(len(admin_rows), 2)
+        self.assertEqual([row[1] for row in admin_rows], [1, 2])
+        self.assertTrue(all(row[3] == "pending" for row in admin_rows))
+        self.assertEqual(len({row[0] for row in admin_rows}), 2)
+        for delivery_key, _, delivery_type, _, payload_json in admin_rows:
+            self.assertEqual(delivery_type, "stripe_admin_message")
+            payload = json.loads(payload_json)
+            self.assertEqual(payload["category"], "first_purchase_recovery_sent")
+            self.assertEqual(payload["severity"], "INFO")
+            self.assertIn("Напоминание о незавершённой первой оплате отправлено", payload["text"])
+            self.assertNotIn(str(user_id), delivery_key)
+
+    def test_first_purchase_recovery_retryable_failure_does_not_create_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9704
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row for row in self.due_recovery_users()}
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertTrue(main.enqueue_first_purchase_recovery_reminder(
+                cur,
+                user_id,
+                due[user_id][1],
+                main.first_purchase_recovery_row_context(due[user_id]),
+            ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["retryable_failed"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "failed")
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )[0], 0)
+
+    def test_first_purchase_recovery_blocked_user_does_not_create_admin_sent_notice(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9705
+        self.insert_recovery_user(user_id)
+        self.insert_checkout_attempt(user_id, hours_ago=25)
+        due = {row[0]: row for row in self.due_recovery_users()}
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_first_purchase_recovery_reminder(
+                cur,
+                user_id,
+                due[user_id][1],
+                main.first_purchase_recovery_row_context(due[user_id]),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["blocked"], 1)
+        self.assertEqual(self.recovery_row(user_id)[1], "permanently_failed")
+        self.assertTrue(self.query_one("SELECT blocked_bot FROM users WHERE telegram_id = %s", (user_id,))[0])
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE %s
+            """,
+            ("%first_purchase_recovery_sent%",),
+        )[0], 0)
+
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
         with tempfile.TemporaryDirectory() as tmp:

@@ -1460,8 +1460,148 @@ def first_purchase_recovery_delivery_key(telegram_id):
 
 def first_purchase_recovery_reminder_text():
     return (
-        "Похоже, оформление доступа не завершилось.\n\n"
-        "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь."
+        "Похоже, вчера оформление доступа не завершилось.\n\n"
+        "Мы всё проверили — сейчас можно попробовать ещё раз 🤍\n\n"
+        "Если снова что-то не получится, просто напишите нам, и мы поможем."
+    )
+
+
+FIRST_PURCHASE_RECOVERY_REASON_LABELS = {
+    "checkout_expired": "ссылка оплаты истекла",
+    "checkout_creation_failed": "не удалось создать ссылку оплаты",
+    "checkout_not_completed": "оформление доступа не завершилось",
+    "payment_confirmation_pending": "Checkout завершён, но успешная оплата не подтверждена",
+    "checkout_retry_unresolved": "предыдущая попытка оплаты осталась незавершённой",
+    "unknown_payment_error": "оплата не завершилась",
+}
+
+FIRST_PURCHASE_RECOVERY_STAGE_LABELS = {
+    "checkout_creation": "создание Checkout",
+    "checkout": "Checkout",
+    "payment_confirmation": "подтверждение оплаты",
+}
+
+
+def classify_first_purchase_recovery_attempt(attempt_status=None, attempt_source=None):
+    status = (attempt_status or "").lower()
+    source = (attempt_source or "").lower()
+    if source == "checkout_retry_event":
+        return "checkout_retry_unresolved", "checkout_creation"
+    if status == "expired":
+        return "checkout_expired", "checkout"
+    if status in ("failed", "creation_unknown"):
+        return "checkout_creation_failed", "checkout_creation"
+    if status == "completed":
+        return "payment_confirmation_pending", "payment_confirmation"
+    if status in ("creating", "open"):
+        return "checkout_not_completed", "checkout"
+    return "unknown_payment_error", "checkout"
+
+
+def first_purchase_recovery_context(
+    telegram_id,
+    latest_attempt_at,
+    tariff_code=None,
+    attempt_status=None,
+    attempt_source=None,
+):
+    reason_category, stage = classify_first_purchase_recovery_attempt(attempt_status, attempt_source)
+    attempted_at = latest_attempt_at.isoformat() if latest_attempt_at else None
+    safe_ref = safe_admin_context_reference(
+        "first_purchase_recovery",
+        telegram_id,
+        attempted_at,
+        tariff_code,
+        attempt_status,
+        attempt_source,
+        reason_category,
+    )
+    return {
+        "reason_category": reason_category,
+        "reason_label": FIRST_PURCHASE_RECOVERY_REASON_LABELS.get(
+            reason_category,
+            FIRST_PURCHASE_RECOVERY_REASON_LABELS["unknown_payment_error"],
+        ),
+        "stage": stage,
+        "stage_label": FIRST_PURCHASE_RECOVERY_STAGE_LABELS.get(stage, stage),
+        "tariff_code": tariff_code or "unknown",
+        "attempt_status": attempt_status or "unknown",
+        "attempt_source": attempt_source or "unknown",
+        "attempted_at": attempted_at,
+        "safe_ref": safe_ref,
+    }
+
+
+def first_purchase_recovery_row_context(row):
+    if not row:
+        return {}
+    telegram_id = row[0]
+    latest_attempt_at = row[1] if len(row) > 1 else None
+    tariff_code = row[2] if len(row) > 2 else None
+    attempt_status = row[3] if len(row) > 3 else None
+    attempt_source = row[4] if len(row) > 4 else None
+    return first_purchase_recovery_context(
+        telegram_id,
+        latest_attempt_at,
+        tariff_code=tariff_code,
+        attempt_status=attempt_status,
+        attempt_source=attempt_source,
+    )
+
+
+def first_purchase_recovery_admin_sent_delivery_key(recovery_delivery_key, admin_id):
+    return f"first_purchase_recovery_admin_sent:{safe_delivery_hash(recovery_delivery_key)}:{int(admin_id)}"
+
+
+def build_first_purchase_recovery_admin_sent_text(telegram_id, payload):
+    safe_ref = payload.get("safe_ref") or safe_admin_context_reference(
+        "first_purchase_recovery_sent",
+        telegram_id,
+        payload.get("attempted_at") or payload.get("latest_attempt_at"),
+    )
+    return (
+        "✅ Напоминание о незавершённой первой оплате отправлено\n\n"
+        f"Пользователь: {telegram_id}\n"
+        f"Этап: {payload.get('stage_label') or 'не определён'}\n"
+        f"Причина: {payload.get('reason_label') or 'не определена'}\n"
+        f"Тариф: {payload.get('tariff_code') or 'unknown'}\n"
+        f"Attempt ref: {safe_ref}"
+    )
+
+
+def enqueue_first_purchase_recovery_admin_sent_notices(cur, recovery_delivery_key, telegram_id, payload):
+    count = 0
+    safe_ref = payload.get("safe_ref") or safe_admin_context_reference(
+        "first_purchase_recovery_sent",
+        telegram_id,
+        payload.get("attempted_at") or payload.get("latest_attempt_at"),
+    )
+    text = build_first_purchase_recovery_admin_sent_text(telegram_id, {**payload, "safe_ref": safe_ref})
+    for admin_id in ADMIN_IDS:
+        if enqueue_message_delivery(
+            cur,
+            first_purchase_recovery_admin_sent_delivery_key(recovery_delivery_key, admin_id),
+            int(admin_id),
+            "stripe_admin_message",
+            stripe_delivery_payload(
+                text,
+                severity="INFO",
+                category="first_purchase_recovery_sent",
+                safe_ref=safe_ref,
+            ),
+        ):
+            count += 1
+    return count
+
+
+def enqueue_first_purchase_recovery_admin_sent_notices_safely(cur, recovery_delivery_key, telegram_id, payload):
+    safe_ref = payload.get("safe_ref") if isinstance(payload, dict) else None
+    return enqueue_admin_payment_notification_savepoint(
+        cur,
+        lambda: enqueue_first_purchase_recovery_admin_sent_notices(cur, recovery_delivery_key, telegram_id, payload),
+        purpose="first_purchase_recovery_sent",
+        category="first_purchase_recovery_sent",
+        safe_ref=safe_ref,
     )
 
 
@@ -1469,7 +1609,9 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
     delivery_clause = """
               AND (%s IS NULL OR md.delivery_key <> %s)
     """ if current_delivery_key else ""
-    select_clause = "COUNT(*)" if count_only else "u.telegram_id, la.latest_attempt_at"
+    select_clause = "COUNT(*)" if count_only else (
+        "u.telegram_id, la.latest_attempt_at, la.tariff_code, la.attempt_status, la.attempt_source"
+    )
     user_clause = "AND u.telegram_id = %s" if single_user else ""
     limit_clause = "" if single_user or count_only else "ORDER BY la.latest_attempt_at ASC LIMIT %s"
     return f"""
@@ -1477,12 +1619,19 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
             SELECT
                 telegram_id,
                 COALESCE(updated_at, created_at) AS attempt_at,
-                tariff_code
+                tariff_code,
+                status AS attempt_status,
+                'checkout_session' AS attempt_source
             FROM checkout_sessions
             WHERE telegram_id IS NOT NULL
               AND status = ANY(%s::text[])
             UNION ALL
-            SELECT telegram_id, attempt_at, tariff_code
+            SELECT
+                telegram_id,
+                attempt_at,
+                tariff_code,
+                'checkout_retry_unresolved' AS attempt_status,
+                'checkout_retry_event' AS attempt_source
             FROM checkout_retry_events
             WHERE telegram_id IS NOT NULL
               AND resolved_at IS NULL
@@ -1490,7 +1639,10 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
         latest_attempt AS (
             SELECT DISTINCT ON (telegram_id)
                 telegram_id,
-                attempt_at AS latest_attempt_at
+                attempt_at AS latest_attempt_at,
+                tariff_code,
+                attempt_status,
+                attempt_source
             FROM attempts
             WHERE attempt_at IS NOT NULL
               AND COALESCE(tariff_code, '') NOT ILIKE 'test%%'
@@ -1592,12 +1744,14 @@ def fetch_first_purchase_recovery_user_if_due(cur, telegram_id, current_delivery
     return cur.fetchone()
 
 
-def enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at):
+def enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at, context=None):
+    context = context or first_purchase_recovery_context(telegram_id, latest_attempt_at)
     payload_json = json.dumps(
         stripe_delivery_payload(
             first_purchase_recovery_reminder_text(),
             keyboard_kind="retry_payment",
             latest_attempt_at=latest_attempt_at.isoformat() if latest_attempt_at else None,
+            **context,
         ),
         ensure_ascii=False,
         sort_keys=True,
@@ -3012,8 +3166,14 @@ async def enqueue_due_first_purchase_recovery_reminders(limit=100):
     try:
         due_users = fetch_due_first_purchase_recovery_users(cur, limit=limit)
         enqueued = 0
-        for telegram_id, latest_attempt_at in due_users:
-            if enqueue_first_purchase_recovery_reminder(cur, telegram_id, latest_attempt_at):
+        for row in due_users:
+            telegram_id, latest_attempt_at = row[0], row[1]
+            if enqueue_first_purchase_recovery_reminder(
+                cur,
+                telegram_id,
+                latest_attempt_at,
+                first_purchase_recovery_row_context(row),
+            ):
                 enqueued += 1
         conn.commit()
         logging.info(
@@ -12070,6 +12230,13 @@ async def process_pending_message_deliveries(limit=25):
                         "invite link sent after payment",
                     ))
                 mark_delivery_sent(sent_cur, delivery_key)
+                if delivery_type == "first_purchase_recovery_reminder" and sending_user_message:
+                    enqueue_first_purchase_recovery_admin_sent_notices_safely(
+                        sent_cur,
+                        delivery_key,
+                        int(telegram_id),
+                        payload,
+                    )
                 sent_conn.commit()
             finally:
                 sent_cur.close()
