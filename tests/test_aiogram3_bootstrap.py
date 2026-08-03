@@ -624,12 +624,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_restore_access_command_user_not_found(self):
         message = FakeIncomingMessage(user_id=1)
         conn = FakeConnection(fetches=[None])
+        closed_during_reply = []
+
+        async def reply_after_close(text, **kwargs):
+            closed_during_reply.append(conn.closed)
+            message.replies.append((text, kwargs))
+
+        message.reply = reply_after_close
 
         with patch.object(self.main, "get_db_conn", return_value=conn):
             await self.main.restore_access_command(message, SimpleNamespace(args="123"))
 
         self.assertEqual(message.replies[0][0], "❌ Пользователь не найден в базе.")
         self.assertTrue(conn.closed)
+        self.assertEqual(closed_during_reply, [True])
 
     async def test_restore_access_command_creates_confirmation_with_user_state(self):
         message = FakeIncomingMessage(user_id=1)
@@ -644,6 +652,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             True,
         )
         conn = FakeConnection(fetches=[user])
+        closed_during_confirmation = []
+
+        async def reply_after_close(text, **kwargs):
+            closed_during_confirmation.append(conn.closed)
+            message.replies.append((text, kwargs))
+
+        message.reply = reply_after_close
 
         with patch.object(self.main, "get_db_conn", return_value=conn):
             await self.main.restore_access_command(message, SimpleNamespace(args="123"))
@@ -655,6 +670,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("paid: True", text)
         self.assertIn("stripe_subscription_id: sub_test", text)
         self.assertIn("reply_markup", kwargs)
+        self.assertEqual(closed_during_confirmation, [True])
+
+    async def test_has_restorable_group_access_requires_paid_future_expiry(self):
+        now = datetime(2026, 9, 1, 12, 0)
+        self.assertTrue(self.main.has_restorable_group_access(True, now + timedelta(days=1), now=now))
+        self.assertFalse(self.main.has_restorable_group_access(False, now + timedelta(days=1), now=now))
+        self.assertFalse(self.main.has_restorable_group_access(True, now - timedelta(seconds=1), now=now))
+        self.assertFalse(self.main.has_restorable_group_access(True, None, now=now))
 
     async def test_restore_access_active_db_member_does_not_extend_or_enqueue(self):
         expiry = datetime.utcnow() + timedelta(days=10)
@@ -779,6 +802,155 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("❌ Восстановление не выполнено", result["admin_message"])
                 self.assertFalse(any("UPDATE users" in query for query, _ in read_conn.cursor_obj.queries))
                 member.assert_not_awaited()
+
+    async def test_restore_access_grace_without_future_expiry_is_not_restorable(self):
+        expired = datetime.utcnow() - timedelta(days=1)
+        grace = datetime.utcnow() + timedelta(days=1)
+        user = (True, expired, True, grace, False, None, "cus_old", True)
+        read_conn = FakeConnection(fetches=[user])
+
+        with patch.object(self.main, "get_db_conn", return_value=read_conn), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock()) as to_thread, \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock()) as member:
+            result = await self.main.execute_confirmed_restore_access({
+                "telegram_id": 123,
+                "admin_id": 1,
+                "action_id": "act1",
+            })
+
+        self.assertFalse(result["restored"])
+        self.assertIn("Активный оплаченный период не подтверждён", result["admin_message"])
+        self.assertNotIn("очередь", result["admin_message"])
+        to_thread.assert_not_awaited()
+        member.assert_not_awaited()
+
+        key = "access-restore:act1:123"
+        payload = json.dumps({"effective_expiry": expired.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        recheck_conn = FakeConnection(fetches=[(True, expired, True, grace)])
+
+        with patch.object(self.main, "get_db_conn", side_effect=[claim_conn, recheck_conn]), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock()) as worker_member:
+            worker_result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(worker_result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        self.assertTrue(any("access_restore_inactive" in str(params) for _, params in recheck_conn.cursor_obj.queries))
+        worker_member.assert_not_awaited()
+
+    async def test_restore_access_active_stripe_fallback_after_grace_syncs_and_queues(self):
+        expired = datetime.utcnow() - timedelta(days=1)
+        grace = datetime.utcnow() + timedelta(days=1)
+        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        stripe_expiry = datetime.utcfromtimestamp(period_end)
+        user = (True, expired, True, grace, False, "sub_123", "cus_old", True)
+        read_conn = FakeConnection(fetches=[user])
+        sync_conn = FakeConnection()
+        enqueue_conn = FakeConnection(fetches=[("access-restore:act1:123",)])
+        subscription = SimpleNamespace(
+            status="trialing",
+            current_period_end=period_end,
+            customer="cus_new",
+            cancel_at_period_end=False,
+        )
+
+        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, sync_conn, enqueue_conn]), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="left"))):
+            result = await self.main.execute_confirmed_restore_access({
+                "telegram_id": 123,
+                "admin_id": 1,
+                "action_id": "act1",
+            })
+
+        self.assertTrue(result["delivery_created"])
+        update_params = next(params for query, params in sync_conn.cursor_obj.queries if "UPDATE users" in query)
+        self.assertEqual(update_params[0], stripe_expiry)
+
+    async def test_access_restore_worker_keeps_command_restorable_delivery(self):
+        key = "access-restore:act1:123"
+        expiry = datetime.utcnow() + timedelta(days=5)
+        payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        recheck_conn = FakeConnection(fetches=[(True, expiry, True, datetime.utcnow() + timedelta(days=1))])
+        already_conn = FakeConnection()
+
+        with patch.object(self.main, "get_db_conn", side_effect=[claim_conn, recheck_conn, already_conn]), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))):
+            result = await self.main.process_pending_message_deliveries(limit=1)
+
+        self.assertEqual(result["sent"], 1)
+        self.assertFalse(any("access_restore_inactive" in str(params) for _, params in recheck_conn.cursor_obj.queries))
+
+    async def test_restore_access_active_db_telegram_membership_error_message_is_specific(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        expiry = datetime.utcnow() + timedelta(days=10)
+        user = (True, expiry, False, None, False, "sub_123", "cus_123", True)
+        read_conn = FakeConnection(fetches=[user])
+
+        with patch.object(self.main, "get_db_conn", return_value=read_conn), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="bot is not admin raw"))):
+            result = await self.main.execute_confirmed_restore_access({
+                "telegram_id": 123,
+                "admin_id": 1,
+                "action_id": "act1",
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Оплаченный период подтверждён", result["admin_message"])
+        self.assertIn("Telegram-проверка", result["admin_message"])
+        self.assertNotIn("Активный оплаченный период не подтверждён", result["admin_message"])
+        self.assertNotIn("bot is not admin raw", result["admin_message"])
+
+    async def test_restore_access_stripe_synced_telegram_error_message_is_specific(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        user = (False, None, False, None, False, "sub_123", "cus_old", True)
+        read_conn = FakeConnection(fetches=[user])
+        sync_conn = FakeConnection()
+        subscription = SimpleNamespace(
+            status="active",
+            current_period_end=period_end,
+            customer="cus_new",
+            cancel_at_period_end=False,
+        )
+
+        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, sync_conn]), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="raw telegram failure"))):
+            result = await self.main.execute_confirmed_restore_access({
+                "telegram_id": 123,
+                "admin_id": 1,
+                "action_id": "act1",
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Stripe-данные синхронизированы", result["admin_message"])
+        self.assertNotIn("Данные пользователя не изменены", result["admin_message"])
+        self.assertNotIn("raw telegram failure", result["admin_message"])
+        self.assertTrue(any("UPDATE users" in query for query, _ in sync_conn.cursor_obj.queries))
+
+    async def test_restore_access_unban_permission_error_message_is_specific(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        expiry = datetime.utcnow() + timedelta(days=10)
+        user = (True, expiry, False, None, False, "sub_123", "cus_123", True)
+        read_conn = FakeConnection(fetches=[user])
+
+        with patch.object(self.main, "get_db_conn", return_value=read_conn), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="bot lacks rights raw"))):
+            result = await self.main.execute_confirmed_restore_access({
+                "telegram_id": 123,
+                "admin_id": 1,
+                "action_id": "act1",
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("бан не снят", result["admin_message"])
+        self.assertNotIn("Активный оплаченный период не подтверждён", result["admin_message"])
+        self.assertNotIn("bot lacks rights raw", result["admin_message"])
 
     async def test_access_restore_worker_rechecks_access_and_cancels_expired(self):
         key = "access-restore:act1:123"

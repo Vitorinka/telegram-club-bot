@@ -2035,7 +2035,7 @@ def enqueue_automatic_membership_repair(
     admin_action_id=None,
     reason=None,
 ):
-    if not effective_expiry or effective_expiry <= datetime.utcnow():
+    if not has_restorable_group_access(True, effective_expiry):
         return False
     if source == ACCESS_RESTORE_SOURCE_AUTO_SYNC:
         delivery_key = access_restore_auto_delivery_key("auto-sync", telegram_id, effective_expiry)
@@ -2090,8 +2090,14 @@ def member_has_group_access(member_status, restricted_has_access=True):
     )
 
 
-def restore_access_admin_message(kind, telegram_id, expiry_date=None):
+def has_restorable_group_access(paid, expiry_date, now=None):
+    now = now or datetime.utcnow()
+    return bool(paid) and bool(expiry_date) and expiry_date > now
+
+
+def restore_access_admin_message(kind, telegram_id, expiry_date=None, safe_ref=None):
     expiry_text = expiry_date.strftime("%d.%m.%Y") if expiry_date else "нет"
+    ref_text = f"\nref: {safe_ref}" if safe_ref else ""
     if kind == "already_member":
         return (
             "✅ Доступ подтверждён\n\n"
@@ -2105,6 +2111,41 @@ def restore_access_admin_message(kind, telegram_id, expiry_date=None):
             f"telegram_id: {telegram_id}\n"
             f"Доступ до: {expiry_text}\n"
             "Пользователь получит одноразовую ссылку после повторной проверки."
+        )
+    if kind == "telegram_membership_check_failed":
+        return (
+            "⚠️ Оплаченный период подтверждён, но Telegram-проверка не завершилась\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"Доступ до: {expiry_text}\n"
+            "Бот не смог проверить, находится ли пользователь в закрытом клубе. "
+            "Проверьте права бота в группе и повторите /restore_access."
+            f"{ref_text}"
+        )
+    if kind == "telegram_unban_failed":
+        return (
+            "⚠️ Оплаченный период подтверждён, но бан не снят\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"Доступ до: {expiry_text}\n"
+            "Бот не смог снять бан в закрытом клубе. Проверьте права бота и повторите /restore_access."
+            f"{ref_text}"
+        )
+    if kind == "stripe_synced_telegram_check_failed":
+        return (
+            "⚠️ Stripe-данные синхронизированы, но Telegram-проверка не завершилась\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"Доступ до: {expiry_text}\n"
+            "paid/expiry_date уже обновлены по активной подписке Stripe. "
+            "Бот не смог проверить членство в группе; проверьте права бота и повторите /restore_access."
+            f"{ref_text}"
+        )
+    if kind == "stripe_synced_telegram_unban_failed":
+        return (
+            "⚠️ Stripe-данные синхронизированы, но бан не снят\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"Доступ до: {expiry_text}\n"
+            "paid/expiry_date уже обновлены по активной подписке Stripe. "
+            "Бот не смог снять бан; проверьте права бота и повторите /restore_access."
+            f"{ref_text}"
         )
     return (
         "❌ Восстановление не выполнено\n\n"
@@ -6688,32 +6729,36 @@ async def restore_access_command(message: types.Message, command: CommandObject)
         await message.reply("⚠️ telegram_id должен быть числом.")
         return
 
+    reply_text = None
+    confirmation_data = None
     conn = get_db_conn()
     cur = conn.cursor()
     try:
         user = fetch_restore_access_user(cur, target_user_id)
         if not user:
-            await message.reply("❌ Пользователь не найден в базе.")
-            return
-        action_id = make_action_request(
-            cur,
-            message.from_user.id,
-            "restore_access",
-            {
-                "telegram_id": target_user_id,
-                "admin_id": message.from_user.id,
-            },
-        )
-        conn.commit()
+            reply_text = "❌ Пользователь не найден в базе."
+        else:
+            action_id = make_action_request(
+                cur,
+                message.from_user.id,
+                "restore_access",
+                {
+                    "telegram_id": target_user_id,
+                    "admin_id": message.from_user.id,
+                },
+            )
+            confirmation_data = (action_id, restore_access_user_summary(target_user_id, user))
+            conn.commit()
     finally:
         cur.close()
         conn.close()
 
-    await send_admin_action_confirmation(
-        message,
-        action_id,
-        restore_access_user_summary(target_user_id, user),
-    )
+    if reply_text:
+        await message.reply(reply_text)
+        return
+
+    action_id, summary = confirmation_data
+    await send_admin_action_confirmation(message, action_id, summary)
 
 
 @router.message(Command('sync_stripe_user'), StateFilter('*'))
@@ -11446,11 +11491,12 @@ async def execute_confirmed_restore_access(payload):
             "status": "completed",
             "telegram_id": telegram_id,
             "restored": False,
-            "admin_message": restore_access_admin_message("no_active", telegram_id),
+            "admin_message": restore_access_admin_message("no_active_access", telegram_id),
         }
 
     paid, expiry_date, payment_failed, grace_period_end = user[:4]
-    if has_active_access(paid, expiry_date, payment_failed, grace_period_end):
+    stripe_synced = False
+    if has_restorable_group_access(paid, expiry_date):
         effective_expiry = expiry_date
     else:
         stripe_result = await sync_restore_access_from_stripe(
@@ -11466,24 +11512,38 @@ async def execute_confirmed_restore_access(payload):
                 "restored": False,
                 "reason": stripe_result.get("reason"),
                 "safe_ref": stripe_result.get("safe_ref"),
-                "admin_message": restore_access_admin_message("no_active", telegram_id),
+                "admin_message": restore_access_admin_message("no_active_access", telegram_id),
             }
         effective_expiry = stripe_result["expiry_date"]
+        stripe_synced = True
 
     try:
         member = await bot.get_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
         member_status = getattr(member, "status", None)
         restricted_has_access = getattr(member, "is_member", True)
     except (TelegramNetworkError, TelegramRetryAfter) as e:
-        raise RuntimeError(f"restore_access_membership_check_retryable:{safe_admin_error_reference('restore_access_membership_check', e)}") from e
-    except (TelegramForbiddenError, TelegramBadRequest) as e:
+        safe_ref = safe_admin_error_reference("restore_access_membership_check", e)
+        kind = "stripe_synced_telegram_check_failed" if stripe_synced else "telegram_membership_check_failed"
         return {
-            "status": "completed",
+            "status": "failed",
+            "telegram_id": telegram_id,
+            "restored": False,
+            "reason": "telegram_membership_check_retryable",
+            "safe_ref": safe_ref,
+            "expiry_date": str(effective_expiry),
+            "admin_message": restore_access_admin_message(kind, telegram_id, effective_expiry, safe_ref=safe_ref),
+        }
+    except (TelegramForbiddenError, TelegramBadRequest) as e:
+        safe_ref = safe_admin_error_reference("restore_access_membership_check", e)
+        kind = "stripe_synced_telegram_check_failed" if stripe_synced else "telegram_membership_check_failed"
+        return {
+            "status": "failed",
             "telegram_id": telegram_id,
             "restored": False,
             "reason": "telegram_group_permission_failed",
-            "safe_ref": safe_admin_error_reference("restore_access_membership_check", e),
-            "admin_message": restore_access_admin_message("no_active", telegram_id),
+            "safe_ref": safe_ref,
+            "expiry_date": str(effective_expiry),
+            "admin_message": restore_access_admin_message(kind, telegram_id, effective_expiry, safe_ref=safe_ref),
         }
 
     if member_has_group_access(member_status, restricted_has_access):
@@ -11507,16 +11567,29 @@ async def execute_confirmed_restore_access(payload):
         try:
             await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=telegram_id)
         except (TelegramNetworkError, TelegramRetryAfter) as e:
-            raise RuntimeError(f"restore_access_unban_retryable:{safe_admin_error_reference('restore_access_unban', e)}") from e
+            safe_ref = safe_admin_error_reference("restore_access_unban", e)
+            kind = "stripe_synced_telegram_unban_failed" if stripe_synced else "telegram_unban_failed"
+            return {
+                "status": "failed",
+                "telegram_id": telegram_id,
+                "restored": False,
+                "reason": "telegram_unban_retryable",
+                "safe_ref": safe_ref,
+                "expiry_date": str(effective_expiry),
+                "admin_message": restore_access_admin_message(kind, telegram_id, effective_expiry, safe_ref=safe_ref),
+            }
         except (TelegramForbiddenError, TelegramBadRequest) as e:
             if not is_benign_rejoin_unban_error(e):
+                safe_ref = safe_admin_error_reference("restore_access_unban", e)
+                kind = "stripe_synced_telegram_unban_failed" if stripe_synced else "telegram_unban_failed"
                 return {
-                    "status": "completed",
+                    "status": "failed",
                     "telegram_id": telegram_id,
                     "restored": False,
                     "reason": "telegram_unban_permission_failed",
-                    "safe_ref": safe_admin_error_reference("restore_access_unban", e),
-                    "admin_message": restore_access_admin_message("no_active", telegram_id),
+                    "safe_ref": safe_ref,
+                    "expiry_date": str(effective_expiry),
+                    "admin_message": restore_access_admin_message(kind, telegram_id, effective_expiry, safe_ref=safe_ref),
                 }
 
     conn = get_db_conn()
@@ -12666,7 +12739,7 @@ async def process_pending_message_deliveries(limit=25):
                         recheck_conn.commit()
                         continue
                     paid, db_expiry, payment_failed, grace_period_end = access_row
-                    if not has_active_access(paid, db_expiry, payment_failed, grace_period_end) or not db_expiry or db_expiry <= datetime.utcnow():
+                    if not has_restorable_group_access(paid, db_expiry):
                         mark_delivery_cancelled(recheck_cur, delivery_key, "access_restore_inactive")
                         record_access_event_cur(
                             recheck_cur,
