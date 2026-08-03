@@ -290,6 +290,8 @@ MIGRATION_BASELINE_REQUIREMENTS = {
                 "token_version",
                 "stripe_session_id",
                 "stripe_payment_intent_id",
+                "checkout_url",
+                "checkout_expires_at",
                 "amount_total",
                 "currency",
                 "paid_at",
@@ -302,6 +304,7 @@ MIGRATION_BASELINE_REQUIREMENTS = {
                 "created_at",
                 "updated_at",
                 "last_error",
+                "last_error_category",
             ),
             "gift_certificate_templates": (
                 "tariff_code",

@@ -1,9 +1,11 @@
 import os
 import logging
 import asyncio
+import base64
 import io
 import json
 import hashlib
+import hmac
 import html
 import secrets
 import shutil
@@ -203,16 +205,23 @@ GIFT_TARIFFS = {
 GIFT_NAME_LIMIT = 80
 GIFT_MESSAGE_LIMIT = 300
 GIFT_TOKEN_PREFIX = "gift_"
+GIFT_TOKEN_SECRET_ENV = "GIFT_TOKEN_SECRET"
 GIFT_CERTIFICATE_BUYER = "gift_certificate_buyer"
 GIFT_CERTIFICATE_RECIPIENT = "gift_certificate_recipient"
 GIFT_TEXT_DELIVERY_TYPES = {
+    "gift_paid_buyer",
+    "gift_checkout_expired_buyer",
+    "gift_checkout_failed_buyer",
     "gift_redeemed_buyer",
     "gift_redeemed_recipient",
     "gift_reserved_buyer",
     "gift_reserved_recipient",
+    "gift_refunded_buyer",
+    "gift_refunded_recipient",
     "gift_admin_success",
     "gift_admin_redeemed",
     "gift_admin_problem",
+    "gift_admin_refund",
 }
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
@@ -1142,12 +1151,51 @@ def gift_sender_default_name(telegram_user):
     return sanitize_gift_text(getattr(telegram_user, "full_name", None) or "Ваш друг", GIFT_NAME_LIMIT)
 
 
+def gift_token_secret():
+    return os.getenv(GIFT_TOKEN_SECRET_ENV) or ""
+
+
 def gift_token_hash(token):
     return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
 
-def generate_gift_token():
-    return secrets.token_urlsafe(32)
+def _gift_b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _gift_b64url_decode(value):
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def generate_gift_token(public_reference, token_version):
+    secret = gift_token_secret()
+    if not secret:
+        raise ValueError("gift_token_secret_missing")
+    payload = f"{public_reference}.{int(token_version)}"
+    signature = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    return f"{_gift_b64url_encode(payload.encode('utf-8'))}.{_gift_b64url_encode(signature[:24])}"
+
+
+def parse_gift_token(token):
+    secret = gift_token_secret()
+    if not secret or not token:
+        return None
+    try:
+        payload_part, signature_part = str(token).split(".", 1)
+        payload = _gift_b64url_decode(payload_part).decode("utf-8")
+        public_reference, version_text = payload.rsplit(".", 1)
+        token_version = int(version_text)
+        expected = generate_gift_token(public_reference, token_version).split(".", 1)[1]
+    except Exception:
+        return None
+    if not hmac.compare_digest(signature_part, expected):
+        return None
+    return public_reference, token_version
+
+
+def gift_token_hash_for_reference(public_reference, token_version):
+    return gift_token_hash(generate_gift_token(public_reference, token_version))
 
 
 def gift_public_reference():
@@ -1165,7 +1213,7 @@ def gift_safe_user_text(value):
     return html.escape(value or "", quote=False)
 
 
-def gift_certificate_caption(row, deep_link):
+def gift_certificate_caption(row):
     recipient = gift_safe_user_text(row.get("recipient_name") or "для вас")
     sender = gift_safe_user_text(row.get("sender_name") or "друга")
     message = gift_safe_user_text(row.get("gift_message"))
@@ -1179,12 +1227,13 @@ def gift_certificate_caption(row, deep_link):
     if message:
         lines.extend(["", message])
     lines.extend(["", "Активировать подарок можно по кнопке ниже."])
-    return "\n".join(lines), inline_keyboard([[
-        InlineKeyboardButton(text="🎁 Активировать подарок", url=deep_link)
-    ]])
+    return "\n".join(lines)
 
 
-def gift_delivery_key(public_reference, purpose, recipient_id=None):
+def gift_delivery_key(public_reference, purpose, recipient_id=None, token_version=None, recipient_kind=None):
+    if purpose in (GIFT_CERTIFICATE_BUYER, GIFT_CERTIFICATE_RECIPIENT):
+        kind = recipient_kind or ("buyer" if purpose == GIFT_CERTIFICATE_BUYER else "recipient")
+        return f"gift:{public_reference}:certificate:{kind}:v{int(token_version)}"
     suffix = f":{int(recipient_id)}" if recipient_id is not None else ""
     return f"gift:{public_reference}:{purpose}{suffix}"
 
@@ -1195,8 +1244,7 @@ def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payl
             delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
         )
         VALUES (%s, %s, %s, 'pending', 0, NULL, %s, NOW())
-        ON CONFLICT (delivery_key) DO UPDATE SET
-            delivery_key = message_delivery_events.delivery_key
+        ON CONFLICT (delivery_key) DO NOTHING
         RETURNING delivery_key
     """, (delivery_key, int(telegram_id), delivery_type, json.dumps(payload, ensure_ascii=False, sort_keys=True)))
     return cur.fetchone() is not None
@@ -1205,7 +1253,7 @@ def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payl
 def enqueue_gift_text_delivery(cur, public_reference, telegram_id, purpose, text, **extra):
     return enqueue_message_delivery(
         cur,
-        gift_delivery_key(public_reference, purpose, telegram_id if purpose.startswith("admin") else None),
+        gift_delivery_key(public_reference, purpose, telegram_id if purpose.startswith("gift_admin_") else None),
         int(telegram_id),
         purpose,
         stripe_delivery_payload(text, **extra),
@@ -1228,12 +1276,12 @@ def enqueue_gift_admin_delivery(cur, public_reference, purpose, text, severity="
     return count
 
 
-def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type, token=None):
-    token = token or row.get("token")
-    if not token:
-        raise ValueError("gift_certificate_token_missing")
-    deep_link = gift_deep_link(token)
-    caption, keyboard = gift_certificate_caption(row, deep_link)
+def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
+    token_version = int(row["token_version"])
+    token_hash = gift_token_hash_for_reference(row["public_reference"], token_version)
+    if not hmac.compare_digest(str(row.get("token_hash") or ""), token_hash):
+        raise ValueError("gift_certificate_token_hash_mismatch")
+    caption = gift_certificate_caption(row)
     cur.execute(
         "SELECT file_id FROM gift_certificate_templates WHERE tariff_code = %s AND active IS TRUE",
         (row["tariff_code"],),
@@ -1243,15 +1291,22 @@ def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type, toke
         raise ValueError("gift_certificate_template_missing")
     return enqueue_message_delivery(
         cur,
-        gift_delivery_key(row["public_reference"], delivery_type),
+        gift_delivery_key(
+            row["public_reference"],
+            delivery_type,
+            token_version=token_version,
+            recipient_kind="buyer" if delivery_type == GIFT_CERTIFICATE_BUYER else "recipient",
+        ),
         int(telegram_id),
         delivery_type,
         {
+            "public_reference": row["public_reference"],
+            "token_version": token_version,
+            "recipient_kind": "buyer" if delivery_type == GIFT_CERTIFICATE_BUYER else "recipient",
             "photo_file_id": template[0],
             "caption": caption,
             "parse_mode": "HTML",
             "button_text": "🎁 Активировать подарок",
-            "button_url": deep_link,
         },
     )
 
@@ -1300,8 +1355,21 @@ def fetch_gift_by_token_hash(cur, token_hash, for_update=False):
     return gift_row_dict(cur, cur.fetchone())
 
 
+def fetch_gift_by_public_reference_version(cur, public_reference, token_version, for_update=False):
+    lock_sql = " FOR UPDATE" if for_update else ""
+    cur.execute(f"""
+        SELECT *
+        FROM gift_access_grants
+        WHERE public_reference = %s
+          AND token_version = %s
+        {lock_sql}
+    """, (public_reference, int(token_version)))
+    return gift_row_dict(cur, cur.fetchone())
+
+
 def gift_configuration_status(cur=None):
     missing_prices = [name for name in gift_required_price_envs() if not os.getenv(name)]
+    missing_secrets = [] if gift_token_secret() else [GIFT_TOKEN_SECRET_ENV]
     template_count = 0
     owns_conn = cur is None
     conn = None
@@ -1321,8 +1389,9 @@ def gift_configuration_status(cur=None):
             cur.close()
             conn.close()
     return {
-        "configured": not missing_prices and template_count == len(GIFT_TARIFFS),
+        "configured": not missing_prices and not missing_secrets and template_count == len(GIFT_TARIFFS),
         "missing_prices": missing_prices,
+        "missing_secrets": missing_secrets,
         "template_count": template_count,
         "required_template_count": len(GIFT_TARIFFS),
     }
@@ -1373,12 +1442,12 @@ def build_gift_preview_text(data):
 
 
 def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message):
-    token = generate_gift_token()
     gift_id = str(uuid.uuid4())
     public_reference = gift_public_reference()
     duration_days = gift_duration_days(tariff_code)
     if not duration_days:
         raise ValueError("invalid_gift_tariff")
+    token_hash = gift_token_hash_for_reference(public_reference, 1)
     cur.execute("""
         INSERT INTO gift_access_grants (
             id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
@@ -1395,36 +1464,69 @@ def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipien
         gift_message,
         tariff_code,
         duration_days,
-        gift_token_hash(token),
+        token_hash,
     ))
     row = gift_row_dict(cur, cur.fetchone())
-    row["token"] = token
     record_gift_event(cur, row, "checkout_draft_created", purchaser_telegram_id, source="gift_fsm")
     return row
 
 
-def mark_gift_checkout_open(cur, gift_id, expected_status, session_id, checkout_url):
+def find_or_create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message):
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET status = 'cancelled',
+            cancelled_at = NOW(),
+            last_error = 'checkout_expired_local',
+            last_error_category = 'checkout_expired_local',
+            updated_at = NOW()
+        WHERE purchaser_telegram_id = %s
+          AND tariff_code = %s
+          AND status = 'checkout_open'
+          AND checkout_expires_at IS NOT NULL
+          AND checkout_expires_at <= NOW()
+    """, (int(purchaser_telegram_id), tariff_code))
+    cur.execute("""
+        SELECT *
+        FROM gift_access_grants
+        WHERE purchaser_telegram_id = %s
+          AND tariff_code = %s
+          AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+        ORDER BY created_at
+        LIMIT 1
+        FOR UPDATE
+    """, (int(purchaser_telegram_id), tariff_code))
+    existing = gift_row_dict(cur, cur.fetchone())
+    if existing:
+        return existing, True
+    return create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message), False
+
+
+def mark_gift_checkout_open(cur, gift_id, expected_status, session_id, checkout_url, checkout_expires_at=None):
     cur.execute("""
         UPDATE gift_access_grants
         SET stripe_session_id = %s,
+            checkout_url = %s,
+            checkout_expires_at = CASE WHEN %s IS NULL THEN checkout_expires_at ELSE to_timestamp(%s) AT TIME ZONE 'UTC' END,
             status = 'checkout_open',
             updated_at = NOW()
         WHERE id = %s
           AND status = %s
         RETURNING *
-    """, (session_id, gift_id, expected_status))
+    """, (session_id, checkout_url, checkout_expires_at, checkout_expires_at, gift_id, expected_status))
     return gift_row_dict(cur, cur.fetchone())
 
 
 def mark_gift_checkout_failed(cur, gift_id, error_text):
+    category = classify_payment_problem(exception=error_text)["category"]
     cur.execute("""
         UPDATE gift_access_grants
         SET status = 'checkout_pending',
-            last_error = LEFT(%s, 500),
+            last_error = %s,
+            last_error_category = %s,
             updated_at = NOW()
         WHERE id = %s
           AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
-    """, (str(error_text), gift_id))
+    """, (category, category, gift_id))
 
 
 def gift_payment_metadata_valid(metadata, gift_row, session):
@@ -1435,7 +1537,159 @@ def gift_payment_metadata_valid(metadata, gift_row, session):
         and metadata.get("tariff_code") == gift_row["tariff_code"]
         and metadata.get("duration_days") == str(gift_row["duration_days"])
         and (stripe_value(session, "mode") == "payment")
+        and (stripe_value(session, "payment_status") == "paid")
     )
+
+
+def validate_gift_payment_proof(session, line_item, price, gift_row):
+    metadata = stripe_value(session, "metadata") or {}
+    if not gift_payment_metadata_valid(metadata, gift_row, session):
+        return False
+    if stripe_value(session, "id") != gift_row.get("stripe_session_id"):
+        return False
+    if str(stripe_value(session, "client_reference_id")) != str(gift_row["purchaser_telegram_id"]):
+        return False
+    if int(stripe_value(line_item, "quantity") or 0) != 1:
+        return False
+    expected_price_id = gift_price_id(gift_row["tariff_code"])
+    if stripe_value(price, "id") != expected_price_id:
+        return False
+    if stripe_value(price, "type") != "one_time":
+        return False
+    if stripe_value(price, "active") is not True:
+        return False
+    amount_total = stripe_value(session, "amount_total")
+    currency = stripe_value(session, "currency")
+    if not isinstance(amount_total, int) or amount_total <= 0:
+        return False
+    if stripe_value(price, "unit_amount") != amount_total:
+        return False
+    if stripe_value(price, "currency") != currency:
+        return False
+    return True
+
+
+def _stripe_collection_first(value):
+    data = stripe_value(value, "data")
+    if data and len(data) == 1:
+        return data[0]
+    if data and len(data) != 1:
+        raise ValueError("gift_checkout_line_item_count_mismatch")
+    return None
+
+
+def fetch_gift_checkout_payment_proof(session_id):
+    session = stripe.checkout.Session.retrieve(session_id, expand=["line_items"])
+    line_item = _stripe_collection_first(stripe_value(session, "line_items"))
+    if not line_item:
+        listed = stripe.checkout.Session.list_line_items(session_id, limit=2)
+        data = stripe_value(listed, "data") or []
+        if len(data) != 1:
+            raise ValueError("gift_checkout_line_item_count_mismatch")
+        line_item = data[0]
+    price = stripe_value(line_item, "price")
+    price_id = get_stripe_object_id(price)
+    if isinstance(price, str) or not stripe_value(price, "type"):
+        price = stripe.Price.retrieve(price_id)
+    return session, line_item, price
+
+
+def cancel_gift_certificate_deliveries_for_version(cur, public_reference, token_version, reason):
+    for delivery_type, kind in ((GIFT_CERTIFICATE_BUYER, "buyer"), (GIFT_CERTIFICATE_RECIPIENT, "recipient")):
+        mark_delivery_cancelled(
+            cur,
+            gift_delivery_key(public_reference, delivery_type, token_version=token_version, recipient_kind=kind),
+            reason,
+        )
+
+
+def gift_refund_amount_from_event(event_type, event_object):
+    if event_type == "charge.refunded":
+        payment_intent = get_stripe_object_id(stripe_value(event_object, "payment_intent"))
+        amount_refunded = stripe_value(event_object, "amount_refunded") or 0
+        charge_amount = stripe_value(event_object, "amount") or 0
+        is_full = bool(stripe_value(event_object, "refunded")) and amount_refunded >= charge_amount > 0
+        return payment_intent, amount_refunded, is_full
+    payment_intent = get_stripe_object_id(stripe_value(event_object, "payment_intent"))
+    amount = stripe_value(event_object, "amount") or 0
+    status = stripe_value(event_object, "status")
+    return payment_intent, amount, status == "succeeded"
+
+
+def apply_gift_refund_event(cur, event_id, event_type, event_object, gift_row):
+    payment_intent, refund_amount, event_full_refund = gift_refund_amount_from_event(event_type, event_object)
+    if not payment_intent or payment_intent != gift_row.get("stripe_payment_intent_id"):
+        raise ValueError("gift_refund_payment_intent_mismatch")
+    gift_amount = int(gift_row.get("amount_total") or 0)
+    full_refund = bool(event_full_refund and gift_amount and int(refund_amount or 0) >= gift_amount)
+    partial_refund = bool(refund_amount and (not full_refund))
+    if gift_row["status"] in ("refunded", "review_required"):
+        record_gift_event(cur, gift_row, f"{event_type}_duplicate_ignored", gift_row.get("purchaser_telegram_id"), source="stripe_webhook")
+        return gift_row
+    if full_refund and gift_row["status"] in ("paid_unclaimed", "reserved"):
+        new_version = int(gift_row["token_version"]) + 1
+        new_hash = gift_token_hash_for_reference(gift_row["public_reference"], new_version)
+        cancel_gift_certificate_deliveries_for_version(cur, gift_row["public_reference"], gift_row["token_version"], "gift_refunded")
+        cur.execute("""
+            UPDATE gift_access_grants
+            SET status = 'refunded',
+                refunded_at = COALESCE(refunded_at, NOW()),
+                token_version = %s,
+                token_hash = %s,
+                updated_at = NOW()
+            WHERE id = %s
+              AND status IN ('paid_unclaimed', 'reserved')
+            RETURNING *
+        """, (new_version, new_hash, gift_row["id"]))
+        updated = gift_row_dict(cur, cur.fetchone())
+        if not updated:
+            return gift_row
+        record_gift_event(cur, updated, "gift_refunded", updated["purchaser_telegram_id"], source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
+        enqueue_gift_text_delivery(
+            cur,
+            updated["public_reference"],
+            updated["purchaser_telegram_id"],
+            "gift_refunded_buyer",
+            "🎁 Возврат по подарку подтверждён. Сертификат больше не активен.",
+        )
+        if updated.get("recipient_telegram_id"):
+            enqueue_gift_text_delivery(
+                cur,
+                updated["public_reference"],
+                updated["recipient_telegram_id"],
+                "gift_refunded_recipient",
+                "🎁 По подарку оформлен возврат, поэтому доступ по нему не будет активирован.",
+            )
+        enqueue_gift_admin_delivery(
+            cur,
+            updated["public_reference"],
+            "gift_admin_refund",
+            gift_admin_text("🎁 Gift refunded before redemption", updated, extra=f"event: {event_type}"),
+            severity="WARNING",
+        )
+        return updated
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET status = 'review_required',
+            updated_at = NOW(),
+            last_error = %s,
+            last_error_category = %s
+        WHERE id = %s
+          AND status IN ('paid_unclaimed', 'reserved', 'redeemed')
+        RETURNING *
+    """, ("gift_refund_requires_review", "gift_refund_requires_review", gift_row["id"]))
+    updated = gift_row_dict(cur, cur.fetchone()) or gift_row
+    event_name = "gift_refund_after_redeemed_review_required" if gift_row["status"] == "redeemed" else "gift_partial_refund_review_required"
+    if partial_refund or full_refund:
+        record_gift_event(cur, updated, event_name, updated.get("purchaser_telegram_id"), source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
+        enqueue_gift_admin_delivery(
+            cur,
+            updated["public_reference"],
+            "gift_admin_refund",
+            gift_admin_text("🚨 Gift refund requires manual review", updated, extra=f"event: {event_type}; auto revoke: no"),
+            severity="CRITICAL",
+        )
+    return updated
 
 
 def build_gift_buyer_paid_text(row):
@@ -1469,6 +1723,51 @@ def build_gift_reserved_recipient_text(row):
     )
 
 
+async def gift_recipient_subscription_state(recipient_telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT paid, expiry_date, auto_renew, stripe_subscription_id
+            FROM users
+            WHERE telegram_id = %s
+        """, (int(recipient_telegram_id),))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    now = datetime.utcnow()
+    if not row:
+        return {"action": "apply", "subscription_id": None, "status": None, "cancel_at_period_end": None}
+    paid, expiry_date, auto_renew, stripe_subscription_id = row
+    active_now = bool(paid and expiry_date and expiry_date > now)
+    if not (active_now and auto_renew and stripe_subscription_id):
+        return {"action": "apply", "subscription_id": stripe_subscription_id, "status": None, "cancel_at_period_end": None}
+    try:
+        subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
+    except Exception as e:
+        logging.warning(
+            "GIFT_RECIPIENT_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s subscription=%s error=%s",
+            safe_log_id(recipient_telegram_id),
+            safe_log_id(stripe_subscription_id),
+            clean_error_reason(e),
+            exc_info=True,
+        )
+        return {"action": "fail", "subscription_id": stripe_subscription_id, "reason": "stripe_unavailable"}
+    status = stripe_value(subscription, "status") or "unknown"
+    cancel_at_period_end = bool(stripe_value(subscription, "cancel_at_period_end"))
+    if status in ("active", "trialing") and not cancel_at_period_end:
+        action = "reserve"
+    else:
+        action = "apply"
+    return {
+        "action": action,
+        "subscription_id": stripe_subscription_id,
+        "status": status,
+        "cancel_at_period_end": cancel_at_period_end,
+    }
+
+
 def gift_admin_text(title, row, extra=None):
     text = (
         f"{title}\n\n"
@@ -1483,14 +1782,14 @@ def gift_admin_text(title, row, extra=None):
     return text
 
 
-def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
+def mark_gift_paid_and_enqueue(cur, event_id, event_type, session, line_item, price, gift_row):
     metadata = stripe_value(session, "metadata") or {}
-    if not gift_payment_metadata_valid(metadata, gift_row, session):
-        raise ValueError("gift_checkout_metadata_mismatch")
+    if not validate_gift_payment_proof(session, line_item, price, gift_row):
+        raise ValueError("gift_checkout_payment_proof_mismatch")
     amount_total = stripe_value(session, "amount_total")
     currency = stripe_value(session, "currency")
     payment_intent = get_stripe_object_id(stripe_value(session, "payment_intent"))
-    delivery_token = generate_gift_token()
+    token_hash = gift_token_hash_for_reference(gift_row["public_reference"], gift_row["token_version"])
     cur.execute("""
         UPDATE gift_access_grants
         SET status = 'paid_unclaimed',
@@ -1499,21 +1798,19 @@ def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
             amount_total = COALESCE(amount_total, %s),
             currency = COALESCE(currency, %s),
             token_hash = %s,
-            token_version = token_version + 1,
             updated_at = NOW(),
             last_error = NULL
         WHERE id = %s
           AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
         RETURNING *
-    """, (payment_intent, amount_total, currency, gift_token_hash(delivery_token), gift_row["id"]))
+    """, (payment_intent, amount_total, currency, token_hash, gift_row["id"]))
     updated = gift_row_dict(cur, cur.fetchone())
     if not updated:
         return gift_row
-    updated["token"] = delivery_token
     insert_payment_event(
         cur,
         event_id,
-        "checkout.session.completed",
+        event_type,
         "succeeded",
         telegram_id=updated["purchaser_telegram_id"],
         checkout_session_id=stripe_value(session, "id"),
@@ -1529,7 +1826,7 @@ def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
     )
     record_gift_event(cur, updated, "gift_paid", updated["purchaser_telegram_id"], source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
     try:
-        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER, token=delivery_token)
+        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
     except ValueError as e:
         if str(e) != "gift_certificate_template_missing":
             raise
@@ -1548,7 +1845,7 @@ def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
         cur,
         updated["public_reference"],
         updated["purchaser_telegram_id"],
-        "gift_redeemed_buyer",
+        "gift_paid_buyer",
         build_gift_buyer_paid_text(updated),
     )
     enqueue_gift_admin_delivery(
@@ -1561,7 +1858,7 @@ def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
     return updated
 
 
-def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id):
+def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subscription_state=None):
     now = datetime.utcnow()
     cur.execute("""
         SELECT paid, expiry_date, auto_renew, stripe_subscription_id
@@ -1576,36 +1873,43 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id):
     active_now = bool(user_row and user_row[0] and old_expiry and old_expiry > now)
 
     if active_now and auto_renew and stripe_subscription_id:
-        cur.execute("""
-            UPDATE gift_access_grants
-            SET status = 'reserved',
-                recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
-                reserved_at = COALESCE(reserved_at, NOW()),
-                updated_at = NOW()
-            WHERE id = %s
-              AND status = 'paid_unclaimed'
-            RETURNING *
-        """, (int(recipient_telegram_id), gift_row["id"]))
-        reserved = gift_row_dict(cur, cur.fetchone())
-        if not reserved:
-            raise ValueError("gift_not_reservable")
-        record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
-        enqueue_gift_text_delivery(
-            cur,
-            reserved["public_reference"],
-            recipient_telegram_id,
-            "gift_reserved_recipient",
-            build_gift_reserved_recipient_text(reserved),
-        )
-        enqueue_gift_text_delivery(
-            cur,
-            reserved["public_reference"],
-            reserved["purchaser_telegram_id"],
-            "gift_reserved_buyer",
-            "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
-        )
-        enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
-        return reserved, "reserved", old_expiry
+        if not subscription_state:
+            raise ValueError("gift_recipient_subscription_state_missing")
+        if subscription_state.get("subscription_id") != stripe_subscription_id:
+            raise ValueError("gift_recipient_subscription_identity_changed")
+        if subscription_state.get("action") == "fail":
+            raise ValueError(subscription_state.get("reason") or "gift_recipient_subscription_check_failed")
+        if subscription_state.get("action") == "reserve":
+            cur.execute("""
+                UPDATE gift_access_grants
+                SET status = 'reserved',
+                    recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
+                    reserved_at = COALESCE(reserved_at, NOW()),
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'paid_unclaimed'
+                RETURNING *
+            """, (int(recipient_telegram_id), gift_row["id"]))
+            reserved = gift_row_dict(cur, cur.fetchone())
+            if not reserved:
+                raise ValueError("gift_not_reservable")
+            record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
+            enqueue_gift_text_delivery(
+                cur,
+                reserved["public_reference"],
+                recipient_telegram_id,
+                "gift_reserved_recipient",
+                build_gift_reserved_recipient_text(reserved),
+            )
+            enqueue_gift_text_delivery(
+                cur,
+                reserved["public_reference"],
+                reserved["purchaser_telegram_id"],
+                "gift_reserved_buyer",
+                "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
+            )
+            enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
+            return reserved, "reserved", old_expiry
 
     base_expiry = old_expiry if old_expiry and old_expiry > now else now
     new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
@@ -5468,33 +5772,52 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         return
 
     gift_row = None
+    reused_checkout_url = None
+    gift_unavailable = False
+    draft_failed = False
     conn = get_db_conn()
     cur = conn.cursor()
     try:
         status = gift_configuration_status(cur)
         if not status["configured"]:
             conn.commit()
-            await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
-            await state.clear()
-            return
-        gift_row = create_gift_checkout_draft(
-            cur,
-            callback.from_user.id,
-            tariff_code,
-            data.get("recipient_name") or "",
-            data.get("sender_name") or gift_sender_default_name(callback.from_user),
-            data.get("gift_message") or "",
-        )
-        conn.commit()
+            gift_unavailable = True
+        else:
+            gift_row, reused_draft = find_or_create_gift_checkout_draft(
+                cur,
+                callback.from_user.id,
+                tariff_code,
+                data.get("recipient_name") or "",
+                data.get("sender_name") or gift_sender_default_name(callback.from_user),
+                data.get("gift_message") or "",
+            )
+            conn.commit()
+            if reused_draft and gift_row.get("checkout_url") and (
+                not gift_row.get("checkout_expires_at") or gift_row["checkout_expires_at"] > datetime.utcnow()
+            ):
+                reused_checkout_url = gift_row["checkout_url"]
     except Exception as e:
         conn.rollback()
         logging.error("GIFT_CHECKOUT_DRAFT_FAILED: user=%s error=%s", callback.from_user.id, str(e), exc_info=True)
-        await callback.message.answer("Не получилось подготовить подарок. Попробуйте позже или напишите администратору.")
-        await state.clear()
-        return
+        draft_failed = True
     finally:
         cur.close()
         conn.close()
+
+    if gift_unavailable:
+        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await state.clear()
+        return
+
+    if draft_failed:
+        await callback.message.answer("Не получилось подготовить подарок. Попробуйте позже или напишите администратору.")
+        await state.clear()
+        return
+
+    if reused_checkout_url:
+        await callback.message.answer(CHECKOUT_OPEN_INSTRUCTION, reply_markup=gift_checkout_keyboard(reused_checkout_url))
+        await state.clear()
+        return
 
     try:
         session = await asyncio.to_thread(
@@ -5516,12 +5839,13 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         )
         session_id = session.id
         checkout_url = session.url
+        checkout_expires_at = stripe_value(session, "expires_at")
         if not checkout_url:
             raise ValueError("gift_checkout_url_missing")
         open_conn = get_db_conn()
         open_cur = open_conn.cursor()
         try:
-            opened = mark_gift_checkout_open(open_cur, gift_row["id"], "checkout_pending", session_id, checkout_url)
+            opened = mark_gift_checkout_open(open_cur, gift_row["id"], gift_row["status"], session_id, checkout_url, checkout_expires_at)
             if not opened:
                 raise ValueError("gift_checkout_identity_changed")
             record_gift_event(open_cur, opened, "checkout_opened", callback.from_user.id, source="stripe_checkout")
@@ -5562,36 +5886,40 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
     public_reference = callback.data.split(":", 1)[1]
     state_data = await state.get_data()
     token_hash = state_data.get("gift_token_hash")
+    token_version = state_data.get("gift_token_version")
     state_public_reference = state_data.get("gift_public_reference")
-    if not token_hash or state_public_reference != public_reference:
+    if not token_hash or not token_version or state_public_reference != public_reference:
         await callback.answer("Откройте подарочную ссылку ещё раз.", show_alert=True)
         return
+    subscription_state = await gift_recipient_subscription_state(callback.from_user.id)
+    if subscription_state.get("action") == "fail":
+        await callback.message.answer("🎁 Сейчас не удалось безопасно проверить текущую подписку. Попробуйте позже или напишите администратору.")
+        await callback.answer()
+        return
+    activation_response_text = None
+    activation_failed = False
+    updated = None
+    action = None
+    effective_expiry = None
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        gift_row = fetch_gift_by_public_reference(cur, public_reference, for_update=True)
-        if not gift_row or gift_row["token_hash"] != token_hash:
+        gift_row = fetch_gift_by_public_reference_version(cur, public_reference, token_version, for_update=True)
+        if not gift_row or not hmac.compare_digest(str(gift_row.get("token_hash") or ""), str(token_hash)):
             conn.rollback()
-            await callback.message.answer("🎁 Эта подарочная ссылка недействительна или была перевыпущена.")
-            await callback.answer()
-            return
-        if gift_row["status"] == "redeemed":
+            activation_response_text = "🎁 Эта подарочная ссылка недействительна или была перевыпущена."
+        elif gift_row["status"] == "redeemed":
             conn.rollback()
-            await callback.message.answer("🎁 Этот подарок уже активирован.")
-            await callback.answer()
-            return
-        if gift_row["status"] not in ("paid_unclaimed",):
+            activation_response_text = "🎁 Этот подарок уже активирован."
+        elif gift_row["status"] not in ("paid_unclaimed",):
             conn.rollback()
-            await callback.message.answer("🎁 Этот подарок сейчас нельзя активировать.")
-            await callback.answer()
-            return
-        if gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(callback.from_user.id):
+            activation_response_text = "🎁 Этот подарок сейчас нельзя активировать."
+        elif gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(callback.from_user.id):
             conn.rollback()
-            await callback.message.answer("🎁 Этот подарок уже закреплён за другим получателем.")
-            await callback.answer()
-            return
-        updated, action, effective_expiry = apply_gift_access_in_transaction(cur, gift_row, callback.from_user.id)
-        conn.commit()
+            activation_response_text = "🎁 Этот подарок уже закреплён за другим получателем."
+        else:
+            updated, action, effective_expiry = apply_gift_access_in_transaction(cur, gift_row, callback.from_user.id, subscription_state)
+            conn.commit()
     except Exception as e:
         conn.rollback()
         logging.error(
@@ -5601,17 +5929,20 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
             str(e),
             exc_info=True,
         )
-        await callback.message.answer("Не получилось активировать подарок. Попробуйте позже или напишите администратору.")
-        await callback.answer()
-        return
+        activation_failed = True
     finally:
         cur.close()
         conn.close()
+    if activation_response_text:
+        await callback.message.answer(activation_response_text)
+        await callback.answer()
+        return
+    if activation_failed:
+        await callback.message.answer("Не получилось активировать подарок. Попробуйте позже или напишите администратору.")
+        await callback.answer()
+        return
     await state.clear()
-    if action == "reserved":
-        await callback.message.answer(build_gift_reserved_recipient_text(updated))
-    else:
-        await callback.message.answer(build_gift_redeemed_recipient_text(updated, effective_expiry))
+    await callback.message.answer("Подарок принят. Подтверждение придёт отдельным сообщением.", reply_markup=get_main_keyboard())
     await callback.answer()
 
 
@@ -6448,15 +6779,20 @@ async def delete_join_leave_service_messages(message: types.Message):
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
 async def show_gift_deep_link(message, state, token):
+    parsed_token = parse_gift_token(token)
+    if not parsed_token:
+        await message.answer("🎁 Эта подарочная ссылка недействительна или уже была перевыпущена.")
+        return
+    public_reference, token_version = parsed_token
     token_hash = gift_token_hash(token)
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        gift_row = fetch_gift_by_token_hash(cur, token_hash, for_update=False)
+        gift_row = fetch_gift_by_public_reference_version(cur, public_reference, token_version, for_update=False)
     finally:
         cur.close()
         conn.close()
-    if not gift_row:
+    if not gift_row or not hmac.compare_digest(str(gift_row.get("token_hash") or ""), token_hash):
         await message.answer("🎁 Эта подарочная ссылка недействительна или уже была перевыпущена.")
         return
     if gift_row["status"] not in ("paid_unclaimed", "reserved"):
@@ -6474,7 +6810,24 @@ async def show_gift_deep_link(message, state, token):
     if gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(message.from_user.id):
         await message.answer("🎁 Этот подарок уже закреплён за другим получателем.")
         return
-    await state.update_data(gift_token_hash=token_hash, gift_public_reference=gift_row["public_reference"])
+    cert_conn = get_db_conn()
+    cert_cur = cert_conn.cursor()
+    try:
+        locked_gift = fetch_gift_by_public_reference_version(cert_cur, public_reference, token_version, for_update=True)
+        if locked_gift and locked_gift["status"] in ("paid_unclaimed", "reserved"):
+            enqueue_gift_certificate_delivery(cert_cur, locked_gift, message.from_user.id, GIFT_CERTIFICATE_RECIPIENT)
+        cert_conn.commit()
+    except Exception:
+        cert_conn.rollback()
+        logging.warning("GIFT_RECIPIENT_CERTIFICATE_ENQUEUE_FAILED: gift=%s", safe_log_id(public_reference), exc_info=True)
+    finally:
+        cert_cur.close()
+        cert_conn.close()
+    await state.update_data(
+        gift_token_hash=token_hash,
+        gift_token_version=token_version,
+        gift_public_reference=gift_row["public_reference"],
+    )
     text = (
         "🎁 Вам подарили доступ в клуб Натальи Ребковец\n\n"
         f"Срок доступа: {gift_tariff_label(gift_row['tariff_code'])}\n"
@@ -9880,6 +10233,24 @@ async def stripe_webhook(request):
             if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
                 gift_id = gift_metadata.get("gift_id")
                 session_id = stripe_value(session, "id")
+                try:
+                    proof_session, line_item, price = await asyncio.to_thread(fetch_gift_checkout_payment_proof, session_id)
+                except Exception as e:
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="gift_checkout_payment_proof_failed",
+                        stage="checkout_completed",
+                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("gift_checkout_proof", event_id, gift_id),
+                        note="Gift checkout payment proof could not be verified. Stripe may retry.",
+                        severity="CRITICAL",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
                 try:
@@ -9887,7 +10258,7 @@ async def stripe_webhook(request):
                         SELECT *
                         FROM gift_access_grants
                         WHERE id = %s
-                           OR stripe_session_id = %s
+                          AND stripe_session_id = %s
                         FOR UPDATE
                     """, (gift_id, session_id))
                     gift_row = gift_row_dict(cur, cur.fetchone())
@@ -9903,8 +10274,8 @@ async def stripe_webhook(request):
                         conn.commit()
                         await release_event_processing(event_id)
                         return web.Response(status=500, text="Unknown gift")
-                    if stripe_value(session, "payment_status") in ("paid", "no_payment_required"):
-                        mark_gift_paid_and_enqueue(cur, event_id, session, gift_row)
+                    if stripe_value(proof_session, "payment_status") == "paid":
+                        mark_gift_paid_and_enqueue(cur, event_id, event_type, proof_session, line_item, price, gift_row)
                     else:
                         cur.execute("""
                             UPDATE gift_access_grants
@@ -12222,6 +12593,24 @@ async def stripe_webhook(request):
             if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
                 gift_id = gift_metadata.get("gift_id")
                 session_id = stripe_value(session, "id")
+                try:
+                    proof_session, line_item, price = await asyncio.to_thread(fetch_gift_checkout_payment_proof, session_id)
+                except Exception as e:
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="gift_async_payment_proof_failed",
+                        stage="checkout_async_payment_succeeded",
+                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("gift_async_success_proof", event_id, gift_id),
+                        note="Gift async success payment proof could not be verified. Stripe may retry.",
+                        severity="CRITICAL",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
                 try:
@@ -12229,13 +12618,13 @@ async def stripe_webhook(request):
                         SELECT *
                         FROM gift_access_grants
                         WHERE id = %s
-                           OR stripe_session_id = %s
+                          AND stripe_session_id = %s
                         FOR UPDATE
                     """, (gift_id, session_id))
                     gift_row = gift_row_dict(cur, cur.fetchone())
                     if not gift_row:
                         raise ValueError("gift_not_found")
-                    mark_gift_paid_and_enqueue(cur, event_id, session, gift_row)
+                    mark_gift_paid_and_enqueue(cur, event_id, event_type, proof_session, line_item, price, gift_row)
                     conn.commit()
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
@@ -12260,6 +12649,46 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
 
+        elif event_type in ("charge.refunded", "refund.created", "refund.updated"):
+            refund_object = event_object
+            payment_intent = gift_refund_amount_from_event(event_type, refund_object)[0]
+            if payment_intent:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        SELECT *
+                        FROM gift_access_grants
+                        WHERE stripe_payment_intent_id = %s
+                        FOR UPDATE
+                    """, (payment_intent,))
+                    gift_row = gift_row_dict(cur, cur.fetchone())
+                    if gift_row:
+                        apply_gift_refund_event(cur, event_id, event_type, refund_object, gift_row)
+                        conn.commit()
+                        await mark_event_processed(event_id)
+                        return web.Response(status=200)
+                    conn.rollback()
+                except Exception as e:
+                    conn.rollback()
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="gift_refund_processing_failed",
+                        stage="refund_webhook",
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("gift_refund", event_id, payment_intent),
+                        note="Gift refund was not applied. Stripe may retry.",
+                        severity="CRITICAL",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+                finally:
+                    cur.close()
+                    conn.close()
+
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session = event_object
@@ -12274,7 +12703,7 @@ async def stripe_webhook(request):
                         SELECT *
                         FROM gift_access_grants
                         WHERE id = %s
-                           OR stripe_session_id = %s
+                          AND stripe_session_id = %s
                         FOR UPDATE
                     """, (gift_id, session_id))
                     gift_row = gift_row_dict(cur, cur.fetchone())
@@ -12285,25 +12714,32 @@ async def stripe_webhook(request):
                             SET status = %s,
                                 cancelled_at = CASE WHEN %s = 'cancelled' THEN NOW() ELSE cancelled_at END,
                                 last_error = %s,
+                                last_error_category = %s,
                                 updated_at = NOW()
                             WHERE id = %s
                               AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
-                        """, (terminal_status, terminal_status, event_type, gift_row["id"]))
-                        record_gift_event(cur, gift_row, event_type, gift_row["purchaser_telegram_id"], source="stripe_webhook")
-                        enqueue_gift_text_delivery(
-                            cur,
-                            gift_row["public_reference"],
-                            gift_row["purchaser_telegram_id"],
-                            "gift_redeemed_buyer",
-                            "Похоже, оформление подарка не завершилось. Вы можете создать подарок заново из меню.",
-                        )
-                        enqueue_gift_admin_delivery(
-                            cur,
-                            gift_row["public_reference"],
-                            "gift_admin_problem",
-                            gift_admin_text("⚠️ Gift checkout did not complete", gift_row, extra=f"event: {event_type}"),
-                            severity="WARNING",
-                        )
+                            RETURNING *
+                        """, (terminal_status, terminal_status, event_type, event_type, gift_row["id"]))
+                        updated_gift = gift_row_dict(cur, cur.fetchone())
+                        if updated_gift:
+                            record_gift_event(cur, updated_gift, event_type, updated_gift["purchaser_telegram_id"], source="stripe_webhook")
+                            buyer_purpose = "gift_checkout_expired_buyer" if event_type == "checkout.session.expired" else "gift_checkout_failed_buyer"
+                            enqueue_gift_text_delivery(
+                                cur,
+                                updated_gift["public_reference"],
+                                updated_gift["purchaser_telegram_id"],
+                                buyer_purpose,
+                                "Похоже, оформление подарка не завершилось. Вы можете создать подарок заново из меню.",
+                            )
+                            enqueue_gift_admin_delivery(
+                                cur,
+                                updated_gift["public_reference"],
+                                "gift_admin_problem",
+                                gift_admin_text("⚠️ Gift checkout did not complete", updated_gift, extra=f"event: {event_type}"),
+                                severity="WARNING",
+                            )
+                        else:
+                            record_gift_event(cur, gift_row, f"{event_type}_ignored", gift_row["purchaser_telegram_id"], source="stripe_webhook")
                     conn.commit()
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
@@ -13578,7 +14014,6 @@ async def execute_confirmed_gift_cancel(payload):
 
 async def execute_confirmed_gift_reissue(payload):
     public_reference = payload["public_reference"]
-    new_token = generate_gift_token()
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -13587,21 +14022,28 @@ async def execute_confirmed_gift_reissue(payload):
             raise ValueError("gift_not_found")
         if gift_row["status"] not in ("paid_unclaimed", "reserved"):
             raise ValueError("gift_not_reissuable")
+        new_token_version = int(gift_row["token_version"]) + 1
+        new_token_hash = gift_token_hash_for_reference(public_reference, new_token_version)
+        for delivery_type, kind in ((GIFT_CERTIFICATE_BUYER, "buyer"), (GIFT_CERTIFICATE_RECIPIENT, "recipient")):
+            mark_delivery_cancelled(
+                cur,
+                gift_delivery_key(public_reference, delivery_type, token_version=gift_row["token_version"], recipient_kind=kind),
+                "gift_certificate_reissued",
+            )
         cur.execute("""
             UPDATE gift_access_grants
             SET token_hash = %s,
-                token_version = token_version + 1,
+                token_version = %s,
                 updated_at = NOW()
             WHERE id = %s
               AND status IN ('paid_unclaimed', 'reserved')
             RETURNING *
-        """, (gift_token_hash(new_token), gift_row["id"]))
+        """, (new_token_hash, new_token_version, gift_row["id"]))
         updated = gift_row_dict(cur, cur.fetchone())
         if not updated:
             raise ValueError("gift_not_reissuable")
-        updated["token"] = new_token
         record_gift_event(cur, updated, "gift_reissued", payload.get("admin_id"), source="admin_action")
-        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER, token=new_token)
+        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
         enqueue_gift_admin_delivery(cur, public_reference, "gift_admin_problem", gift_admin_text("🎁 Gift certificate reissued", updated))
         conn.commit()
     finally:
@@ -14431,9 +14873,33 @@ async def process_pending_message_deliveries(limit=25):
             elif delivery_type in (GIFT_CERTIFICATE_BUYER, GIFT_CERTIFICATE_RECIPIENT):
                 photo_file_id = payload.get("photo_file_id")
                 caption = payload.get("caption")
-                button_url = payload.get("button_url")
-                if not photo_file_id or not caption or not button_url:
+                public_reference = payload.get("public_reference")
+                token_version = payload.get("token_version")
+                if not photo_file_id or not caption or not public_reference or not token_version:
                     raise ValueError("invalid_gift_certificate_payload")
+                cert_conn = get_db_conn()
+                cert_cur = cert_conn.cursor()
+                try:
+                    gift_row = fetch_gift_by_public_reference_version(
+                        cert_cur,
+                        public_reference,
+                        int(token_version),
+                        for_update=False,
+                    )
+                    if not gift_row or gift_row["status"] not in ("paid_unclaimed", "reserved"):
+                        mark_delivery_cancelled(cert_cur, delivery_key, "gift_certificate_stale_or_unavailable")
+                        cert_conn.commit()
+                        continue
+                    expected_hash = gift_token_hash_for_reference(public_reference, token_version)
+                    if not hmac.compare_digest(str(gift_row.get("token_hash") or ""), expected_hash):
+                        mark_delivery_cancelled(cert_cur, delivery_key, "gift_certificate_token_version_mismatch")
+                        cert_conn.commit()
+                        continue
+                    cert_conn.commit()
+                finally:
+                    cert_cur.close()
+                    cert_conn.close()
+                button_url = gift_deep_link(generate_gift_token(public_reference, token_version))
                 sending_user_message = True
                 await bot.send_photo(
                     int(telegram_id),
@@ -14636,37 +15102,74 @@ async def scheduled_process_message_deliveries():
 
 
 async def apply_reserved_gifts(limit=50):
-    conn = get_db_conn()
-    cur = conn.cursor()
-    applied = 0
+    read_conn = get_db_conn()
+    read_cur = read_conn.cursor()
     try:
-        cur.execute("""
+        read_cur.execute("""
             SELECT *
             FROM gift_access_grants
             WHERE status = 'reserved'
               AND recipient_telegram_id IS NOT NULL
             ORDER BY reserved_at NULLS FIRST, updated_at
             LIMIT %s
-            FOR UPDATE SKIP LOCKED
         """, (int(limit),))
-        gifts = [gift_row_dict(cur, row) for row in cur.fetchall()]
-        for gift_row in gifts:
+        gifts = [gift_row_dict(read_cur, row) for row in read_cur.fetchall()]
+    finally:
+        read_cur.close()
+        read_conn.close()
+
+    applied = 0
+    skipped = 0
+    for gift_row in gifts:
+        subscription_state = await gift_recipient_subscription_state(gift_row["recipient_telegram_id"])
+        if subscription_state.get("action") in ("fail", "reserve"):
+            skipped += 1
+            continue
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT *
+                FROM gift_access_grants
+                WHERE id = %s
+                  AND status = 'reserved'
+                FOR UPDATE
+            """, (gift_row["id"],))
+            locked_gift = gift_row_dict(cur, cur.fetchone())
+            if not locked_gift:
+                conn.rollback()
+                continue
             cur.execute("""
                 SELECT paid, expiry_date, auto_renew, stripe_subscription_id
                 FROM users
                 WHERE telegram_id = %s
                 FOR UPDATE
-            """, (int(gift_row["recipient_telegram_id"]),))
+            """, (int(locked_gift["recipient_telegram_id"]),))
             user_row = cur.fetchone()
             if not user_row:
+                conn.rollback()
                 continue
             old_expiry = user_row[1]
             auto_renew = bool(user_row[2])
             stripe_subscription_id = user_row[3]
             if auto_renew and stripe_subscription_id and old_expiry and old_expiry > datetime.utcnow():
-                continue
+                if subscription_state.get("subscription_id") != stripe_subscription_id:
+                    record_gift_event(
+                        cur,
+                        locked_gift,
+                        "reserved_gift_identity_changed",
+                        locked_gift["recipient_telegram_id"],
+                        source="scheduler",
+                    )
+                    conn.commit()
+                    skipped += 1
+                    continue
+                if subscription_state.get("action") == "reserve":
+                    conn.rollback()
+                    skipped += 1
+                    continue
             base_expiry = old_expiry if old_expiry and old_expiry > datetime.utcnow() else datetime.utcnow()
-            new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
+            new_expiry = base_expiry + timedelta(days=locked_gift["duration_days"])
             cur.execute("""
                 UPDATE users
                 SET paid = TRUE,
@@ -14677,7 +15180,7 @@ async def apply_reserved_gifts(limit=50):
                     reminder_sent = FALSE,
                     blocked_bot = FALSE
                 WHERE telegram_id = %s
-            """, (new_expiry, int(gift_row["recipient_telegram_id"])))
+            """, (new_expiry, int(locked_gift["recipient_telegram_id"])))
             cur.execute("""
                 UPDATE gift_access_grants
                 SET status = 'redeemed',
@@ -14687,53 +15190,53 @@ async def apply_reserved_gifts(limit=50):
                     updated_at = NOW()
                 WHERE id = %s
                   AND status = 'reserved'
-            """, (new_expiry, gift_row["id"]))
+            """, (new_expiry, locked_gift["id"]))
             record_access_event_cur(
                 cur,
-                gift_row["recipient_telegram_id"],
+                locked_gift["recipient_telegram_id"],
                 "gift_access_reserved_applied",
                 source="scheduled_apply_reserved_gifts",
                 old_expiry=old_expiry,
                 new_expiry=new_expiry,
-                notes=f"gift={gift_row['public_reference']}",
+                notes=f"gift={locked_gift['public_reference']}",
             )
-            record_gift_event(cur, gift_row, "reserved_gift_applied", gift_row["recipient_telegram_id"], source="scheduler")
+            record_gift_event(cur, locked_gift, "reserved_gift_applied", locked_gift["recipient_telegram_id"], source="scheduler")
             enqueue_automatic_membership_repair(
                 cur,
-                gift_row["recipient_telegram_id"],
+                locked_gift["recipient_telegram_id"],
                 new_expiry,
                 "gift_access",
                 reason="reserved_gift_applied",
             )
             enqueue_gift_text_delivery(
                 cur,
-                gift_row["public_reference"],
-                gift_row["recipient_telegram_id"],
+                locked_gift["public_reference"],
+                locked_gift["recipient_telegram_id"],
                 "gift_redeemed_recipient",
-                build_gift_redeemed_recipient_text(gift_row, new_expiry),
+                build_gift_redeemed_recipient_text(locked_gift, new_expiry),
             )
             enqueue_gift_text_delivery(
                 cur,
-                gift_row["public_reference"],
-                gift_row["purchaser_telegram_id"],
+                locked_gift["public_reference"],
+                locked_gift["purchaser_telegram_id"],
                 "gift_redeemed_buyer",
-                build_gift_redeemed_buyer_text(gift_row),
+                build_gift_redeemed_buyer_text(locked_gift),
             )
             enqueue_gift_admin_delivery(
                 cur,
-                gift_row["public_reference"],
+                locked_gift["public_reference"],
                 "gift_admin_redeemed",
-                gift_admin_text("🎁 Reserved gift applied", gift_row, extra=f"new_expiry: {new_expiry}"),
+                gift_admin_text("🎁 Reserved gift applied", locked_gift, extra=f"new_expiry: {new_expiry}"),
             )
+            conn.commit()
             applied += 1
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
-        conn.close()
-    return {"applied": applied}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+    return {"applied": applied, "skipped": skipped}
 
 
 async def scheduled_apply_reserved_gifts():

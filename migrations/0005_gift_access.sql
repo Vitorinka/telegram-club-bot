@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS gift_access_grants (
     token_version INTEGER NOT NULL DEFAULT 1,
     stripe_session_id TEXT UNIQUE,
     stripe_payment_intent_id TEXT UNIQUE,
+    checkout_url TEXT,
+    checkout_expires_at TIMESTAMP,
     amount_total INTEGER,
     currency TEXT,
     paid_at TIMESTAMP,
@@ -25,6 +27,7 @@ CREATE TABLE IF NOT EXISTS gift_access_grants (
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
     last_error TEXT,
+    last_error_category TEXT,
     CHECK (duration_days IN (30, 180, 365)),
     CHECK (status IN (
         'checkout_pending',
@@ -54,6 +57,8 @@ ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS token_hash TEXT;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS token_version INTEGER DEFAULT 1;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS stripe_session_id TEXT;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT;
+ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS checkout_url TEXT;
+ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS checkout_expires_at TIMESTAMP;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS amount_total INTEGER;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS currency TEXT;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP;
@@ -66,6 +71,7 @@ ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
 ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE gift_access_grants ADD COLUMN IF NOT EXISTS last_error_category TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS gift_access_grants_checkout_open_idx
 ON gift_access_grants (purchaser_telegram_id, tariff_code)
