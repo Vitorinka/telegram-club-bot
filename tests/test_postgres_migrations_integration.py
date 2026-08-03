@@ -1993,6 +1993,35 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["source"], main.ACCESS_RESTORE_SOURCE_AUTO_SYNC)
         self.assertEqual(payload["reason"], "sync_stripe_user_active_period")
 
+    def test_admin_action_requests_failed_restore_status_real_postgres(self):
+        from admin_security import claim_admin_action, complete_admin_action, fail_admin_action, make_action_request
+
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            failed_action_id = make_action_request(cur, 1, "restore_access", {"telegram_id": 9907})
+            completed_action_id = make_action_request(cur, 1, "restore_access", {"telegram_id": 9908})
+            conn.commit()
+
+            self.assertEqual(claim_admin_action(cur, failed_action_id, 1)["status"], "claimed")
+            fail_admin_action(cur, failed_action_id)
+            self.assertEqual(claim_admin_action(cur, completed_action_id, 1)["status"], "claimed")
+            complete_admin_action(cur, completed_action_id)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id = %s",
+            (failed_action_id,),
+        )[0], "failed")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id = %s",
+            (completed_action_id,),
+        )[0], "completed")
+
     def test_access_restore_worker_sends_invite_and_persists_state_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
