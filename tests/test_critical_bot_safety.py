@@ -1211,20 +1211,25 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("status IN ('creating', 'creation_unknown', 'open')", source)
         self.assertIn("RETURNING id, telegram_id, tariff_code, status", source)
 
-    def test_perform_set_expiry_checks_membership_and_handles_bot_blocked(self):
+    def test_perform_set_expiry_enqueues_durable_membership_repair(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_set_expiry"):MAIN_SOURCE.index("async def perform_link_stripe_user")]
-        self.assertIn("user_is_current_group_member", source)
-        self.assertIn("generate_invite_link", source)
-        self.assertIn("TelegramForbiddenError", source)
-        self.assertIn("mark_user_blocked_bot", source)
-        self.assertIn("completed_with_warning", MAIN_SOURCE)
+        self.assertIn("enqueue_automatic_membership_repair", source)
+        self.assertIn("manual_set_expiry_confirmed", source)
+        self.assertLess(source.index("enqueue_automatic_membership_repair"), source.index("conn.commit()"))
+        self.assertNotIn("user_is_current_group_member", source)
+        self.assertNotIn("generate_invite_link", source)
+        self.assertNotIn("bot.send_message", source)
+        self.assertNotIn("bot.unban_chat_member", source)
 
-    def test_perform_give_access_post_commit_errors_become_warnings(self):
+    def test_perform_give_access_enqueues_durable_membership_repair(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_give_access"):MAIN_SOURCE.index("async def perform_set_expiry")]
-        self.assertLess(source.index("conn.commit()"), source.index("bot.unban_chat_member"))
-        self.assertIn("warnings.append", source)
-        self.assertIn("notify_admins", source)
-        self.assertIn("mark_user_blocked_bot", source)
+        self.assertIn("enqueue_automatic_membership_repair", source)
+        self.assertIn("manual_give_access_confirmed", source)
+        self.assertLess(source.index("enqueue_automatic_membership_repair"), source.index("conn.commit()"))
+        self.assertNotIn("bot.send_message", source)
+        self.assertNotIn("bot.unban_chat_member", source)
+        self.assertNotIn("notify_admins", source)
+        self.assertNotIn("mark_user_blocked_bot", source)
         self.assertNotIn("last_payment_succeeded_at", source)
         self.assertNotIn("trial_used", source)
 
