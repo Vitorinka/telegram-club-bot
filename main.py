@@ -4,9 +4,12 @@ import asyncio
 import io
 import json
 import hashlib
+import html
+import secrets
 import shutil
 import stripe
 import psycopg2
+import uuid
 from psycopg2 import pool as psycopg2_pool
 import subprocess
 import threading
@@ -191,6 +194,26 @@ FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "ope
 ACCESS_RESTORE_DELIVERY_TYPE = "access_restore_invite"
 ACCESS_RESTORE_SOURCE_ADMIN = "admin_restore_access"
 ACCESS_RESTORE_SOURCE_AUTO_SYNC = "automatic_membership_repair"
+GIFT_PAYMENT_KIND = "gift_access"
+GIFT_TARIFFS = {
+    "gift_1m": {"duration_days": 30, "price_env": "GIFT_PRICE_1M", "label": "1 месяц"},
+    "gift_6m": {"duration_days": 180, "price_env": "GIFT_PRICE_6M", "label": "6 месяцев"},
+    "gift_12m": {"duration_days": 365, "price_env": "GIFT_PRICE_12M", "label": "12 месяцев"},
+}
+GIFT_NAME_LIMIT = 80
+GIFT_MESSAGE_LIMIT = 300
+GIFT_TOKEN_PREFIX = "gift_"
+GIFT_CERTIFICATE_BUYER = "gift_certificate_buyer"
+GIFT_CERTIFICATE_RECIPIENT = "gift_certificate_recipient"
+GIFT_TEXT_DELIVERY_TYPES = {
+    "gift_redeemed_buyer",
+    "gift_redeemed_recipient",
+    "gift_reserved_buyer",
+    "gift_reserved_recipient",
+    "gift_admin_success",
+    "gift_admin_redeemed",
+    "gift_admin_problem",
+}
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
 DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
@@ -228,6 +251,13 @@ class RegistrationStates(StatesGroup):
     description = State()
     rules = State()
     choice = State()
+
+
+class GiftPurchaseStates(StatesGroup):
+    recipient_name = State()
+    sender_name = State()
+    message = State()
+    preview = State()
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -1075,6 +1105,582 @@ def stripe_delivery_payload(text, keyboard_kind=None, parse_mode=None, **extra):
         payload["parse_mode"] = parse_mode
     payload.update({key: value for key, value in extra.items() if value is not None})
     return payload
+
+
+def gift_duration_days(tariff_code):
+    tariff = GIFT_TARIFFS.get(tariff_code)
+    return tariff["duration_days"] if tariff else None
+
+
+def gift_tariff_label(tariff_code):
+    tariff = GIFT_TARIFFS.get(tariff_code)
+    return tariff["label"] if tariff else "неизвестно"
+
+
+def gift_price_id(tariff_code):
+    tariff = GIFT_TARIFFS.get(tariff_code)
+    return os.getenv(tariff["price_env"]) if tariff else None
+
+
+def gift_required_price_envs():
+    return [config["price_env"] for config in GIFT_TARIFFS.values()]
+
+
+def gift_access_unavailable_text():
+    return "Подарочные сертификаты временно недоступны"
+
+
+def sanitize_gift_text(value, limit):
+    value = (value or "").replace("\x00", "").strip()
+    value = "".join(ch for ch in value if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+    if len(value) > limit:
+        value = value[:limit].rstrip()
+    return value
+
+
+def gift_sender_default_name(telegram_user):
+    return sanitize_gift_text(getattr(telegram_user, "full_name", None) or "Ваш друг", GIFT_NAME_LIMIT)
+
+
+def gift_token_hash(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def generate_gift_token():
+    return secrets.token_urlsafe(32)
+
+
+def gift_public_reference():
+    return f"GIFT-{secrets.token_hex(4).upper()}"
+
+
+def gift_deep_link(token):
+    username = os.getenv("BOT_USERNAME")
+    if username:
+        return f"https://t.me/{username.lstrip('@')}?start={GIFT_TOKEN_PREFIX}{token}"
+    return f"https://t.me/{os.getenv('BOT_NAME', 'Natalia_SoulFit_bot')}?start={GIFT_TOKEN_PREFIX}{token}"
+
+
+def gift_safe_user_text(value):
+    return html.escape(value or "", quote=False)
+
+
+def gift_certificate_caption(row, deep_link):
+    recipient = gift_safe_user_text(row.get("recipient_name") or "для вас")
+    sender = gift_safe_user_text(row.get("sender_name") or "друга")
+    message = gift_safe_user_text(row.get("gift_message"))
+    lines = [
+        "🎁 Подарочный сертификат в клуб Натальи Ребковец",
+        "",
+        f"Для: {recipient}",
+        f"От: {sender}",
+        f"Срок доступа: {gift_tariff_label(row.get('tariff_code'))}",
+    ]
+    if message:
+        lines.extend(["", message])
+    lines.extend(["", "Активировать подарок можно по кнопке ниже."])
+    return "\n".join(lines), inline_keyboard([[
+        InlineKeyboardButton(text="🎁 Активировать подарок", url=deep_link)
+    ]])
+
+
+def gift_delivery_key(public_reference, purpose, recipient_id=None):
+    suffix = f":{int(recipient_id)}" if recipient_id is not None else ""
+    return f"gift:{public_reference}:{purpose}{suffix}"
+
+
+def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload):
+    cur.execute("""
+        INSERT INTO message_delivery_events (
+            delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
+        )
+        VALUES (%s, %s, %s, 'pending', 0, NULL, %s, NOW())
+        ON CONFLICT (delivery_key) DO UPDATE SET
+            delivery_key = message_delivery_events.delivery_key
+        RETURNING delivery_key
+    """, (delivery_key, int(telegram_id), delivery_type, json.dumps(payload, ensure_ascii=False, sort_keys=True)))
+    return cur.fetchone() is not None
+
+
+def enqueue_gift_text_delivery(cur, public_reference, telegram_id, purpose, text, **extra):
+    return enqueue_message_delivery(
+        cur,
+        gift_delivery_key(public_reference, purpose, telegram_id if purpose.startswith("admin") else None),
+        int(telegram_id),
+        purpose,
+        stripe_delivery_payload(text, **extra),
+    )
+
+
+def enqueue_gift_admin_delivery(cur, public_reference, purpose, text, severity="INFO"):
+    count = 0
+    for admin_id in ADMIN_IDS:
+        if enqueue_gift_text_delivery(
+            cur,
+            public_reference,
+            int(admin_id),
+            purpose,
+            text,
+            severity=severity,
+            safe_ref=public_reference,
+        ):
+            count += 1
+    return count
+
+
+def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type, token=None):
+    token = token or row.get("token")
+    if not token:
+        raise ValueError("gift_certificate_token_missing")
+    deep_link = gift_deep_link(token)
+    caption, keyboard = gift_certificate_caption(row, deep_link)
+    cur.execute(
+        "SELECT file_id FROM gift_certificate_templates WHERE tariff_code = %s AND active IS TRUE",
+        (row["tariff_code"],),
+    )
+    template = cur.fetchone()
+    if not template:
+        raise ValueError("gift_certificate_template_missing")
+    return enqueue_message_delivery(
+        cur,
+        gift_delivery_key(row["public_reference"], delivery_type),
+        int(telegram_id),
+        delivery_type,
+        {
+            "photo_file_id": template[0],
+            "caption": caption,
+            "parse_mode": "HTML",
+            "button_text": "🎁 Активировать подарок",
+            "button_url": deep_link,
+        },
+    )
+
+
+def gift_row_dict(cur, row):
+    if not row:
+        return None
+    return {desc[0]: value for desc, value in zip(cur.description, row)}
+
+
+def record_gift_event(cur, gift_row, event_type, telegram_id=None, source=None, notes=None):
+    cur.execute("""
+        INSERT INTO gift_access_events (
+            gift_id, public_reference, telegram_id, event_type, source, notes
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (
+        gift_row["id"],
+        gift_row["public_reference"],
+        int(telegram_id) if telegram_id is not None else None,
+        event_type,
+        source,
+        notes,
+    ))
+
+
+def fetch_gift_by_public_reference(cur, public_reference, for_update=False):
+    lock_sql = " FOR UPDATE" if for_update else ""
+    cur.execute(f"""
+        SELECT *
+        FROM gift_access_grants
+        WHERE public_reference = %s
+        {lock_sql}
+    """, (public_reference,))
+    return gift_row_dict(cur, cur.fetchone())
+
+
+def fetch_gift_by_token_hash(cur, token_hash, for_update=False):
+    lock_sql = " FOR UPDATE" if for_update else ""
+    cur.execute(f"""
+        SELECT *
+        FROM gift_access_grants
+        WHERE token_hash = %s
+        {lock_sql}
+    """, (token_hash,))
+    return gift_row_dict(cur, cur.fetchone())
+
+
+def gift_configuration_status(cur=None):
+    missing_prices = [name for name in gift_required_price_envs() if not os.getenv(name)]
+    template_count = 0
+    owns_conn = cur is None
+    conn = None
+    if owns_conn:
+        conn = get_db_conn()
+        cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM gift_certificate_templates
+            WHERE active IS TRUE
+              AND tariff_code = ANY(%s)
+        """, (list(GIFT_TARIFFS.keys()),))
+        template_count = cur.fetchone()[0]
+    finally:
+        if owns_conn:
+            cur.close()
+            conn.close()
+    return {
+        "configured": not missing_prices and template_count == len(GIFT_TARIFFS),
+        "missing_prices": missing_prices,
+        "template_count": template_count,
+        "required_template_count": len(GIFT_TARIFFS),
+    }
+
+
+def gift_tariffs_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="🎁 1 месяц", callback_data="gift_tariff:gift_1m")],
+        [InlineKeyboardButton(text="🎁 6 месяцев", callback_data="gift_tariff:gift_6m")],
+        [InlineKeyboardButton(text="🎁 12 месяцев", callback_data="gift_tariff:gift_12m")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gift_cancel_flow")],
+    ])
+
+
+def gift_preview_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="💳 Оплатить подарок", callback_data="gift_pay")],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data="gift_edit")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gift_cancel_flow")],
+    ])
+
+
+def gift_activation_keyboard(public_reference):
+    return inline_keyboard([[
+        InlineKeyboardButton(text="🎁 Активировать подарок", callback_data=f"gift_activate:{public_reference}")
+    ]])
+
+
+def gift_checkout_keyboard(checkout_url):
+    return inline_keyboard([[
+        InlineKeyboardButton(text="💳 Оплатить подарок", url=checkout_url)
+    ]])
+
+
+def build_gift_preview_text(data):
+    recipient_name = data.get("recipient_name") or "не указано"
+    sender_name = data.get("sender_name") or "не указано"
+    gift_message = data.get("gift_message") or "без личного сообщения"
+    tariff_code = data.get("tariff_code")
+    return (
+        "🎁 Проверьте подарочный сертификат\n\n"
+        f"Срок доступа: {gift_tariff_label(tariff_code)}\n"
+        f"Получатель: {gift_safe_user_text(recipient_name)}\n"
+        f"От кого: {gift_safe_user_text(sender_name)}\n"
+        f"Сообщение: {gift_safe_user_text(gift_message)}\n\n"
+        "После оплаты я пришлю вам сертификат с одноразовой ссылкой."
+    )
+
+
+def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message):
+    token = generate_gift_token()
+    gift_id = str(uuid.uuid4())
+    public_reference = gift_public_reference()
+    duration_days = gift_duration_days(tariff_code)
+    if not duration_days:
+        raise ValueError("invalid_gift_tariff")
+    cur.execute("""
+        INSERT INTO gift_access_grants (
+            id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+            gift_message, tariff_code, duration_days, status, token_hash, token_version
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'checkout_pending', %s, 1)
+        RETURNING *
+    """, (
+        gift_id,
+        public_reference,
+        int(purchaser_telegram_id),
+        recipient_name,
+        sender_name,
+        gift_message,
+        tariff_code,
+        duration_days,
+        gift_token_hash(token),
+    ))
+    row = gift_row_dict(cur, cur.fetchone())
+    row["token"] = token
+    record_gift_event(cur, row, "checkout_draft_created", purchaser_telegram_id, source="gift_fsm")
+    return row
+
+
+def mark_gift_checkout_open(cur, gift_id, expected_status, session_id, checkout_url):
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET stripe_session_id = %s,
+            status = 'checkout_open',
+            updated_at = NOW()
+        WHERE id = %s
+          AND status = %s
+        RETURNING *
+    """, (session_id, gift_id, expected_status))
+    return gift_row_dict(cur, cur.fetchone())
+
+
+def mark_gift_checkout_failed(cur, gift_id, error_text):
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET status = 'checkout_pending',
+            last_error = LEFT(%s, 500),
+            updated_at = NOW()
+        WHERE id = %s
+          AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+    """, (str(error_text), gift_id))
+
+
+def gift_payment_metadata_valid(metadata, gift_row, session):
+    return (
+        metadata.get("payment_kind") == GIFT_PAYMENT_KIND
+        and metadata.get("gift_id") == str(gift_row["id"])
+        and metadata.get("purchaser_telegram_id") == str(gift_row["purchaser_telegram_id"])
+        and metadata.get("tariff_code") == gift_row["tariff_code"]
+        and metadata.get("duration_days") == str(gift_row["duration_days"])
+        and (stripe_value(session, "mode") == "payment")
+    )
+
+
+def build_gift_buyer_paid_text(row):
+    return (
+        "🎁 Подарок оплачен\n\n"
+        "Сертификат уже готов. Сохраните его и отправьте получателю.\n\n"
+        f"Номер подарка: {row['public_reference']}"
+    )
+
+
+def build_gift_redeemed_recipient_text(row, expiry_date):
+    return (
+        "🎁 Подарок активирован!\n\n"
+        f"Доступ в клуб открыт до {expiry_date.strftime('%d.%m.%Y')}.\n"
+        "Ссылка для входа придёт отдельным сообщением."
+    )
+
+
+def build_gift_redeemed_buyer_text(row):
+    return (
+        "🎁 Ваш подарок активирован получателем.\n\n"
+        f"Номер подарка: {row['public_reference']}"
+    )
+
+
+def build_gift_reserved_recipient_text(row):
+    return (
+        "🎁 Подарок сохранён за вами\n\n"
+        "Сейчас у вас активна продлеваемая подписка. "
+        "Подарочный период будет добавлен, когда текущая автопродлеваемая подписка завершится."
+    )
+
+
+def gift_admin_text(title, row, extra=None):
+    text = (
+        f"{title}\n\n"
+        f"gift: {row['public_reference']}\n"
+        f"purchaser: {row['purchaser_telegram_id']}\n"
+        f"recipient: {row.get('recipient_telegram_id') or 'не указан'}\n"
+        f"tariff: {row['tariff_code']}\n"
+        f"status: {row['status']}"
+    )
+    if extra:
+        text += f"\n{extra}"
+    return text
+
+
+def mark_gift_paid_and_enqueue(cur, event_id, session, gift_row):
+    metadata = stripe_value(session, "metadata") or {}
+    if not gift_payment_metadata_valid(metadata, gift_row, session):
+        raise ValueError("gift_checkout_metadata_mismatch")
+    amount_total = stripe_value(session, "amount_total")
+    currency = stripe_value(session, "currency")
+    payment_intent = get_stripe_object_id(stripe_value(session, "payment_intent"))
+    delivery_token = generate_gift_token()
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET status = 'paid_unclaimed',
+            paid_at = COALESCE(paid_at, NOW()),
+            stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, %s),
+            amount_total = COALESCE(amount_total, %s),
+            currency = COALESCE(currency, %s),
+            token_hash = %s,
+            token_version = token_version + 1,
+            updated_at = NOW(),
+            last_error = NULL
+        WHERE id = %s
+          AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+        RETURNING *
+    """, (payment_intent, amount_total, currency, gift_token_hash(delivery_token), gift_row["id"]))
+    updated = gift_row_dict(cur, cur.fetchone())
+    if not updated:
+        return gift_row
+    updated["token"] = delivery_token
+    insert_payment_event(
+        cur,
+        event_id,
+        "checkout.session.completed",
+        "succeeded",
+        telegram_id=updated["purchaser_telegram_id"],
+        checkout_session_id=stripe_value(session, "id"),
+        stripe_customer_id=get_stripe_object_id(stripe_value(session, "customer")),
+        stripe_subscription_id=None,
+        payment_kind=GIFT_PAYMENT_KIND,
+        tariff_code=updated["tariff_code"],
+        amount_paid=amount_total,
+        amount_due=amount_total,
+        currency=currency,
+        period_start=datetime.utcnow(),
+        period_end=datetime.utcnow() + timedelta(days=updated["duration_days"]),
+    )
+    record_gift_event(cur, updated, "gift_paid", updated["purchaser_telegram_id"], source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
+    try:
+        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER, token=delivery_token)
+    except ValueError as e:
+        if str(e) != "gift_certificate_template_missing":
+            raise
+        enqueue_gift_admin_delivery(
+            cur,
+            updated["public_reference"],
+            "gift_admin_problem",
+            gift_admin_text(
+                "⚠️ Gift certificate template missing",
+                updated,
+                extra="Подарок оплачен, но сертификат не поставлен в outbox. Загрузите шаблон и используйте /gift_reissue.",
+            ),
+            severity="CRITICAL",
+        )
+    enqueue_gift_text_delivery(
+        cur,
+        updated["public_reference"],
+        updated["purchaser_telegram_id"],
+        "gift_redeemed_buyer",
+        build_gift_buyer_paid_text(updated),
+    )
+    enqueue_gift_admin_delivery(
+        cur,
+        updated["public_reference"],
+        "gift_admin_success",
+        gift_admin_text("🎁 Gift payment succeeded", updated),
+        severity="INFO",
+    )
+    return updated
+
+
+def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id):
+    now = datetime.utcnow()
+    cur.execute("""
+        SELECT paid, expiry_date, auto_renew, stripe_subscription_id
+        FROM users
+        WHERE telegram_id = %s
+        FOR UPDATE
+    """, (int(recipient_telegram_id),))
+    user_row = cur.fetchone()
+    old_expiry = user_row[1] if user_row else None
+    auto_renew = bool(user_row[2]) if user_row else False
+    stripe_subscription_id = user_row[3] if user_row else None
+    active_now = bool(user_row and user_row[0] and old_expiry and old_expiry > now)
+
+    if active_now and auto_renew and stripe_subscription_id:
+        cur.execute("""
+            UPDATE gift_access_grants
+            SET status = 'reserved',
+                recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
+                reserved_at = COALESCE(reserved_at, NOW()),
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'paid_unclaimed'
+            RETURNING *
+        """, (int(recipient_telegram_id), gift_row["id"]))
+        reserved = gift_row_dict(cur, cur.fetchone())
+        if not reserved:
+            raise ValueError("gift_not_reservable")
+        record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
+        enqueue_gift_text_delivery(
+            cur,
+            reserved["public_reference"],
+            recipient_telegram_id,
+            "gift_reserved_recipient",
+            build_gift_reserved_recipient_text(reserved),
+        )
+        enqueue_gift_text_delivery(
+            cur,
+            reserved["public_reference"],
+            reserved["purchaser_telegram_id"],
+            "gift_reserved_buyer",
+            "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
+        )
+        enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
+        return reserved, "reserved", old_expiry
+
+    base_expiry = old_expiry if old_expiry and old_expiry > now else now
+    new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
+    cur.execute("""
+        INSERT INTO users (
+            telegram_id, paid, expiry_date, payment_failed, payment_failed_at,
+            grace_period_end, reminder_sent, blocked_bot, auto_renew
+        )
+        VALUES (%s, TRUE, %s, FALSE, NULL, NULL, FALSE, FALSE, FALSE)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            paid = TRUE,
+            expiry_date = EXCLUDED.expiry_date,
+            payment_failed = FALSE,
+            payment_failed_at = NULL,
+            grace_period_end = NULL,
+            reminder_sent = FALSE,
+            blocked_bot = FALSE,
+            auto_renew = CASE
+                WHEN users.stripe_subscription_id IS NULL THEN FALSE
+                ELSE users.auto_renew
+            END
+    """, (int(recipient_telegram_id), new_expiry))
+    cur.execute("""
+        UPDATE gift_access_grants
+        SET status = 'redeemed',
+            recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
+            redeemed_at = COALESCE(redeemed_at, NOW()),
+            applied_at = COALESCE(applied_at, NOW()),
+            applied_expiry = %s,
+            updated_at = NOW()
+        WHERE id = %s
+          AND status = 'paid_unclaimed'
+        RETURNING *
+    """, (int(recipient_telegram_id), new_expiry, gift_row["id"]))
+    redeemed = gift_row_dict(cur, cur.fetchone())
+    if not redeemed:
+        raise ValueError("gift_not_redeemable")
+    record_access_event_cur(
+        cur,
+        recipient_telegram_id,
+        "gift_access_redeemed",
+        source="gift_access",
+        old_expiry=old_expiry,
+        new_expiry=new_expiry,
+        notes=f"gift={redeemed['public_reference']}",
+    )
+    record_gift_event(cur, redeemed, "gift_redeemed", recipient_telegram_id, source="recipient_activation")
+    enqueue_automatic_membership_repair(
+        cur,
+        recipient_telegram_id,
+        new_expiry,
+        "gift_access",
+        reason="gift_access_redeemed",
+    )
+    enqueue_gift_text_delivery(
+        cur,
+        redeemed["public_reference"],
+        recipient_telegram_id,
+        "gift_redeemed_recipient",
+        build_gift_redeemed_recipient_text(redeemed, new_expiry),
+    )
+    enqueue_gift_text_delivery(
+        cur,
+        redeemed["public_reference"],
+        redeemed["purchaser_telegram_id"],
+        "gift_redeemed_buyer",
+        build_gift_redeemed_buyer_text(redeemed),
+    )
+    enqueue_gift_admin_delivery(
+        cur,
+        redeemed["public_reference"],
+        "gift_admin_redeemed",
+        gift_admin_text("🎁 Gift redeemed", redeemed, extra=f"new_expiry: {new_expiry}"),
+    )
+    return redeemed, "redeemed", new_expiry
 
 
 def format_user_access_date(expiry_date):
@@ -4726,6 +5332,7 @@ async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
 def get_main_keyboard():
     return reply_keyboard([
         [KeyboardButton(text="🎁 Бесплатный урок")],
+        [KeyboardButton(text="🎁 Подарить доступ")],
         [KeyboardButton(text="💬 Задать вопрос"), KeyboardButton(text="🆘 Правила клуба")],
         [KeyboardButton(text="👤 Профиль и подписка")],
     ], resize_keyboard=True)
@@ -4744,6 +5351,268 @@ async def show_menu(message: types.Message, state: FSMContext):
 async def profile_button_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await profile(message)
+
+
+@router.message(F.text == "🎁 Подарить доступ", StateFilter('*'))
+async def gift_access_button_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    save_telegram_user_profile(message.from_user)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        status = gift_configuration_status(cur)
+    finally:
+        cur.close()
+        conn.close()
+    if not status["configured"]:
+        await message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await enqueue_admin_payment_problem_now(
+            event_id=None,
+            purpose="gift_access_configuration_missing",
+            stage="gift_access",
+            telegram_id=message.from_user.id,
+            category="configuration_missing",
+            stripe_retry="нет",
+            recovery_reminder="не применимо",
+            safe_ref=safe_admin_context_reference("gift_config", status["missing_prices"], status["template_count"]),
+            note=(
+                f"missing_prices: {', '.join(status['missing_prices']) or 'нет'}\n"
+                f"templates: {status['template_count']}/{status['required_template_count']}"
+            ),
+        )
+        return
+    await state.set_state(GiftPurchaseStates.recipient_name)
+    await message.answer(
+        "🎁 На какой срок подарить доступ?",
+        reply_markup=gift_tariffs_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("gift_tariff:"), StateFilter(GiftPurchaseStates.recipient_name))
+async def gift_tariff_selected(callback: types.CallbackQuery, state: FSMContext):
+    tariff_code = callback.data.split(":", 1)[1]
+    if tariff_code not in GIFT_TARIFFS:
+        await callback.answer("Неизвестный тариф.", show_alert=True)
+        return
+    await state.update_data(tariff_code=tariff_code)
+    await state.set_state(GiftPurchaseStates.recipient_name)
+    await callback.message.answer(
+        "Напишите имя получателя для сертификата.\n\n"
+        "Можно отправить «-», если не хотите указывать имя."
+    )
+    await callback.answer()
+
+
+@router.message(StateFilter(GiftPurchaseStates.recipient_name))
+async def gift_recipient_name_received(message: types.Message, state: FSMContext):
+    text = sanitize_gift_text(message.text, GIFT_NAME_LIMIT)
+    recipient_name = "" if text in ("-", "—") else text
+    await state.update_data(recipient_name=recipient_name)
+    await state.set_state(GiftPurchaseStates.sender_name)
+    await message.answer(
+        "Как подписать отправителя?\n\n"
+        f"По умолчанию: {gift_sender_default_name(message.from_user)}\n"
+        "Отправьте «-», чтобы оставить значение по умолчанию."
+    )
+
+
+@router.message(StateFilter(GiftPurchaseStates.sender_name))
+async def gift_sender_name_received(message: types.Message, state: FSMContext):
+    text = sanitize_gift_text(message.text, GIFT_NAME_LIMIT)
+    sender_name = gift_sender_default_name(message.from_user) if text in ("", "-", "—") else text
+    await state.update_data(sender_name=sender_name)
+    await state.set_state(GiftPurchaseStates.message)
+    await message.answer(
+        "Добавьте короткое пожелание для сертификата.\n\n"
+        "Можно отправить «-», если личное сообщение не нужно."
+    )
+
+
+@router.message(StateFilter(GiftPurchaseStates.message))
+async def gift_message_received(message: types.Message, state: FSMContext):
+    text = sanitize_gift_text(message.text, GIFT_MESSAGE_LIMIT)
+    gift_message = "" if text in ("-", "—") else text
+    await state.update_data(gift_message=gift_message)
+    data = await state.get_data()
+    await state.set_state(GiftPurchaseStates.preview)
+    await message.answer(
+        build_gift_preview_text(data),
+        reply_markup=gift_preview_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "gift_edit", StateFilter(GiftPurchaseStates.preview))
+async def gift_edit_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(GiftPurchaseStates.recipient_name)
+    await callback.message.answer("Хорошо, начнём заново. Выберите срок подарка:", reply_markup=gift_tariffs_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "gift_cancel_flow", StateFilter('*'))
+async def gift_cancel_flow_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Подарок отменён.", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "gift_pay", StateFilter(GiftPurchaseStates.preview))
+async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("⏳ Создаём оплату...")
+    data = await state.get_data()
+    tariff_code = data.get("tariff_code")
+    price_id = gift_price_id(tariff_code)
+    if tariff_code not in GIFT_TARIFFS or not price_id:
+        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await state.clear()
+        return
+
+    gift_row = None
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        status = gift_configuration_status(cur)
+        if not status["configured"]:
+            conn.commit()
+            await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+            await state.clear()
+            return
+        gift_row = create_gift_checkout_draft(
+            cur,
+            callback.from_user.id,
+            tariff_code,
+            data.get("recipient_name") or "",
+            data.get("sender_name") or gift_sender_default_name(callback.from_user),
+            data.get("gift_message") or "",
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error("GIFT_CHECKOUT_DRAFT_FAILED: user=%s error=%s", callback.from_user.id, str(e), exc_info=True)
+        await callback.message.answer("Не получилось подготовить подарок. Попробуйте позже или напишите администратору.")
+        await state.clear()
+        return
+    finally:
+        cur.close()
+        conn.close()
+
+    try:
+        session = await asyncio.to_thread(
+            stripe.checkout.Session.create,
+            idempotency_key=f"gift:{gift_row['id']}",
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            mode="payment",
+            success_url="https://t.me/Natalia_SoulFit_bot",
+            cancel_url="https://t.me/Natalia_SoulFit_bot",
+            client_reference_id=str(callback.from_user.id),
+            metadata={
+                "payment_kind": GIFT_PAYMENT_KIND,
+                "gift_id": str(gift_row["id"]),
+                "purchaser_telegram_id": str(callback.from_user.id),
+                "tariff_code": tariff_code,
+                "duration_days": str(gift_row["duration_days"]),
+            },
+        )
+        session_id = session.id
+        checkout_url = session.url
+        if not checkout_url:
+            raise ValueError("gift_checkout_url_missing")
+        open_conn = get_db_conn()
+        open_cur = open_conn.cursor()
+        try:
+            opened = mark_gift_checkout_open(open_cur, gift_row["id"], "checkout_pending", session_id, checkout_url)
+            if not opened:
+                raise ValueError("gift_checkout_identity_changed")
+            record_gift_event(open_cur, opened, "checkout_opened", callback.from_user.id, source="stripe_checkout")
+            open_conn.commit()
+        finally:
+            open_cur.close()
+            open_conn.close()
+        await callback.message.answer(CHECKOUT_OPEN_INSTRUCTION, reply_markup=gift_checkout_keyboard(checkout_url))
+        await state.clear()
+    except Exception as e:
+        fail_conn = get_db_conn()
+        fail_cur = fail_conn.cursor()
+        try:
+            mark_gift_checkout_failed(fail_cur, gift_row["id"], e)
+            fail_conn.commit()
+        finally:
+            fail_cur.close()
+            fail_conn.close()
+        logging.error("GIFT_CHECKOUT_CREATE_FAILED: gift=%s error=%s", safe_log_id(gift_row["public_reference"]), str(e), exc_info=True)
+        await enqueue_admin_payment_problem_now(
+            event_id=None,
+            purpose="gift_checkout_creation_failed",
+            stage="checkout_creation",
+            telegram_id=callback.from_user.id,
+            category="checkout_creation_failed",
+            exception=e,
+            stripe_retry="неизвестно",
+            recovery_reminder="не применимо",
+            safe_ref=safe_admin_context_reference("gift_checkout_create", gift_row["public_reference"]),
+            note=f"gift: {gift_row['public_reference']}",
+        )
+        await callback.message.answer("Техническая ошибка при создании оплаты. Попробуйте позже или напишите администратору.")
+        await state.clear()
+
+
+@router.callback_query(F.data.startswith("gift_activate:"), StateFilter('*'))
+async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContext):
+    public_reference = callback.data.split(":", 1)[1]
+    state_data = await state.get_data()
+    token_hash = state_data.get("gift_token_hash")
+    state_public_reference = state_data.get("gift_public_reference")
+    if not token_hash or state_public_reference != public_reference:
+        await callback.answer("Откройте подарочную ссылку ещё раз.", show_alert=True)
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference, for_update=True)
+        if not gift_row or gift_row["token_hash"] != token_hash:
+            conn.rollback()
+            await callback.message.answer("🎁 Эта подарочная ссылка недействительна или была перевыпущена.")
+            await callback.answer()
+            return
+        if gift_row["status"] == "redeemed":
+            conn.rollback()
+            await callback.message.answer("🎁 Этот подарок уже активирован.")
+            await callback.answer()
+            return
+        if gift_row["status"] not in ("paid_unclaimed",):
+            conn.rollback()
+            await callback.message.answer("🎁 Этот подарок сейчас нельзя активировать.")
+            await callback.answer()
+            return
+        if gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(callback.from_user.id):
+            conn.rollback()
+            await callback.message.answer("🎁 Этот подарок уже закреплён за другим получателем.")
+            await callback.answer()
+            return
+        updated, action, effective_expiry = apply_gift_access_in_transaction(cur, gift_row, callback.from_user.id)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(
+            "GIFT_ACTIVATION_FAILED: gift=%s user=%s error=%s",
+            safe_log_id(public_reference),
+            callback.from_user.id,
+            str(e),
+            exc_info=True,
+        )
+        await callback.message.answer("Не получилось активировать подарок. Попробуйте позже или напишите администратору.")
+        await callback.answer()
+        return
+    finally:
+        cur.close()
+        conn.close()
+    await state.clear()
+    if action == "reserved":
+        await callback.message.answer(build_gift_reserved_recipient_text(updated))
+    else:
+        await callback.message.answer(build_gift_redeemed_recipient_text(updated, effective_expiry))
+    await callback.answer()
 
 
 @router.message(F.text == "🆘 Правила клуба", StateFilter('*'))
@@ -5578,6 +6447,44 @@ async def delete_join_leave_service_messages(message: types.Message):
         )
 
 # --- ХЕНДЛЕРЫ КОМАНД И КОЛБЭКОВ ---
+async def show_gift_deep_link(message, state, token):
+    token_hash = gift_token_hash(token)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_token_hash(cur, token_hash, for_update=False)
+    finally:
+        cur.close()
+        conn.close()
+    if not gift_row:
+        await message.answer("🎁 Эта подарочная ссылка недействительна или уже была перевыпущена.")
+        return
+    if gift_row["status"] not in ("paid_unclaimed", "reserved"):
+        status_text = {
+            "checkout_pending": "Подарок ещё не оплачен.",
+            "checkout_open": "Подарок ещё не оплачен.",
+            "payment_pending": "Оплата подарка ещё подтверждается.",
+            "redeemed": "Этот подарок уже активирован.",
+            "cancelled": "Этот подарок отменён.",
+            "refunded": "Этот подарок был возвращён.",
+            "review_required": "Этот подарок требует ручной проверки.",
+        }.get(gift_row["status"], "Этот подарок сейчас недоступен.")
+        await message.answer(f"🎁 {status_text}")
+        return
+    if gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(message.from_user.id):
+        await message.answer("🎁 Этот подарок уже закреплён за другим получателем.")
+        return
+    await state.update_data(gift_token_hash=token_hash, gift_public_reference=gift_row["public_reference"])
+    text = (
+        "🎁 Вам подарили доступ в клуб Натальи Ребковец\n\n"
+        f"Срок доступа: {gift_tariff_label(gift_row['tariff_code'])}\n"
+        f"От: {gift_safe_user_text(gift_row.get('sender_name') or 'друга')}"
+    )
+    if gift_row.get("gift_message"):
+        text += f"\n\n{gift_safe_user_text(gift_row['gift_message'])}"
+    await message.answer(text, reply_markup=gift_activation_keyboard(gift_row["public_reference"]), parse_mode="HTML")
+
+
 @router.message(CommandStart(), StateFilter('*'))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -5599,6 +6506,11 @@ async def start(message: types.Message, state: FSMContext):
     finally:
         cur.close()
         conn.close()
+
+    start_parts = (message.text or "").split(maxsplit=1)
+    if len(start_parts) == 2 and start_parts[1].startswith(GIFT_TOKEN_PREFIX):
+        await show_gift_deep_link(message, state, start_parts[1][len(GIFT_TOKEN_PREFIX):])
+        return
 
     # Отправка приветствия
     await state.set_state(RegistrationStates.intro)
@@ -6810,6 +7722,184 @@ async def restore_access_command(message: types.Message, command: CommandObject)
     await send_admin_action_confirmation(message, action_id, summary)
 
 
+@router.message(Command('gift_templates'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gift_templates_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT tariff_code, active, updated_at
+            FROM gift_certificate_templates
+            ORDER BY tariff_code
+        """)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    known = {row[0]: row for row in rows}
+    lines = ["🎁 Gift templates"]
+    for tariff_code in GIFT_TARIFFS:
+        row = known.get(tariff_code)
+        lines.append(f"{tariff_code}: {'OK' if row and row[1] else 'MISSING'}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command('gift_template_upload'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gift_template_upload_command(message: types.Message, command: CommandObject):
+    args = (command.args or "").split()
+    if len(args) != 1 or args[0] not in GIFT_TARIFFS:
+        await message.reply("⚠️ Использование: /gift_template_upload <gift_1m|gift_6m|gift_12m> ответом на фото")
+        return
+    if not message.reply_to_message or not message.reply_to_message.photo:
+        await message.reply("Отправьте команду ответом на фото сертификата.")
+        return
+    file_id = message.reply_to_message.photo[-1].file_id
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO gift_certificate_templates (tariff_code, file_id, uploaded_by, active, updated_at)
+            VALUES (%s, %s, %s, TRUE, NOW())
+            ON CONFLICT (tariff_code) DO UPDATE SET
+                file_id = EXCLUDED.file_id,
+                uploaded_by = EXCLUDED.uploaded_by,
+                active = TRUE,
+                updated_at = NOW()
+        """, (args[0], file_id, int(message.from_user.id)))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    await message.answer(f"✅ Шаблон {args[0]} сохранён.")
+
+
+@router.message(Command('gift_info'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gift_info_command(message: types.Message, command: CommandObject):
+    public_reference = (command.args or "").strip()
+    if not public_reference:
+        await message.reply("⚠️ Использование: /gift_info <public_reference>")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference)
+    finally:
+        cur.close()
+        conn.close()
+    if not gift_row:
+        await message.answer("Подарок не найден.")
+        return
+    await message.answer(gift_admin_text("🎁 Gift info", gift_row, extra=f"paid_at: {gift_row.get('paid_at') or 'нет'}\napplied_expiry: {gift_row.get('applied_expiry') or 'нет'}"))
+
+
+@router.message(Command('gift_cancel'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gift_cancel_command(message: types.Message, command: CommandObject):
+    public_reference = (command.args or "").strip()
+    if not public_reference:
+        await message.reply("⚠️ Использование: /gift_cancel <public_reference>")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference)
+        if not gift_row:
+            await message.answer("Подарок не найден.")
+            return
+        action_id = make_action_request(
+            cur,
+            message.from_user.id,
+            "gift_cancel",
+            {"public_reference": public_reference, "admin_id": message.from_user.id},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    await send_admin_action_confirmation(message, action_id, gift_admin_text("Подтвердите отмену подарка", gift_row))
+
+
+@router.message(Command('gift_reissue'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gift_reissue_command(message: types.Message, command: CommandObject):
+    public_reference = (command.args or "").strip()
+    if not public_reference:
+        await message.reply("⚠️ Использование: /gift_reissue <public_reference>")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference)
+        if not gift_row:
+            await message.answer("Подарок не найден.")
+            return
+        action_id = make_action_request(
+            cur,
+            message.from_user.id,
+            "gift_reissue",
+            {"public_reference": public_reference, "admin_id": message.from_user.id},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    await send_admin_action_confirmation(message, action_id, gift_admin_text("Подтвердите перевыпуск сертификата", gift_row))
+
+
+@router.message(Command('gifts_pending'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def gifts_pending_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT public_reference, purchaser_telegram_id, recipient_telegram_id, tariff_code, status, created_at
+            FROM gift_access_grants
+            WHERE status IN ('checkout_open', 'payment_pending', 'paid_unclaimed', 'reserved', 'review_required')
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    if not rows:
+        await message.answer("Активных подарков нет.")
+        return
+    lines = ["🎁 Pending gifts"]
+    for row in rows:
+        lines.append(f"{row[0]} | buyer={row[1]} | recipient={row[2] or 'нет'} | {row[3]} | {row[4]}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command('gift_status'), StateFilter('*'))
+async def gift_status_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT public_reference, tariff_code, status, created_at, applied_expiry
+            FROM gift_access_grants
+            WHERE purchaser_telegram_id = %s
+            ORDER BY created_at DESC
+            LIMIT 10
+        """, (int(message.from_user.id),))
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    if not rows:
+        await message.answer("У вас пока нет подарочных сертификатов.")
+        return
+    lines = ["🎁 Ваши подарки"]
+    for row in rows:
+        lines.append(f"{row[0]} | {gift_tariff_label(row[1])} | {row[2]} | до {row[4] or 'не активирован'}")
+    await message.answer("\n".join(lines))
+
+
 @router.message(Command('sync_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def sync_stripe_user_command(message: types.Message, command: CommandObject):
@@ -7789,6 +8879,14 @@ async def bot_health_command(message: types.Message):
         "cancelled": "нет",
         "permanently_failed": "нет",
     }
+    gift_stats = {
+        "configured": "нет",
+        "missing_prices": "нет",
+        "template_count": "нет",
+        "statuses": {},
+        "created_24h": "нет",
+        "failed_deliveries": "нет",
+    }
     conn = None
     cur = None
 
@@ -7890,6 +8988,30 @@ async def bot_health_command(message: types.Message):
               AND sent_at >= NOW() - INTERVAL '24 hours'
         """)
         first_purchase_recovery_stats["sent_24h"] = cur.fetchone()[0]
+        gift_config = gift_configuration_status(cur)
+        gift_stats["configured"] = "yes" if gift_config["configured"] else "no"
+        gift_stats["missing_prices"] = ", ".join(gift_config["missing_prices"]) if gift_config["missing_prices"] else "нет"
+        gift_stats["template_count"] = f"{gift_config['template_count']}/{gift_config['required_template_count']}"
+        cur.execute("""
+            SELECT status, COUNT(*)
+            FROM gift_access_grants
+            GROUP BY status
+            ORDER BY status
+        """)
+        gift_stats["statuses"] = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM gift_access_grants
+            WHERE created_at >= NOW() - INTERVAL '24 hours'
+        """)
+        gift_stats["created_24h"] = cur.fetchone()[0]
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = ANY(%s)
+              AND status IN ('failed', 'permanently_failed')
+        """, ([GIFT_CERTIFICATE_BUYER, GIFT_CERTIFICATE_RECIPIENT] + list(GIFT_TEXT_DELIVERY_TYPES),))
+        gift_stats["failed_deliveries"] = cur.fetchone()[0]
         cur.execute("""
             SELECT COUNT(*)
             FROM message_delivery_events m
@@ -7937,6 +9059,9 @@ async def bot_health_command(message: types.Message):
         await asyncio.wait_for(asyncio.to_thread(stripe.Balance.retrieve), timeout=5)
         for env_name in ("PRICE_TRIAL", "PRICE_1M", "PRICE_6M", "PRICE_12M"):
             await asyncio.wait_for(asyncio.to_thread(stripe.Price.retrieve, os.getenv(env_name)), timeout=5)
+        for env_name in gift_required_price_envs():
+            if os.getenv(env_name):
+                await asyncio.wait_for(asyncio.to_thread(stripe.Price.retrieve, os.getenv(env_name)), timeout=5)
         stripe_status = "OK"
     except Exception as e:
         error_ref = safe_admin_error_reference("bot_health_stripe", e)
@@ -7975,6 +9100,13 @@ async def bot_health_command(message: types.Message):
         f"sent за 24 часа: {first_purchase_recovery_stats['sent_24h']}\n"
         f"cancelled: {first_purchase_recovery_stats['cancelled']}\n"
         f"permanently_failed: {first_purchase_recovery_stats['permanently_failed']}\n\n"
+        "Gift access:\n"
+        f"configured: {gift_stats['configured']}\n"
+        f"missing prices: {gift_stats['missing_prices']}\n"
+        f"templates: {gift_stats['template_count']}\n"
+        f"created за 24 часа: {gift_stats['created_24h']}\n"
+        f"failed deliveries: {gift_stats['failed_deliveries']}\n"
+        f"statuses: {gift_stats['statuses']}\n\n"
         "Users:\n"
         f"Всего пользователей: {user_stats['total']}\n"
         f"paid=True: {user_stats['paid']}\n"
@@ -8744,6 +9876,74 @@ async def stripe_webhook(request):
         # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
         if event_type == 'checkout.session.completed':
             session = event_object
+            gift_metadata = stripe_value(session, "metadata") or {}
+            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = gift_metadata.get("gift_id")
+                session_id = stripe_value(session, "id")
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        SELECT *
+                        FROM gift_access_grants
+                        WHERE id = %s
+                           OR stripe_session_id = %s
+                        FOR UPDATE
+                    """, (gift_id, session_id))
+                    gift_row = gift_row_dict(cur, cur.fetchone())
+                    if not gift_row:
+                        enqueue_gift_admin_delivery(
+                            cur,
+                            safe_admin_context_reference("gift_missing", event_id, session_id),
+                            "gift_admin_problem",
+                            "⚠️ Gift payment webhook received for unknown gift.\n\n"
+                            f"safe_ref: {safe_admin_context_reference('gift_missing', event_id, session_id)}",
+                            severity="CRITICAL",
+                        )
+                        conn.commit()
+                        await release_event_processing(event_id)
+                        return web.Response(status=500, text="Unknown gift")
+                    if stripe_value(session, "payment_status") in ("paid", "no_payment_required"):
+                        mark_gift_paid_and_enqueue(cur, event_id, session, gift_row)
+                    else:
+                        cur.execute("""
+                            UPDATE gift_access_grants
+                            SET status = 'payment_pending',
+                                updated_at = NOW()
+                            WHERE id = %s
+                              AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+                        """, (gift_row["id"],))
+                        record_gift_event(cur, gift_row, "gift_payment_pending", gift_row["purchaser_telegram_id"], source="stripe_webhook")
+                    conn.commit()
+                    await mark_event_processed(event_id)
+                    return web.Response(status=200)
+                except Exception as e:
+                    conn.rollback()
+                    logging.error(
+                        "GIFT_CHECKOUT_COMPLETED_FAILED: event_id=%s gift=%s error=%s",
+                        safe_log_id(event_id),
+                        safe_log_id(gift_id),
+                        str(e),
+                        exc_info=True,
+                    )
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="gift_checkout_completed_failed",
+                        stage="checkout_completed",
+                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("gift_checkout_completed", event_id, gift_id),
+                        note="Gift payment was not applied. Stripe may retry.",
+                        severity="CRITICAL",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+                finally:
+                    cur.close()
+                    conn.close()
             user_id = resolve_checkout_telegram_id(session)
             metadata_obj = stripe_value(session, 'metadata') or {}
             metadata_keys = list(metadata_obj.keys()) if isinstance(metadata_obj, dict) else []
@@ -11016,9 +12216,100 @@ async def stripe_webhook(request):
                     if conn:
                         conn.close()
 
+        elif event_type == 'checkout.session.async_payment_succeeded':
+            session = event_object
+            gift_metadata = stripe_value(session, "metadata") or {}
+            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = gift_metadata.get("gift_id")
+                session_id = stripe_value(session, "id")
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        SELECT *
+                        FROM gift_access_grants
+                        WHERE id = %s
+                           OR stripe_session_id = %s
+                        FOR UPDATE
+                    """, (gift_id, session_id))
+                    gift_row = gift_row_dict(cur, cur.fetchone())
+                    if not gift_row:
+                        raise ValueError("gift_not_found")
+                    mark_gift_paid_and_enqueue(cur, event_id, session, gift_row)
+                    conn.commit()
+                    await mark_event_processed(event_id)
+                    return web.Response(status=200)
+                except Exception as e:
+                    conn.rollback()
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="gift_async_payment_succeeded_failed",
+                        stage="checkout_async_payment_succeeded",
+                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference("gift_async_success", event_id, gift_id),
+                        note="Gift async success was not applied. Stripe may retry.",
+                        severity="CRITICAL",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+                finally:
+                    cur.close()
+                    conn.close()
+
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session = event_object
+            gift_metadata = stripe_value(session, "metadata") or {}
+            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = gift_metadata.get("gift_id")
+                session_id = stripe_value(session, "id")
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        SELECT *
+                        FROM gift_access_grants
+                        WHERE id = %s
+                           OR stripe_session_id = %s
+                        FOR UPDATE
+                    """, (gift_id, session_id))
+                    gift_row = gift_row_dict(cur, cur.fetchone())
+                    if gift_row:
+                        terminal_status = "cancelled" if event_type == "checkout.session.expired" else "payment_pending"
+                        cur.execute("""
+                            UPDATE gift_access_grants
+                            SET status = %s,
+                                cancelled_at = CASE WHEN %s = 'cancelled' THEN NOW() ELSE cancelled_at END,
+                                last_error = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                              AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+                        """, (terminal_status, terminal_status, event_type, gift_row["id"]))
+                        record_gift_event(cur, gift_row, event_type, gift_row["purchaser_telegram_id"], source="stripe_webhook")
+                        enqueue_gift_text_delivery(
+                            cur,
+                            gift_row["public_reference"],
+                            gift_row["purchaser_telegram_id"],
+                            "gift_redeemed_buyer",
+                            "Похоже, оформление подарка не завершилось. Вы можете создать подарок заново из меню.",
+                        )
+                        enqueue_gift_admin_delivery(
+                            cur,
+                            gift_row["public_reference"],
+                            "gift_admin_problem",
+                            gift_admin_text("⚠️ Gift checkout did not complete", gift_row, extra=f"event: {event_type}"),
+                            severity="WARNING",
+                        )
+                    conn.commit()
+                    await mark_event_processed(event_id)
+                    return web.Response(status=200)
+                finally:
+                    cur.close()
+                    conn.close()
             user_id = getattr(session, 'client_reference_id', None)
             session_id = stripe_value(session, 'id')
             conn = get_db_conn()
@@ -11794,6 +13085,10 @@ async def execute_confirmed_admin_action(action_type, payload):
         return await execute_confirmed_retry_delivery(payload)
     if action_type == "restore_access":
         return await execute_confirmed_restore_access(payload)
+    if action_type == "gift_cancel":
+        return await execute_confirmed_gift_cancel(payload)
+    if action_type == "gift_reissue":
+        return await execute_confirmed_gift_reissue(payload)
     raise ValueError(f"Unsupported admin action: {action_type}")
 
 
@@ -12248,6 +13543,71 @@ async def execute_confirmed_revoke_invite_links(payload):
             failed += 1
             logging.error("BOT_INVITE_LINK_REVOKE_FAILED: invite_link=%s, error=%s", safe_log_url(invite_link), str(e), exc_info=True)
     return {"revoked": revoked, "failed": failed}
+
+
+async def execute_confirmed_gift_cancel(payload):
+    public_reference = payload["public_reference"]
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference, for_update=True)
+        if not gift_row:
+            raise ValueError("gift_not_found")
+        if gift_row["status"] not in ("checkout_pending", "checkout_open", "payment_pending", "paid_unclaimed", "reserved"):
+            raise ValueError("gift_not_cancellable")
+        cur.execute("""
+            UPDATE gift_access_grants
+            SET status = 'cancelled',
+                cancelled_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+              AND status IN ('checkout_pending', 'checkout_open', 'payment_pending', 'paid_unclaimed', 'reserved')
+            RETURNING *
+        """, (gift_row["id"],))
+        updated = gift_row_dict(cur, cur.fetchone())
+        if not updated:
+            raise ValueError("gift_not_cancellable")
+        record_gift_event(cur, updated, "gift_cancelled", payload.get("admin_id"), source="admin_action")
+        enqueue_gift_admin_delivery(cur, public_reference, "gift_admin_problem", gift_admin_text("🎁 Gift cancelled by admin", updated))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    return {"status": "completed", "public_reference": public_reference, "gift_status": "cancelled"}
+
+
+async def execute_confirmed_gift_reissue(payload):
+    public_reference = payload["public_reference"]
+    new_token = generate_gift_token()
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift_row = fetch_gift_by_public_reference(cur, public_reference, for_update=True)
+        if not gift_row:
+            raise ValueError("gift_not_found")
+        if gift_row["status"] not in ("paid_unclaimed", "reserved"):
+            raise ValueError("gift_not_reissuable")
+        cur.execute("""
+            UPDATE gift_access_grants
+            SET token_hash = %s,
+                token_version = token_version + 1,
+                updated_at = NOW()
+            WHERE id = %s
+              AND status IN ('paid_unclaimed', 'reserved')
+            RETURNING *
+        """, (gift_token_hash(new_token), gift_row["id"]))
+        updated = gift_row_dict(cur, cur.fetchone())
+        if not updated:
+            raise ValueError("gift_not_reissuable")
+        updated["token"] = new_token
+        record_gift_event(cur, updated, "gift_reissued", payload.get("admin_id"), source="admin_action")
+        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER, token=new_token)
+        enqueue_gift_admin_delivery(cur, public_reference, "gift_admin_problem", gift_admin_text("🎁 Gift certificate reissued", updated))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    return {"status": "completed", "public_reference": public_reference, "gift_status": updated["status"]}
 
 
 @router.callback_query(F.data.startswith("admin_action:confirm:"), StateFilter('*'))
@@ -13068,6 +14428,22 @@ async def process_pending_message_deliveries(limit=25):
                         reply_markup=stripe_delivery_reply_markup(payload),
                         parse_mode=payload.get("parse_mode"),
                     )
+            elif delivery_type in (GIFT_CERTIFICATE_BUYER, GIFT_CERTIFICATE_RECIPIENT):
+                photo_file_id = payload.get("photo_file_id")
+                caption = payload.get("caption")
+                button_url = payload.get("button_url")
+                if not photo_file_id or not caption or not button_url:
+                    raise ValueError("invalid_gift_certificate_payload")
+                sending_user_message = True
+                await bot.send_photo(
+                    int(telegram_id),
+                    photo_file_id,
+                    caption=caption,
+                    reply_markup=inline_keyboard([[
+                        InlineKeyboardButton(text=payload.get("button_text") or "🎁 Активировать подарок", url=button_url)
+                    ]]),
+                    parse_mode=payload.get("parse_mode"),
+                )
             elif delivery_type == "stripe_admin_message":
                 if int(telegram_id) not in ADMIN_IDS:
                     raise ValueError("invalid_stripe_admin_message_recipient")
@@ -13259,6 +14635,116 @@ async def scheduled_process_message_deliveries():
     )
 
 
+async def apply_reserved_gifts(limit=50):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    applied = 0
+    try:
+        cur.execute("""
+            SELECT *
+            FROM gift_access_grants
+            WHERE status = 'reserved'
+              AND recipient_telegram_id IS NOT NULL
+            ORDER BY reserved_at NULLS FIRST, updated_at
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        """, (int(limit),))
+        gifts = [gift_row_dict(cur, row) for row in cur.fetchall()]
+        for gift_row in gifts:
+            cur.execute("""
+                SELECT paid, expiry_date, auto_renew, stripe_subscription_id
+                FROM users
+                WHERE telegram_id = %s
+                FOR UPDATE
+            """, (int(gift_row["recipient_telegram_id"]),))
+            user_row = cur.fetchone()
+            if not user_row:
+                continue
+            old_expiry = user_row[1]
+            auto_renew = bool(user_row[2])
+            stripe_subscription_id = user_row[3]
+            if auto_renew and stripe_subscription_id and old_expiry and old_expiry > datetime.utcnow():
+                continue
+            base_expiry = old_expiry if old_expiry and old_expiry > datetime.utcnow() else datetime.utcnow()
+            new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
+            cur.execute("""
+                UPDATE users
+                SET paid = TRUE,
+                    expiry_date = %s,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    grace_period_end = NULL,
+                    reminder_sent = FALSE,
+                    blocked_bot = FALSE
+                WHERE telegram_id = %s
+            """, (new_expiry, int(gift_row["recipient_telegram_id"])))
+            cur.execute("""
+                UPDATE gift_access_grants
+                SET status = 'redeemed',
+                    redeemed_at = COALESCE(redeemed_at, NOW()),
+                    applied_at = COALESCE(applied_at, NOW()),
+                    applied_expiry = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'reserved'
+            """, (new_expiry, gift_row["id"]))
+            record_access_event_cur(
+                cur,
+                gift_row["recipient_telegram_id"],
+                "gift_access_reserved_applied",
+                source="scheduled_apply_reserved_gifts",
+                old_expiry=old_expiry,
+                new_expiry=new_expiry,
+                notes=f"gift={gift_row['public_reference']}",
+            )
+            record_gift_event(cur, gift_row, "reserved_gift_applied", gift_row["recipient_telegram_id"], source="scheduler")
+            enqueue_automatic_membership_repair(
+                cur,
+                gift_row["recipient_telegram_id"],
+                new_expiry,
+                "gift_access",
+                reason="reserved_gift_applied",
+            )
+            enqueue_gift_text_delivery(
+                cur,
+                gift_row["public_reference"],
+                gift_row["recipient_telegram_id"],
+                "gift_redeemed_recipient",
+                build_gift_redeemed_recipient_text(gift_row, new_expiry),
+            )
+            enqueue_gift_text_delivery(
+                cur,
+                gift_row["public_reference"],
+                gift_row["purchaser_telegram_id"],
+                "gift_redeemed_buyer",
+                build_gift_redeemed_buyer_text(gift_row),
+            )
+            enqueue_gift_admin_delivery(
+                cur,
+                gift_row["public_reference"],
+                "gift_admin_redeemed",
+                gift_admin_text("🎁 Reserved gift applied", gift_row, extra=f"new_expiry: {new_expiry}"),
+            )
+            applied += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+    return {"applied": applied}
+
+
+async def scheduled_apply_reserved_gifts():
+    return await run_scheduled_with_lock(
+        "apply_reserved_gifts",
+        datetime.utcnow().strftime("%Y%m%d%H"),
+        apply_reserved_gifts,
+        lease_minutes=60,
+    )
+
+
 def register_scheduler_jobs_once():
     global SCHEDULER_JOBS_REGISTERED
     if SCHEDULER_JOBS_REGISTERED:
@@ -13321,6 +14807,15 @@ def register_scheduler_jobs_once():
     )
 
     scheduler.add_job(
+        scheduled_apply_reserved_gifts,
+        'cron',
+        minute=5,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
         scheduled_cleanup_stale_postgres_fsm_storage,
         'cron',
         hour=4,
@@ -13357,6 +14852,7 @@ async def on_startup(app):
         types.BotCommand(command="start", description="Запуск бота"),
         types.BotCommand(command="menu", description="Главное меню"),
         types.BotCommand(command="profile", description="Мой профиль и подписка"),
+        types.BotCommand(command="gift_status", description="Мои подарки"),
         types.BotCommand(command="ask", description="Задать вопрос"),
     ])
 

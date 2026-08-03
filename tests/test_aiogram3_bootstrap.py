@@ -2173,8 +2173,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 53)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 19)
+        self.assertEqual(len(self.main.router.message.handlers), 64)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 24)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2205,13 +2205,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 53)
-        self.assertEqual(len(callback_handlers), 19)
+        self.assertEqual(len(message_handlers), 64)
+        self.assertEqual(len(callback_handlers), 24)
         self.assertEqual(
             commands,
             [
                 "promo_trial", "cancel", "menu", "ask", "start", "profile",
-                "send_user", "broadcast", "give_access", "set_expiry", "restore_access", "sync_stripe_user",
+                "send_user", "broadcast", "give_access", "set_expiry", "restore_access",
+                "gift_templates", "gift_template_upload", "gift_info", "gift_cancel",
+                "gift_reissue", "gifts_pending", "gift_status", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
                 "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
@@ -4255,7 +4257,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 8)
+        self.assertEqual(len(fake_scheduler.jobs), 9)
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):
@@ -4285,6 +4287,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             [[button.text for button in row] for row in menu_keyboard.keyboard],
             [
                 ["🎁 Бесплатный урок"],
+                ["🎁 Подарить доступ"],
                 ["💬 Задать вопрос", "🆘 Правила клуба"],
                 ["👤 Профиль и подписка"],
             ],
