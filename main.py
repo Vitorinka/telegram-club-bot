@@ -1609,17 +1609,21 @@ def gift_refund_amount_from_event(event_type, event_object):
         amount_refunded = stripe_value(event_object, "amount_refunded") or 0
         charge_amount = stripe_value(event_object, "amount") or 0
         is_full = bool(stripe_value(event_object, "refunded")) and amount_refunded >= charge_amount > 0
-        return payment_intent, amount_refunded, is_full
+        return payment_intent, amount_refunded, is_full, "succeeded"
     payment_intent = get_stripe_object_id(stripe_value(event_object, "payment_intent"))
     amount = stripe_value(event_object, "amount") or 0
     status = stripe_value(event_object, "status")
-    return payment_intent, amount, status == "succeeded"
+    return payment_intent, amount, status == "succeeded", status or "unknown"
 
 
 def apply_gift_refund_event(cur, event_id, event_type, event_object, gift_row):
-    payment_intent, refund_amount, event_full_refund = gift_refund_amount_from_event(event_type, event_object)
+    payment_intent, refund_amount, event_full_refund, refund_status = gift_refund_amount_from_event(event_type, event_object)
     if not payment_intent or payment_intent != gift_row.get("stripe_payment_intent_id"):
         raise ValueError("gift_refund_payment_intent_mismatch")
+    if event_type in ("refund.created", "refund.updated") and refund_status != "succeeded":
+        event_name = "gift_refund_pending" if refund_status == "pending" else f"gift_refund_{refund_status}_ignored"
+        record_gift_event(cur, gift_row, event_name, gift_row.get("purchaser_telegram_id"), source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
+        return gift_row
     gift_amount = int(gift_row.get("amount_total") or 0)
     full_refund = bool(event_full_refund and gift_amount and int(refund_amount or 0) >= gift_amount)
     partial_refund = bool(refund_amount and (not full_refund))
@@ -1736,21 +1740,19 @@ async def gift_recipient_subscription_state(recipient_telegram_id):
     finally:
         cur.close()
         conn.close()
-    now = datetime.utcnow()
     if not row:
         return {"action": "apply", "subscription_id": None, "status": None, "cancel_at_period_end": None}
     paid, expiry_date, auto_renew, stripe_subscription_id = row
-    active_now = bool(paid and expiry_date and expiry_date > now)
-    if not (active_now and auto_renew and stripe_subscription_id):
+    if not stripe_subscription_id:
         return {"action": "apply", "subscription_id": stripe_subscription_id, "status": None, "cancel_at_period_end": None}
     try:
         subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
     except Exception as e:
         logging.warning(
-            "GIFT_RECIPIENT_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s subscription=%s error=%s",
+            "GIFT_RECIPIENT_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s subscription=%s error_ref=%s",
             safe_log_id(recipient_telegram_id),
             safe_log_id(stripe_subscription_id),
-            clean_error_reason(e),
+            safe_admin_error_reference("gift_recipient_subscription_retrieve", e),
             exc_info=True,
         )
         return {"action": "fail", "subscription_id": stripe_subscription_id, "reason": "stripe_unavailable"}
@@ -1758,13 +1760,18 @@ async def gift_recipient_subscription_state(recipient_telegram_id):
     cancel_at_period_end = bool(stripe_value(subscription, "cancel_at_period_end"))
     if status in ("active", "trialing") and not cancel_at_period_end:
         action = "reserve"
-    else:
+    elif status in ("active", "trialing") and cancel_at_period_end:
+        action = "apply_after_current_expiry"
+    elif status in ("canceled", "incomplete_expired", "unpaid"):
         action = "apply"
+    else:
+        action = "fail"
     return {
         "action": action,
         "subscription_id": stripe_subscription_id,
         "status": status,
         "cancel_at_period_end": cancel_at_period_end,
+        "reason": None if action != "fail" else "stripe_status_unknown",
     }
 
 
@@ -1828,7 +1835,7 @@ def mark_gift_paid_and_enqueue(cur, event_id, event_type, session, line_item, pr
     try:
         enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
     except ValueError as e:
-        if str(e) != "gift_certificate_template_missing":
+        if e.args != ("gift_certificate_template_missing",):
             raise
         enqueue_gift_admin_delivery(
             cur,
@@ -1870,46 +1877,44 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subsc
     old_expiry = user_row[1] if user_row else None
     auto_renew = bool(user_row[2]) if user_row else False
     stripe_subscription_id = user_row[3] if user_row else None
-    active_now = bool(user_row and user_row[0] and old_expiry and old_expiry > now)
 
-    if active_now and auto_renew and stripe_subscription_id:
-        if not subscription_state:
-            raise ValueError("gift_recipient_subscription_state_missing")
+    if subscription_state and subscription_state.get("subscription_id") is not None:
         if subscription_state.get("subscription_id") != stripe_subscription_id:
             raise ValueError("gift_recipient_subscription_identity_changed")
         if subscription_state.get("action") == "fail":
             raise ValueError(subscription_state.get("reason") or "gift_recipient_subscription_check_failed")
-        if subscription_state.get("action") == "reserve":
-            cur.execute("""
-                UPDATE gift_access_grants
-                SET status = 'reserved',
-                    recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
-                    reserved_at = COALESCE(reserved_at, NOW()),
-                    updated_at = NOW()
-                WHERE id = %s
-                  AND status = 'paid_unclaimed'
-                RETURNING *
-            """, (int(recipient_telegram_id), gift_row["id"]))
-            reserved = gift_row_dict(cur, cur.fetchone())
-            if not reserved:
-                raise ValueError("gift_not_reservable")
-            record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
-            enqueue_gift_text_delivery(
-                cur,
-                reserved["public_reference"],
-                recipient_telegram_id,
-                "gift_reserved_recipient",
-                build_gift_reserved_recipient_text(reserved),
-            )
-            enqueue_gift_text_delivery(
-                cur,
-                reserved["public_reference"],
-                reserved["purchaser_telegram_id"],
-                "gift_reserved_buyer",
-                "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
-            )
-            enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
-            return reserved, "reserved", old_expiry
+
+    if subscription_state and subscription_state.get("action") == "reserve":
+        cur.execute("""
+            UPDATE gift_access_grants
+            SET status = 'reserved',
+                recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
+                reserved_at = COALESCE(reserved_at, NOW()),
+                updated_at = NOW()
+            WHERE id = %s
+              AND status = 'paid_unclaimed'
+            RETURNING *
+        """, (int(recipient_telegram_id), gift_row["id"]))
+        reserved = gift_row_dict(cur, cur.fetchone())
+        if not reserved:
+            raise ValueError("gift_not_reservable")
+        record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
+        enqueue_gift_text_delivery(
+            cur,
+            reserved["public_reference"],
+            recipient_telegram_id,
+            "gift_reserved_recipient",
+            build_gift_reserved_recipient_text(reserved),
+        )
+        enqueue_gift_text_delivery(
+            cur,
+            reserved["public_reference"],
+            reserved["purchaser_telegram_id"],
+            "gift_reserved_buyer",
+            "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
+        )
+        enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
+        return reserved, "reserved", old_expiry
 
     base_expiry = old_expiry if old_expiry and old_expiry > now else now
     new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
@@ -5798,7 +5803,12 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
                 reused_checkout_url = gift_row["checkout_url"]
     except Exception as e:
         conn.rollback()
-        logging.error("GIFT_CHECKOUT_DRAFT_FAILED: user=%s error=%s", callback.from_user.id, str(e), exc_info=True)
+        logging.error(
+            "GIFT_CHECKOUT_DRAFT_FAILED: user=%s error_ref=%s",
+            callback.from_user.id,
+            safe_admin_error_reference("gift_checkout_draft", e),
+            exc_info=True,
+        )
         draft_failed = True
     finally:
         cur.close()
@@ -5864,14 +5874,19 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         finally:
             fail_cur.close()
             fail_conn.close()
-        logging.error("GIFT_CHECKOUT_CREATE_FAILED: gift=%s error=%s", safe_log_id(gift_row["public_reference"]), str(e), exc_info=True)
+        logging.error(
+            "GIFT_CHECKOUT_CREATE_FAILED: gift=%s error_ref=%s",
+            safe_log_id(gift_row["public_reference"]),
+            safe_admin_error_reference("gift_checkout_create", e),
+            exc_info=True,
+        )
         await enqueue_admin_payment_problem_now(
             event_id=None,
             purpose="gift_checkout_creation_failed",
             stage="checkout_creation",
             telegram_id=callback.from_user.id,
             category="checkout_creation_failed",
-            exception=e,
+            exception=None,
             stripe_retry="неизвестно",
             recovery_reminder="не применимо",
             safe_ref=safe_admin_context_reference("gift_checkout_create", gift_row["public_reference"]),
@@ -5923,10 +5938,10 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
     except Exception as e:
         conn.rollback()
         logging.error(
-            "GIFT_ACTIVATION_FAILED: gift=%s user=%s error=%s",
+            "GIFT_ACTIVATION_FAILED: gift=%s user=%s error_ref=%s",
             safe_log_id(public_reference),
             callback.from_user.id,
-            str(e),
+            safe_admin_error_reference("gift_activation", e),
             exc_info=True,
         )
         activation_failed = True
@@ -10242,7 +10257,7 @@ async def stripe_webhook(request):
                         stage="checkout_completed",
                         telegram_id=gift_metadata.get("purchaser_telegram_id"),
                         category="webhook_processing_failed",
-                        exception=e,
+                        exception=None,
                         stripe_retry="да",
                         recovery_reminder="не применимо",
                         safe_ref=safe_admin_context_reference("gift_checkout_proof", event_id, gift_id),
@@ -10253,6 +10268,10 @@ async def stripe_webhook(request):
                     return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
+                gift_response = web.Response(status=200)
+                gift_mark_processed = False
+                gift_release_event = False
+                gift_admin_problem = None
                 try:
                     cur.execute("""
                         SELECT *
@@ -10272,11 +10291,13 @@ async def stripe_webhook(request):
                             severity="CRITICAL",
                         )
                         conn.commit()
-                        await release_event_processing(event_id)
-                        return web.Response(status=500, text="Unknown gift")
-                    if stripe_value(proof_session, "payment_status") == "paid":
+                        gift_release_event = True
+                        gift_response = web.Response(status=500, text="Unknown gift")
+                    elif stripe_value(proof_session, "payment_status") == "paid":
                         mark_gift_paid_and_enqueue(cur, event_id, event_type, proof_session, line_item, price, gift_row)
-                    else:
+                        conn.commit()
+                        gift_mark_processed = True
+                    elif gift_row:
                         cur.execute("""
                             UPDATE gift_access_grants
                             SET status = 'payment_pending',
@@ -10285,36 +10306,43 @@ async def stripe_webhook(request):
                               AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
                         """, (gift_row["id"],))
                         record_gift_event(cur, gift_row, "gift_payment_pending", gift_row["purchaser_telegram_id"], source="stripe_webhook")
-                    conn.commit()
-                    await mark_event_processed(event_id)
-                    return web.Response(status=200)
+                        conn.commit()
+                        gift_mark_processed = True
                 except Exception as e:
                     conn.rollback()
+                    error_ref = safe_admin_error_reference("gift_checkout_completed", e)
                     logging.error(
-                        "GIFT_CHECKOUT_COMPLETED_FAILED: event_id=%s gift=%s error=%s",
+                        "GIFT_CHECKOUT_COMPLETED_FAILED: event_id=%s gift=%s error_ref=%s",
                         safe_log_id(event_id),
                         safe_log_id(gift_id),
-                        str(e),
+                        error_ref,
                         exc_info=True,
                     )
-                    await enqueue_admin_payment_problem_now(
-                        event_id=event_id,
-                        purpose="gift_checkout_completed_failed",
-                        stage="checkout_completed",
-                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
-                        category="webhook_processing_failed",
-                        exception=e,
-                        stripe_retry="да",
-                        recovery_reminder="не применимо",
-                        safe_ref=safe_admin_context_reference("gift_checkout_completed", event_id, gift_id),
-                        note="Gift payment was not applied. Stripe may retry.",
-                        severity="CRITICAL",
-                    )
-                    await release_event_processing(event_id)
-                    return web.Response(status=500)
+                    gift_admin_problem = {
+                        "event_id": event_id,
+                        "purpose": "gift_checkout_completed_failed",
+                        "stage": "checkout_completed",
+                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "category": "webhook_processing_failed",
+                        "exception": None,
+                        "stripe_retry": "да",
+                        "recovery_reminder": "не применимо",
+                        "safe_ref": safe_admin_context_reference("gift_checkout_completed", event_id, gift_id),
+                        "note": "Gift payment was not applied. Stripe may retry.",
+                        "severity": "CRITICAL",
+                    }
+                    gift_release_event = True
+                    gift_response = web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
+                if gift_mark_processed:
+                    await mark_event_processed(event_id)
+                if gift_admin_problem:
+                    await enqueue_admin_payment_problem_now(**gift_admin_problem)
+                if gift_release_event:
+                    await release_event_processing(event_id)
+                return gift_response
             user_id = resolve_checkout_telegram_id(session)
             metadata_obj = stripe_value(session, 'metadata') or {}
             metadata_keys = list(metadata_obj.keys()) if isinstance(metadata_obj, dict) else []
@@ -10520,7 +10548,7 @@ async def stripe_webhook(request):
                         stage="checkout_completed",
                         telegram_id=user_id,
                         category="webhook_processing_failed",
-                        exception=e,
+                        exception=None,
                         stripe_retry="да",
                         recovery_reminder="неизвестно",
                         safe_ref=safe_admin_error_reference("checkout_subscription_link", e),
@@ -11727,7 +11755,7 @@ async def stripe_webhook(request):
                         purpose="invoice_payment_failed_subscription_retrieve",
                         stage="invoice_payment_failed",
                         telegram_id=None,
-                        exception=e,
+                        exception=None,
                         stripe_retry="да",
                         recovery_reminder="неизвестно",
                         safe_ref=safe_admin_error_reference('payment_failed_subscription_retrieve', e),
@@ -12602,7 +12630,7 @@ async def stripe_webhook(request):
                         stage="checkout_async_payment_succeeded",
                         telegram_id=gift_metadata.get("purchaser_telegram_id"),
                         category="webhook_processing_failed",
-                        exception=e,
+                        exception=None,
                         stripe_retry="да",
                         recovery_reminder="не применимо",
                         safe_ref=safe_admin_context_reference("gift_async_success_proof", event_id, gift_id),
@@ -12613,6 +12641,10 @@ async def stripe_webhook(request):
                     return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
+                gift_response = web.Response(status=200)
+                gift_mark_processed = False
+                gift_release_event = False
+                gift_admin_problem = None
                 try:
                     cur.execute("""
                         SELECT *
@@ -12626,28 +12658,34 @@ async def stripe_webhook(request):
                         raise ValueError("gift_not_found")
                     mark_gift_paid_and_enqueue(cur, event_id, event_type, proof_session, line_item, price, gift_row)
                     conn.commit()
-                    await mark_event_processed(event_id)
-                    return web.Response(status=200)
+                    gift_mark_processed = True
                 except Exception as e:
                     conn.rollback()
-                    await enqueue_admin_payment_problem_now(
-                        event_id=event_id,
-                        purpose="gift_async_payment_succeeded_failed",
-                        stage="checkout_async_payment_succeeded",
-                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
-                        category="webhook_processing_failed",
-                        exception=e,
-                        stripe_retry="да",
-                        recovery_reminder="не применимо",
-                        safe_ref=safe_admin_context_reference("gift_async_success", event_id, gift_id),
-                        note="Gift async success was not applied. Stripe may retry.",
-                        severity="CRITICAL",
-                    )
-                    await release_event_processing(event_id)
-                    return web.Response(status=500)
+                    gift_admin_problem = {
+                        "event_id": event_id,
+                        "purpose": "gift_async_payment_succeeded_failed",
+                        "stage": "checkout_async_payment_succeeded",
+                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "category": "webhook_processing_failed",
+                        "exception": None,
+                        "stripe_retry": "да",
+                        "recovery_reminder": "не применимо",
+                        "safe_ref": safe_admin_context_reference("gift_async_success", event_id, gift_id),
+                        "note": "Gift async success was not applied. Stripe may retry.",
+                        "severity": "CRITICAL",
+                    }
+                    gift_release_event = True
+                    gift_response = web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
+                if gift_mark_processed:
+                    await mark_event_processed(event_id)
+                if gift_admin_problem:
+                    await enqueue_admin_payment_problem_now(**gift_admin_problem)
+                if gift_release_event:
+                    await release_event_processing(event_id)
+                return gift_response
 
         elif event_type in ("charge.refunded", "refund.created", "refund.updated"):
             refund_object = event_object
@@ -12655,6 +12693,10 @@ async def stripe_webhook(request):
             if payment_intent:
                 conn = get_db_conn()
                 cur = conn.cursor()
+                gift_response = web.Response(status=200)
+                gift_mark_processed = False
+                gift_release_event = False
+                gift_admin_problem = None
                 try:
                     cur.execute("""
                         SELECT *
@@ -12666,28 +12708,36 @@ async def stripe_webhook(request):
                     if gift_row:
                         apply_gift_refund_event(cur, event_id, event_type, refund_object, gift_row)
                         conn.commit()
-                        await mark_event_processed(event_id)
-                        return web.Response(status=200)
-                    conn.rollback()
+                        gift_mark_processed = True
+                    else:
+                        conn.rollback()
                 except Exception as e:
                     conn.rollback()
-                    await enqueue_admin_payment_problem_now(
-                        event_id=event_id,
-                        purpose="gift_refund_processing_failed",
-                        stage="refund_webhook",
-                        category="webhook_processing_failed",
-                        exception=e,
-                        stripe_retry="да",
-                        recovery_reminder="не применимо",
-                        safe_ref=safe_admin_context_reference("gift_refund", event_id, payment_intent),
-                        note="Gift refund was not applied. Stripe may retry.",
-                        severity="CRITICAL",
-                    )
-                    await release_event_processing(event_id)
-                    return web.Response(status=500)
+                    gift_admin_problem = {
+                        "event_id": event_id,
+                        "purpose": "gift_refund_processing_failed",
+                        "stage": "refund_webhook",
+                        "category": "webhook_processing_failed",
+                        "exception": None,
+                        "stripe_retry": "да",
+                        "recovery_reminder": "не применимо",
+                        "safe_ref": safe_admin_context_reference("gift_refund", event_id, payment_intent),
+                        "note": "Gift refund was not applied. Stripe may retry.",
+                        "severity": "CRITICAL",
+                    }
+                    gift_release_event = True
+                    gift_response = web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
+                if gift_mark_processed:
+                    await mark_event_processed(event_id)
+                if gift_admin_problem:
+                    await enqueue_admin_payment_problem_now(**gift_admin_problem)
+                if gift_release_event:
+                    await release_event_processing(event_id)
+                if gift_mark_processed or gift_release_event:
+                    return gift_response
 
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
@@ -12698,6 +12748,10 @@ async def stripe_webhook(request):
                 session_id = stripe_value(session, "id")
                 conn = get_db_conn()
                 cur = conn.cursor()
+                gift_mark_processed = False
+                gift_release_event = False
+                gift_admin_problem = None
+                gift_response = web.Response(status=200)
                 try:
                     cur.execute("""
                         SELECT *
@@ -12741,11 +12795,34 @@ async def stripe_webhook(request):
                         else:
                             record_gift_event(cur, gift_row, f"{event_type}_ignored", gift_row["purchaser_telegram_id"], source="stripe_webhook")
                     conn.commit()
-                    await mark_event_processed(event_id)
-                    return web.Response(status=200)
+                    gift_mark_processed = True
+                except Exception as e:
+                    conn.rollback()
+                    gift_admin_problem = {
+                        "event_id": event_id,
+                        "purpose": "gift_checkout_terminal_failed",
+                        "stage": "checkout_terminal",
+                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "category": "webhook_processing_failed",
+                        "exception": None,
+                        "stripe_retry": "да",
+                        "recovery_reminder": "не применимо",
+                        "safe_ref": safe_admin_context_reference("gift_checkout_terminal", event_id, gift_id),
+                        "note": "Gift checkout terminal event was not applied. Stripe may retry.",
+                        "severity": "CRITICAL",
+                    }
+                    gift_release_event = True
+                    gift_response = web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
+                if gift_mark_processed:
+                    await mark_event_processed(event_id)
+                if gift_admin_problem:
+                    await enqueue_admin_payment_problem_now(**gift_admin_problem)
+                if gift_release_event:
+                    await release_event_processing(event_id)
+                return gift_response
             user_id = getattr(session, 'client_reference_id', None)
             session_id = stripe_value(session, 'id')
             conn = get_db_conn()
@@ -15152,18 +15229,18 @@ async def apply_reserved_gifts(limit=50):
             old_expiry = user_row[1]
             auto_renew = bool(user_row[2])
             stripe_subscription_id = user_row[3]
+            if subscription_state.get("subscription_id") is not None and subscription_state.get("subscription_id") != stripe_subscription_id:
+                record_gift_event(
+                    cur,
+                    locked_gift,
+                    "reserved_gift_identity_changed",
+                    locked_gift["recipient_telegram_id"],
+                    source="scheduler",
+                )
+                conn.commit()
+                skipped += 1
+                continue
             if auto_renew and stripe_subscription_id and old_expiry and old_expiry > datetime.utcnow():
-                if subscription_state.get("subscription_id") != stripe_subscription_id:
-                    record_gift_event(
-                        cur,
-                        locked_gift,
-                        "reserved_gift_identity_changed",
-                        locked_gift["recipient_telegram_id"],
-                        source="scheduler",
-                    )
-                    conn.commit()
-                    skipped += 1
-                    continue
                 if subscription_state.get("action") == "reserve":
                     conn.rollback()
                     skipped += 1

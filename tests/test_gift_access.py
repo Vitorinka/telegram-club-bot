@@ -1,8 +1,10 @@
 import importlib
+import asyncio
 import os
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 TEST_ENV = {
     "BOT_TOKEN": "123456:TEST_TOKEN_FOR_GIFT_ONLY",
@@ -177,6 +179,104 @@ class GiftAccessTests(unittest.TestCase):
         self.assertNotIn("button_url", payload)
         self.assertIn('"public_reference": "GIFT-ABCD1234"', payload)
         self.assertIn('"token_version": 1', payload)
+
+    def test_gift_subscription_state_retrieves_live_stripe_for_any_subscription_id(self):
+        main = self.main
+
+        class Cursor:
+            def execute(self, query, params=None):
+                pass
+
+            def fetchone(self):
+                return (False, None, False, "sub_live")
+
+            def close(self):
+                pass
+
+        class Conn:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(main, "get_db_conn", return_value=Conn()), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "active", "cancel_at_period_end": False}) as retrieve:
+            result = asyncio.run(main.gift_recipient_subscription_state(123))
+
+        retrieve.assert_called_once_with("sub_live")
+        self.assertEqual(result["action"], "reserve")
+
+    def test_gift_subscription_state_status_matrix(self):
+        main = self.main
+
+        class Cursor:
+            def execute(self, query, params=None):
+                pass
+
+            def fetchone(self):
+                return (True, None, True, "sub_status")
+
+            def close(self):
+                pass
+
+        class Conn:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                pass
+
+        cases = [
+            ({"status": "trialing", "cancel_at_period_end": False}, "reserve"),
+            ({"status": "active", "cancel_at_period_end": True}, "apply_after_current_expiry"),
+            ({"status": "canceled", "cancel_at_period_end": False}, "apply"),
+            ({"status": "unpaid", "cancel_at_period_end": False}, "apply"),
+            ({"status": "paused", "cancel_at_period_end": False}, "fail"),
+        ]
+        for subscription, expected_action in cases:
+            with self.subTest(subscription=subscription), \
+                 mock.patch.object(main, "get_db_conn", return_value=Conn()), \
+                 mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription):
+                self.assertEqual(asyncio.run(main.gift_recipient_subscription_state(123))["action"], expected_action)
+
+    def test_gift_refund_pending_and_failed_do_not_change_status(self):
+        main = self.main
+        events = []
+
+        class Cursor:
+            def execute(self, query, params=None):
+                events.append((query, params))
+
+        row = {
+            "id": "gift-id",
+            "public_reference": "GIFT-REFUND",
+            "purchaser_telegram_id": 123,
+            "status": "paid_unclaimed",
+            "stripe_payment_intent_id": "pi_refund",
+            "amount_total": 5000,
+            "token_version": 1,
+        }
+        for status in ("pending", "requires_action", "canceled", "failed", "unknown"):
+            result = main.apply_gift_refund_event(
+                Cursor(),
+                f"evt_{status}",
+                "refund.updated",
+                {"payment_intent": "pi_refund", "amount": 5000, "status": status},
+                row,
+            )
+            self.assertIs(result, row)
+        update_queries = [query for query, _ in events if "UPDATE gift_access_grants" in query]
+        self.assertEqual(update_queries, [])
+
+    def test_new_gift_logs_do_not_use_raw_str_exception_text(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        gift_log_lines = [
+            line for line in source.splitlines()
+            if line.strip().startswith('"GIFT_') or line.strip().startswith("'GIFT_")
+        ]
+        self.assertFalse(any("error=%s" in line for line in gift_log_lines))
+        self.assertFalse(any("str(e)" in line for line in gift_log_lines))
 
 
 if __name__ == "__main__":

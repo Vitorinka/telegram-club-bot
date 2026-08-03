@@ -787,7 +787,9 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_subscription_updated_active_sql_params_match_placeholders(self):
         marker = "last_subscription_state_event_created_at = GREATEST("
-        marker_index = MAIN_SOURCE.index(marker, MAIN_SOURCE.index("elif status in (\"active\", \"trialing\")"))
+        subscription_updated_index = MAIN_SOURCE.index("elif event_type == 'customer.subscription.updated'")
+        active_status_index = MAIN_SOURCE.index("elif status in (\"active\", \"trialing\")", subscription_updated_index)
+        marker_index = MAIN_SOURCE.index(marker, active_status_index)
         source = MAIN_SOURCE[MAIN_SOURCE.rfind('cur.execute("""', 0, marker_index):MAIN_SOURCE.index("))", marker_index)]
         sql = source[source.index('cur.execute("""') + len('cur.execute("""'):source.index('""", (')]
         self.assertEqual(sql.count("%s"), 9)
