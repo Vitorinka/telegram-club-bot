@@ -2022,6 +2022,160 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (completed_action_id,),
         )[0], "completed")
 
+    def test_sync_stripe_user_identity_changed_rolls_back_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9910
+        grace = datetime.utcnow() + timedelta(hours=2)
+        self.insert_recovery_user(
+            user_id,
+            paid=False,
+            expiry_date=None,
+            payment_failed=True,
+            grace_period_end=grace,
+            stripe_subscription_id="sub_A",
+            stripe_customer_id="cus_old",
+        )
+        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+
+        class ReplyMessage:
+            def __init__(self):
+                self.from_user = SimpleNamespace(id=1)
+                self.chat = SimpleNamespace(type="private")
+                self.replies = []
+
+            async def reply(self, text, **kwargs):
+                self.replies.append((text, kwargs))
+
+        async def stripe_after_pointer_change(func, *args, **kwargs):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "UPDATE users SET stripe_subscription_id = 'sub_B', stripe_customer_id = 'cus_newer' WHERE telegram_id = %s",
+                    (user_id,),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return SimpleNamespace(status="active", current_period_end=period_end, customer="cus_A", cancel_at_period_end=False)
+
+        message = ReplyMessage()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.asyncio, "to_thread", mock.AsyncMock(side_effect=stripe_after_pointer_change)):
+            asyncio.run(main.sync_stripe_user_command(message, SimpleNamespace(args=str(user_id))))
+
+        self.assertIn("Stripe subscription пользователя изменилась", message.replies[0][0])
+        self.assertNotIn("sub_A", message.replies[0][0])
+        self.assertNotIn("sub_B", message.replies[0][0])
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, payment_failed, grace_period_end IS NOT NULL, stripe_subscription_id, stripe_customer_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (False, None, True, True, "sub_B", "cus_newer"))
+        self.assertIsNone(self.query_one(
+            "SELECT 1 FROM access_events WHERE telegram_id = %s AND event_type = 'manual_stripe_sync'",
+            (user_id,),
+        ))
+        self.assertIsNone(self.query_one(
+            "SELECT 1 FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = %s",
+            (user_id, main.ACCESS_RESTORE_DELIVERY_TYPE),
+        ))
+
+    def test_restore_access_stripe_identity_changed_fails_closed_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9911
+        self.insert_recovery_user(
+            user_id,
+            paid=False,
+            expiry_date=None,
+            stripe_subscription_id="sub_A",
+            stripe_customer_id="cus_old",
+        )
+        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+
+        async def stripe_after_pointer_change(func, *args, **kwargs):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "UPDATE users SET stripe_subscription_id = 'sub_B', stripe_customer_id = 'cus_newer' WHERE telegram_id = %s",
+                    (user_id,),
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return SimpleNamespace(status="active", current_period_end=period_end, customer="cus_A", cancel_at_period_end=False)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.asyncio, "to_thread", mock.AsyncMock(side_effect=stripe_after_pointer_change)), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock()) as member:
+            result = asyncio.run(main.execute_confirmed_restore_access({
+                "telegram_id": user_id,
+                "admin_id": 1,
+                "action_id": "act_identity_changed",
+            }))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "stripe_identity_changed")
+        self.assertIn("Stripe subscription пользователя изменилась", result["admin_message"])
+        self.assertNotIn("sub_A", result["admin_message"])
+        self.assertNotIn("sub_B", result["admin_message"])
+        member.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, stripe_subscription_id, stripe_customer_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (False, None, "sub_B", "cus_newer"))
+        self.assertIsNone(self.query_one(
+            "SELECT 1 FROM access_events WHERE telegram_id = %s AND event_type = 'restore_access_stripe_sync'",
+            (user_id,),
+        ))
+        self.assertIsNone(self.query_one(
+            "SELECT 1 FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = %s",
+            (user_id, main.ACCESS_RESTORE_DELIVERY_TYPE),
+        ))
+
+    def test_restore_access_matching_stripe_identity_updates_event_and_delivery_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9912
+        self.insert_recovery_user(
+            user_id,
+            paid=False,
+            expiry_date=None,
+            stripe_subscription_id="sub_A",
+            stripe_customer_id="cus_old",
+        )
+        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        subscription = SimpleNamespace(status="active", current_period_end=period_end, customer="cus_A", cancel_at_period_end=False)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.asyncio, "to_thread", mock.AsyncMock(return_value=subscription)), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))):
+            result = asyncio.run(main.execute_confirmed_restore_access({
+                "telegram_id": user_id,
+                "admin_id": 1,
+                "action_id": "act_identity_match",
+            }))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["delivery_created"])
+        row = self.query_one(
+            "SELECT paid, stripe_subscription_id, stripe_customer_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        )
+        self.assertEqual(row, (True, "sub_A", "cus_A"))
+        self.assertEqual(self.query_one(
+            "SELECT stripe_subscription_id FROM access_events WHERE telegram_id = %s AND event_type = 'restore_access_stripe_sync'",
+            (user_id,),
+        )[0], "sub_A")
+        self.assertEqual(self.query_one(
+            "SELECT delivery_type, status FROM message_delivery_events WHERE telegram_id = %s AND delivery_key = %s",
+            (user_id, main.access_restore_delivery_key("act_identity_match", user_id)),
+        ), (main.ACCESS_RESTORE_DELIVERY_TYPE, "pending"))
+
     def test_access_restore_worker_sends_invite_and_persists_state_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()

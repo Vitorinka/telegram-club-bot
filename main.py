@@ -2173,6 +2173,21 @@ def restore_access_admin_message(kind, telegram_id, expiry_date=None, safe_ref=N
             "current_period_end отсутствует и paid invoice fallback не дал будущую дату. "
             "Доступ не восстановлен, delivery не создан."
         )
+    if kind == "stripe_period_not_future":
+        status_text = safe_ref or "unknown"
+        return (
+            "⚠️ Будущий оплаченный период Stripe не подтверждён\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"status: {status_text}\n"
+            "Найденный период уже завершился.\n"
+            "Доступ не восстановлен, delivery не создан."
+        )
+    if kind == "stripe_identity_changed":
+        return (
+            "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
+            f"telegram_id: {telegram_id}\n"
+            "Данные пользователя не изменены. Повторите команду, чтобы проверить текущую подписку."
+        )
     if kind == "stripe_not_active":
         status_text = safe_ref or "unknown"
         return (
@@ -6904,6 +6919,7 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                 SELECT stripe_subscription_id, stripe_customer_id, expiry_date
                 FROM users
                 WHERE telegram_id = %s
+                FOR UPDATE
             """, (target_user_id,))
             current_row = write_cur.fetchone()
             if not current_row:
@@ -6911,9 +6927,14 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                 reply_text = "❌ Пользователь не найден в базе."
             else:
                 current_subscription_id, current_customer_id, current_old_expiry = current_row
-                if not current_subscription_id:
+                if current_subscription_id != stripe_subscription_id:
                     write_conn.rollback()
-                    reply_text = "⚠️ У пользователя нет stripe_subscription_id. Синхронизация со Stripe невозможна."
+                    reply_text = (
+                        "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
+                        f"telegram_id: {target_user_id}\n"
+                        "Данные пользователя не изменены. Повторите /sync_stripe_user, "
+                        "чтобы проверить текущую подписку."
+                    )
                 else:
                     write_cur.execute("""
                         UPDATE users
@@ -6966,6 +6987,7 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                 SELECT stripe_subscription_id, stripe_customer_id, expiry_date
                 FROM users
                 WHERE telegram_id = %s
+                FOR UPDATE
             """, (target_user_id,))
             current_row = write_cur.fetchone()
             if not current_row:
@@ -6973,28 +6995,37 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                 reply_text = "❌ Пользователь не найден в базе."
             else:
                 current_subscription_id, current_customer_id, current_old_expiry = current_row
-                write_cur.execute("""
-                    UPDATE users
-                    SET stripe_subscription_id = %s,
-                        stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                        auto_renew = %s,
-                        payment_failed = FALSE,
-                        payment_failed_at = NULL,
-                        last_payment_succeeded_at = NOW(),
-                        grace_period_end = NULL,
-                        reminder_sent = FALSE,
-                        blocked_bot = FALSE
-                    WHERE telegram_id = %s
-                """, (current_subscription_id or stripe_subscription_id, customer_id, auto_renew, target_user_id))
-                write_conn.commit()
-                reply_text = (
-                    "⚠️ Подписка активна, customer_id обновлен, но current_period_end не найден. expiry_date не меняла.\n\n"
-                    f"telegram_id: {target_user_id}\n"
-                    f"status: {status}\n"
-                    f"auto_renew: {auto_renew}\n"
-                    f"stripe_subscription_id: {current_subscription_id or stripe_subscription_id}\n"
-                    f"stripe_customer_id: {customer_id or current_customer_id or 'нет'}"
-                )
+                if current_subscription_id != stripe_subscription_id:
+                    write_conn.rollback()
+                    reply_text = (
+                        "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
+                        f"telegram_id: {target_user_id}\n"
+                        "Данные пользователя не изменены. Повторите /sync_stripe_user, "
+                        "чтобы проверить текущую подписку."
+                    )
+                else:
+                    write_cur.execute("""
+                        UPDATE users
+                        SET stripe_subscription_id = %s,
+                            stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                            auto_renew = %s,
+                            payment_failed = FALSE,
+                            payment_failed_at = NULL,
+                            last_payment_succeeded_at = NOW(),
+                            grace_period_end = NULL,
+                            reminder_sent = FALSE,
+                            blocked_bot = FALSE
+                        WHERE telegram_id = %s
+                    """, (current_subscription_id, customer_id, auto_renew, target_user_id))
+                    write_conn.commit()
+                    reply_text = (
+                        "⚠️ Подписка активна, customer_id обновлен, но current_period_end не найден. expiry_date не меняла.\n\n"
+                        f"telegram_id: {target_user_id}\n"
+                        f"status: {status}\n"
+                        f"auto_renew: {auto_renew}\n"
+                        f"stripe_subscription_id: {current_subscription_id}\n"
+                        f"stripe_customer_id: {customer_id or current_customer_id or 'нет'}"
+                    )
         else:
             reply_text = (
                 "⚠️ Подписка в Stripe не активна\n\n"
@@ -11501,6 +11532,21 @@ async def sync_restore_access_from_stripe(telegram_id, user, admin_id=None, acti
     cur = conn.cursor()
     try:
         cur.execute("""
+            SELECT stripe_subscription_id, expiry_date
+            FROM users
+            WHERE telegram_id = %s
+            FOR UPDATE
+        """, (int(telegram_id),))
+        current_row = cur.fetchone()
+        if not current_row or current_row[0] != stripe_subscription_id:
+            conn.rollback()
+            return {
+                "ok": False,
+                "reason": "stripe_identity_changed",
+                "stripe_status": status or "unknown",
+            }
+        current_subscription_id, current_old_expiry = current_row
+        cur.execute("""
             UPDATE users
             SET paid = TRUE,
                 expiry_date = %s,
@@ -11519,9 +11565,9 @@ async def sync_restore_access_from_stripe(telegram_id, user, admin_id=None, acti
             telegram_id,
             "restore_access_stripe_sync",
             source=ACCESS_RESTORE_SOURCE_ADMIN,
-            old_expiry=old_expiry,
+            old_expiry=current_old_expiry,
             new_expiry=new_expiry,
-            stripe_subscription_id=stripe_subscription_id,
+            stripe_subscription_id=current_subscription_id,
             notes=f"status={status}; auto_renew={auto_renew}; period_source={period_source}; admin_id={admin_id}; action_id={action_id}",
         )
         conn.commit()
@@ -11581,11 +11627,14 @@ async def execute_confirmed_restore_access(payload):
                 result_status = "completed"
             elif stripe_reason == "stripe_period_not_future":
                 admin_message = restore_access_admin_message(
-                    "stripe_not_active",
+                    "stripe_period_not_future",
                     telegram_id,
-                    safe_ref=f"{stripe_result.get('stripe_status') or 'unknown'}; period_not_future",
+                    safe_ref=stripe_result.get("stripe_status") or "unknown",
                 )
                 result_status = "completed"
+            elif stripe_reason == "stripe_identity_changed":
+                admin_message = restore_access_admin_message("stripe_identity_changed", telegram_id)
+                result_status = "failed"
             elif stripe_reason == "stripe_not_active":
                 admin_message = restore_access_admin_message(
                     "stripe_not_active",
