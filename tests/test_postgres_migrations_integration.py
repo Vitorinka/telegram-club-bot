@@ -11,6 +11,7 @@ from unittest import mock
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 import psycopg2
@@ -1942,6 +1943,246 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """,
             ("%first_purchase_recovery_sent%",),
         )[0], 0)
+
+    def test_access_restore_delivery_dedupe_and_auto_sync_key_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9901
+        expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expiry)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            first = main.enqueue_automatic_membership_repair(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_AUTO_SYNC,
+                requested_by_admin_id=1,
+                reason="sync_stripe_user_active_period",
+            )
+            second = main.enqueue_automatic_membership_repair(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_AUTO_SYNC,
+                requested_by_admin_id=1,
+                reason="sync_stripe_user_active_period",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        expected_key = main.access_restore_auto_delivery_key("auto-sync", user_id, expiry)
+        row = self.query_one(
+            """
+            SELECT COUNT(*), MIN(delivery_type), MIN(status), MIN(payload_json)
+            FROM message_delivery_events
+            WHERE delivery_key = %s
+            """,
+            (expected_key,),
+        )
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], main.ACCESS_RESTORE_DELIVERY_TYPE)
+        self.assertEqual(row[2], "pending")
+        payload = json.loads(row[3])
+        self.assertEqual(payload["telegram_id"], user_id)
+        self.assertEqual(payload["source"], main.ACCESS_RESTORE_SOURCE_AUTO_SYNC)
+        self.assertEqual(payload["reason"], "sync_stripe_user_active_period")
+
+    def test_access_restore_worker_sends_invite_and_persists_state_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9902
+        expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expiry)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                requested_by_admin_id=1,
+                admin_action_id="act_pg_restore",
+                reason="manual_restore_access",
+                delivery_key=main.access_restore_delivery_key("act_pg_restore", user_id),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "create_chat_invite_link", mock.AsyncMock(return_value=SimpleNamespace(invite_link="https://t.me/+restore_pg"))) as create_link, \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()) as send_message:
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["sent"], 1)
+        create_link.assert_awaited_once()
+        send_message.assert_awaited_once()
+        delivery = self.query_one(
+            """
+            SELECT status, invite_link
+            FROM message_delivery_events
+            WHERE delivery_key = %s
+            """,
+            (main.access_restore_delivery_key("act_pg_restore", user_id),),
+        )
+        self.assertEqual(delivery, ("sent", "https://t.me/+restore_pg"))
+        self.assertEqual(self.query_one(
+            "SELECT source, telegram_id, status FROM bot_invite_links WHERE invite_link = %s",
+            ("https://t.me/+restore_pg",),
+        ), (main.ACCESS_RESTORE_SOURCE_ADMIN, user_id, "active"))
+        self.assertEqual(self.query_one(
+            "SELECT event_type FROM access_events WHERE telegram_id = %s AND event_type = 'restore_access_invite_sent'",
+            (user_id,),
+        )[0], "restore_access_invite_sent")
+
+    def test_access_restore_worker_cancels_inactive_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9903
+        expired = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expired)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                datetime.utcnow() + timedelta(days=1),
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                admin_action_id="act_expired",
+                delivery_key=main.access_restore_delivery_key("act_expired", user_id),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock()) as member:
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        member.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status, last_error FROM message_delivery_events WHERE delivery_key = %s",
+            (main.access_restore_delivery_key("act_expired", user_id),),
+        ), ("cancelled", "access_restore_inactive"))
+        self.assertEqual(self.query_one(
+            "SELECT event_type FROM access_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0], "restore_access_cancelled_inactive")
+
+    def test_access_restore_retry_reuses_existing_invite_real_postgres(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9904
+        expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expiry)
+        key = main.access_restore_delivery_key("act_retry", user_id)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                admin_action_id="act_retry",
+                delivery_key=key,
+            )
+            cur.execute("UPDATE message_delivery_events SET invite_link = %s WHERE delivery_key = %s", ("https://t.me/+saved_restore", key))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "create_chat_invite_link", mock.AsyncMock()) as create_link, \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(result["retryable_failed"], 1)
+        create_link.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status, invite_link FROM message_delivery_events WHERE delivery_key = %s",
+            (key,),
+        )[0:2], ("failed", "https://t.me/+saved_restore"))
+
+    def test_access_restore_second_worker_does_not_resend_sent_delivery_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9905
+        expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expiry)
+        key = main.access_restore_delivery_key("act_once", user_id)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                admin_action_id="act_once",
+                delivery_key=key,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "create_chat_invite_link", mock.AsyncMock(return_value=SimpleNamespace(invite_link="https://t.me/+once"))), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()) as send_message:
+            first = asyncio.run(main.process_pending_message_deliveries(limit=10))
+            second = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        self.assertEqual(send_message.await_count, 1)
+        self.assertEqual(self.query_one("SELECT status FROM message_delivery_events WHERE delivery_key = %s", (key,))[0], "sent")
+
+    def test_active_paid_user_removal_protection_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9906
+        expiry = datetime.utcnow() + timedelta(days=7)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            auto_renew=False,
+            stripe_subscription_id=None,
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            result = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(result, "active_in_db")
+        ban.assert_not_awaited()
+        self.assertTrue(self.query_one("SELECT paid FROM users WHERE telegram_id = %s", (user_id,))[0])
+        self.assertEqual(self.query_one(
+            "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("pending", "active_access_in_db"))
 
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
