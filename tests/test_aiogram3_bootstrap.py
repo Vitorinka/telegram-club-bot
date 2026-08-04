@@ -2174,7 +2174,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 64)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 24)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 25)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2206,7 +2206,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_filters.append(text)
 
         self.assertEqual(len(message_handlers), 64)
-        self.assertEqual(len(callback_handlers), 24)
+        self.assertEqual(len(callback_handlers), 25)
         self.assertEqual(
             commands,
             [
@@ -2228,6 +2228,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catch_all_messages, [])
         self.assertTrue(any("F.data.startswith('sub_')" in item for item in callback_filters))
         self.assertTrue(any("F.data == 'retry_payment'" in item for item in callback_filters))
+        self.assertTrue(any("F.data.startswith('gift_cancel_checkout:')" in item for item in callback_filters))
 
     async def test_keyboard_callback_data_are_routable(self):
         source = Path(self.main.__file__).read_text()

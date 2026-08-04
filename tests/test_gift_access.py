@@ -57,16 +57,28 @@ class GiftAccessTests(unittest.TestCase):
         self.assertIsNone(self.main.gift_duration_days("sub_1"))
 
     def test_gift_deep_link_uses_signed_token_but_token_hash_is_separate(self):
-        token = self.main.generate_gift_token("GIFT-ABCD1234", 3)
-        self.assertEqual(token, self.main.generate_gift_token("GIFT-ABCD1234", 3))
-        self.assertNotEqual(token, self.main.generate_gift_token("GIFT-ABCD1234", 4))
+        token = self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 3)
+        self.assertEqual(token, self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 3))
+        self.assertNotEqual(token, self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 4))
         link = self.main.gift_deep_link(token)
         self.assertIn("start=gift_", link)
         self.assertIn(token, link)
+        self.assertNotIn(".", token)
         self.assertNotEqual(self.main.gift_token_hash(token), token)
         self.assertEqual(len(self.main.gift_token_hash(token)), 64)
-        self.assertEqual(self.main.parse_gift_token(token), ("GIFT-ABCD1234", 3))
+        self.assertEqual(self.main.parse_gift_token(token), ("GIFT-ABCD1234ABCD1234", 3))
         self.assertIsNone(self.main.parse_gift_token(token + "x"))
+
+    def test_gift_start_parameter_is_telegram_safe_and_tamper_proof(self):
+        reference = self.main.gift_public_reference()
+        for version in (1, 999999):
+            token = self.main.generate_gift_token(reference, version)
+            start_parameter = "gift_" + token
+            self.assertLessEqual(len(start_parameter), 64)
+            self.assertRegex(start_parameter, r"^[A-Za-z0-9_-]{1,64}$")
+            self.assertEqual(self.main.parse_gift_token(token), (reference, version))
+            replacement = "A" if token[0] != "A" else "B"
+            self.assertIsNone(self.main.parse_gift_token(replacement + token[1:]))
 
     def test_gift_public_reference_uses_wider_entropy(self):
         reference = self.main.gift_public_reference()
@@ -90,7 +102,7 @@ class GiftAccessTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"GIFT_TOKEN_SECRET": "x" * 32}, clear=True):
             self.assertEqual(main.gift_token_secret(), "x" * 32)
-            self.assertTrue(main.generate_gift_token("GIFT-ABCD1234", 1))
+            self.assertTrue(main.generate_gift_token("GIFT-ABCD1234ABCD1234", 1))
 
         with mock.patch.dict(os.environ, {"GIFT_TOKEN_SECRET": "y" * 64}, clear=True):
             self.assertEqual(main.gift_token_secret(), "y" * 64)
@@ -133,8 +145,17 @@ class GiftAccessTests(unittest.TestCase):
         line_item = {"quantity": 1}
         price = {"id": "price_gift_1m", "type": "one_time", "active": True, "unit_amount": 5000, "currency": "usd"}
         self.assertTrue(self.main.validate_gift_payment_proof(session, line_item, price, gift_row))
+        archived_price = {**price, "active": False}
+        self.assertTrue(self.main.validate_gift_payment_proof(session, line_item, archived_price, gift_row))
         self.assertFalse(self.main.validate_gift_payment_proof({**session, "payment_status": "no_payment_required"}, line_item, price, gift_row))
         self.assertFalse(self.main.validate_gift_payment_proof(session, {"quantity": 2}, price, gift_row))
+
+    def test_gift_fsm_requires_tariff_before_recipient_name(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn("tariff = State()", source)
+        self.assertIn("await state.set_state(GiftPurchaseStates.tariff)", source)
+        self.assertIn('@router.callback_query(F.data.startswith("gift_tariff:"), StateFilter(GiftPurchaseStates.tariff))', source)
+        self.assertNotIn('@router.callback_query(F.data.startswith("gift_tariff:"), StateFilter(GiftPurchaseStates.recipient_name))', source)
 
     def test_gift_certificate_caption_has_activation_button_and_no_none_text(self):
         row = {
@@ -157,7 +178,7 @@ class GiftAccessTests(unittest.TestCase):
 
     def test_gift_admin_text_uses_public_reference_not_token_hash(self):
         row = {
-            "public_reference": "GIFT-ABCD1234",
+            "public_reference": "GIFT-ABCD1234ABCD1234",
             "purchaser_telegram_id": 123,
             "recipient_telegram_id": None,
             "tariff_code": "gift_12m",
@@ -165,7 +186,7 @@ class GiftAccessTests(unittest.TestCase):
             "token_hash": "secret-hash",
         }
         text = self.main.gift_admin_text("Gift", row)
-        self.assertIn("GIFT-ABCD1234", text)
+        self.assertIn("GIFT-ABCD1234ABCD1234", text)
         self.assertNotIn("secret-hash", text)
 
     def test_gift_certificate_delivery_payload_does_not_store_token_or_url(self):
@@ -188,24 +209,24 @@ class GiftAccessTests(unittest.TestCase):
                 if "SELECT file_id" in query:
                     return ("photo_file",)
                 if "INSERT INTO message_delivery_events" in query:
-                    return ("gift:GIFT-ABCD1234:certificate:buyer:v1",)
+                    return ("gift:GIFT-ABCD1234ABCD1234:certificate:buyer:v1",)
                 return None
 
         row = {
-            "public_reference": "GIFT-ABCD1234",
+            "public_reference": "GIFT-ABCD1234ABCD1234",
             "recipient_name": "Recipient",
             "sender_name": "Sender",
             "gift_message": "",
             "tariff_code": "gift_1m",
             "token_version": 1,
-            "token_hash": self.main.gift_token_hash_for_reference("GIFT-ABCD1234", 1),
+            "token_hash": self.main.gift_token_hash_for_reference("GIFT-ABCD1234ABCD1234", 1),
         }
         cur = FakeCursor()
         self.assertTrue(self.main.enqueue_gift_certificate_delivery(cur, row, 123, self.main.GIFT_CERTIFICATE_BUYER))
         payload = cur.payload
         self.assertNotIn("gift_", payload)
         self.assertNotIn("button_url", payload)
-        self.assertIn('"public_reference": "GIFT-ABCD1234"', payload)
+        self.assertIn('"public_reference": "GIFT-ABCD1234ABCD1234"', payload)
         self.assertIn('"token_version": 1', payload)
 
     def test_gift_subscription_state_retrieves_live_stripe_for_any_subscription_id(self):
@@ -278,7 +299,7 @@ class GiftAccessTests(unittest.TestCase):
 
         row = {
             "id": "gift-id",
-            "public_reference": "GIFT-REFUND",
+            "public_reference": "GIFT-ABCDEFABCDEF0000",
             "purchaser_telegram_id": 123,
             "status": "paid_unclaimed",
             "stripe_payment_intent_id": "pi_refund",
