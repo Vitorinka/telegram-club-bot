@@ -38,6 +38,10 @@ MAIN_TEST_ENV = {
     "PRICE_1M": "price_1m",
     "PRICE_6M": "price_6m",
     "PRICE_12M": "price_12m",
+    "GIFT_TOKEN_SECRET": "postgres-test-gift-token-secret-32chars",
+    "GIFT_PRICE_1M": "price_gift_1m",
+    "GIFT_PRICE_6M": "price_gift_6m",
+    "GIFT_PRICE_12M": "price_gift_12m",
 }
 
 
@@ -2185,7 +2189,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
-            main.enqueue_access_restore_invite(
+            self.assertTrue(main.enqueue_access_restore_invite(
                 cur,
                 user_id,
                 expiry,
@@ -2194,7 +2198,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 admin_action_id="act_pg_restore",
                 reason="manual_restore_access",
                 delivery_key=main.access_restore_delivery_key("act_pg_restore", user_id),
-            )
+            ))
+            self.assertTrue(main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                requested_by_admin_id=1,
+                admin_action_id="act_pg_restore",
+                reason="manual_restore_access",
+                delivery_key=main.access_restore_delivery_key("act_pg_restore", user_id),
+            ))
             conn.commit()
         finally:
             cur.close()
@@ -2366,6 +2380,734 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
             (user_id,),
         ), ("pending", "active_access_in_db"))
+
+    def test_gift_certificate_delivery_is_deduped_and_stores_no_raw_token_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO gift_certificate_templates (tariff_code, file_id, uploaded_by)
+                VALUES ('gift_1m', 'photo_file_id', 1)
+            """)
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000001", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000001', 9907, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            first = main.enqueue_gift_certificate_delivery(cur, gift_row, 9907, main.GIFT_CERTIFICATE_BUYER)
+            second = main.enqueue_gift_certificate_delivery(cur, gift_row, 9907, main.GIFT_CERTIFICATE_BUYER)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        row = self.query_one("""
+            SELECT delivery_key, payload_json
+            FROM message_delivery_events
+            WHERE delivery_type = %s
+        """, (main.GIFT_CERTIFICATE_BUYER,))
+        self.assertEqual(row[0], "gift:GIFT-0000000000000001:certificate:buyer:v1")
+        self.assertNotIn("button_url", row[1])
+        self.assertNotIn("start=gift_", row[1])
+        self.assertIn('"token_version": 1', row[1])
+
+    def test_gift_checkout_draft_replaces_only_when_recipient_sender_and_message_match_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        purchaser_id = 9925
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            first = main.create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Анна",
+                "Олег",
+                "С днём рождения",
+            )
+            same, same_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Анна",
+                "Олег",
+                "С днём рождения",
+            )
+            changed_recipient, recipient_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Олег",
+                "С днём рождения",
+            )
+            changed_sender, sender_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Ирина",
+                "С днём рождения",
+            )
+            changed_message, message_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Ирина",
+                "Для тебя",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(same["id"], first["id"])
+        self.assertEqual(same_result, "draft_reused")
+        self.assertNotEqual(changed_recipient["id"], first["id"])
+        self.assertFalse(recipient_result)
+        self.assertNotEqual(changed_sender["id"], changed_recipient["id"])
+        self.assertFalse(sender_result)
+        self.assertNotEqual(changed_message["id"], changed_sender["id"])
+        self.assertFalse(message_result)
+        self.assertEqual(
+            self.query_one("""
+                SELECT recipient_name, sender_name, gift_message, status
+                FROM gift_access_grants
+                WHERE id = %s
+            """, (changed_message["id"],)),
+            ("Мария", "Ирина", "Для тебя", "checkout_pending"),
+        )
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM gift_access_grants
+                WHERE purchaser_telegram_id = %s
+                  AND status = 'cancelled'
+            """, (purchaser_id,))[0],
+            3,
+        )
+
+    def test_gift_checkout_open_with_changed_details_requires_existing_payment_resolution_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        purchaser_id = 9926
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            draft = main.create_gift_checkout_draft(cur, purchaser_id, "gift_1m", "Анна", "Олег", "Первый")
+            opened = main.mark_gift_checkout_open(
+                cur,
+                draft["id"],
+                "checkout_pending",
+                "cs_open_existing",
+                "https://checkout.example/existing",
+                None,
+            )
+            conflict, conflict_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Олег",
+                "Первый",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(conflict["id"], opened["id"])
+        self.assertEqual(conflict_result, "active_checkout_conflict")
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM gift_access_grants
+                WHERE purchaser_telegram_id = %s
+                  AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+            """, (purchaser_id,))[0],
+            1,
+        )
+
+    def test_gift_paid_and_reserved_cannot_be_cancelled_without_refund_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        cases = [
+            ("GIFT-0000000000000011", "paid_unclaimed"),
+            ("GIFT-0000000000000012", "reserved"),
+            ("GIFT-0000000000000013", "payment_pending"),
+        ]
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for index, (reference, status) in enumerate(cases):
+                token_hash = main.gift_token_hash_for_reference(reference, 1)
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                        gift_message, tariff_code, duration_days, status, token_hash, token_version,
+                        stripe_session_id
+                    )
+                    VALUES (%s, %s, %s, 'Recipient', 'Sender', '',
+                            'gift_1m', 30, %s, %s, 1, %s)
+                """, (
+                    str(uuid.uuid4()),
+                    reference,
+                    9931 + index,
+                    status,
+                    token_hash,
+                    f"cs_cancel_blocked_{index}",
+                ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "expire_stripe_checkout_session", mock.AsyncMock()) as expire:
+            results = [
+                asyncio.run(main.safely_cancel_gift_checkout(reference, 1, source="test_cancel"))
+                for reference, _ in cases
+            ]
+
+        expire.assert_not_awaited()
+        self.assertEqual([result["status"] for result in results], ["failed", "failed", "failed"])
+        self.assertEqual(
+            self.query_all("""
+                SELECT public_reference, status
+                FROM gift_access_grants
+                WHERE public_reference IN (%s, %s, %s)
+                ORDER BY public_reference
+            """, tuple(reference for reference, _ in cases)),
+            sorted(cases),
+        )
+
+    def test_gift_checkout_open_cancel_expires_stripe_before_local_cancel_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        reference = "GIFT-0000000000000014"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token_hash = main.gift_token_hash_for_reference(reference, 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version,
+                    stripe_session_id, checkout_url
+                )
+                VALUES (%s, %s, 9934, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'checkout_open', %s, 1,
+                        'cs_open_cancel', 'https://checkout.example/old')
+            """, (str(uuid.uuid4()), reference, token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "expire_stripe_checkout_session", mock.AsyncMock(return_value={"status": "expired"})) as expire:
+            result = asyncio.run(main.safely_cancel_gift_checkout(reference, 9934, source="test_cancel"))
+
+        expire.assert_awaited_once_with("cs_open_cancel")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            self.query_one("SELECT status, cancelled_at IS NOT NULL FROM gift_access_grants WHERE public_reference = %s", (reference,)),
+            ("cancelled", True),
+        )
+
+    def test_cancelled_gift_paid_webhook_records_payment_and_manual_review_alert_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        reference = "GIFT-0000000000000015"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token_hash = main.gift_token_hash_for_reference(reference, 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version,
+                    stripe_session_id
+                )
+                VALUES (%s, %s, 9935, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'cancelled', %s, 1, 'cs_paid_after_cancel')
+                RETURNING *
+            """, (str(uuid.uuid4()), reference, token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            session = {
+                "id": "cs_paid_after_cancel",
+                "mode": "payment",
+                "payment_status": "paid",
+                "client_reference_id": "9935",
+                "amount_total": 5000,
+                "currency": "usd",
+                "payment_intent": "pi_paid_after_cancel",
+                "metadata": {
+                    "payment_kind": main.GIFT_PAYMENT_KIND,
+                    "gift_id": str(gift_row["id"]),
+                    "purchaser_telegram_id": "9935",
+                    "tariff_code": "gift_1m",
+                    "duration_days": "30",
+                },
+            }
+            line_item = {"quantity": 1}
+            price = {"id": "price_gift_1m", "type": "one_time", "active": False, "unit_amount": 5000, "currency": "usd"}
+            updated = main.mark_gift_paid_and_enqueue(cur, "evt_paid_after_cancel", "checkout.session.completed", session, line_item, price, gift_row)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(updated["status"], "review_required")
+        self.assertEqual(
+            self.query_one("SELECT status, stripe_payment_intent_id, last_error_category FROM gift_access_grants WHERE public_reference = %s", (reference,)),
+            ("review_required", "pi_paid_after_cancel", "manual_review_required"),
+        )
+        self.assertEqual(
+            self.query_one("SELECT payment_status, payment_kind FROM payment_events WHERE stripe_event_id = 'evt_paid_after_cancel'"),
+            ("succeeded", main.GIFT_PAYMENT_KIND),
+        )
+        alert_count = self.query_one("""
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_key LIKE %s
+              AND payload_json LIKE '%%CRITICAL%%'
+        """, (f"gift:{reference}:gift_admin_problem:%",))[0]
+        self.assertEqual(alert_count, len(main.ADMIN_IDS))
+
+    def test_gift_async_payment_failed_cancels_terminal_session_in_source(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn("elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):", source)
+        self.assertIn('terminal_status = "cancelled"', source)
+        self.assertNotIn('terminal_status = "cancelled" if event_type == "checkout.session.expired" else "payment_pending"', source)
+
+    def test_gift_refund_before_redeem_invalidates_token_and_cancels_certificate_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000002", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version,
+                    stripe_payment_intent_id, amount_total, currency
+                )
+                VALUES (%s, 'GIFT-0000000000000002', 9908, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1, 'pi_refund_before', 5000, 'usd')
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            main.enqueue_message_delivery(
+                cur,
+                main.gift_delivery_key("GIFT-0000000000000002", main.GIFT_CERTIFICATE_BUYER, token_version=1, recipient_kind="buyer"),
+                9908,
+                main.GIFT_CERTIFICATE_BUYER,
+                {"public_reference": "GIFT-0000000000000002", "token_version": 1},
+            )
+            updated = main.apply_gift_refund_event(
+                cur,
+                "evt_refund_before",
+                "charge.refunded",
+                {"payment_intent": "pi_refund_before", "amount": 5000, "amount_refunded": 5000, "refunded": True},
+                gift_row,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(updated["status"], "refunded")
+        self.assertEqual(updated["token_version"], 2)
+        self.assertEqual(self.query_one("SELECT status FROM message_delivery_events WHERE delivery_key = %s", (
+            "gift:GIFT-0000000000000002:certificate:buyer:v1",
+        ))[0], "cancelled")
+
+    def test_gift_refund_after_redeem_requires_review_without_user_revoke_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            user_id = 9909
+            expiry = datetime.utcnow() + timedelta(days=30)
+            cur.execute("INSERT INTO users (telegram_id, paid, expiry_date) VALUES (%s, TRUE, %s)", (user_id, expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000003", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version, stripe_payment_intent_id, amount_total, currency
+                )
+                VALUES (%s, 'GIFT-0000000000000003', 9910, %s, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'redeemed', %s, 1, 'pi_refund_after', 5000, 'usd')
+                RETURNING *
+            """, (str(uuid.uuid4()), user_id, token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            updated = main.apply_gift_refund_event(
+                cur,
+                "evt_refund_after",
+                "refund.updated",
+                {"payment_intent": "pi_refund_after", "amount": 5000, "status": "succeeded"},
+                gift_row,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(updated["status"], "review_required")
+        self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (user_id,)), (True, expiry))
+
+    def test_reserved_gift_scheduler_skips_live_active_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9911
+        expiry = datetime.utcnow() + timedelta(days=10)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, TRUE, 'sub_live_active')
+            """, (recipient_id, expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000004", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000004', 9912, %s, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'reserved', %s, 1)
+            """, (str(uuid.uuid4()), recipient_id, token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "active", "cancel_at_period_end": False}):
+            result = asyncio.run(main.apply_reserved_gifts(limit=10))
+
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000004'")[0], "reserved")
+
+    def test_reserved_gift_scheduler_applies_after_cancelled_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9913
+        expiry = datetime.utcnow() - timedelta(days=1)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, TRUE, 'sub_cancelled')
+            """, (recipient_id, expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000005", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000005', 9914, %s, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'reserved', %s, 1)
+            """, (str(uuid.uuid4()), recipient_id, token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "canceled", "cancel_at_period_end": False}):
+            result = asyncio.run(main.apply_reserved_gifts(limit=10))
+
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000005'")[0], "reserved")
+        self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expiry))
+
+    def test_gift_activation_blocked_for_active_auto_renew(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9920
+        old_expiry = datetime.utcnow() + timedelta(days=14)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, TRUE, 'sub_live_auto')
+            """, (recipient_id, old_expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000008", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000008', 9921, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            first, first_action, first_expiry = main.apply_gift_access_in_transaction(
+                cur,
+                gift_row,
+                recipient_id,
+                {"action": "block_active_auto_renew", "subscription_id": "sub_live_auto", "status": "active"},
+            )
+            second, second_action, second_expiry = main.apply_gift_access_in_transaction(
+                cur,
+                gift_row,
+                recipient_id,
+                {"action": "block_active_auto_renew", "subscription_id": "sub_live_auto", "status": "active"},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(first_action, "blocked_active_auto_renew")
+        self.assertEqual(second_action, "blocked_active_auto_renew")
+        self.assertEqual(first_expiry, old_expiry)
+        self.assertEqual(second_expiry, old_expiry)
+        self.assertEqual(first["status"], "paid_unclaimed")
+        self.assertEqual(second["status"], "paid_unclaimed")
+        self.assertIn("напишите администратору", main.build_gift_reserved_recipient_text(first))
+        self.assertEqual(
+            self.query_one("SELECT paid, expiry_date, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s", (recipient_id,)),
+            (True, old_expiry, True, "sub_live_auto"),
+        )
+        self.assertEqual(
+            self.query_one("""
+                SELECT status, recipient_telegram_id, reserved_at, redeemed_at, applied_at, applied_expiry
+                FROM gift_access_grants
+                WHERE public_reference = 'GIFT-0000000000000008'
+            """),
+            ("paid_unclaimed", None, None, None, None, None),
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s", ("gift:GIFT-0000000000000008:%",))[0],
+            0,
+        )
+        self.assertEqual(asyncio.run(main.apply_reserved_gifts(limit=10)), {"applied": 0, "skipped": 0})
+
+    def test_gift_activation_paid_false_future_expiry_starts_from_now_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9927
+        stale_future_expiry = datetime.utcnow() + timedelta(days=90)
+        before_activation = datetime.utcnow()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, FALSE, %s, FALSE, NULL)
+            """, (recipient_id, stale_future_expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000010", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000010', 9928, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            updated, action, new_expiry = main.apply_gift_access_in_transaction(cur, gift_row, recipient_id, None)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(action, "redeemed")
+        self.assertEqual(updated["status"], "redeemed")
+        self.assertLess(new_expiry, stale_future_expiry)
+        self.assertGreaterEqual(new_expiry, before_activation + timedelta(days=30))
+        self.assertLess(new_expiry, before_activation + timedelta(days=30, seconds=10))
+        self.assertEqual(
+            self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)),
+            (True, new_expiry),
+        )
+
+    def test_gift_activation_is_atomic_under_concurrency(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        winner_ids = (9922, 9923)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000009", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000009', 9924, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+            """, (str(uuid.uuid4()), token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def activate(recipient_id):
+            local_conn = self.get_conn()
+            local_cur = local_conn.cursor()
+            try:
+                barrier.wait(timeout=5)
+                gift_row = main.fetch_gift_by_public_reference_version(local_cur, "GIFT-0000000000000009", 1, for_update=True)
+                if not gift_row or gift_row["status"] != "paid_unclaimed":
+                    local_conn.rollback()
+                    results.append((recipient_id, "already_used"))
+                    return
+                updated, action, _ = main.apply_gift_access_in_transaction(local_cur, gift_row, recipient_id, None)
+                local_conn.commit()
+                results.append((recipient_id, action, updated["recipient_telegram_id"]))
+            except Exception as exc:
+                local_conn.rollback()
+                errors.append(exc)
+            finally:
+                local_cur.close()
+                local_conn.close()
+
+        first = threading.Thread(target=activate, args=(winner_ids[0],))
+        second = threading.Thread(target=activate, args=(winner_ids[1],))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        activated = [row for row in results if len(row) >= 2 and row[1] == "redeemed"]
+        blocked = [row for row in results if len(row) >= 2 and row[1] == "already_used"]
+        self.assertEqual(len(activated), 1)
+        self.assertEqual(len(blocked), 1)
+        winner_id = activated[0][0]
+        loser_id = blocked[0][0]
+        self.assertIn(winner_id, winner_ids)
+        self.assertIn(loser_id, winner_ids)
+        self.assertNotEqual(winner_id, loser_id)
+        self.assertEqual(
+            self.query_one("""
+                SELECT status, recipient_telegram_id, redeemed_at IS NOT NULL, applied_at IS NOT NULL
+                FROM gift_access_grants
+                WHERE public_reference = 'GIFT-0000000000000009'
+            """),
+            ("redeemed", winner_id, True, True),
+        )
+        self.assertEqual(self.query_one("SELECT paid, expiry_date > NOW() AT TIME ZONE 'UTC' FROM users WHERE telegram_id = %s", (winner_id,)), (True, True))
+        self.assertIsNone(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (loser_id,)))
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM access_events
+                WHERE event_type = 'gift_access_redeemed'
+                  AND notes LIKE 'gift=GIFT-0000000000000009'
+            """)[0],
+            1,
+        )
+
+    def test_gift_activation_identity_changed_rolls_back_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9915
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, FALSE, NULL, FALSE, 'sub_write_b')
+            """, (recipient_id,))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000006", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000006', 9916, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            conn.commit()
+            with self.assertRaisesRegex(ValueError, "gift_recipient_subscription_identity_changed"):
+                main.apply_gift_access_in_transaction(
+                    cur,
+                    gift_row,
+                    recipient_id,
+                    {"action": "apply", "subscription_id": "sub_initial_a", "status": "canceled"},
+                )
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000006'")[0], "paid_unclaimed")
+        self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (False, None))
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
+
+    def test_reserved_gift_scheduler_identity_guard_even_if_db_flags_changed_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9917
+        expired = datetime.utcnow() - timedelta(days=1)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, FALSE, 'sub_write_b')
+            """, (recipient_id, expired))
+            token_hash = main.gift_token_hash_for_reference("GIFT-0000000000000007", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-0000000000000007', 9918, %s, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'reserved', %s, 1)
+            """, (str(uuid.uuid4()), recipient_id, token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main,
+                 "gift_recipient_subscription_state",
+                 mock.AsyncMock(return_value={"action": "apply", "subscription_id": "sub_initial_a", "status": "canceled"}),
+             ):
+            result = asyncio.run(main.apply_reserved_gifts(limit=10))
+
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000007'")[0], "reserved")
+        self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expired))
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
 
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
