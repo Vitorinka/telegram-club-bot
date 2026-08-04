@@ -38,7 +38,7 @@ MAIN_TEST_ENV = {
     "PRICE_1M": "price_1m",
     "PRICE_6M": "price_6m",
     "PRICE_12M": "price_12m",
-    "GIFT_TOKEN_SECRET": "postgres-test-gift-token-secret",
+    "GIFT_TOKEN_SECRET": "postgres-test-gift-token-secret-32chars",
     "GIFT_PRICE_1M": "price_gift_1m",
     "GIFT_PRICE_6M": "price_gift_6m",
     "GIFT_PRICE_12M": "price_gift_12m",
@@ -2521,7 +2521,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "active", "cancel_at_period_end": False}):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result, {"applied": 0, "skipped": 1})
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
         self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-PG000004'")[0], "reserved")
 
     def test_reserved_gift_scheduler_applies_after_cancelled_subscription_real_postgres(self):
@@ -2555,9 +2555,158 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "canceled", "cancel_at_period_end": False}):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result["applied"], 1)
-        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-PG000005'")[0], "redeemed")
-        self.assertTrue(self.query_one("SELECT paid, expiry_date > NOW() AT TIME ZONE 'UTC' FROM users WHERE telegram_id = %s", (recipient_id,))[1])
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-PG000005'")[0], "reserved")
+        self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expiry))
+
+    def test_gift_activation_blocked_for_active_auto_renew(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9920
+        old_expiry = datetime.utcnow() + timedelta(days=14)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, TRUE, 'sub_live_auto')
+            """, (recipient_id, old_expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-PG000008", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-PG000008', 9921, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            first, first_action, first_expiry = main.apply_gift_access_in_transaction(
+                cur,
+                gift_row,
+                recipient_id,
+                {"action": "block_active_auto_renew", "subscription_id": "sub_live_auto", "status": "active"},
+            )
+            second, second_action, second_expiry = main.apply_gift_access_in_transaction(
+                cur,
+                gift_row,
+                recipient_id,
+                {"action": "block_active_auto_renew", "subscription_id": "sub_live_auto", "status": "active"},
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(first_action, "blocked_active_auto_renew")
+        self.assertEqual(second_action, "blocked_active_auto_renew")
+        self.assertEqual(first_expiry, old_expiry)
+        self.assertEqual(second_expiry, old_expiry)
+        self.assertEqual(first["status"], "paid_unclaimed")
+        self.assertEqual(second["status"], "paid_unclaimed")
+        self.assertIn("напишите администратору", main.build_gift_reserved_recipient_text(first))
+        self.assertEqual(
+            self.query_one("SELECT paid, expiry_date, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s", (recipient_id,)),
+            (True, old_expiry, True, "sub_live_auto"),
+        )
+        self.assertEqual(
+            self.query_one("""
+                SELECT status, recipient_telegram_id, reserved_at, redeemed_at, applied_at, applied_expiry
+                FROM gift_access_grants
+                WHERE public_reference = 'GIFT-PG000008'
+            """),
+            ("paid_unclaimed", None, None, None, None, None),
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s", ("gift:GIFT-PG000008:%",))[0],
+            0,
+        )
+        self.assertEqual(asyncio.run(main.apply_reserved_gifts(limit=10)), {"applied": 0, "skipped": 0})
+
+    def test_gift_activation_is_atomic_under_concurrency(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        winner_ids = (9922, 9923)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            token_hash = main.gift_token_hash_for_reference("GIFT-PG000009", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-PG000009', 9924, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+            """, (str(uuid.uuid4()), token_hash))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def activate(recipient_id):
+            local_conn = self.get_conn()
+            local_cur = local_conn.cursor()
+            try:
+                barrier.wait(timeout=5)
+                gift_row = main.fetch_gift_by_public_reference_version(local_cur, "GIFT-PG000009", 1, for_update=True)
+                if not gift_row or gift_row["status"] != "paid_unclaimed":
+                    local_conn.rollback()
+                    results.append((recipient_id, "already_used"))
+                    return
+                updated, action, _ = main.apply_gift_access_in_transaction(local_cur, gift_row, recipient_id, None)
+                local_conn.commit()
+                results.append((recipient_id, action, updated["recipient_telegram_id"]))
+            except Exception as exc:
+                local_conn.rollback()
+                errors.append(exc)
+            finally:
+                local_cur.close()
+                local_conn.close()
+
+        first = threading.Thread(target=activate, args=(winner_ids[0],))
+        second = threading.Thread(target=activate, args=(winner_ids[1],))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        activated = [row for row in results if len(row) >= 2 and row[1] == "redeemed"]
+        blocked = [row for row in results if len(row) >= 2 and row[1] == "already_used"]
+        self.assertEqual(len(activated), 1)
+        self.assertEqual(len(blocked), 1)
+        winner_id = activated[0][0]
+        loser_id = blocked[0][0]
+        self.assertIn(winner_id, winner_ids)
+        self.assertIn(loser_id, winner_ids)
+        self.assertNotEqual(winner_id, loser_id)
+        self.assertEqual(
+            self.query_one("""
+                SELECT status, recipient_telegram_id, redeemed_at IS NOT NULL, applied_at IS NOT NULL
+                FROM gift_access_grants
+                WHERE public_reference = 'GIFT-PG000009'
+            """),
+            ("redeemed", winner_id, True, True),
+        )
+        self.assertEqual(self.query_one("SELECT paid, expiry_date > NOW() AT TIME ZONE 'UTC' FROM users WHERE telegram_id = %s", (winner_id,)), (True, True))
+        self.assertIsNone(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (loser_id,)))
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM access_events
+                WHERE event_type = 'gift_access_redeemed'
+                  AND notes LIKE 'gift=GIFT-PG000009'
+            """)[0],
+            1,
+        )
 
     def test_gift_activation_identity_changed_rolls_back_real_postgres(self):
         run_migrations(self.get_conn)
@@ -2633,7 +2782,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              ):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result, {"applied": 0, "skipped": 1})
+        self.assertEqual(result, {"applied": 0, "skipped": 0})
         self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-PG000007'")[0], "reserved")
         self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expired))
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)

@@ -26,7 +26,7 @@ def import_main():
     env = dict(TEST_ENV)
     env.update({
         "BOT_USERNAME": "ClubGiftBot",
-        "GIFT_TOKEN_SECRET": "unit-test-gift-token-secret",
+        "GIFT_TOKEN_SECRET": "unit-test-gift-token-secret-32chars",
         "GIFT_PRICE_1M": "price_gift_1m",
         "GIFT_PRICE_6M": "price_gift_6m",
         "GIFT_PRICE_12M": "price_gift_12m",
@@ -66,6 +66,25 @@ class GiftAccessTests(unittest.TestCase):
         self.assertEqual(len(self.main.gift_token_hash(token)), 64)
         self.assertEqual(self.main.parse_gift_token(token), ("GIFT-ABCD1234", 3))
         self.assertIsNone(self.main.parse_gift_token(token + "x"))
+
+    def test_gift_token_secret_requires_missing_and_minimum_length(self):
+        main = self.main
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "gift_token_secret_missing") as missing:
+                main.gift_token_secret()
+            self.assertNotIn("GIFT_TOKEN_SECRET", str(missing.exception))
+
+        with mock.patch.dict(os.environ, {"GIFT_TOKEN_SECRET": "x" * 31}, clear=True):
+            with self.assertRaisesRegex(ValueError, "gift_token_secret_too_short") as short:
+                main.gift_token_secret()
+            self.assertNotIn("x" * 31, str(short.exception))
+
+        with mock.patch.dict(os.environ, {"GIFT_TOKEN_SECRET": "x" * 32}, clear=True):
+            self.assertEqual(main.gift_token_secret(), "x" * 32)
+            self.assertTrue(main.generate_gift_token("GIFT-ABCD1234", 1))
+
+        with mock.patch.dict(os.environ, {"GIFT_TOKEN_SECRET": "y" * 64}, clear=True):
+            self.assertEqual(main.gift_token_secret(), "y" * 64)
 
     def test_gift_text_is_sanitized_and_html_escaped(self):
         raw = "<Natalia>\x00\n" + "x" * 400
@@ -205,7 +224,7 @@ class GiftAccessTests(unittest.TestCase):
             result = asyncio.run(main.gift_recipient_subscription_state(123))
 
         retrieve.assert_called_once_with("sub_live")
-        self.assertEqual(result["action"], "reserve")
+        self.assertEqual(result["action"], "block_active_auto_renew")
 
     def test_gift_subscription_state_status_matrix(self):
         main = self.main
@@ -228,7 +247,7 @@ class GiftAccessTests(unittest.TestCase):
                 pass
 
         cases = [
-            ({"status": "trialing", "cancel_at_period_end": False}, "reserve"),
+            ({"status": "trialing", "cancel_at_period_end": False}, "block_active_auto_renew"),
             ({"status": "active", "cancel_at_period_end": True}, "apply_after_current_expiry"),
             ({"status": "canceled", "cancel_at_period_end": False}, "apply"),
             ({"status": "unpaid", "cancel_at_period_end": False}, "apply"),

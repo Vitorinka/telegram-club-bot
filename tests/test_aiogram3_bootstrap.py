@@ -4257,7 +4257,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 9)
+        self.assertEqual(len(fake_scheduler.jobs), 8)
+        self.assertNotIn(
+            self.main.scheduled_apply_reserved_gifts,
+            [args[0] for args, _ in fake_scheduler.jobs],
+        )
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):

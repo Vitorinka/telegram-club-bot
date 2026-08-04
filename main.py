@@ -1152,7 +1152,20 @@ def gift_sender_default_name(telegram_user):
 
 
 def gift_token_secret():
-    return os.getenv(GIFT_TOKEN_SECRET_ENV) or ""
+    secret = (os.getenv(GIFT_TOKEN_SECRET_ENV) or "").strip()
+    if not secret:
+        raise ValueError("gift_token_secret_missing")
+    if len(secret) < 32:
+        raise ValueError("gift_token_secret_too_short")
+    return secret
+
+
+def gift_token_secret_configured():
+    try:
+        gift_token_secret()
+        return True
+    except ValueError:
+        return False
 
 
 def gift_token_hash(token):
@@ -1170,18 +1183,16 @@ def _gift_b64url_decode(value):
 
 def generate_gift_token(public_reference, token_version):
     secret = gift_token_secret()
-    if not secret:
-        raise ValueError("gift_token_secret_missing")
     payload = f"{public_reference}.{int(token_version)}"
     signature = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     return f"{_gift_b64url_encode(payload.encode('utf-8'))}.{_gift_b64url_encode(signature[:24])}"
 
 
 def parse_gift_token(token):
-    secret = gift_token_secret()
-    if not secret or not token:
+    if not token:
         return None
     try:
+        gift_token_secret()
         payload_part, signature_part = str(token).split(".", 1)
         payload = _gift_b64url_decode(payload_part).decode("utf-8")
         public_reference, version_text = payload.rsplit(".", 1)
@@ -1369,7 +1380,7 @@ def fetch_gift_by_public_reference_version(cur, public_reference, token_version,
 
 def gift_configuration_status(cur=None):
     missing_prices = [name for name in gift_required_price_envs() if not os.getenv(name)]
-    missing_secrets = [] if gift_token_secret() else [GIFT_TOKEN_SECRET_ENV]
+    missing_secrets = [] if gift_token_secret_configured() else [GIFT_TOKEN_SECRET_ENV]
     template_count = 0
     owns_conn = cur is None
     conn = None
@@ -1721,9 +1732,9 @@ def build_gift_redeemed_buyer_text(row):
 
 def build_gift_reserved_recipient_text(row):
     return (
-        "🎁 Подарок сохранён за вами\n\n"
-        "Сейчас у вас активна продлеваемая подписка. "
-        "Подарочный период будет добавлен, когда текущая автопродлеваемая подписка завершится."
+        "🎁 Подарок пока нельзя активировать автоматически\n\n"
+        "Сейчас у вас активна автопродлеваемая подписка. "
+        "Чтобы безопасно применить подарок, пожалуйста, напишите администратору."
     )
 
 
@@ -1759,7 +1770,7 @@ async def gift_recipient_subscription_state(recipient_telegram_id):
     status = stripe_value(subscription, "status") or "unknown"
     cancel_at_period_end = bool(stripe_value(subscription, "cancel_at_period_end"))
     if status in ("active", "trialing") and not cancel_at_period_end:
-        action = "reserve"
+        action = "block_active_auto_renew"
     elif status in ("active", "trialing") and cancel_at_period_end:
         action = "apply_after_current_expiry"
     elif status in ("canceled", "incomplete_expired", "unpaid"):
@@ -1884,37 +1895,8 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subsc
         if subscription_state.get("action") == "fail":
             raise ValueError(subscription_state.get("reason") or "gift_recipient_subscription_check_failed")
 
-    if subscription_state and subscription_state.get("action") == "reserve":
-        cur.execute("""
-            UPDATE gift_access_grants
-            SET status = 'reserved',
-                recipient_telegram_id = COALESCE(recipient_telegram_id, %s),
-                reserved_at = COALESCE(reserved_at, NOW()),
-                updated_at = NOW()
-            WHERE id = %s
-              AND status = 'paid_unclaimed'
-            RETURNING *
-        """, (int(recipient_telegram_id), gift_row["id"]))
-        reserved = gift_row_dict(cur, cur.fetchone())
-        if not reserved:
-            raise ValueError("gift_not_reservable")
-        record_gift_event(cur, reserved, "gift_reserved", recipient_telegram_id, source="recipient_activation")
-        enqueue_gift_text_delivery(
-            cur,
-            reserved["public_reference"],
-            recipient_telegram_id,
-            "gift_reserved_recipient",
-            build_gift_reserved_recipient_text(reserved),
-        )
-        enqueue_gift_text_delivery(
-            cur,
-            reserved["public_reference"],
-            reserved["purchaser_telegram_id"],
-            "gift_reserved_buyer",
-            "🎁 Получатель открыл подарок. Период будет добавлен после завершения его текущей автопродлеваемой подписки.",
-        )
-        enqueue_gift_admin_delivery(cur, reserved["public_reference"], "gift_admin_redeemed", gift_admin_text("🎁 Gift reserved", reserved))
-        return reserved, "reserved", old_expiry
+    if subscription_state and subscription_state.get("action") == "block_active_auto_renew":
+        return gift_row, "blocked_active_auto_renew", old_expiry
 
     base_expiry = old_expiry if old_expiry and old_expiry > now else now
     new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
@@ -5954,6 +5936,10 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
         return
     if activation_failed:
         await callback.message.answer("Не получилось активировать подарок. Попробуйте позже или напишите администратору.")
+        await callback.answer()
+        return
+    if action == "blocked_active_auto_renew":
+        await callback.message.answer(build_gift_reserved_recipient_text(updated), reply_markup=get_main_keyboard())
         await callback.answer()
         return
     await state.clear()
@@ -15179,141 +15165,7 @@ async def scheduled_process_message_deliveries():
 
 
 async def apply_reserved_gifts(limit=50):
-    read_conn = get_db_conn()
-    read_cur = read_conn.cursor()
-    try:
-        read_cur.execute("""
-            SELECT *
-            FROM gift_access_grants
-            WHERE status = 'reserved'
-              AND recipient_telegram_id IS NOT NULL
-            ORDER BY reserved_at NULLS FIRST, updated_at
-            LIMIT %s
-        """, (int(limit),))
-        gifts = [gift_row_dict(read_cur, row) for row in read_cur.fetchall()]
-    finally:
-        read_cur.close()
-        read_conn.close()
-
-    applied = 0
-    skipped = 0
-    for gift_row in gifts:
-        subscription_state = await gift_recipient_subscription_state(gift_row["recipient_telegram_id"])
-        if subscription_state.get("action") in ("fail", "reserve"):
-            skipped += 1
-            continue
-        conn = get_db_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT *
-                FROM gift_access_grants
-                WHERE id = %s
-                  AND status = 'reserved'
-                FOR UPDATE
-            """, (gift_row["id"],))
-            locked_gift = gift_row_dict(cur, cur.fetchone())
-            if not locked_gift:
-                conn.rollback()
-                continue
-            cur.execute("""
-                SELECT paid, expiry_date, auto_renew, stripe_subscription_id
-                FROM users
-                WHERE telegram_id = %s
-                FOR UPDATE
-            """, (int(locked_gift["recipient_telegram_id"]),))
-            user_row = cur.fetchone()
-            if not user_row:
-                conn.rollback()
-                continue
-            old_expiry = user_row[1]
-            auto_renew = bool(user_row[2])
-            stripe_subscription_id = user_row[3]
-            if subscription_state.get("subscription_id") is not None and subscription_state.get("subscription_id") != stripe_subscription_id:
-                record_gift_event(
-                    cur,
-                    locked_gift,
-                    "reserved_gift_identity_changed",
-                    locked_gift["recipient_telegram_id"],
-                    source="scheduler",
-                )
-                conn.commit()
-                skipped += 1
-                continue
-            if auto_renew and stripe_subscription_id and old_expiry and old_expiry > datetime.utcnow():
-                if subscription_state.get("action") == "reserve":
-                    conn.rollback()
-                    skipped += 1
-                    continue
-            base_expiry = old_expiry if old_expiry and old_expiry > datetime.utcnow() else datetime.utcnow()
-            new_expiry = base_expiry + timedelta(days=locked_gift["duration_days"])
-            cur.execute("""
-                UPDATE users
-                SET paid = TRUE,
-                    expiry_date = %s,
-                    payment_failed = FALSE,
-                    payment_failed_at = NULL,
-                    grace_period_end = NULL,
-                    reminder_sent = FALSE,
-                    blocked_bot = FALSE
-                WHERE telegram_id = %s
-            """, (new_expiry, int(locked_gift["recipient_telegram_id"])))
-            cur.execute("""
-                UPDATE gift_access_grants
-                SET status = 'redeemed',
-                    redeemed_at = COALESCE(redeemed_at, NOW()),
-                    applied_at = COALESCE(applied_at, NOW()),
-                    applied_expiry = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                  AND status = 'reserved'
-            """, (new_expiry, locked_gift["id"]))
-            record_access_event_cur(
-                cur,
-                locked_gift["recipient_telegram_id"],
-                "gift_access_reserved_applied",
-                source="scheduled_apply_reserved_gifts",
-                old_expiry=old_expiry,
-                new_expiry=new_expiry,
-                notes=f"gift={locked_gift['public_reference']}",
-            )
-            record_gift_event(cur, locked_gift, "reserved_gift_applied", locked_gift["recipient_telegram_id"], source="scheduler")
-            enqueue_automatic_membership_repair(
-                cur,
-                locked_gift["recipient_telegram_id"],
-                new_expiry,
-                "gift_access",
-                reason="reserved_gift_applied",
-            )
-            enqueue_gift_text_delivery(
-                cur,
-                locked_gift["public_reference"],
-                locked_gift["recipient_telegram_id"],
-                "gift_redeemed_recipient",
-                build_gift_redeemed_recipient_text(locked_gift, new_expiry),
-            )
-            enqueue_gift_text_delivery(
-                cur,
-                locked_gift["public_reference"],
-                locked_gift["purchaser_telegram_id"],
-                "gift_redeemed_buyer",
-                build_gift_redeemed_buyer_text(locked_gift),
-            )
-            enqueue_gift_admin_delivery(
-                cur,
-                locked_gift["public_reference"],
-                "gift_admin_redeemed",
-                gift_admin_text("🎁 Reserved gift applied", locked_gift, extra=f"new_expiry: {new_expiry}"),
-            )
-            conn.commit()
-            applied += 1
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cur.close()
-            conn.close()
-    return {"applied": applied, "skipped": skipped}
+    return {"applied": 0, "skipped": 0}
 
 
 async def scheduled_apply_reserved_gifts():
@@ -15381,15 +15233,6 @@ def register_scheduler_jobs_once():
         scheduled_enqueue_first_purchase_recovery_reminders,
         'cron',
         minute=45,
-        misfire_grace_time=300,
-        coalesce=True,
-        max_instances=1
-    )
-
-    scheduler.add_job(
-        scheduled_apply_reserved_gifts,
-        'cron',
-        minute=5,
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1
