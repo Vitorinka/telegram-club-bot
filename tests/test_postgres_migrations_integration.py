@@ -397,7 +397,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     datetime(2026, 9, 1, 0, 0),
                     "evt_pg_admin_success",
                 )
-                self.assertEqual(duplicate_result, 0)
+                self.assertEqual(duplicate_result, len(admin_ids))
                 cur.execute(
                     """
                     SELECT COUNT(*), COUNT(DISTINCT telegram_id), COUNT(DISTINCT delivery_key)
@@ -495,7 +495,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "renewal_success",
                 confirmed_expiry,
             ))
-            self.assertFalse(main.enqueue_user_payment_success_message(
+            self.assertTrue(main.enqueue_user_payment_success_message(
                 cur,
                 "evt_pg_renewal",
                 9802,
@@ -1979,7 +1979,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         self.assertTrue(first)
-        self.assertFalse(second)
+        self.assertTrue(second)
         expected_key = main.access_restore_auto_delivery_key("auto-sync", user_id, expiry)
         row = self.query_one(
             """
@@ -2189,7 +2189,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         conn = self.get_conn()
         cur = conn.cursor()
         try:
-            main.enqueue_access_restore_invite(
+            self.assertTrue(main.enqueue_access_restore_invite(
                 cur,
                 user_id,
                 expiry,
@@ -2198,7 +2198,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 admin_action_id="act_pg_restore",
                 reason="manual_restore_access",
                 delivery_key=main.access_restore_delivery_key("act_pg_restore", user_id),
-            )
+            ))
+            self.assertTrue(main.enqueue_access_restore_invite(
+                cur,
+                user_id,
+                expiry,
+                main.ACCESS_RESTORE_SOURCE_ADMIN,
+                requested_by_admin_id=1,
+                admin_action_id="act_pg_restore",
+                reason="manual_restore_access",
+                delivery_key=main.access_restore_delivery_key("act_pg_restore", user_id),
+            ))
             conn.commit()
         finally:
             cur.close()
@@ -2410,6 +2420,125 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn("button_url", row[1])
         self.assertNotIn("start=gift_", row[1])
         self.assertIn('"token_version": 1', row[1])
+
+    def test_gift_checkout_draft_replaces_only_when_recipient_sender_and_message_match_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        purchaser_id = 9925
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            first = main.create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Анна",
+                "Олег",
+                "С днём рождения",
+            )
+            same, same_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Анна",
+                "Олег",
+                "С днём рождения",
+            )
+            changed_recipient, recipient_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Олег",
+                "С днём рождения",
+            )
+            changed_sender, sender_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Ирина",
+                "С днём рождения",
+            )
+            changed_message, message_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Ирина",
+                "Для тебя",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(same["id"], first["id"])
+        self.assertEqual(same_result, "draft_reused")
+        self.assertNotEqual(changed_recipient["id"], first["id"])
+        self.assertFalse(recipient_result)
+        self.assertNotEqual(changed_sender["id"], changed_recipient["id"])
+        self.assertFalse(sender_result)
+        self.assertNotEqual(changed_message["id"], changed_sender["id"])
+        self.assertFalse(message_result)
+        self.assertEqual(
+            self.query_one("""
+                SELECT recipient_name, sender_name, gift_message, status
+                FROM gift_access_grants
+                WHERE id = %s
+            """, (changed_message["id"],)),
+            ("Мария", "Ирина", "Для тебя", "checkout_pending"),
+        )
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM gift_access_grants
+                WHERE purchaser_telegram_id = %s
+                  AND status = 'cancelled'
+            """, (purchaser_id,))[0],
+            3,
+        )
+
+    def test_gift_checkout_open_with_changed_details_requires_existing_payment_resolution_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        purchaser_id = 9926
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            draft = main.create_gift_checkout_draft(cur, purchaser_id, "gift_1m", "Анна", "Олег", "Первый")
+            opened = main.mark_gift_checkout_open(
+                cur,
+                draft["id"],
+                "checkout_pending",
+                "cs_open_existing",
+                "https://checkout.example/existing",
+                None,
+            )
+            conflict, conflict_result = main.find_or_create_gift_checkout_draft(
+                cur,
+                purchaser_id,
+                "gift_1m",
+                "Мария",
+                "Олег",
+                "Первый",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(conflict["id"], opened["id"])
+        self.assertEqual(conflict_result, "active_checkout_conflict")
+        self.assertEqual(
+            self.query_one("""
+                SELECT COUNT(*)
+                FROM gift_access_grants
+                WHERE purchaser_telegram_id = %s
+                  AND status IN ('checkout_pending', 'checkout_open', 'payment_pending')
+            """, (purchaser_id,))[0],
+            1,
+        )
 
     def test_gift_refund_before_redeem_invalidates_token_and_cancels_certificate_real_postgres(self):
         run_migrations(self.get_conn)
@@ -2624,6 +2753,46 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             0,
         )
         self.assertEqual(asyncio.run(main.apply_reserved_gifts(limit=10)), {"applied": 0, "skipped": 0})
+
+    def test_gift_activation_paid_false_future_expiry_starts_from_now_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9927
+        stale_future_expiry = datetime.utcnow() + timedelta(days=90)
+        before_activation = datetime.utcnow()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, FALSE, %s, FALSE, NULL)
+            """, (recipient_id, stale_future_expiry))
+            token_hash = main.gift_token_hash_for_reference("GIFT-PG000010", 1)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, 'GIFT-PG000010', 9928, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (str(uuid.uuid4()), token_hash))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            updated, action, new_expiry = main.apply_gift_access_in_transaction(cur, gift_row, recipient_id, None)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(action, "redeemed")
+        self.assertEqual(updated["status"], "redeemed")
+        self.assertLess(new_expiry, stale_future_expiry)
+        self.assertGreaterEqual(new_expiry, before_activation + timedelta(days=30))
+        self.assertLess(new_expiry, before_activation + timedelta(days=30, seconds=10))
+        self.assertEqual(
+            self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)),
+            (True, new_expiry),
+        )
 
     def test_gift_activation_is_atomic_under_concurrency(self):
         run_migrations(self.get_conn)

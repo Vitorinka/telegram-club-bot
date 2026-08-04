@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest import mock
+import scheduled_jobs
 
 TEST_ENV = {
     "BOT_TOKEN": "123456:TEST_TOKEN_FOR_GIFT_ONLY",
@@ -66,6 +67,14 @@ class GiftAccessTests(unittest.TestCase):
         self.assertEqual(len(self.main.gift_token_hash(token)), 64)
         self.assertEqual(self.main.parse_gift_token(token), ("GIFT-ABCD1234", 3))
         self.assertIsNone(self.main.parse_gift_token(token + "x"))
+
+    def test_gift_public_reference_uses_wider_entropy(self):
+        reference = self.main.gift_public_reference()
+        self.assertRegex(reference, r"^GIFT-[0-9A-F]{16}$")
+
+    def test_gift_outbox_helper_does_not_override_shared_scheduled_jobs_enqueue(self):
+        self.assertIs(self.main.enqueue_message_delivery, scheduled_jobs.enqueue_message_delivery)
+        self.assertIsNot(self.main.enqueue_gift_message_delivery, scheduled_jobs.enqueue_message_delivery)
 
     def test_gift_token_secret_requires_missing_and_minimum_length(self):
         main = self.main

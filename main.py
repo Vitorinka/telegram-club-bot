@@ -1210,7 +1210,7 @@ def gift_token_hash_for_reference(public_reference, token_version):
 
 
 def gift_public_reference():
-    return f"GIFT-{secrets.token_hex(4).upper()}"
+    return f"GIFT-{secrets.token_hex(8).upper()}"
 
 
 def gift_deep_link(token):
@@ -1249,7 +1249,7 @@ def gift_delivery_key(public_reference, purpose, recipient_id=None, token_versio
     return f"gift:{public_reference}:{purpose}{suffix}"
 
 
-def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload):
+def enqueue_gift_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload):
     cur.execute("""
         INSERT INTO message_delivery_events (
             delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
@@ -1262,7 +1262,7 @@ def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payl
 
 
 def enqueue_gift_text_delivery(cur, public_reference, telegram_id, purpose, text, **extra):
-    return enqueue_message_delivery(
+    return enqueue_gift_message_delivery(
         cur,
         gift_delivery_key(public_reference, purpose, telegram_id if purpose.startswith("gift_admin_") else None),
         int(telegram_id),
@@ -1300,7 +1300,7 @@ def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
     template = cur.fetchone()
     if not template:
         raise ValueError("gift_certificate_template_missing")
-    return enqueue_message_delivery(
+    return enqueue_gift_message_delivery(
         cur,
         gift_delivery_key(
             row["public_reference"],
@@ -1508,7 +1508,29 @@ def find_or_create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, 
     """, (int(purchaser_telegram_id), tariff_code))
     existing = gift_row_dict(cur, cur.fetchone())
     if existing:
-        return existing, True
+        same_details = (
+            (existing.get("recipient_name") or "") == (recipient_name or "")
+            and (existing.get("sender_name") or "") == (sender_name or "")
+            and (existing.get("gift_message") or "") == (gift_message or "")
+        )
+        has_stripe_checkout = bool(existing.get("stripe_session_id") or existing.get("checkout_url"))
+        if same_details:
+            return existing, "checkout_reused" if has_stripe_checkout else "draft_reused"
+        if existing["status"] == "checkout_pending" and not has_stripe_checkout:
+            cur.execute("""
+                UPDATE gift_access_grants
+                SET status = 'cancelled',
+                    cancelled_at = NOW(),
+                    last_error = 'checkout_draft_replaced',
+                    last_error_category = 'checkout_draft_replaced',
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND status = 'checkout_pending'
+                  AND stripe_session_id IS NULL
+            """, (existing["id"],))
+            record_gift_event(cur, existing, "checkout_draft_replaced", purchaser_telegram_id, source="gift_fsm")
+            return create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message), False
+        return existing, "active_checkout_conflict"
     return create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message), False
 
 
@@ -1885,6 +1907,7 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subsc
         FOR UPDATE
     """, (int(recipient_telegram_id),))
     user_row = cur.fetchone()
+    paid = bool(user_row[0]) if user_row else False
     old_expiry = user_row[1] if user_row else None
     auto_renew = bool(user_row[2]) if user_row else False
     stripe_subscription_id = user_row[3] if user_row else None
@@ -1898,7 +1921,7 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subsc
     if subscription_state and subscription_state.get("action") == "block_active_auto_renew":
         return gift_row, "blocked_active_auto_renew", old_expiry
 
-    base_expiry = old_expiry if old_expiry and old_expiry > now else now
+    base_expiry = old_expiry if paid and old_expiry and old_expiry > now else now
     new_expiry = base_expiry + timedelta(days=gift_row["duration_days"])
     cur.execute("""
         INSERT INTO users (
@@ -5762,6 +5785,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
     reused_checkout_url = None
     gift_unavailable = False
     draft_failed = False
+    active_checkout_conflict = False
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -5770,7 +5794,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
             conn.commit()
             gift_unavailable = True
         else:
-            gift_row, reused_draft = find_or_create_gift_checkout_draft(
+            gift_row, draft_result = find_or_create_gift_checkout_draft(
                 cur,
                 callback.from_user.id,
                 tariff_code,
@@ -5779,7 +5803,9 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
                 data.get("gift_message") or "",
             )
             conn.commit()
-            if reused_draft and gift_row.get("checkout_url") and (
+            if draft_result == "active_checkout_conflict":
+                active_checkout_conflict = True
+            elif draft_result == "checkout_reused" and gift_row.get("checkout_url") and (
                 not gift_row.get("checkout_expires_at") or gift_row["checkout_expires_at"] > datetime.utcnow()
             ):
                 reused_checkout_url = gift_row["checkout_url"]
@@ -5803,6 +5829,15 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
 
     if draft_failed:
         await callback.message.answer("Не получилось подготовить подарок. Попробуйте позже или напишите администратору.")
+        await state.clear()
+        return
+
+    if active_checkout_conflict:
+        await callback.message.answer(
+            "У вас уже есть незавершённая оплата подарка с другими данными.\n\n"
+            "Пожалуйста, завершите прежнюю оплату или отмените оформление подарка и начните заново.",
+            reply_markup=get_main_keyboard(),
+        )
         await state.clear()
         return
 
@@ -5868,7 +5903,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
             stage="checkout_creation",
             telegram_id=callback.from_user.id,
             category="checkout_creation_failed",
-            exception=None,
+            exception=e,
             stripe_retry="неизвестно",
             recovery_reminder="не применимо",
             safe_ref=safe_admin_context_reference("gift_checkout_create", gift_row["public_reference"]),
@@ -10243,7 +10278,7 @@ async def stripe_webhook(request):
                         stage="checkout_completed",
                         telegram_id=gift_metadata.get("purchaser_telegram_id"),
                         category="webhook_processing_failed",
-                        exception=None,
+                        exception=e,
                         stripe_retry="да",
                         recovery_reminder="не применимо",
                         safe_ref=safe_admin_context_reference("gift_checkout_proof", event_id, gift_id),
@@ -10534,7 +10569,7 @@ async def stripe_webhook(request):
                         stage="checkout_completed",
                         telegram_id=user_id,
                         category="webhook_processing_failed",
-                        exception=None,
+                        exception=e,
                         stripe_retry="да",
                         recovery_reminder="неизвестно",
                         safe_ref=safe_admin_error_reference("checkout_subscription_link", e),
@@ -11741,7 +11776,7 @@ async def stripe_webhook(request):
                         purpose="invoice_payment_failed_subscription_retrieve",
                         stage="invoice_payment_failed",
                         telegram_id=None,
-                        exception=None,
+                        exception=e,
                         stripe_retry="да",
                         recovery_reminder="неизвестно",
                         safe_ref=safe_admin_error_reference('payment_failed_subscription_retrieve', e),
@@ -12616,7 +12651,7 @@ async def stripe_webhook(request):
                         stage="checkout_async_payment_succeeded",
                         telegram_id=gift_metadata.get("purchaser_telegram_id"),
                         category="webhook_processing_failed",
-                        exception=None,
+                        exception=e,
                         stripe_retry="да",
                         recovery_reminder="не применимо",
                         safe_ref=safe_admin_context_reference("gift_async_success_proof", event_id, gift_id),
