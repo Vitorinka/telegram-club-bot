@@ -2695,20 +2695,35 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(confirmations), 1)
         self.assertIn(f"delivery_hash: {requested_hash}", confirmations[0][1])
 
-    async def run_checkout_days_webhook(self, days_marker, notify_side_effect=None):
+    async def run_checkout_days_webhook(
+        self,
+        days_marker,
+        notify_side_effect=None,
+        payment_status="paid",
+        retrieve_session=None,
+        conn=None,
+        event_id=None,
+        session_id=None,
+        checkout_status="open",
+        checkout_tariff="sub_1",
+        checkout_mode="payment",
+        checkout_telegram_id=123,
+    ):
+        session_id = session_id or f"cs_days_{days_marker if days_marker is not None else 'missing'}"
         session_payload = {
-            "id": f"cs_days_{days_marker if days_marker is not None else 'missing'}",
+            "id": session_id,
             "client_reference_id": "123",
             "mode": "payment",
-            "payment_status": "paid",
             "customer": f"cus_days_{days_marker if days_marker is not None else 'missing'}",
             "subscription": None,
             "amount_total": 1000,
             "currency": "usd",
         }
+        if payment_status != "missing":
+            session_payload["payment_status"] = payment_status
         if days_marker != "missing":
             session_payload["metadata"] = {"days": days_marker}
-        event_id = f"evt_days_{days_marker if days_marker is not None else 'none'}"
+        event_id = event_id or f"evt_days_{days_marker if days_marker is not None else 'none'}"
         event = SimpleNamespace(
             id=event_id,
             type="checkout.session.completed",
@@ -2725,7 +2740,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock(side_effect=notify_side_effect)
         release = AsyncMock()
         mark_processed = AsyncMock()
-        conn = FakeConnection()
+        conn = conn or FakeConnection(fetches=[
+            (checkout_telegram_id, checkout_tariff, checkout_mode, checkout_status),
+            (False, None, False, False),
+        ])
         get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
@@ -2733,6 +2751,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "notify_admins", notify), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", Mock(return_value=retrieve_session)) as retrieve, \
              patch.object(self.main, "get_db_conn", get_db_conn):
             response = await self.main.stripe_webhook(request)
 
@@ -2744,6 +2763,66 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             get_db_conn=get_db_conn,
             conn=conn,
             event_id=event_id,
+            retrieve=retrieve,
+        )
+
+    async def run_checkout_async_success_webhook(
+        self,
+        payment_status="paid",
+        mode="payment",
+        conn=None,
+        event_id="evt_async_success",
+        session_id="cs_async_success",
+        claim_result="claimed",
+    ):
+        session_payload = {
+            "id": session_id,
+            "client_reference_id": "123",
+            "mode": mode,
+            "payment_status": payment_status,
+            "customer": "cus_async_success",
+            "subscription": "sub_async_success" if mode == "subscription" else None,
+            "amount_total": 1000,
+            "currency": "usd",
+            "metadata": {"days": "30", "telegram_id": "123"},
+        }
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.async_payment_succeeded",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        payload = json.dumps({
+            "id": event_id,
+            "object": "event",
+            "type": "checkout.session.async_payment_succeeded",
+            "data": {"object": session_payload},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+        conn = conn or FakeConnection(fetches=[
+            (123, "sub_1", "payment", "payment_pending"),
+            (False, None, False, False),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=claim_result)), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "claim_trial_redemption", return_value=True), \
+             patch.object(self.main, "reset_checkout_retry_state_after_success") as reset_retry, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        return SimpleNamespace(
+            response=response,
+            mark_processed=mark_processed,
+            release=release,
+            reset_retry=reset_retry,
+            conn=conn,
+            event_id=event_id,
+            session_id=session_id,
         )
 
     async def run_checkout_identity_webhook(self, client_reference_id="123", metadata_telegram_id="123", notify_side_effect=None):
@@ -2778,7 +2857,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         notify = AsyncMock(side_effect=notify_side_effect)
         release = AsyncMock()
         mark_processed = AsyncMock()
-        conn = FakeConnection(fetches=[(False, None, False)])
+        conn = FakeConnection(fetches=[
+            (123, "sub_trial", "payment", "open"),
+            (False, None, False, False),
+        ])
         get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
@@ -2887,6 +2969,312 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result.mark_processed.assert_not_awaited()
         result.get_db_conn.assert_called_once()
 
+    async def test_checkout_payment_status_unpaid_and_processing_do_not_grant_access(self):
+        for payment_status in ("unpaid", "processing"):
+            with self.subTest(payment_status=payment_status):
+                result = await self.run_checkout_days_webhook("30", payment_status=payment_status)
+
+                self.assertEqual(result.response.status, 200)
+                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.release.assert_not_awaited()
+                sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+                self.assertTrue(any(params and params[0] == "payment_pending" for _, params in result.conn.cursor_obj.queries))
+                self.assertNotIn("INSERT INTO users", sql)
+                self.assertNotIn("INSERT INTO payment_events", sql)
+                self.assertNotIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_payment_status_no_payment_required_requires_manual_review(self):
+        result = await self.run_checkout_days_webhook("30", payment_status="no_payment_required")
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertTrue(any(params and params[0] == "manual_review_required" for _, params in result.conn.cursor_obj.queries))
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(result.conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(all(payload["severity"] == "CRITICAL" for payload in admin_payloads))
+        self.assertIn("Доступ не выдан", admin_payloads[0]["text"])
+
+    async def test_checkout_payment_status_missing_retrieves_once_and_fails_closed(self):
+        retrieved = SimpleNamespace(
+            id="cs_days_30",
+            client_reference_id="123",
+            metadata={"days": "30"},
+            mode="payment",
+            payment_status="processing",
+            customer="cus_days_30",
+            subscription=None,
+            amount_total=1000,
+            currency="usd",
+        )
+        result = await self.run_checkout_days_webhook("30", payment_status="missing", retrieve_session=retrieved)
+
+        self.assertEqual(result.response.status, 200)
+        result.retrieve.assert_called_once()
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertTrue(any(params and params[0] == "payment_pending" for _, params in result.conn.cursor_obj.queries))
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+
+    async def test_checkout_completed_open_row_applies_access_once(self):
+        result = await self.run_checkout_days_webhook(
+            "30",
+            event_id="evt_completed_open_row",
+            session_id="cs_completed_idempotent",
+            checkout_status="open",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
+        self.assertIn("FOR UPDATE", sql)
+        self.assertIn("INSERT INTO users", sql)
+        self.assertIn("INSERT INTO payment_events", sql)
+        self.assertIn("INSERT INTO access_events", sql)
+
+    async def test_repeat_checkout_completed_same_session_already_completed_is_noop(self):
+        conn = FakeConnection(fetches=[(123, "sub_1", "payment", "completed")])
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=conn,
+            event_id="evt_completed_repeated_after_commit",
+            session_id="cs_completed_idempotent",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with("evt_completed_repeated_after_commit")
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+        self.assertFalse(self.delivery_inserts(conn))
+
+    async def test_checkout_completed_missing_row_fails_closed_with_durable_alert(self):
+        conn = FakeConnection(fetches=[None])
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=conn,
+            event_id="evt_completed_missing_checkout_row",
+            session_id="cs_missing_checkout_row",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(all(payload["severity"] == "CRITICAL" for payload in admin_payloads))
+        self.assertIn("access_granted: false", admin_payloads[0]["text"])
+        self.assertIn("checkout_session_row_missing", admin_payloads[0]["text"])
+
+    async def test_checkout_completed_row_identity_tariff_or_mode_mismatch_fails_closed(self):
+        cases = (
+            ("telegram", 456, "sub_1", "payment"),
+            ("tariff", 123, "sub_6", "payment"),
+            ("mode", 123, "sub_1", "subscription"),
+        )
+        for label, checkout_telegram_id, checkout_tariff, checkout_mode in cases:
+            with self.subTest(label=label):
+                conn = FakeConnection(fetches=[(checkout_telegram_id, checkout_tariff, checkout_mode, "open")])
+                result = await self.run_checkout_days_webhook(
+                    "30",
+                    conn=conn,
+                    event_id=f"evt_completed_mismatch_{label}",
+                    session_id=f"cs_completed_mismatch_{label}",
+                )
+
+                self.assertEqual(result.response.status, 200)
+                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.release.assert_not_awaited()
+                sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+                self.assertNotIn("INSERT INTO users", sql)
+                self.assertNotIn("INSERT INTO payment_events", sql)
+                self.assertNotIn("INSERT INTO access_events", sql)
+                admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
+                self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+
+    async def test_checkout_completed_then_async_success_same_session_second_is_noop(self):
+        completed = await self.run_checkout_days_webhook(
+            "30",
+            event_id="evt_completed_before_async",
+            session_id="cs_completed_then_async",
+            checkout_status="open",
+        )
+        self.assertEqual(completed.response.status, 200)
+        self.assertIn("INSERT INTO users", "\n".join(query for query, _ in completed.conn.cursor_obj.queries))
+
+        async_conn = FakeConnection(fetches=[(123, "sub_1", "payment", "completed")])
+        async_result = await self.run_checkout_async_success_webhook(
+            conn=async_conn,
+            event_id="evt_async_after_completed",
+            session_id="cs_completed_then_async",
+        )
+
+        self.assertEqual(async_result.response.status, 200)
+        async_result.mark_processed.assert_awaited_once_with("evt_async_after_completed")
+        sql = "\n".join(query for query, _ in async_conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_async_success_applies_payment_pending_checkout(self):
+        result = await self.run_checkout_async_success_webhook()
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
+        self.assertIn("INSERT INTO users", sql)
+        self.assertIn("INSERT INTO payment_events", sql)
+        self.assertIn("INSERT INTO access_events", sql)
+        self.assertIn("SET status = 'completed'", sql)
+
+    async def test_duplicate_checkout_async_success_does_not_apply_twice(self):
+        conn = FakeConnection(fetches=[(123, "sub_1", "payment", "completed")])
+        result = await self.run_checkout_async_success_webhook(
+            conn=conn,
+            event_id="evt_async_success_duplicate",
+            session_id="cs_async_success_duplicate",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_async_success_without_paid_status_fails_closed(self):
+        result = await self.run_checkout_async_success_webhook(payment_status="processing")
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertTrue(any(params and params[0] == "manual_review_required" for _, params in result.conn.cursor_obj.queries))
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_async_payment_failed_marks_pending_failed_without_access(self):
+        event_id = "evt_async_failed_pending"
+        session_payload = {
+            "id": "cs_async_failed_pending",
+            "client_reference_id": "123",
+            "metadata": {"days": "30", "telegram_id": "123"},
+        }
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.async_payment_failed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(**session_payload)),
+        )
+        payload = json.dumps({
+            "id": event_id,
+            "object": "event",
+            "type": "checkout.session.async_payment_failed",
+            "data": {"object": session_payload},
+        }).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertTrue(any(params and params[0] == "failed" for _, params in conn.cursor_obj.queries))
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+
+    async def test_checkout_creation_existing_payment_pending_does_not_create_new_session(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        claim_result = {
+            "action": "payment_pending",
+            "record": {
+                "id": 51,
+                "stripe_session_id": "cs_pending_existing",
+                "checkout_url": None,
+                "status": "payment_pending",
+                "expires_at": None,
+                "idempotency_key": "idem_pending_existing",
+                "created_at": datetime.utcnow(),
+            },
+        }
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        self.assertIn("Оплата уже обрабатывается Stripe", callback.message.answers[-1][0])
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_checkout_creation_pending_other_tariff_does_not_create_new_session(self):
+        callback = FakeCallback()
+        callback.data = "sub_6"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        pending_created_at = datetime.utcnow() - timedelta(minutes=5)
+        claim_conn = FakeConnection(fetches=[
+            (61, "cs_pending_sub_1", None, "payment_pending", None, "idem_pending_sub_1", pending_created_at),
+        ])
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow())), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        self.assertIn("Оплата уже обрабатывается Stripe", callback.message.answers[-1][0])
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_checkout_async_success_subscription_mode_stays_link_only(self):
+        result = await self.run_checkout_async_success_webhook(
+            mode="subscription",
+            event_id="evt_async_success_subscription",
+            session_id="cs_async_success_subscription",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.release.assert_not_awaited()
+        sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO users", sql)
+        self.assertNotIn("INSERT INTO payment_events", sql)
+        self.assertNotIn("INSERT INTO access_events", sql)
+
     async def test_checkout_days_seven_success_path_still_processes(self):
         event = SimpleNamespace(
             id="evt_days_valid_7",
@@ -2911,7 +3299,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "data": {"object": {"id": "cs_days_valid_7", "client_reference_id": "123", "metadata": {"days": "7"}}},
         }).encode("utf-8")
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
-        conn = FakeConnection(fetches=[(False, None, False)])
+        conn = FakeConnection(fetches=[
+            (123, "sub_trial", "payment", "open"),
+            (False, None, False, False),
+        ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
              patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
@@ -4142,7 +4533,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             success_key = "stripe:%s:payment_recovered" % event_id
         else:
             success_key = "stripe:%s:payment_success" % event_id
+        checkout_tariff = "sub_trial" if days == "7" else "sub_1"
         conn = FakeConnection(fetches=[
+            (123, checkout_tariff, "payment", "open"),
             (True, datetime.utcnow() - timedelta(days=1), True, payment_failed),
             (success_key,),
             ("stripe:%s:rejoin_invite" % event_id,),
@@ -4189,6 +4582,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
+            (123, "sub_1", "payment", "open"),
             (True, datetime.utcnow() + timedelta(days=14), True),
             ("stripe:evt_checkout_boundary:rejoin_invite",),
         ])
@@ -4394,6 +4788,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ).encode("utf-8")
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
+            (123, "sub_1", "payment", "open"),
             (False, datetime.utcnow() - timedelta(days=1), False),
             ("stripe:evt_checkout_duplicate:rejoin_invite",),
         ])

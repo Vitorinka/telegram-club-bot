@@ -890,7 +890,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("if mode == 'subscription' and stripe_subscription_id", source)
 
     def test_creation_unknown_is_active_checkout_status(self):
-        cur = FakeCursor(fetches=[(1, None, None, "creation_unknown", None, "idem_1", datetime.utcnow())])
+        cur = FakeCursor(fetches=[None, (1, None, None, "creation_unknown", None, "idem_1", datetime.utcnow())])
         result = active_result = __import__("checkout_safety").claim_checkout_session_record(cur, 1, "sub_1", "subscription")
         self.assertEqual(result["action"], "retry_create")
         self.assertEqual(active_result["record"]["idempotency_key"], "idem_1")
@@ -910,8 +910,8 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertEqual(cur.queries[-1][1][0], "failed")
 
     def test_checkout_unique_index_includes_creation_unknown(self):
-        self.assertIn('CHECKOUT_OPEN_STATUSES = ("creating", "creation_unknown", "open")', CHECKOUT_SAFETY_SOURCE)
-        self.assertIn("status IN ('creating', 'creation_unknown', 'open')", CHECKOUT_SAFETY_SOURCE)
+        self.assertIn('CHECKOUT_OPEN_STATUSES = ("creating", "creation_unknown", "open", "payment_pending")', CHECKOUT_SAFETY_SOURCE)
+        self.assertIn("status IN ('creating', 'creation_unknown', 'open', 'payment_pending')", CHECKOUT_SAFETY_SOURCE)
 
     def test_checkout_retry_events_persist_attempts_for_restart_and_replicas(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]
@@ -1075,7 +1075,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_creation_unknown_old_record_retries_same_key_without_insert(self):
         old = datetime.utcnow() - timedelta(hours=3)
-        cur = FakeCursor(fetches=[(7, None, None, "creation_unknown", None, "idem_old", old)])
+        cur = FakeCursor(fetches=[None, (7, None, None, "creation_unknown", None, "idem_old", old)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 1, "sub_1", "subscription")
         self.assertEqual(result["action"], "retry_create")
         self.assertEqual(result["record"]["id"], 7)
@@ -1085,7 +1085,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_stale_creating_retries_same_key_without_insert(self):
         old = datetime.utcnow() - timedelta(minutes=3)
-        cur = FakeCursor(fetches=[(8, None, None, "creating", None, "idem_creating", old)])
+        cur = FakeCursor(fetches=[None, (8, None, None, "creating", None, "idem_creating", old)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 2, "sub_1", "subscription")
         self.assertEqual(result["action"], "retry_create")
         self.assertEqual(result["record"]["idempotency_key"], "idem_creating")
@@ -1094,13 +1094,44 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_fresh_creating_still_reports_in_progress(self):
         fresh = datetime.utcnow()
-        cur = FakeCursor(fetches=[(9, None, None, "creating", None, "idem_fresh", fresh)])
+        cur = FakeCursor(fetches=[None, (9, None, None, "creating", None, "idem_fresh", fresh)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 3, "sub_1", "subscription")
         self.assertEqual(result["action"], "creating_in_progress")
+
+    def test_payment_pending_checkout_blocks_new_checkout_creation(self):
+        old = datetime.utcnow() - timedelta(minutes=10)
+        cur = FakeCursor(fetches=[(24, "cs_pending", None, "payment_pending", None, "idem_pending", old)])
+        result = __import__("checkout_safety").claim_checkout_session_record(cur, 9, "sub_1", "subscription")
+        self.assertEqual(result["action"], "payment_pending")
+        self.assertEqual(result["record"]["stripe_session_id"], "cs_pending")
+        self.assertNotIn("INSERT INTO checkout_sessions", "\n".join(query for query, _ in cur.queries))
+
+    def test_payment_pending_other_tariff_blocks_new_checkout_creation(self):
+        old = datetime.utcnow() - timedelta(minutes=10)
+        cur = FakeCursor(fetches=[(25, "cs_pending_sub_1", None, "payment_pending", None, "idem_pending_sub_1", old)])
+        result = __import__("checkout_safety").claim_checkout_session_record(cur, 9, "sub_6", "subscription")
+        self.assertEqual(result["action"], "payment_pending")
+        self.assertEqual(result["record"]["stripe_session_id"], "cs_pending_sub_1")
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("status = 'payment_pending'", sql)
+        self.assertNotIn("INSERT INTO checkout_sessions", sql)
+
+    def test_completed_failed_or_expired_other_tariff_do_not_block_checkout_creation(self):
+        for status in ("completed", "failed", "expired"):
+            with self.subTest(status=status):
+                cur = FakeCursor(fetches=[
+                    None,
+                    None,
+                    (30, None, None, "creating", None, f"idem_{status}", datetime.utcnow()),
+                ])
+                result = __import__("checkout_safety").claim_checkout_session_record(cur, 10, "sub_12", "subscription")
+                self.assertEqual(result["action"], "create")
+                self.assertIn("INSERT INTO checkout_sessions", "\n".join(query for query, _ in cur.queries))
 
     def test_open_expired_terminal_update_allows_new_insert(self):
         old = datetime.utcnow() - timedelta(minutes=5)
         cur = FakeCursor(fetches=[
+            None,
             (10, "cs_old", "https://checkout", "open", old, "idem_open", old),
             (11, None, None, "creating", None, "idem_new", datetime.utcnow()),
         ])
@@ -1111,7 +1142,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("INSERT INTO checkout_sessions", sql)
 
     def test_failed_status_not_active_allows_new_key(self):
-        cur = FakeCursor(fetches=[None, (12, None, None, "creating", None, "idem_new_failed", datetime.utcnow())])
+        cur = FakeCursor(fetches=[None, None, (12, None, None, "creating", None, "idem_new_failed", datetime.utcnow())])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 5, "sub_1", "subscription")
         self.assertEqual(result["action"], "create")
         self.assertEqual(result["record"]["id"], 12)
@@ -1173,7 +1204,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_ambiguous_checkout_under_retry_limit_reuses_same_key(self):
         old = datetime.utcnow() - timedelta(hours=19)
-        cur = FakeCursor(fetches=[(21, None, None, "creation_unknown", None, "idem_19h", old)])
+        cur = FakeCursor(fetches=[None, (21, None, None, "creation_unknown", None, "idem_19h", old)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 6, "sub_1", "subscription")
         self.assertEqual(result["action"], "retry_create")
         self.assertEqual(result["record"]["idempotency_key"], "idem_19h")
@@ -1181,7 +1212,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_ambiguous_checkout_over_retry_limit_requires_manual_review(self):
         old = datetime.utcnow() - timedelta(hours=21)
-        cur = FakeCursor(fetches=[(22, None, None, "creation_unknown", None, "idem_21h", old)])
+        cur = FakeCursor(fetches=[None, (22, None, None, "creation_unknown", None, "idem_21h", old)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 7, "sub_1", "subscription")
         self.assertEqual(result["action"], "manual_review_required")
         self.assertEqual(result["record"]["idempotency_key"], "idem_21h")
@@ -1189,7 +1220,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_ambiguous_checkout_days_old_requires_manual_review(self):
         old = datetime.utcnow() - timedelta(days=3)
-        cur = FakeCursor(fetches=[(23, None, None, "creating", None, "idem_days", old)])
+        cur = FakeCursor(fetches=[None, (23, None, None, "creating", None, "idem_days", old)])
         result = __import__("checkout_safety").claim_checkout_session_record(cur, 8, "sub_1", "subscription")
         self.assertEqual(result["action"], "manual_review_required")
         self.assertEqual(CHECKOUT_AMBIGUOUS_AUTO_RETRY_HOURS, 20)
@@ -1199,6 +1230,30 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("enqueue_admin_payment_problem_now", source)
         self.assertIn("/resolve_checkout <record_id> <failed|expired>", source)
         self.assertNotIn("stripe.checkout.Session.create", source)
+
+    def test_process_payment_payment_pending_path_does_not_create_stripe_session(self):
+        source = MAIN_SOURCE[MAIN_SOURCE.index('if claim_result["action"] == "payment_pending"'):MAIN_SOURCE.index('if claim_result["action"] == "manual_review_required"')]
+        self.assertIn("Оплата уже обрабатывается Stripe", source)
+        self.assertNotIn("stripe.checkout.Session.create", source)
+
+    def test_async_success_uses_common_paid_checkout_access_pipeline(self):
+        helper_index = MAIN_SOURCE.index("async def apply_paid_checkout_access")
+        async_index = MAIN_SOURCE.index("elif event_type == 'checkout.session.async_payment_succeeded'")
+        async_source = MAIN_SOURCE[async_index:MAIN_SOURCE.index("elif event_type in (\"charge.refunded\"", async_index)]
+        self.assertIn("await apply_paid_checkout_access", async_source)
+        helper_source = MAIN_SOURCE[helper_index:MAIN_SOURCE.index("# ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT", helper_index)]
+        self.assertIn("SELECT telegram_id, tariff_code, mode, status", helper_source)
+        self.assertIn("FOR UPDATE", helper_source)
+        self.assertIn("INSERT INTO users", helper_source)
+        self.assertIn("insert_payment_event(", helper_source)
+        self.assertIn("INSERT INTO access_events", helper_source)
+
+    def test_checkout_claim_uses_user_wide_pending_lock_before_per_tariff_logic(self):
+        self.assertIn('f"checkout:{int(telegram_id)}"', CHECKOUT_SAFETY_SOURCE)
+        self.assertIn("status = 'payment_pending'", CHECKOUT_SAFETY_SOURCE)
+        pending_index = CHECKOUT_SAFETY_SOURCE.index("status = 'payment_pending'")
+        tariff_index = CHECKOUT_SAFETY_SOURCE.index("AND tariff_code = %s")
+        self.assertLess(pending_index, tariff_index)
 
     def test_resolve_checkout_command_is_confirm_only(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def resolve_checkout_command"):MAIN_SOURCE.index("@router.message(Command('link_stripe_user')")]

@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from checkout_safety import checkout_payment_access_decision
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -363,6 +364,30 @@ class StripeInvoiceRulesTest(unittest.TestCase):
 
     def test_checkout_payment_still_activates_trial_access(self):
         self.assertEqual(checkout_completion_action("payment", None), "activate_access")
+
+    def test_checkout_payment_access_decision_requires_paid_payment_status(self):
+        self.assertEqual(
+            checkout_payment_access_decision("payment", "paid")["action"],
+            "grant_access",
+        )
+        for status in ("unpaid", "processing"):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    checkout_payment_access_decision("payment", status)["action"],
+                    "payment_pending",
+                )
+        self.assertEqual(
+            checkout_payment_access_decision("payment", "no_payment_required")["action"],
+            "review_required",
+        )
+        self.assertEqual(
+            checkout_payment_access_decision("payment", None)["action"],
+            "retrieve",
+        )
+        self.assertEqual(
+            checkout_payment_access_decision("subscription", "paid")["action"],
+            "link_only",
+        )
 
     def test_empty_current_period_preserves_existing_expiry(self):
         existing = self.now + timedelta(days=10)

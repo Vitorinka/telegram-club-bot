@@ -63,6 +63,7 @@ from checkout_safety import (
     build_pg_dump_command,
     claim_checkout_session_record,
     claim_trial_redemption,
+    checkout_payment_access_decision,
     has_active_access,
     is_terminal_subscription_status,
     live_subscription_is_paid,
@@ -7737,6 +7738,14 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             await state.clear()
             return
 
+        if claim_result["action"] == "payment_pending":
+            await callback.message.answer(
+                "⏳ Оплата уже обрабатывается Stripe.\n\n"
+                "Пожалуйста, дождитесь подтверждения. Если статус долго не меняется, напишите администратору."
+            )
+            await state.clear()
+            return
+
         if claim_result["action"] == "manual_review_required":
             logging.warning(
                 "CHECKOUT_MANUAL_REVIEW_REQUIRED: record_id=%s, user_id=%s, sub_type=%s, mode=%s, session_id=%s",
@@ -10553,6 +10562,311 @@ async def stripe_webhook(request):
                 ),
             )
 
+        async def apply_paid_checkout_access(
+            session,
+            user_id,
+            days_to_add,
+            sub_id,
+            customer_id,
+            customer_email,
+            checkout_action,
+            source_event_type,
+        ):
+            is_trial = (days_to_add == 7)
+            has_subscription = bool(sub_id)
+            session_id = stripe_value(session, 'id')
+            conn = get_db_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    SELECT telegram_id, tariff_code, mode, status
+                    FROM checkout_sessions
+                    WHERE stripe_session_id = %s
+                    FOR UPDATE
+                """, (session_id,))
+                checkout_row = cur.fetchone()
+                checkout_review_reason = None
+                expected_tariff = tariff_code_from_checkout_days(days_to_add)
+                if not checkout_row:
+                    checkout_review_reason = "checkout_session_row_missing"
+                else:
+                    row_telegram_id, row_tariff_code, row_mode, row_status = checkout_row
+                    if int(row_telegram_id) != int(user_id):
+                        checkout_review_reason = "checkout_session_telegram_id_mismatch"
+                    elif row_mode != "payment":
+                        checkout_review_reason = "checkout_session_mode_mismatch"
+                    elif expected_tariff != "unknown" and row_tariff_code != expected_tariff:
+                        checkout_review_reason = "checkout_session_tariff_mismatch"
+                    elif row_status == "completed":
+                        conn.commit()
+                        logging.info(
+                            "CHECKOUT_PAID_ALREADY_COMPLETED: event_id=%s, event.type=%s, session_id=%s, user_id=%s",
+                            safe_log_id(event_id),
+                            event_type,
+                            safe_log_id(session_id),
+                            user_id,
+                        )
+                        return {"applied": False, "already_completed": True}
+                    elif row_status not in ("payment_pending", "open"):
+                        checkout_review_reason = "checkout_session_status_not_payable"
+
+                if checkout_review_reason:
+                    enqueue_admin_payment_problem_safely(
+                        cur,
+                        event_id=event_id,
+                        purpose="checkout_paid_session_row_review_required",
+                        stage=source_event_type,
+                        telegram_id=user_id,
+                        category="invalid_checkout_metadata",
+                        stripe_retry="нет",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference(
+                            "checkout_paid_session_row_review",
+                            event_id,
+                            session_id,
+                            user_id,
+                            checkout_review_reason,
+                        ),
+                        note=(
+                            "Paid Checkout was not applied because the persisted checkout_sessions row "
+                            f"did not match the Stripe session. reason={checkout_review_reason}; access_granted: false"
+                        ),
+                        severity="CRITICAL",
+                    )
+                    conn.commit()
+                    logging.error(
+                        "CHECKOUT_PAID_SESSION_ROW_REVIEW_REQUIRED: event_id=%s, event.type=%s, "
+                        "session_id=%s, user_id=%s, reason=%s",
+                        safe_log_id(event_id),
+                        event_type,
+                        safe_log_id(session_id),
+                        user_id,
+                        checkout_review_reason,
+                    )
+                    return {"applied": False, "manual_review": True, "reason": checkout_review_reason}
+
+                cur.execute("SELECT paid, expiry_date, first_payment_done, payment_failed FROM users WHERE telegram_id = %s", (int(user_id),))
+                row = cur.fetchone()
+                now = datetime.utcnow()
+                old_expiry = row[1] if row else None
+                checkout_was_payment_failed = bool(row[3]) if row and len(row) > 3 else False
+
+                if row and row[0] and row[1] and row[1] > now:
+                    new_expiry = row[1] + timedelta(days=days_to_add)
+                else:
+                    new_expiry = now + timedelta(days=days_to_add)
+
+                if is_trial:
+                    trial_claimed = claim_trial_redemption(
+                        cur,
+                        int(user_id),
+                        event_id,
+                        session_id,
+                    )
+                    if not trial_claimed:
+                        mark_checkout_completed(
+                            cur,
+                            session_id,
+                            customer_id=customer_id,
+                            subscription_id=sub_id,
+                        )
+                        conn.commit()
+                        logging.warning(
+                            "TRIAL_REDEMPTION_DUPLICATE_BLOCKED: telegram_id=%s, event_id=%s, session_id=%s",
+                            user_id,
+                            safe_log_id(event_id),
+                            safe_log_id(session_id),
+                        )
+                        await enqueue_admin_payment_problem_now(
+                            event_id=event_id,
+                            purpose="duplicate_trial_checkout",
+                            stage="checkout_completed",
+                            telegram_id=user_id,
+                            category="invalid_checkout_metadata",
+                            stripe_retry="нет",
+                            recovery_reminder="не применимо",
+                            safe_ref=safe_admin_context_reference("duplicate_trial_checkout", event_id, session_id, user_id),
+                            note="Доступ и payment_event не созданы. Проверьте, нужен ли ручной refund.",
+                        )
+                        return {"applied": False, "duplicate_trial": True}
+
+                needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
+                checkout_access_confirmed = checkout_action == "activate_access" and days_to_add > 0
+                cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, payment_failed_at, last_payment_succeeded_at, grace_period_end, first_payment_done, blocked_bot)
+                VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, NOW(), NULL, FALSE, FALSE)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    paid = TRUE,
+                    expiry_date = EXCLUDED.expiry_date,
+                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
+                    stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
+                    trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
+                    payment_failed = FALSE,
+                    payment_failed_at = NULL,
+                    last_payment_succeeded_at = NOW(),
+                    grace_period_end = NULL,
+                    auto_renew = EXCLUDED.auto_renew,
+                    reminder_sent = FALSE,
+                    blocked_bot = FALSE,
+                    first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
+                """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
+                upsert_stripe_link(
+                    cur,
+                    user_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                    customer_email=customer_email,
+                    status="checkout_completed",
+                    current_period_end=new_expiry,
+                    is_active=True,
+                    source=source_event_type,
+                )
+                mark_checkout_completed(
+                    cur,
+                    session_id,
+                    customer_id=customer_id,
+                    subscription_id=sub_id,
+                )
+                insert_payment_event(
+                    cur,
+                    event_id,
+                    source_event_type,
+                    "succeeded",
+                    telegram_id=user_id,
+                    checkout_session_id=session_id,
+                    stripe_customer_id=customer_id,
+                    stripe_subscription_id=sub_id,
+                    payment_kind="trial" if is_trial and not has_subscription else "unknown",
+                    tariff_code="sub_trial" if is_trial and not has_subscription else "unknown",
+                    amount_paid=stripe_value(session, 'amount_total'),
+                    amount_due=stripe_value(session, 'amount_total'),
+                    currency=stripe_value(session, 'currency'),
+                    period_start=now,
+                    period_end=new_expiry,
+                )
+                cancel_first_purchase_recovery_deliveries(
+                    cur,
+                    user_id,
+                    reason="checkout_session_completed",
+                )
+                cur.execute("""
+                    INSERT INTO access_events (
+                        telegram_id, event_type, source, old_expiry, new_expiry,
+                        stripe_event_id, stripe_subscription_id, notes
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    int(user_id),
+                    "stripe_checkout_completed",
+                    "stripe_webhook",
+                    old_expiry,
+                    new_expiry,
+                    event_id,
+                    sub_id,
+                    f"days={days_to_add}; customer_id={safe_log_id(customer_id)}",
+                ))
+
+                if checkout_access_confirmed:
+                    if is_trial and not has_subscription:
+                        enqueue_stripe_user_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            "trial_success",
+                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
+                            "Все материалы уже доступны в меню.",
+                        )
+                    else:
+                        purpose = payment_success_purpose("initial_subscription", checkout_was_payment_failed)
+                        enqueue_user_payment_success_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            purpose,
+                            new_expiry,
+                            keyboard_kind="cancel_subscription" if has_subscription else None,
+                        )
+                        enqueue_admin_payment_success_safely(
+                            cur,
+                            event_id,
+                            purpose,
+                            user_id,
+                            tariff_code_from_checkout_days(days_to_add),
+                            stripe_value(session, 'amount_total'),
+                            stripe_value(session, 'currency'),
+                            new_expiry,
+                            safe_log_id(event_id or session_id),
+                        )
+                    enqueue_rejoin_invite_after_payment(
+                        cur,
+                        user_id,
+                        new_expiry,
+                        source_event_type,
+                        event_id,
+                        stripe_subscription_id=sub_id,
+                    )
+                else:
+                    purpose = (
+                        "trial_success"
+                        if is_trial and not has_subscription
+                        else payment_success_purpose("initial_subscription", checkout_was_payment_failed)
+                    )
+                    if purpose == "trial_success":
+                        enqueue_stripe_user_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            purpose,
+                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
+                            "Все материалы уже доступны в меню.",
+                        )
+                    else:
+                        enqueue_user_payment_success_message(
+                            cur,
+                            event_id,
+                            user_id,
+                            purpose,
+                            new_expiry,
+                            keyboard_kind="cancel_subscription" if has_subscription else None,
+                        )
+                        enqueue_admin_payment_success_safely(
+                            cur,
+                            event_id,
+                            purpose,
+                            user_id,
+                            tariff_code_from_checkout_days(days_to_add),
+                            stripe_value(session, 'amount_total'),
+                            stripe_value(session, 'currency'),
+                            new_expiry,
+                            safe_log_id(event_id or session_id),
+                        )
+                conn.commit()
+                logging.info(
+                    f"Checkout Session marked completed: user_id={user_id}, "
+                    f"session_id={safe_log_id(session_id)}, event_id={safe_log_id(event_id)}"
+                )
+                reset_checkout_retry_state_after_success(user_id, source_event_type)
+                logging.info(
+                    "User access activated: source=%s, event_id=%s, event.type=%s, "
+                    "user_id=%s, customer_id=%s, customer_email=%s, paid=True, expiry_date=%s, "
+                    "stripe_subscription_id=%s, blocked_bot=False",
+                    source_event_type,
+                    safe_log_id(event_id),
+                    event_type,
+                    user_id,
+                    safe_log_id(customer_id),
+                    safe_log_email(customer_email),
+                    new_expiry,
+                    safe_log_id(sub_id),
+                )
+                return {"applied": True, "new_expiry": new_expiry}
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
+                conn.close()
+
         # ---------- 1. ОПЛАТА ЧЕРЕЗ CHECKOUT (ПЕРВИЧНАЯ ИЛИ ПРОДЛЕНИЕ) ----------
         if event_type == 'checkout.session.completed':
             session = event_object
@@ -10910,227 +11224,137 @@ async def stripe_webhook(request):
                     await release_event_processing(event_id)
                 return web.Response(status=500, text="Invalid checkout metadata.days")
 
-            is_trial = (days_to_add == 7)
-            has_subscription = bool(sub_id)
-            conn = get_db_conn()
-            cur = conn.cursor()
-            try:
-                cur.execute("SELECT paid, expiry_date, first_payment_done, payment_failed FROM users WHERE telegram_id = %s", (int(user_id),))
-                row = cur.fetchone()
-                now = datetime.utcnow()
-                old_expiry = row[1] if row else None
-                checkout_was_payment_failed = bool(row[3]) if row and len(row) > 3 else False
-
-                if row and row[0] and row[1] and row[1] > now:
-                    new_expiry = row[1] + timedelta(days=days_to_add)
-                else:
-                    new_expiry = now + timedelta(days=days_to_add)
-
-                if is_trial:
-                    trial_claimed = claim_trial_redemption(
-                        cur,
-                        int(user_id),
-                        event_id,
-                        stripe_value(session, 'id'),
+            session_id = stripe_value(session, 'id')
+            payment_decision = checkout_payment_access_decision(
+                checkout_mode,
+                stripe_value(session, "payment_status"),
+                amount_total=stripe_value(session, "amount_total"),
+                has_subscription=bool(sub_id),
+                days_to_add=days_to_add,
+            )
+            if payment_decision["action"] == "retrieve" and session_id:
+                try:
+                    session = await asyncio.to_thread(
+                        stripe.checkout.Session.retrieve,
+                        session_id,
+                        expand=["subscription", "customer"],
                     )
-                    if not trial_claimed:
-                        mark_checkout_completed(
+                    sub_id = stripe_object_id(stripe_value(session, "subscription"))
+                    customer_id = customer_id or stripe_object_id(stripe_value(session, "customer"))
+                    customer_email = (
+                        customer_email
+                        or stripe_value(session, "customer_details", "email")
+                        or stripe_value(session, "customer_email")
+                    )
+                    checkout_mode = stripe_value(session, "mode") or checkout_mode
+                    payment_decision = checkout_payment_access_decision(
+                        checkout_mode,
+                        stripe_value(session, "payment_status"),
+                        amount_total=stripe_value(session, "amount_total"),
+                        has_subscription=bool(sub_id),
+                        days_to_add=days_to_add,
+                    )
+                except Exception as e:
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_payment_status_retrieve_failed",
+                        stage="checkout_completed",
+                        telegram_id=user_id,
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference("checkout_payment_status_retrieve", e),
+                        note="Не удалось повторно получить Checkout Session. Доступ не выдан.",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+
+            if payment_decision["action"] in ("payment_pending", "review_required"):
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    terminal_status = (
+                        "payment_pending"
+                        if payment_decision["action"] == "payment_pending"
+                        else "manual_review_required"
+                    )
+                    mark_checkout_terminal(cur, session_id, terminal_status, error_text=payment_decision["reason"])
+                    if payment_decision["action"] == "review_required":
+                        enqueue_admin_payment_problem_safely(
                             cur,
-                            stripe_value(session, 'id'),
-                            customer_id=customer_id,
-                            subscription_id=sub_id,
-                        )
-                        conn.commit()
-                        logging.warning(
-                            "TRIAL_REDEMPTION_DUPLICATE_BLOCKED: telegram_id=%s, event_id=%s, session_id=%s",
-                            user_id,
-                            safe_log_id(event_id),
-                            safe_log_id(stripe_value(session, 'id')),
-                        )
-                        await enqueue_admin_payment_problem_now(
                             event_id=event_id,
-                            purpose="duplicate_trial_checkout",
+                            purpose="checkout_payment_status_review_required",
                             stage="checkout_completed",
                             telegram_id=user_id,
                             category="invalid_checkout_metadata",
                             stripe_retry="нет",
                             recovery_reminder="не применимо",
-                            safe_ref=safe_admin_context_reference("duplicate_trial_checkout", event_id, stripe_value(session, 'id'), user_id),
-                            note="Доступ и payment_event не созданы. Проверьте, нужен ли ручной refund.",
+                            safe_ref=safe_admin_context_reference(
+                                "checkout_payment_status_review",
+                                event_id,
+                                session_id,
+                                user_id,
+                                payment_decision["reason"],
+                            ),
+                            note=(
+                                f"Доступ не выдан. payment_status={stripe_value(session, 'payment_status') or 'нет'}; "
+                                f"reason={payment_decision['reason']}"
+                            ),
+                            severity="CRITICAL",
                         )
-                        await mark_event_processed(event_id)
-                        return web.Response(status=200)
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_payment_status_gate_failed",
+                        stage="checkout_completed",
+                        telegram_id=user_id,
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference("checkout_payment_status_gate", e),
+                        note="Payment status gate failed before access grant. Access not granted.",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+                finally:
+                    cur.close()
+                    conn.close()
 
-                needs_link = (row is None) or (not row[0]) or (row[1] is not None and row[1] < now)
-                checkout_access_confirmed = checkout_action == "activate_access" and days_to_add > 0
-                cur.execute("""
-                INSERT INTO users (telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew, trial_used, payment_failed, payment_failed_at, last_payment_succeeded_at, grace_period_end, first_payment_done, blocked_bot)
-                VALUES (%s, TRUE, %s, %s, %s, %s, %s, FALSE, NULL, NOW(), NULL, FALSE, FALSE)
-                ON CONFLICT (telegram_id) DO UPDATE SET
-                    paid = TRUE,
-                    expiry_date = EXCLUDED.expiry_date,
-                    stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, users.stripe_subscription_id),
-                    stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, users.stripe_customer_id),
-                    trial_used = CASE WHEN EXCLUDED.trial_used = TRUE THEN TRUE ELSE users.trial_used END,
-                    payment_failed = FALSE,
-                    payment_failed_at = NULL,
-                    last_payment_succeeded_at = NOW(),
-                    grace_period_end = NULL,
-                    auto_renew = EXCLUDED.auto_renew,
-                    reminder_sent = FALSE,
-                    blocked_bot = FALSE,
-                    first_payment_done = CASE WHEN %s THEN FALSE ELSE COALESCE(users.first_payment_done, FALSE) END
-                """, (int(user_id), new_expiry, sub_id, customer_id, has_subscription, is_trial, needs_link))
-                upsert_stripe_link(
-                    cur,
-                    user_id,
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=sub_id,
-                    customer_email=customer_email,
-                    status="checkout_completed",
-                    current_period_end=new_expiry,
-                    is_active=True,
-                    source="checkout.session.completed",
-                )
-                mark_checkout_completed(
-                    cur,
-                    stripe_value(session, 'id'),
-                    customer_id=customer_id,
-                    subscription_id=sub_id,
-                )
-                insert_payment_event(
-                    cur,
-                    event_id,
-                    event_type,
-                    "succeeded",
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
+            if payment_decision["action"] != "grant_access":
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="checkout_payment_status_unknown_action",
+                    stage="checkout_completed",
                     telegram_id=user_id,
-                    checkout_session_id=stripe_value(session, 'id'),
-                    stripe_customer_id=customer_id,
-                    stripe_subscription_id=sub_id,
-                    payment_kind="trial" if is_trial and not has_subscription else "unknown",
-                    tariff_code="sub_trial" if is_trial and not has_subscription else "unknown",
-                    amount_paid=stripe_value(session, 'amount_total'),
-                    amount_due=stripe_value(session, 'amount_total'),
-                    currency=stripe_value(session, 'currency'),
-                    period_start=now,
-                    period_end=new_expiry,
+                    category="webhook_processing_failed",
+                    stripe_retry="нет",
+                    recovery_reminder="не применимо",
+                    safe_ref=safe_admin_context_reference("checkout_payment_status_unknown", event_id, session_id, user_id),
+                    note="Payment status decision did not allow access. Access not granted.",
+                    severity="CRITICAL",
                 )
-                cancel_first_purchase_recovery_deliveries(
-                    cur,
-                    user_id,
-                    reason="checkout_session_completed",
-                )
-                cur.execute("""
-                    INSERT INTO access_events (
-                        telegram_id, event_type, source, old_expiry, new_expiry,
-                        stripe_event_id, stripe_subscription_id, notes
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    int(user_id),
-                    "stripe_checkout_completed",
-                    "stripe_webhook",
-                    old_expiry,
-                    new_expiry,
-                    event_id,
-                    sub_id,
-                    f"days={days_to_add}; customer_id={safe_log_id(customer_id)}",
-                ))
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
 
-                if checkout_access_confirmed:
-                    if is_trial and not has_subscription:
-                        enqueue_stripe_user_message(
-                            cur,
-                            event_id,
-                            user_id,
-                            "trial_success",
-                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
-                            "Все материалы уже доступны в меню.",
-                        )
-                    else:
-                        purpose = payment_success_purpose("initial_subscription", checkout_was_payment_failed)
-                        enqueue_user_payment_success_message(
-                            cur,
-                            event_id,
-                            user_id,
-                            purpose,
-                            new_expiry,
-                            keyboard_kind="cancel_subscription" if has_subscription else None,
-                        )
-                        enqueue_admin_payment_success_safely(
-                            cur,
-                            event_id,
-                            purpose,
-                            user_id,
-                            tariff_code_from_checkout_days(days_to_add),
-                            stripe_value(session, 'amount_total'),
-                            stripe_value(session, 'currency'),
-                            new_expiry,
-                            safe_log_id(event_id or stripe_value(session, 'id')),
-                        )
-                    enqueue_rejoin_invite_after_payment(
-                        cur,
-                        user_id,
-                        new_expiry,
-                        "checkout.session.completed",
-                        event_id,
-                        stripe_subscription_id=sub_id,
-                    )
-                else:
-                    purpose = (
-                        "trial_success"
-                        if is_trial and not has_subscription
-                        else payment_success_purpose("initial_subscription", checkout_was_payment_failed)
-                    )
-                    if purpose == "trial_success":
-                        enqueue_stripe_user_message(
-                            cur,
-                            event_id,
-                            user_id,
-                            purpose,
-                            f"Пробная неделя активирована до {new_expiry.strftime('%d.%m.%Y')}.\n\n"
-                            "Все материалы уже доступны в меню.",
-                        )
-                    else:
-                        enqueue_user_payment_success_message(
-                            cur,
-                            event_id,
-                            user_id,
-                            purpose,
-                            new_expiry,
-                            keyboard_kind="cancel_subscription" if has_subscription else None,
-                        )
-                        enqueue_admin_payment_success_safely(
-                            cur,
-                            event_id,
-                            purpose,
-                            user_id,
-                            tariff_code_from_checkout_days(days_to_add),
-                            stripe_value(session, 'amount_total'),
-                            stripe_value(session, 'currency'),
-                            new_expiry,
-                            safe_log_id(event_id or stripe_value(session, 'id')),
-                        )
-                conn.commit()
-                logging.info(
-                    f"Checkout Session marked completed: user_id={user_id}, "
-                    f"session_id={safe_log_id(stripe_value(session, 'id'))}, event_id={safe_log_id(event_id)}"
-                )
-                reset_checkout_retry_state_after_success(user_id, "checkout.session.completed")
-                logging.info(
-                    "User access activated: source=checkout.session.completed, event_id=%s, event.type=%s, "
-                    "user_id=%s, customer_id=%s, customer_email=%s, paid=True, expiry_date=%s, "
-                    "stripe_subscription_id=%s, blocked_bot=False",
-                    safe_log_id(event_id),
-                    event_type,
+            try:
+                await apply_paid_checkout_access(
+                    session,
                     user_id,
-                    safe_log_id(customer_id),
-                    safe_log_email(customer_email),
-                    new_expiry,
-                    safe_log_id(sub_id),
+                    days_to_add,
+                    sub_id,
+                    customer_id,
+                    customer_email,
+                    checkout_action,
+                    "checkout.session.completed",
                 )
             except Exception as e:
-                conn.rollback()
                 logging.exception(
                     f"Ошибка обработки checkout.session.completed: event_id={safe_log_id(event_id)}, "
                     f"user_id={user_id}, session_id={safe_log_id(stripe_value(session, 'id'))}: {e}"
@@ -11149,9 +11373,6 @@ async def stripe_webhook(request):
                 )
                 await release_event_processing(event_id)
                 return web.Response(status=500)
-            finally:
-                cur.close()
-                conn.close()
 
         # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
             # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
@@ -12998,6 +13219,196 @@ async def stripe_webhook(request):
                 if gift_release_event:
                     await release_event_processing(event_id)
                 return gift_response
+
+            user_id = resolve_checkout_telegram_id(session)
+            session_id = stripe_value(session, 'id')
+            metadata_raw = stripe_value(session, 'metadata') or getattr(session, 'metadata', None)
+            metadata_keys = list(metadata_raw.keys()) if isinstance(metadata_raw, dict) else []
+            if not user_id:
+                logging.error(
+                    "CHECKOUT_ASYNC_SUCCESS_INVALID_IDENTITY: event_id=%s, session_id=%s, metadata_keys=%s. Access not granted.",
+                    safe_log_id(event_id),
+                    safe_log_id(session_id),
+                    metadata_keys,
+                )
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="checkout_async_success_invalid_identity",
+                    stage="checkout_async_payment_succeeded",
+                    telegram_id=None,
+                    category="missing_subscription_identity",
+                    stripe_retry="да",
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_context_reference("checkout_async_success_invalid_identity", event_id, session_id),
+                    note="client_reference_id/metadata.telegram_id missing, invalid, or conflicting\naccess_granted: false",
+                    severity="CRITICAL",
+                )
+                await release_event_processing(event_id)
+                return web.Response(status=500, text="Invalid checkout Telegram identity")
+
+            sub_id = stripe_object_id(stripe_value(session, 'subscription'))
+            customer_id = stripe_object_id(stripe_value(session, 'customer'))
+            customer_email = stripe_value(session, 'customer_details', 'email') or stripe_value(session, 'customer_email')
+            checkout_mode = stripe_value(session, 'mode') or getattr(session, 'mode', None)
+            payment_decision = checkout_payment_access_decision(
+                checkout_mode,
+                stripe_value(session, "payment_status"),
+                amount_total=stripe_value(session, "amount_total"),
+                has_subscription=bool(sub_id),
+            )
+            if payment_decision["action"] == "retrieve" and session_id:
+                try:
+                    session = await asyncio.to_thread(
+                        stripe.checkout.Session.retrieve,
+                        session_id,
+                        expand=["subscription", "customer"],
+                    )
+                    metadata_raw = stripe_value(session, 'metadata') or getattr(session, 'metadata', None)
+                    sub_id = stripe_object_id(stripe_value(session, "subscription"))
+                    customer_id = customer_id or stripe_object_id(stripe_value(session, "customer"))
+                    customer_email = (
+                        customer_email
+                        or stripe_value(session, "customer_details", "email")
+                        or stripe_value(session, "customer_email")
+                    )
+                    checkout_mode = stripe_value(session, "mode") or checkout_mode
+                    payment_decision = checkout_payment_access_decision(
+                        checkout_mode,
+                        stripe_value(session, "payment_status"),
+                        amount_total=stripe_value(session, "amount_total"),
+                        has_subscription=bool(sub_id),
+                    )
+                except Exception as e:
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_async_success_retrieve_failed",
+                        stage="checkout_async_payment_succeeded",
+                        telegram_id=user_id,
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference("checkout_async_success_retrieve", e),
+                        note="Не удалось повторно получить Checkout Session. Доступ не выдан.",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+
+            days_to_add = parse_checkout_days(metadata_raw)
+            if days_to_add is None:
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="checkout_async_success_invalid_metadata",
+                    stage="checkout_async_payment_succeeded",
+                    telegram_id=user_id,
+                    category="invalid_checkout_metadata",
+                    stripe_retry="да",
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_context_reference("checkout_async_success_invalid_days", event_id, session_id, user_id),
+                    note="metadata.days missing or invalid\naccess_granted: false",
+                    severity="CRITICAL",
+                )
+                await release_event_processing(event_id)
+                return web.Response(status=500, text="Invalid checkout metadata.days")
+
+            checkout_action = checkout_completion_action(checkout_mode, sub_id)
+            if payment_decision["action"] == "link_only" or checkout_action == "link_only":
+                logging.info(
+                    "CHECKOUT_ASYNC_SUCCESS_SUBSCRIPTION_LINK_ONLY: event_id=%s, session_id=%s, user_id=%s",
+                    safe_log_id(event_id),
+                    safe_log_id(session_id),
+                    user_id,
+                )
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
+            if payment_decision["action"] != "grant_access":
+                conn = get_db_conn()
+                cur = conn.cursor()
+                try:
+                    mark_checkout_terminal(cur, session_id, "manual_review_required", error_text=payment_decision["reason"])
+                    enqueue_admin_payment_problem_safely(
+                        cur,
+                        event_id=event_id,
+                        purpose="checkout_async_success_payment_status_review_required",
+                        stage="checkout_async_payment_succeeded",
+                        telegram_id=user_id,
+                        category="invalid_checkout_metadata",
+                        stripe_retry="нет",
+                        recovery_reminder="не применимо",
+                        safe_ref=safe_admin_context_reference(
+                            "checkout_async_success_payment_status_review",
+                            event_id,
+                            session_id,
+                            user_id,
+                            payment_decision["reason"],
+                        ),
+                        note=(
+                            f"Доступ не выдан. payment_status={stripe_value(session, 'payment_status') or 'нет'}; "
+                            f"reason={payment_decision['reason']}"
+                        ),
+                        severity="CRITICAL",
+                    )
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    await enqueue_admin_payment_problem_now(
+                        event_id=event_id,
+                        purpose="checkout_async_success_gate_failed",
+                        stage="checkout_async_payment_succeeded",
+                        telegram_id=user_id,
+                        category="webhook_processing_failed",
+                        exception=e,
+                        stripe_retry="да",
+                        recovery_reminder="неизвестно",
+                        safe_ref=safe_admin_error_reference("checkout_async_success_gate", e),
+                        note="Payment status gate failed before access grant. Access not granted.",
+                    )
+                    await release_event_processing(event_id)
+                    return web.Response(status=500)
+                finally:
+                    cur.close()
+                    conn.close()
+                await mark_event_processed(event_id)
+                return web.Response(status=200)
+
+            try:
+                await apply_paid_checkout_access(
+                    session,
+                    user_id,
+                    days_to_add,
+                    sub_id,
+                    customer_id,
+                    customer_email,
+                    checkout_action,
+                    "checkout.session.async_payment_succeeded",
+                )
+            except Exception as e:
+                logging.exception(
+                    "Ошибка обработки checkout.session.async_payment_succeeded: event_id=%s, "
+                    "user_id=%s, session_id=%s: %s",
+                    safe_log_id(event_id),
+                    user_id,
+                    safe_log_id(session_id),
+                    e,
+                )
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="checkout_async_success_processing_failed",
+                    stage="checkout_async_payment_succeeded",
+                    telegram_id=user_id,
+                    category="webhook_processing_failed",
+                    exception=e,
+                    stripe_retry="да",
+                    recovery_reminder="неизвестно",
+                    safe_ref=safe_admin_error_reference("checkout_async_success_processing", e),
+                    note="Операция не выполнена. Webhook вернул 500.",
+                )
+                await release_event_processing(event_id)
+                return web.Response(status=500)
+
+            await mark_event_processed(event_id)
+            return web.Response(status=200)
 
         elif event_type in ("charge.refunded", "refund.created", "refund.updated"):
             refund_object = event_object

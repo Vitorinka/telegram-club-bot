@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 CHECKOUT_CREATING_LEASE_SECONDS = 120
 CHECKOUT_AMBIGUOUS_AUTO_RETRY_HOURS = 20
-CHECKOUT_OPEN_STATUSES = ("creating", "creation_unknown", "open")
+CHECKOUT_OPEN_STATUSES = ("creating", "creation_unknown", "open", "payment_pending")
 BLOCKING_SUBSCRIPTION_STATUSES = {
     "active",
     "trialing",
@@ -31,6 +31,24 @@ def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None)
     ambiguous_review_before = now - timedelta(hours=CHECKOUT_AMBIGUOUS_AUTO_RETRY_HOURS)
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"checkout:{int(telegram_id)}",),
+    )
+    cur.execute(
+        """
+        SELECT id, stripe_session_id, checkout_url, status, expires_at, idempotency_key, created_at
+        FROM checkout_sessions
+        WHERE telegram_id = %s
+          AND status = 'payment_pending'
+        FOR UPDATE
+        """,
+        (int(telegram_id),),
+    )
+    pending_row = cur.fetchone()
+    if pending_row:
+        return {"action": "payment_pending", "record": checkout_row_to_dict(pending_row)}
+
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
         (f"checkout:{int(telegram_id)}:{tariff_code}",),
     )
     cur.execute(
@@ -39,7 +57,7 @@ def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None)
         FROM checkout_sessions
         WHERE telegram_id = %s
           AND tariff_code = %s
-          AND status IN ('creating', 'creation_unknown', 'open')
+          AND status IN ('creating', 'creation_unknown', 'open', 'payment_pending')
         FOR UPDATE
         """,
         (int(telegram_id), tariff_code),
@@ -50,6 +68,8 @@ def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None)
         status = record["status"]
         expires_at = record["expires_at"]
         created_at = record["created_at"]
+        if status == "payment_pending":
+            return {"action": "payment_pending", "record": record}
         if status == "open" and record["checkout_url"] and (expires_at is None or expires_at > now):
             return {"action": "reuse_open", "record": record}
         if status == "creation_unknown":
@@ -91,6 +111,22 @@ def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None)
 def checkout_row_to_dict(row):
     keys = ("id", "stripe_session_id", "checkout_url", "status", "expires_at", "idempotency_key", "created_at")
     return dict(zip(keys, row))
+
+
+def checkout_payment_access_decision(mode, payment_status, amount_total=None, has_subscription=False, days_to_add=None):
+    if mode == "subscription":
+        return {"action": "link_only", "reason": "subscription_checkout_waits_for_invoice"}
+    if mode != "payment":
+        return {"action": "review_required", "reason": "unsupported_checkout_mode"}
+    if payment_status == "paid":
+        return {"action": "grant_access", "reason": "checkout_paid"}
+    if payment_status in ("unpaid", "processing"):
+        return {"action": "payment_pending", "reason": f"checkout_{payment_status}"}
+    if payment_status == "no_payment_required":
+        return {"action": "review_required", "reason": "checkout_no_payment_required_not_allowed"}
+    if payment_status in (None, ""):
+        return {"action": "retrieve", "reason": "checkout_payment_status_missing"}
+    return {"action": "review_required", "reason": "checkout_payment_status_unknown"}
 
 
 def mark_checkout_open(cur, record_id, stripe_session_id, checkout_url, expires_at):
