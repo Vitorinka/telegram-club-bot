@@ -7,6 +7,7 @@ import sys
 import unittest
 from unittest import mock
 import scheduled_jobs
+import stripe
 
 TEST_ENV = {
     "BOT_TOKEN": "123456:TEST_TOKEN_FOR_GIFT_ONLY",
@@ -150,6 +151,51 @@ class GiftAccessTests(unittest.TestCase):
         self.assertTrue(self.main.validate_gift_payment_proof(session, line_item, archived_price, gift_row))
         self.assertFalse(self.main.validate_gift_payment_proof({**session, "payment_status": "no_payment_required"}, line_item, price, gift_row))
         self.assertFalse(self.main.validate_gift_payment_proof(session, {"quantity": 2}, price, gift_row))
+
+    def test_gift_payment_metadata_accepts_real_stripe_object_without_get(self):
+        gift_row = {
+            "id": "gift-id",
+            "purchaser_telegram_id": 123,
+            "tariff_code": "gift_1m",
+            "duration_days": 30,
+            "stripe_session_id": "cs_gift",
+        }
+        session = stripe.StripeObject.construct_from({
+            "id": "cs_gift",
+            "mode": "payment",
+            "payment_status": "paid",
+            "client_reference_id": "123",
+            "amount_total": 5000,
+            "currency": "usd",
+            "metadata": {
+                "payment_kind": self.main.GIFT_PAYMENT_KIND,
+                "gift_id": "gift-id",
+                "purchaser_telegram_id": "123",
+                "tariff_code": "gift_1m",
+                "duration_days": "30",
+            },
+        }, None)
+        self.assertFalse(hasattr(session.metadata, "get"))
+        line_item = stripe.StripeObject.construct_from({"quantity": 1}, None)
+        price = stripe.StripeObject.construct_from({
+            "id": "price_gift_1m",
+            "type": "one_time",
+            "active": False,
+            "unit_amount": 5000,
+            "currency": "usd",
+        }, None)
+
+        self.assertTrue(self.main.gift_payment_metadata_valid(session.metadata, gift_row, session))
+        self.assertTrue(self.main.validate_gift_payment_proof(session, line_item, price, gift_row))
+
+    def test_gift_stripe_metadata_paths_do_not_call_get_on_stripe_metadata(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertNotIn("gift_metadata.get(", source)
+        helper_source = source[
+            source.index("def gift_payment_metadata_valid"):
+            source.index("def _stripe_collection_first")
+        ]
+        self.assertNotIn("metadata.get(", helper_source)
 
     def test_gift_fsm_requires_tariff_before_recipient_name(self):
         source = Path("main.py").read_text(encoding="utf-8")
