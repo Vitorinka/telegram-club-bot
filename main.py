@@ -208,6 +208,7 @@ GIFT_TOKEN_PREFIX = "gift_"
 GIFT_TOKEN_SECRET_ENV = "GIFT_TOKEN_SECRET"
 GIFT_CERTIFICATE_BUYER = "gift_certificate_buyer"
 GIFT_CERTIFICATE_RECIPIENT = "gift_certificate_recipient"
+GIFT_CERTIFICATE_CAPTION_LIMIT = 1024
 GIFT_TEXT_DELIVERY_TYPES = {
     "gift_paid_buyer",
     "gift_checkout_expired_buyer",
@@ -1257,8 +1258,28 @@ def gift_certificate_caption(row):
     ]
     if message:
         lines.extend(["", message])
-    lines.extend(["", "Активировать подарок можно по кнопке ниже."])
+    lines.extend(["", "Активировать подарок можно по кнопке или ссылке ниже."])
     return "\n".join(lines)
+
+
+def gift_certificate_delivery_caption(base_caption, button_url):
+    instruction = "Активировать подарок можно по кнопке или ссылке:"
+    old_instruction = "Активировать подарок можно по кнопке ниже."
+    current_instruction = "Активировать подарок можно по кнопке или ссылке ниже."
+    caption = html.unescape(base_caption or "").strip()
+    for removable in (old_instruction, current_instruction):
+        if caption.endswith(removable):
+            caption = caption[: -len(removable)].rstrip()
+            break
+    url = button_url or ""
+    suffix = f"\n\n{instruction}\n\n{url}"
+    available = GIFT_CERTIFICATE_CAPTION_LIMIT - len(suffix)
+    if available < 0:
+        return html.escape(suffix.strip()[:GIFT_CERTIFICATE_CAPTION_LIMIT], quote=True)
+    if len(caption) > available:
+        caption = caption[:available].rstrip()
+    final_caption = f"{caption}{suffix}" if caption else suffix.strip()
+    return html.escape(final_caption, quote=True)
 
 
 def gift_delivery_key(public_reference, purpose, recipient_id=None, token_version=None, recipient_kind=None):
@@ -15246,7 +15267,7 @@ async def process_pending_message_deliveries(limit=25):
                 await bot.send_photo(
                     int(telegram_id),
                     photo_file_id,
-                    caption=caption,
+                    caption=gift_certificate_delivery_caption(caption, button_url),
                     reply_markup=inline_keyboard([[
                         InlineKeyboardButton(text=payload.get("button_text") or "🎁 Активировать подарок", url=button_url)
                     ]]),
