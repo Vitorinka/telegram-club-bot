@@ -1757,11 +1757,11 @@ async def safely_cancel_gift_checkout(public_reference, actor_id=None, source="g
 
 def gift_payment_metadata_valid(metadata, gift_row, session):
     return (
-        metadata.get("payment_kind") == GIFT_PAYMENT_KIND
-        and metadata.get("gift_id") == str(gift_row["id"])
-        and metadata.get("purchaser_telegram_id") == str(gift_row["purchaser_telegram_id"])
-        and metadata.get("tariff_code") == gift_row["tariff_code"]
-        and metadata.get("duration_days") == str(gift_row["duration_days"])
+        stripe_value(metadata, "payment_kind") == GIFT_PAYMENT_KIND
+        and stripe_value(metadata, "gift_id") == str(gift_row["id"])
+        and stripe_value(metadata, "purchaser_telegram_id") == str(gift_row["purchaser_telegram_id"])
+        and stripe_value(metadata, "tariff_code") == gift_row["tariff_code"]
+        and stripe_value(metadata, "duration_days") == str(gift_row["duration_days"])
         and (stripe_value(session, "mode") == "payment")
         and (stripe_value(session, "payment_status") == "paid")
     )
@@ -10557,8 +10557,8 @@ async def stripe_webhook(request):
         if event_type == 'checkout.session.completed':
             session = event_object
             gift_metadata = stripe_value(session, "metadata") or {}
-            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
-                gift_id = gift_metadata.get("gift_id")
+            if stripe_value(gift_metadata, "payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = stripe_value(gift_metadata, "gift_id")
                 session_id = stripe_value(session, "id")
                 try:
                     proof_session, line_item, price = await asyncio.to_thread(fetch_gift_checkout_payment_proof, session_id)
@@ -10567,7 +10567,7 @@ async def stripe_webhook(request):
                         event_id=event_id,
                         purpose="gift_checkout_payment_proof_failed",
                         stage="checkout_completed",
-                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        telegram_id=stripe_value(gift_metadata, "purchaser_telegram_id"),
                         category="webhook_processing_failed",
                         exception=e,
                         stripe_retry="да",
@@ -10634,7 +10634,7 @@ async def stripe_webhook(request):
                         "event_id": event_id,
                         "purpose": "gift_checkout_completed_failed",
                         "stage": "checkout_completed",
-                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "telegram_id": stripe_value(gift_metadata, "purchaser_telegram_id"),
                         "category": "webhook_processing_failed",
                         "exception": None,
                         "stripe_retry": "да",
@@ -12930,8 +12930,8 @@ async def stripe_webhook(request):
         elif event_type == 'checkout.session.async_payment_succeeded':
             session = event_object
             gift_metadata = stripe_value(session, "metadata") or {}
-            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
-                gift_id = gift_metadata.get("gift_id")
+            if stripe_value(gift_metadata, "payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = stripe_value(gift_metadata, "gift_id")
                 session_id = stripe_value(session, "id")
                 try:
                     proof_session, line_item, price = await asyncio.to_thread(fetch_gift_checkout_payment_proof, session_id)
@@ -12940,7 +12940,7 @@ async def stripe_webhook(request):
                         event_id=event_id,
                         purpose="gift_async_payment_proof_failed",
                         stage="checkout_async_payment_succeeded",
-                        telegram_id=gift_metadata.get("purchaser_telegram_id"),
+                        telegram_id=stripe_value(gift_metadata, "purchaser_telegram_id"),
                         category="webhook_processing_failed",
                         exception=e,
                         stripe_retry="да",
@@ -12977,7 +12977,7 @@ async def stripe_webhook(request):
                         "event_id": event_id,
                         "purpose": "gift_async_payment_succeeded_failed",
                         "stage": "checkout_async_payment_succeeded",
-                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "telegram_id": stripe_value(gift_metadata, "purchaser_telegram_id"),
                         "category": "webhook_processing_failed",
                         "exception": None,
                         "stripe_retry": "да",
@@ -13055,8 +13055,8 @@ async def stripe_webhook(request):
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session = event_object
             gift_metadata = stripe_value(session, "metadata") or {}
-            if gift_metadata.get("payment_kind") == GIFT_PAYMENT_KIND:
-                gift_id = gift_metadata.get("gift_id")
+            if stripe_value(gift_metadata, "payment_kind") == GIFT_PAYMENT_KIND:
+                gift_id = stripe_value(gift_metadata, "gift_id")
                 session_id = stripe_value(session, "id")
                 conn = get_db_conn()
                 cur = conn.cursor()
@@ -13114,7 +13114,7 @@ async def stripe_webhook(request):
                         "event_id": event_id,
                         "purpose": "gift_checkout_terminal_failed",
                         "stage": "checkout_terminal",
-                        "telegram_id": gift_metadata.get("purchaser_telegram_id"),
+                        "telegram_id": stripe_value(gift_metadata, "purchaser_telegram_id"),
                         "category": "webhook_processing_failed",
                         "exception": None,
                         "stripe_retry": "да",

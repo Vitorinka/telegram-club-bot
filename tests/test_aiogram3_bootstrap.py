@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
+import stripe
 
 
 TEST_ENV = {
@@ -206,6 +207,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.main.bot.session.close()
+
+    def stripe_object(self, payload):
+        return stripe.StripeObject.construct_from(payload, None)
 
     def route_count(self, app, method, path):
         return sum(
@@ -3489,6 +3493,251 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Напоминание через 24 часа: будет проверено через 24 часа", admin_payload["text"])
         self.assertIn("Немедленное сообщение retry_payment поставлено в outbox", admin_payload["text"])
         self.assertNotIn("Напоминание через 24 часа: запланировано", admin_payload["text"])
+
+    async def test_stripeobject_metadata_regular_checkout_expired_does_not_enter_gift_branch(self):
+        event_id = "evt_stripeobject_regular_expired"
+        session = self.stripe_object({
+            "id": "cs_regular_expired",
+            "client_reference_id": "123",
+            "metadata": {},
+        })
+        self.assertFalse(hasattr(session.metadata, "get"))
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.expired",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": {"id": "cs_regular_expired"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        conn = FakeConnection(fetches=[
+            ("stripe:%s:checkout_expired" % event_id,),
+            ("stripe-admin:%s:checkout_expired:1" % event_id,),
+            ("stripe-admin:%s:checkout_expired:2" % event_id,),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertTrue(self.user_delivery_inserts(conn))
+
+    async def test_stripeobject_metadata_gift_checkout_expired_cancels_and_is_idempotent(self):
+        event_id = "evt_stripeobject_gift_expired"
+        gift_id = "gift-id-expired"
+        gift_row = {
+            "id": gift_id,
+            "public_reference": "GIFT-EXPIRED0000001",
+            "purchaser_telegram_id": 123,
+            "recipient_telegram_id": None,
+            "tariff_code": "gift_1m",
+            "status": "checkout_open",
+            "token_version": 1,
+            "token_hash": "safe-hash",
+        }
+        updated_row = {**gift_row, "status": "cancelled"}
+        session = self.stripe_object({
+            "id": "cs_gift_expired",
+            "client_reference_id": "123",
+            "metadata": {
+                "payment_kind": self.main.GIFT_PAYMENT_KIND,
+                "gift_id": gift_id,
+                "purchaser_telegram_id": "123",
+            },
+        })
+        self.assertFalse(hasattr(session.metadata, "get"))
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.expired",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.expired", "data": {"object": {"id": "cs_gift_expired"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        conn = FakeConnection(fetches=[
+            ("select gift",),
+            ("updated gift",),
+            ("gift:GIFT-EXPIRED0000001:gift_checkout_expired_buyer",),
+            ("gift-admin:GIFT-EXPIRED0000001:problem",),
+        ])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=["claimed", "duplicate"])), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "gift_row_dict", side_effect=[gift_row, updated_row]), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response1 = await self.main.stripe_webhook(request)
+            response2 = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response1.status, 200)
+        self.assertEqual(response2.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        update_queries = [query for query, _ in conn.cursor_obj.queries if "UPDATE gift_access_grants" in query]
+        self.assertTrue(update_queries)
+        self.assertIn("cancelled_at", update_queries[0])
+
+    async def test_stripeobject_metadata_gift_checkout_completed_uses_gift_branch(self):
+        event_id = "evt_stripeobject_gift_completed"
+        gift_id = "gift-id-completed"
+        session = self.stripe_object({
+            "id": "cs_gift_completed",
+            "mode": "payment",
+            "payment_status": "paid",
+            "metadata": {
+                "payment_kind": self.main.GIFT_PAYMENT_KIND,
+                "gift_id": gift_id,
+                "purchaser_telegram_id": "123",
+                "tariff_code": "gift_1m",
+                "duration_days": "30",
+            },
+        })
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.completed", "data": {"object": {"id": "cs_gift_completed"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        gift_row = {"id": gift_id, "public_reference": "GIFT-COMPLETED0001", "purchaser_telegram_id": 123}
+        conn = FakeConnection(fetches=[("select gift",)])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "fetch_gift_checkout_payment_proof", return_value=(session, {"quantity": 1}, {"id": "price_gift_1m"})), \
+             patch.object(self.main, "gift_row_dict", return_value=gift_row), \
+             patch.object(self.main, "mark_gift_paid_and_enqueue", return_value={**gift_row, "status": "paid_unclaimed"}) as mark_gift, \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_gift.assert_called_once()
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+
+    async def test_stripeobject_metadata_gift_async_payment_succeeded_uses_gift_branch(self):
+        event_id = "evt_stripeobject_gift_async_success"
+        gift_id = "gift-id-async"
+        session = self.stripe_object({
+            "id": "cs_gift_async",
+            "metadata": {
+                "payment_kind": self.main.GIFT_PAYMENT_KIND,
+                "gift_id": gift_id,
+                "purchaser_telegram_id": "123",
+            },
+        })
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.async_payment_succeeded",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.async_payment_succeeded", "data": {"object": {"id": "cs_gift_async"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        gift_row = {"id": gift_id, "public_reference": "GIFT-ASYNC00000001", "purchaser_telegram_id": 123}
+        conn = FakeConnection(fetches=[("select gift",)])
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "fetch_gift_checkout_payment_proof", return_value=(session, {"quantity": 1}, {"id": "price_gift_1m"})), \
+             patch.object(self.main, "gift_row_dict", return_value=gift_row), \
+             patch.object(self.main, "mark_gift_paid_and_enqueue", return_value={**gift_row, "status": "paid_unclaimed"}) as mark_gift, \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_gift.assert_called_once()
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+
+    async def test_stripeobject_metadata_regular_checkout_completed_uses_subscription_path(self):
+        event_id = "evt_stripeobject_regular_completed"
+        session = self.stripe_object({
+            "id": "cs_regular_completed",
+            "client_reference_id": "123",
+            "metadata": {},
+            "mode": "subscription",
+            "payment_status": "paid",
+            "customer": "cus_regular_completed",
+            "subscription": "sub_regular_completed",
+        })
+        self.assertFalse(hasattr(session.metadata, "get"))
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.completed", "data": {"object": {"id": "cs_regular_completed"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+        conn = FakeConnection()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
+             patch.object(self.main, "reset_checkout_retry_state_after_success"), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+
+    async def test_stripeobject_metadata_gift_error_path_reads_purchaser_safely(self):
+        event_id = "evt_stripeobject_gift_error_path"
+        session = self.stripe_object({
+            "id": "cs_gift_error",
+            "metadata": {
+                "payment_kind": self.main.GIFT_PAYMENT_KIND,
+                "gift_id": "gift-id-error",
+                "purchaser_telegram_id": "123",
+            },
+        })
+        event = self.stripe_object({
+            "id": event_id,
+            "type": "checkout.session.completed",
+            "created": 1720000000,
+            "data": {"object": session},
+        })
+        request = FakeStripeRequest(
+            json.dumps({"id": event_id, "type": "checkout.session.completed", "data": {"object": {"id": "cs_gift_error"}}}).encode("utf-8"),
+            {"Stripe-Signature": "sig", "Content-Type": "application/json"},
+        )
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "fetch_gift_checkout_payment_proof", side_effect=RuntimeError("proof failed")), \
+             patch.object(self.main, "enqueue_admin_payment_problem_now", AsyncMock()) as admin_problem, \
+             patch.object(self.main, "release_event_processing", AsyncMock()) as release:
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        admin_problem.assert_awaited_once()
+        self.assertEqual(admin_problem.await_args.kwargs["telegram_id"], "123")
+        release.assert_awaited_once_with(event_id)
 
     async def test_invoice_payment_failed_admin_alert_does_not_claim_24h_reminder(self):
         event_id = "evt_invoice_failed_retry_status"
