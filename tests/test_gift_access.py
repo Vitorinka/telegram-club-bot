@@ -1,5 +1,6 @@
 import importlib
 import asyncio
+import html
 import os
 from pathlib import Path
 import sys
@@ -167,6 +168,68 @@ class GiftAccessTests(unittest.TestCase):
         caption = self.main.gift_certificate_caption(row)
         self.assertNotIn("None", caption)
         self.assertIn("6 месяцев", caption)
+        self.assertIn("Активировать подарок можно по кнопке или ссылке ниже.", caption)
+
+    def test_gift_certificate_delivery_caption_adds_runtime_deep_link(self):
+        row = {
+            "recipient_name": "Анна",
+            "sender_name": "Виктория",
+            "gift_message": "С любовью",
+            "tariff_code": "gift_1m",
+        }
+        base_caption = self.main.gift_certificate_caption(row)
+        token = self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 1)
+        button_url = self.main.gift_deep_link(token)
+        caption = self.main.gift_certificate_delivery_caption(base_caption, button_url)
+
+        self.assertIn("https://t.me/ClubGiftBot?start=gift_", caption)
+        self.assertIn("🎁 Подарочный сертификат в клуб Натальи Ребковец", caption)
+        self.assertIn("Для: Анна", caption)
+        self.assertIn("От: Виктория", caption)
+        self.assertIn("Срок доступа: 1 месяц", caption)
+        self.assertIn("С любовью", caption)
+        self.assertIn("Активировать подарок можно по кнопке или ссылке:", caption)
+
+    def test_gift_certificate_delivery_caption_stays_within_telegram_limit(self):
+        row = {
+            "recipient_name": "<" * self.main.GIFT_NAME_LIMIT,
+            "sender_name": ">" * self.main.GIFT_NAME_LIMIT,
+            "gift_message": "&" * self.main.GIFT_MESSAGE_LIMIT,
+            "tariff_code": "gift_12m",
+        }
+        base_caption = self.main.gift_certificate_caption(row)
+        token = self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 999999)
+        button_url = self.main.gift_deep_link(token)
+        caption = self.main.gift_certificate_delivery_caption(base_caption, button_url)
+        visible_caption = html.unescape(caption)
+
+        self.assertLessEqual(len(visible_caption), self.main.GIFT_CERTIFICATE_CAPTION_LIMIT)
+        self.assertIn(button_url, visible_caption)
+        self.assertEqual(button_url, visible_caption.rsplit("\n", 1)[-1])
+        self.assertIn("<" * self.main.GIFT_NAME_LIMIT, visible_caption)
+        self.assertIn(">" * self.main.GIFT_NAME_LIMIT, visible_caption)
+        self.assertIn("&" * self.main.GIFT_MESSAGE_LIMIT, visible_caption)
+
+    def test_gift_certificate_delivery_caption_does_not_cut_html_entity_for_maximum_text(self):
+        row = {
+            "recipient_name": "<" * self.main.GIFT_NAME_LIMIT,
+            "sender_name": ">" * self.main.GIFT_NAME_LIMIT,
+            "gift_message": "&" * self.main.GIFT_MESSAGE_LIMIT,
+            "tariff_code": "gift_12m",
+        }
+        base_caption = self.main.gift_certificate_caption(row)
+        token = self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 999999)
+        button_url = self.main.gift_deep_link(token)
+        caption = self.main.gift_certificate_delivery_caption(base_caption, button_url)
+        visible_caption = html.unescape(caption)
+
+        self.assertEqual(button_url, visible_caption.rsplit("\n", 1)[-1])
+        self.assertNotIn("<" * self.main.GIFT_NAME_LIMIT, caption)
+        self.assertNotIn(">" * self.main.GIFT_NAME_LIMIT, caption)
+        self.assertIn("&lt;", caption)
+        self.assertIn("&gt;", caption)
+        self.assertIn("&amp;", caption)
+        self.assertFalse(caption.rstrip().endswith(("&", "&a", "&am", "&amp")))
 
     def test_gift_migration_defines_required_tables_without_raw_token_column(self):
         migration_sql = Path("migrations/0005_gift_access.sql").read_text(encoding="utf-8")
@@ -224,8 +287,12 @@ class GiftAccessTests(unittest.TestCase):
         cur = FakeCursor()
         self.assertTrue(self.main.enqueue_gift_certificate_delivery(cur, row, 123, self.main.GIFT_CERTIFICATE_BUYER))
         payload = cur.payload
+        raw_token = self.main.generate_gift_token("GIFT-ABCD1234ABCD1234", 1)
         self.assertNotIn("gift_", payload)
+        self.assertNotIn("start=gift_", payload)
+        self.assertNotIn("https://t.me/", payload)
         self.assertNotIn("button_url", payload)
+        self.assertNotIn(raw_token, payload)
         self.assertIn('"public_reference": "GIFT-ABCD1234ABCD1234"', payload)
         self.assertIn('"token_version": 1', payload)
 

@@ -3263,6 +3263,70 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_calls, [("stripe-admin:evt_admin:payment_success:1", "invalid_stripe_admin_message_payload", None, True)])
         send_message.assert_not_awaited()
 
+    async def test_gift_certificate_delivery_runtime_caption_and_button_share_deep_link(self):
+        public_reference = "GIFT-ABCD1234ABCD1234"
+        token_version = 2
+        gift_env = {
+            "BOT_USERNAME": "ClubGiftBot",
+            "GIFT_TOKEN_SECRET": "unit-test-gift-token-secret-32chars",
+        }
+        with patch.dict(os.environ, gift_env):
+            token_hash = self.main.gift_token_hash_for_reference(public_reference, token_version)
+        payload = {
+            "public_reference": public_reference,
+            "token_version": token_version,
+            "recipient_kind": "buyer",
+            "photo_file_id": "photo_file_id",
+            "caption": (
+                "🎁 Подарочный сертификат в клуб Натальи Ребковец\n\n"
+                "Для: Анна\n"
+                "От: Виктория\n"
+                "Срок доступа: 1 месяц\n\n"
+                "Активировать подарок можно по кнопке или ссылке ниже."
+            ),
+            "parse_mode": "HTML",
+            "button_text": "🎁 Активировать подарок",
+        }
+        gift_row = {
+            "public_reference": public_reference,
+            "token_version": token_version,
+            "token_hash": token_hash,
+            "status": "paid_unclaimed",
+        }
+        send_photo = AsyncMock()
+
+        with patch.dict(os.environ, gift_env), \
+             patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 (
+                     self.main.gift_delivery_key(public_reference, self.main.GIFT_CERTIFICATE_BUYER, token_version=token_version, recipient_kind="buyer"),
+                     123,
+                     self.main.GIFT_CERTIFICATE_BUYER,
+                     json.dumps(payload, ensure_ascii=False),
+                     1,
+                     None,
+                 )
+             ]), \
+             patch.object(self.main, "fetch_gift_by_public_reference_version", return_value=gift_row), \
+             patch.object(self.main.bot, "send_photo", send_photo), \
+             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        send_photo.assert_awaited_once()
+        _, args, kwargs = send_photo.mock_calls[0]
+        self.assertEqual(args[:2], (123, "photo_file_id"))
+        caption = kwargs["caption"]
+        button_url = kwargs["reply_markup"].inline_keyboard[0][0].url
+        self.assertIn("https://t.me/ClubGiftBot?start=gift_", caption)
+        self.assertIn("🎁 Подарочный сертификат в клуб Натальи Ребковец", caption)
+        self.assertIn("Для: Анна", caption)
+        self.assertIn("Активировать подарок можно по кнопке или ссылке:", caption)
+        self.assertEqual(button_url, caption.rsplit("\n", 1)[-1])
+        self.assertLessEqual(len(caption), self.main.GIFT_CERTIFICATE_CAPTION_LIMIT)
+        mark_sent.assert_called_once()
+
     async def test_admin_payment_helpers_enqueue_all_admins_and_sanitize_problem_text(self):
         conn = FakeConnection(fetches=[("admin-1",), ("admin-2",)])
         with patch.object(self.main, "ADMIN_IDS", [1, 2]):

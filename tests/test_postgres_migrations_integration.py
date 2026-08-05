@@ -2417,8 +2417,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             WHERE delivery_type = %s
         """, (main.GIFT_CERTIFICATE_BUYER,))
         self.assertEqual(row[0], "gift:GIFT-0000000000000001:certificate:buyer:v1")
+        raw_token = main.generate_gift_token("GIFT-0000000000000001", 1)
         self.assertNotIn("button_url", row[1])
         self.assertNotIn("start=gift_", row[1])
+        self.assertNotIn("https://t.me/", row[1])
+        self.assertNotIn(raw_token, row[1])
         self.assertIn('"token_version": 1', row[1])
 
     def test_gift_checkout_draft_replaces_only_when_recipient_sender_and_message_match_real_postgres(self):
