@@ -3749,6 +3749,305 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         )}
         self.assertIn("blocked_bot", columns)
 
+    def test_subscription_refund_reconciliation_migration_fresh_and_idempotent(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0007_subscription_refund_reconciliation", first["applied"])
+        self.assertIn("0007_subscription_refund_reconciliation", second["applied"])
+        columns = {row[0] for row in self.query_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'subscription_refund_reconciliations'
+            """
+        )}
+        for column in (
+            "reconciliation_key",
+            "refund_id",
+            "stripe_event_id",
+            "charge_id",
+            "payment_intent_id",
+            "invoice_id",
+            "customer_id",
+            "subscription_id",
+            "telegram_id",
+            "original_payment_event_id",
+            "reconciliation_result",
+            "review_reason",
+            "access_revoked_at",
+        ):
+            self.assertIn(column, columns)
+        for index_name in (
+            "subscription_refund_reconciliations_unique_key",
+            "subscription_refund_reconciliations_unique_refund_id",
+            "srr_unique_refund_payment_revoke",
+            "subscription_refund_events_unique_stripe_event_id",
+        ):
+            self.assertEqual(
+                self.query_one("SELECT to_regclass(%s)", (f"public.{index_name}",))[0],
+                index_name,
+            )
+        removal_columns = {row[0] for row in self.query_all(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'subscription_removal_events'
+            """
+        )}
+        self.assertIn("revoke_started_at", removal_columns)
+
+    def test_subscription_refund_reconciliation_unique_guards_block_duplicates(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO subscription_refund_reconciliations (
+                    reconciliation_key, refund_id, stripe_event_id, original_payment_event_id,
+                    reconciliation_result
+                )
+                VALUES ('refund:re_dup', 're_dup', 'evt_refund_dup_1', 10, 'access_revoked')
+                RETURNING id
+                """
+            )
+            reconciliation_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO subscription_refund_events (reconciliation_id, stripe_event_id, event_type)
+                VALUES (%s, 'evt_refund_dup_1', 'refund.created')
+                """,
+                (reconciliation_id,),
+            )
+            cur.execute(
+                """
+                INSERT INTO subscription_refund_events (reconciliation_id, stripe_event_id, event_type)
+                VALUES (%s, 'evt_refund_dup_2', 'refund.updated')
+                """,
+                (reconciliation_id,),
+            )
+            conn.commit()
+            self.assertEqual(
+                self.query_one(
+                    "SELECT COUNT(*) FROM subscription_refund_events WHERE reconciliation_id = %s",
+                    (reconciliation_id,),
+                )[0],
+                2,
+            )
+            with self.assertRaises(Exception):
+                cur.execute(
+                    """
+                    INSERT INTO subscription_refund_reconciliations (
+                        reconciliation_key, refund_id, stripe_event_id, original_payment_event_id,
+                        reconciliation_result
+                    )
+                    VALUES ('refund:re_dup_2', 're_dup_2', 'evt_refund_dup_3', 10, 'access_revoked')
+                    """
+                )
+                conn.commit()
+        finally:
+            conn.rollback()
+            cur.close()
+            conn.close()
+
+    def test_subscription_refund_charge_and_refund_events_share_revoked_payment_concurrently(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO subscription_refund_reconciliations (
+                    reconciliation_key, refund_id, stripe_event_id, original_payment_event_id,
+                    reconciliation_result, telegram_id, access_revoked_at
+                )
+                VALUES ('refund:re_concurrent', 're_concurrent', 'evt_refund_concurrent_1', 10,
+                        'access_revoked', 123, NOW())
+                RETURNING id
+                """
+            )
+            reconciliation_id = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO subscription_refund_events (reconciliation_id, stripe_event_id, event_type)
+                VALUES (%s, 'evt_refund_concurrent_1', 'refund.updated')
+                """,
+                (reconciliation_id,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        errors = []
+
+        def record_event(event_id, event_type):
+            worker_conn = self.get_conn()
+            worker_cur = worker_conn.cursor()
+            try:
+                row = main.find_access_revoked_refund_reconciliation(worker_cur, 10)
+                self.assertIsNotNone(row)
+                main.record_subscription_refund_event(worker_cur, row[0], event_id, event_type)
+                worker_conn.commit()
+            except Exception as exc:
+                worker_conn.rollback()
+                errors.append(exc)
+            finally:
+                worker_cur.close()
+                worker_conn.close()
+
+        threads = [
+            threading.Thread(target=record_event, args=("evt_refund_concurrent_2", "refund.updated")),
+            threading.Thread(target=record_event, args=("evt_charge_concurrent_3", "charge.refunded")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM subscription_refund_reconciliations
+                WHERE original_payment_event_id = 10
+                  AND reconciliation_result = 'access_revoked'
+                """
+            )[0],
+            1,
+        )
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM subscription_refund_events
+                WHERE reconciliation_id = %s
+                """,
+                (reconciliation_id,),
+            )[0],
+            3,
+        )
+
+    def test_subscription_removal_new_revoke_reopens_terminal_cycle_real_postgres(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        old_started_at = datetime.utcnow() - timedelta(days=1)
+        new_started_at = datetime.utcnow()
+        try:
+            cur.execute(
+                """
+                INSERT INTO subscription_removal_events (
+                    telegram_id, status, reason, owner_id, claimed_at, lease_until,
+                    telegram_removed_at, db_finalized_at, attempt_count, last_error,
+                    revoke_started_at, created_at, updated_at
+                )
+                VALUES (123, 'superseded', 'manual_access_revoked', 'old-owner', NOW(), NOW() + INTERVAL '1 hour',
+                        NOW(), NOW(), 5, 'old error', %s, NOW(), NOW())
+                """,
+                (old_started_at,),
+            )
+            main.enqueue_subscription_refund_group_removal(
+                cur,
+                123,
+                reason="manual_access_revoked",
+                revoke_started_at=new_started_at,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT status, reason, owner_id, claimed_at, lease_until, telegram_removed_at,
+                       db_finalized_at, attempt_count, last_error, revoke_started_at
+                FROM subscription_removal_events
+                WHERE telegram_id = 123
+                """
+            ),
+            ("pending", "manual_access_revoked", None, None, None, None, None, 0, None, new_started_at),
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertEqual(main.claim_subscription_removal(cur, 123, "subscription_expired"), "claimed")
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_subscription_removal_terminal_without_new_revoke_is_not_claimed_real_postgres(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO subscription_removal_events (
+                    telegram_id, status, reason, attempt_count, revoke_started_at, created_at, updated_at
+                )
+                VALUES (124, 'superseded', 'subscription_refund_reconciled', 2, NOW(), NOW(), NOW())
+                """
+            )
+            conn.commit()
+            self.assertEqual(main.claim_subscription_removal(cur, 124, "subscription_expired"), "superseded")
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_subscription_removal_new_revoke_after_removed_or_finalized_restarts_cycle_real_postgres(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for telegram_id, status in ((125, "telegram_removed"), (126, "db_finalized"), (127, "cancelled"), (128, "not_due")):
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, owner_id, claimed_at, lease_until,
+                        telegram_removed_at, db_finalized_at, attempt_count, last_error,
+                        revoke_started_at, created_at, updated_at
+                    )
+                    VALUES (%s, %s, 'subscription_refund_reconciled', 'old-owner', NOW(), NOW() + INTERVAL '1 hour',
+                            NOW(), NOW(), 4, 'old error', NOW() - INTERVAL '1 day', NOW(), NOW())
+                    """,
+                    (telegram_id, status),
+                )
+                main.enqueue_subscription_refund_group_removal(
+                    cur,
+                    telegram_id,
+                    reason="subscription_refund_reconciled",
+                    revoke_started_at=datetime.utcnow(),
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        for telegram_id in (125, 126, 127, 128):
+            with self.subTest(telegram_id=telegram_id):
+                self.assertEqual(
+                    self.query_one(
+                        """
+                        SELECT status, owner_id, claimed_at, lease_until, telegram_removed_at,
+                               db_finalized_at, attempt_count, last_error
+                        FROM subscription_removal_events
+                        WHERE telegram_id = %s
+                        """,
+                        (telegram_id,),
+                    ),
+                    ("pending", None, None, None, None, None, 0, None),
+                )
+
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "0001_drop.sql").write_text("DROP TABLE users;", encoding="utf-8")

@@ -198,6 +198,22 @@ FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "ope
 ACCESS_RESTORE_DELIVERY_TYPE = "access_restore_invite"
 ACCESS_RESTORE_SOURCE_ADMIN = "admin_restore_access"
 ACCESS_RESTORE_SOURCE_AUTO_SYNC = "automatic_membership_repair"
+SUBSCRIPTION_REFUND_REVOKE_EVENT = "stripe_refund_access_revoked"
+MANUAL_ACCESS_REVOKED_EVENT = "manual_access_revoked"
+SUBSCRIPTION_REFUND_REVIEW_REQUIRED = "review_required"
+SUBSCRIPTION_REFUND_ACCESS_REVOKED = "access_revoked"
+SUBSCRIPTION_REFUND_ALREADY_RECONCILED = "already_reconciled"
+SUBSCRIPTION_REFUND_ALREADY_INACTIVE = "already_inactive"
+SUBSCRIPTION_REFUND_EXPIRY_TOLERANCE_SECONDS = 120
+SUBSCRIPTION_REFUND_DANGEROUS_DELIVERY_TYPES = (
+    "stripe_rejoin_invite",
+    "stripe_rejoin_check",
+    ACCESS_RESTORE_DELIVERY_TYPE,
+    "subscription_expiry_reminder",
+    "grace_reminder",
+    "payment_recovery_reminder",
+    "first_purchase_recovery_reminder",
+)
 GIFT_PAYMENT_KIND = "gift_access"
 GIFT_TARIFFS = {
     "gift_1m": {"duration_days": 30, "price_env": "GIFT_PRICE_1M", "label": "1 месяц"},
@@ -2423,6 +2439,643 @@ def apply_gift_refund_event(cur, event_id, event_type, event_object, gift_row):
     return updated
 
 
+def stripe_refund_object_id(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return stripe_value(value, "id")
+
+
+def normalize_currency(value):
+    return str(value or "").strip().lower() or None
+
+
+def subscription_refund_proof_from_event(event_type, event_object):
+    charge = event_object if event_type == "charge.refunded" else None
+    refund = event_object if event_type in ("refund.created", "refund.updated") else None
+    refund_id = stripe_value(refund, "id") if refund is not None else None
+    refunds_data = stripe_value(charge, "refunds", "data") or []
+    charge_id = stripe_refund_object_id(stripe_value(refund, "charge")) if refund is not None else stripe_value(charge, "id")
+    payment_intent_id = (
+        stripe_refund_object_id(stripe_value(refund, "payment_intent"))
+        if refund is not None
+        else stripe_refund_object_id(stripe_value(charge, "payment_intent"))
+    )
+    amount_refunded = (
+        stripe_value(refund, "amount")
+        if refund is not None
+        else stripe_value(charge, "amount_refunded")
+    )
+    refund_status = (
+        stripe_value(refund, "status")
+        if refund is not None
+        else ("succeeded" if stripe_value(charge, "refunded") else "unknown")
+    )
+    reconciliation_key = f"refund:{refund_id}" if refund_id else f"charge:{charge_id}" if charge_id else None
+    pending_refunds = 0
+    failed_refunds = 0
+    succeeded_refund_total = 0
+    if charge is not None and refunds_data:
+        for refund_row in refunds_data:
+            row_status = stripe_value(refund_row, "status") or "unknown"
+            row_amount = int(stripe_value(refund_row, "amount") or 0)
+            if row_status == "succeeded":
+                succeeded_refund_total += row_amount
+            elif row_status in ("pending", "requires_action"):
+                pending_refunds += 1
+            elif row_status == "failed":
+                failed_refunds += 1
+        if succeeded_refund_total:
+            amount_refunded = succeeded_refund_total
+        elif stripe_value(charge, "amount_refunded") is not None:
+            amount_refunded = stripe_value(charge, "amount_refunded")
+    return {
+        "reconciliation_key": reconciliation_key,
+        "proof_model": "refund" if refund_id else "charge",
+        "refund_id": refund_id,
+        "charge_id": charge_id,
+        "payment_intent_id": payment_intent_id,
+        "invoice_id": stripe_refund_object_id(stripe_value(charge, "invoice")) if charge is not None else None,
+        "customer_id": stripe_refund_object_id(stripe_value(charge, "customer")) if charge is not None else None,
+        "subscription_id": None,
+        "amount_refunded": int(amount_refunded or 0),
+        "refund_status": refund_status or "unknown",
+        "currency": stripe_value(refund, "currency") if refund is not None else stripe_value(charge, "currency"),
+        "pending_refunds": pending_refunds,
+        "failed_refunds": failed_refunds,
+    }
+
+
+async def enrich_subscription_refund_proof(proof):
+    retrieved_charge = None
+    if proof.get("charge_id") and (not proof.get("invoice_id") or not proof.get("customer_id")):
+        charge = await asyncio.to_thread(stripe.Charge.retrieve, proof["charge_id"], expand=["invoice"])
+        retrieved_charge = charge
+        proof["invoice_id"] = proof.get("invoice_id") or stripe_refund_object_id(stripe_value(charge, "invoice"))
+        proof["customer_id"] = proof.get("customer_id") or stripe_refund_object_id(stripe_value(charge, "customer"))
+        proof["payment_intent_id"] = proof.get("payment_intent_id") or stripe_refund_object_id(stripe_value(charge, "payment_intent"))
+        proof["currency"] = proof.get("currency") or stripe_value(charge, "currency")
+        if not proof.get("amount_refunded"):
+            proof["amount_refunded"] = int(stripe_value(charge, "amount_refunded") or 0)
+    expanded_invoice = stripe_value(retrieved_charge, "invoice") if retrieved_charge is not None else None
+    if proof.get("invoice_id") and not proof.get("subscription_id") and expanded_invoice is not None and not isinstance(expanded_invoice, str):
+        invoice = expanded_invoice
+        proof["subscription_id"] = stripe_refund_object_id(stripe_value(invoice, "subscription")) or stripe_refund_object_id(
+            stripe_value(invoice, "parent", "subscription_details", "subscription")
+        )
+        proof["customer_id"] = proof.get("customer_id") or stripe_refund_object_id(stripe_value(invoice, "customer"))
+    elif proof.get("invoice_id") and not proof.get("subscription_id") and retrieved_charge is None:
+        invoice = await asyncio.to_thread(stripe.Invoice.retrieve, proof["invoice_id"])
+        proof["subscription_id"] = stripe_refund_object_id(stripe_value(invoice, "subscription")) or stripe_refund_object_id(
+            stripe_value(invoice, "parent", "subscription_details", "subscription")
+        )
+        proof["customer_id"] = proof.get("customer_id") or stripe_refund_object_id(stripe_value(invoice, "customer"))
+    return proof
+
+
+def subscription_refund_review_text(proof, reason, telegram_id=None):
+    return (
+        "🚨 Refund requires manual review\n\n"
+        f"reason: {reason}\n"
+        f"telegram_id: {telegram_id if telegram_id is not None else 'unknown'}\n"
+        f"refund_id: {safe_log_id(proof.get('refund_id')) or 'none'}\n"
+        f"charge_id: {safe_log_id(proof.get('charge_id')) or 'none'}\n"
+        f"payment_intent_id: {safe_log_id(proof.get('payment_intent_id')) or 'none'}\n"
+        f"invoice_id: {safe_log_id(proof.get('invoice_id')) or 'none'}\n"
+        f"subscription_id: {safe_log_id(proof.get('subscription_id')) or 'none'}\n"
+        "access_changed: false"
+    )
+
+
+def insert_subscription_refund_reconciliation(
+    cur,
+    event_id,
+    proof,
+    result,
+    event_type=None,
+    review_reason=None,
+    telegram_id=None,
+    original_payment_event_id=None,
+    original_amount=None,
+    access_revoked_at=None,
+):
+    reconciliation_key = proof.get("reconciliation_key")
+    if not reconciliation_key:
+        reconciliation_key = (
+            f"refund:{proof.get('refund_id')}"
+            if proof.get("refund_id")
+            else f"charge:{proof.get('charge_id')}"
+            if proof.get("charge_id")
+            else f"event:{event_id}"
+        )
+        proof["reconciliation_key"] = reconciliation_key
+    cur.execute(
+        """
+        INSERT INTO subscription_refund_reconciliations (
+            reconciliation_key, refund_id, stripe_event_id, charge_id, payment_intent_id, invoice_id,
+            customer_id, subscription_id, telegram_id, original_payment_event_id,
+            amount_refunded, original_amount, currency, refund_status, is_full_refund,
+            reconciliation_result, review_reason, access_revoked_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (reconciliation_key) DO UPDATE SET
+            stripe_event_id = EXCLUDED.stripe_event_id,
+            charge_id = COALESCE(EXCLUDED.charge_id, subscription_refund_reconciliations.charge_id),
+            payment_intent_id = COALESCE(EXCLUDED.payment_intent_id, subscription_refund_reconciliations.payment_intent_id),
+            invoice_id = COALESCE(EXCLUDED.invoice_id, subscription_refund_reconciliations.invoice_id),
+            customer_id = COALESCE(EXCLUDED.customer_id, subscription_refund_reconciliations.customer_id),
+            subscription_id = COALESCE(EXCLUDED.subscription_id, subscription_refund_reconciliations.subscription_id),
+            telegram_id = COALESCE(EXCLUDED.telegram_id, subscription_refund_reconciliations.telegram_id),
+            original_payment_event_id = COALESCE(EXCLUDED.original_payment_event_id, subscription_refund_reconciliations.original_payment_event_id),
+            amount_refunded = EXCLUDED.amount_refunded,
+            original_amount = COALESCE(EXCLUDED.original_amount, subscription_refund_reconciliations.original_amount),
+            currency = COALESCE(EXCLUDED.currency, subscription_refund_reconciliations.currency),
+            refund_status = EXCLUDED.refund_status,
+            is_full_refund = EXCLUDED.is_full_refund,
+            reconciliation_result = EXCLUDED.reconciliation_result,
+            review_reason = EXCLUDED.review_reason,
+            access_revoked_at = COALESCE(EXCLUDED.access_revoked_at, subscription_refund_reconciliations.access_revoked_at),
+            updated_at = NOW()
+        RETURNING id, reconciliation_result
+        """,
+        (
+            reconciliation_key,
+            proof.get("refund_id"),
+            event_id,
+            proof.get("charge_id"),
+            proof.get("payment_intent_id"),
+            proof.get("invoice_id"),
+            proof.get("customer_id"),
+            proof.get("subscription_id"),
+            int(telegram_id) if telegram_id is not None else None,
+            original_payment_event_id,
+            proof.get("amount_refunded"),
+            original_amount,
+            proof.get("currency"),
+            proof.get("refund_status"),
+            bool(original_amount and proof.get("amount_refunded") == original_amount),
+            result,
+            review_reason,
+            access_revoked_at,
+        ),
+    )
+    row = cur.fetchone()
+    reconciliation_id = row[0] if row and len(row) > 1 else None
+    reconciliation_result = row[1] if row and len(row) > 1 else result
+    if reconciliation_id is not None:
+        record_subscription_refund_event(cur, reconciliation_id, event_id, event_type)
+    return reconciliation_result
+
+
+def record_subscription_refund_event(cur, reconciliation_id, event_id, event_type=None):
+    cur.execute(
+        """
+        INSERT INTO subscription_refund_events (reconciliation_id, stripe_event_id, event_type)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (stripe_event_id) DO NOTHING
+        """,
+        (reconciliation_id, event_id, event_type),
+    )
+
+
+def find_access_revoked_refund_reconciliation(cur, original_payment_event_id):
+    cur.execute(
+        """
+        SELECT id, reconciliation_key, reconciliation_result
+        FROM subscription_refund_reconciliations
+        WHERE original_payment_event_id = %s
+          AND reconciliation_result = %s
+        FOR UPDATE
+        """,
+        (original_payment_event_id, SUBSCRIPTION_REFUND_ACCESS_REVOKED),
+    )
+    return cur.fetchone()
+
+
+def alias_subscription_refund_reconciliation(cur, reconciliation_id, event_id, proof):
+    cur.execute(
+        """
+        UPDATE subscription_refund_reconciliations
+        SET stripe_event_id = %s,
+            charge_id = COALESCE(charge_id, %s),
+            payment_intent_id = COALESCE(payment_intent_id, %s),
+            invoice_id = COALESCE(invoice_id, %s),
+            customer_id = COALESCE(customer_id, %s),
+            subscription_id = COALESCE(subscription_id, %s),
+            updated_at = NOW()
+        WHERE id = %s
+        """,
+        (
+            event_id,
+            proof.get("charge_id"),
+            proof.get("payment_intent_id"),
+            proof.get("invoice_id"),
+            proof.get("customer_id"),
+            proof.get("subscription_id"),
+            reconciliation_id,
+        ),
+    )
+
+
+def enqueue_subscription_refund_review(cur, event_id, proof, reason, telegram_id=None, event_type=None):
+    insert_subscription_refund_reconciliation(
+        cur,
+        event_id,
+        proof,
+        SUBSCRIPTION_REFUND_REVIEW_REQUIRED,
+        event_type=event_type,
+        review_reason=reason,
+        telegram_id=telegram_id,
+    )
+    return enqueue_stripe_admin_message(
+        cur,
+        event_id,
+        "subscription_refund_review_required",
+        subscription_refund_review_text(proof, reason, telegram_id),
+        severity="CRITICAL",
+        category="subscription_refund_review_required",
+        safe_ref=safe_admin_context_reference("subscription_refund_review", event_id, proof.get("refund_id"), proof.get("charge_id")),
+    )
+
+
+def find_refunded_subscription_payment_event(cur, proof):
+    clauses = []
+    params = []
+    if proof.get("invoice_id"):
+        clauses.append("invoice_id = %s")
+        params.append(proof["invoice_id"])
+    elif proof.get("customer_id") and proof.get("subscription_id"):
+        clauses.append("(stripe_customer_id = %s AND stripe_subscription_id = %s)")
+        params.extend([proof["customer_id"], proof["subscription_id"]])
+    if not clauses:
+        return "review_required", "missing_payment_match_ids", None
+    cur.execute(
+        f"""
+        SELECT id, telegram_id, amount_paid, currency, stripe_customer_id,
+               stripe_subscription_id, payment_kind, payment_status, period_end, created_at
+        FROM payment_events
+        WHERE payment_status = 'succeeded'
+          AND payment_kind IN ('initial_subscription', 'recurring')
+          AND ({' OR '.join(clauses)})
+        ORDER BY created_at DESC, id DESC
+        FOR UPDATE
+        """,
+        tuple(params),
+    )
+    rows = cur.fetchall()
+    if len(rows) != 1:
+        return "review_required", "ambiguous_payment_match" if rows else "missing_payment_event", None
+    return "matched", None, rows[0]
+
+
+def cancel_access_restoration_deliveries_after_revoke(cur, telegram_id, reason):
+    cur.execute(
+        """
+        UPDATE message_delivery_events
+        SET status = 'cancelled',
+            last_error = LEFT(%s, 500),
+            lease_until = NULL,
+            next_attempt_at = NULL
+        WHERE telegram_id = %s
+          AND delivery_type = ANY(%s)
+          AND status IN ('pending', 'failed', 'processing')
+    """,
+        (reason, int(telegram_id), list(SUBSCRIPTION_REFUND_DANGEROUS_DELIVERY_TYPES)),
+    )
+    return getattr(cur, "rowcount", 0)
+
+
+def enqueue_subscription_refund_group_removal(cur, telegram_id, reason="subscription_refund_reconciled", revoke_started_at=None):
+    revoke_started_at = revoke_started_at or datetime.utcnow()
+    cur.execute(
+        """
+        INSERT INTO subscription_removal_events (
+            telegram_id, status, reason, owner_id, attempt_count, revoke_started_at, created_at, updated_at
+        )
+        VALUES (%s, 'pending', %s, NULL, 0, %s, NOW(), NOW())
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            status = 'pending',
+            reason = EXCLUDED.reason,
+            owner_id = NULL,
+            claimed_at = NULL,
+            lease_until = NULL,
+            telegram_removed_at = NULL,
+            db_finalized_at = NULL,
+            attempt_count = 0,
+            last_error = NULL,
+            revoke_started_at = EXCLUDED.revoke_started_at,
+            updated_at = NOW()
+        """,
+        (int(telegram_id), reason, revoke_started_at),
+    )
+
+
+def apply_manual_access_revoke(cur, telegram_id, reason, admin_id=None, action_id=None):
+    cur.execute(
+        """
+        SELECT paid, expiry_date, stripe_subscription_id, stripe_customer_id, auto_renew
+        FROM users
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (int(telegram_id),),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {"status": "failed", "reason": "user_not_found"}
+    paid, old_expiry, subscription_id, customer_id, auto_renew = row
+    now = datetime.utcnow()
+    new_expiry = min(old_expiry or now, now)
+    cur.execute(
+        """
+        UPDATE users
+        SET paid = FALSE,
+            expiry_date = LEAST(COALESCE(expiry_date, NOW()), NOW()),
+            auto_renew = FALSE,
+            payment_failed = FALSE,
+            payment_failed_at = NULL,
+            grace_period_end = NULL,
+            reminder_sent = TRUE
+        WHERE telegram_id = %s
+        """,
+        (int(telegram_id),),
+    )
+    record_access_event_cur(
+        cur,
+        telegram_id,
+        MANUAL_ACCESS_REVOKED_EVENT,
+        source="admin_action_confirmed",
+        old_expiry=old_expiry,
+        new_expiry=new_expiry,
+        stripe_subscription_id=subscription_id,
+        notes=f"reason={str(reason)[:160]}; admin_id={admin_id}; action_id={action_id or 'none'}",
+    )
+    cancelled_deliveries = cancel_access_restoration_deliveries_after_revoke(cur, telegram_id, "manual_access_revoked")
+    enqueue_subscription_refund_group_removal(cur, telegram_id, reason="manual_access_revoked", revoke_started_at=now)
+    return {
+        "status": "completed",
+        "telegram_id": int(telegram_id),
+        "old_expiry": old_expiry,
+        "new_expiry": new_expiry,
+        "subscription_id": subscription_id,
+        "customer_id": customer_id,
+        "cancelled_deliveries": cancelled_deliveries,
+        "was_paid": bool(paid),
+        "old_auto_renew": bool(auto_renew),
+    }
+
+
+def apply_subscription_refund_reconciliation(cur, event_id, proof, source="stripe_webhook", event_type=None):
+    reconciliation_key = proof.get("reconciliation_key") or (
+        f"refund:{proof.get('refund_id')}"
+        if proof.get("refund_id")
+        else f"charge:{proof.get('charge_id')}"
+        if proof.get("charge_id")
+        else f"event:{event_id}"
+    )
+    proof["reconciliation_key"] = reconciliation_key
+    cur.execute(
+        """
+        SELECT reconciliation_result
+        FROM subscription_refund_reconciliations
+        WHERE reconciliation_key = %s
+        FOR UPDATE
+        """,
+        (reconciliation_key,),
+    )
+    existing = cur.fetchone()
+    if existing and existing[0] in (SUBSCRIPTION_REFUND_ACCESS_REVOKED, SUBSCRIPTION_REFUND_ALREADY_RECONCILED):
+        insert_subscription_refund_reconciliation(
+            cur,
+            event_id,
+            proof,
+            existing[0],
+            event_type=event_type,
+            review_reason="final_state_duplicate",
+        )
+        return {"result": SUBSCRIPTION_REFUND_ALREADY_RECONCILED, "reason": existing[0]}
+    if proof.get("pending_refunds"):
+        enqueue_subscription_refund_review(cur, event_id, proof, "pending_refunds_present", event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "pending_refunds_present"}
+    if proof.get("failed_refunds"):
+        enqueue_subscription_refund_review(cur, event_id, proof, "failed_refunds_present", event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "failed_refunds_present"}
+    if proof.get("refund_status") != "succeeded":
+        enqueue_subscription_refund_review(cur, event_id, proof, f"refund_status_{proof.get('refund_status')}", event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "refund_not_succeeded"}
+
+    match_status, review_reason, payment = find_refunded_subscription_payment_event(cur, proof)
+    if match_status != "matched":
+        enqueue_subscription_refund_review(cur, event_id, proof, review_reason, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": review_reason}
+    (
+        payment_event_id,
+        telegram_id,
+        original_amount,
+        original_currency,
+        payment_customer_id,
+        payment_subscription_id,
+        _payment_kind,
+        _payment_status,
+        payment_period_end,
+        payment_created_at,
+    ) = payment
+
+    review_reason = None
+    if proof.get("amount_refunded") != original_amount:
+        review_reason = "amount_mismatch_or_partial_refund"
+    elif normalize_currency(proof.get("currency")) != normalize_currency(original_currency):
+        review_reason = "currency_mismatch"
+    elif proof.get("customer_id") and proof.get("customer_id") != payment_customer_id:
+        review_reason = "customer_mismatch"
+    elif proof.get("subscription_id") and proof.get("subscription_id") != payment_subscription_id:
+        review_reason = "subscription_mismatch"
+    elif not payment_period_end:
+        review_reason = "missing_payment_period_end"
+    if review_reason:
+        enqueue_subscription_refund_review(cur, event_id, proof, review_reason, telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": review_reason, "telegram_id": telegram_id}
+
+    already_revoked = find_access_revoked_refund_reconciliation(cur, payment_event_id)
+    if already_revoked:
+        reconciliation_id, existing_key, existing_result = already_revoked
+        alias_subscription_refund_reconciliation(cur, reconciliation_id, event_id, proof)
+        record_subscription_refund_event(cur, reconciliation_id, event_id, event_type)
+        return {
+            "result": SUBSCRIPTION_REFUND_ALREADY_RECONCILED,
+            "reason": existing_result,
+            "telegram_id": telegram_id,
+            "reconciliation_key": existing_key,
+        }
+
+    cur.execute(
+        """
+        SELECT paid, expiry_date, stripe_subscription_id, stripe_customer_id
+        FROM users
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (int(telegram_id),),
+    )
+    user_row = cur.fetchone()
+    if not user_row:
+        enqueue_subscription_refund_review(cur, event_id, proof, "user_not_found", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "user_not_found", "telegram_id": telegram_id}
+    paid, old_expiry, user_subscription_id, user_customer_id = user_row
+    if paid is not True:
+        insert_subscription_refund_reconciliation(
+            cur,
+            event_id,
+            proof,
+            SUBSCRIPTION_REFUND_ALREADY_INACTIVE,
+            event_type=event_type,
+            review_reason="user_already_inactive",
+            telegram_id=telegram_id,
+            original_payment_event_id=payment_event_id,
+            original_amount=original_amount,
+        )
+        return {"result": SUBSCRIPTION_REFUND_ALREADY_INACTIVE, "reason": "user_already_inactive", "telegram_id": telegram_id}
+    if user_customer_id and payment_customer_id and user_customer_id != payment_customer_id:
+        enqueue_subscription_refund_review(cur, event_id, proof, "current_customer_mismatch", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "current_customer_mismatch", "telegram_id": telegram_id}
+    if user_subscription_id and payment_subscription_id and user_subscription_id != payment_subscription_id:
+        enqueue_subscription_refund_review(cur, event_id, proof, "current_subscription_mismatch", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "current_subscription_mismatch", "telegram_id": telegram_id}
+    if old_expiry and old_expiry > payment_period_end + timedelta(seconds=SUBSCRIPTION_REFUND_EXPIRY_TOLERANCE_SECONDS):
+        enqueue_subscription_refund_review(cur, event_id, proof, "current_expiry_exceeds_refunded_period", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "current_expiry_exceeds_refunded_period", "telegram_id": telegram_id}
+
+    cur.execute(
+        """
+        SELECT 1
+        FROM payment_events
+        WHERE telegram_id = %s
+          AND payment_status = 'succeeded'
+          AND payment_kind IN ('initial_subscription', 'recurring')
+          AND id <> %s
+          AND created_at > %s
+        LIMIT 1
+        """,
+        (int(telegram_id), payment_event_id, payment_created_at),
+    )
+    if cur.fetchone():
+        enqueue_subscription_refund_review(cur, event_id, proof, "newer_succeeded_payment_exists", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "newer_succeeded_payment_exists", "telegram_id": telegram_id}
+    cur.execute(
+        """
+        SELECT 1
+        FROM access_events
+        WHERE telegram_id = %s
+          AND created_at > %s
+          AND event_type <> %s
+          AND (
+                new_expiry IS NULL
+                OR new_expiry > %s + (%s * INTERVAL '1 second')
+                OR event_type IN (
+                    'stripe_invoice_paid',
+                    'manual_set_expiry',
+                    'manual_restore_access',
+                    'restore_access_invite_sent',
+                    'manual_give_access',
+                    'manual_link_stripe_user',
+                    'gift_access_applied'
+                )
+          )
+        LIMIT 1
+        """,
+        (
+            int(telegram_id),
+            payment_created_at,
+            SUBSCRIPTION_REFUND_REVOKE_EVENT,
+            payment_period_end,
+            SUBSCRIPTION_REFUND_EXPIRY_TOLERANCE_SECONDS,
+        ),
+    )
+    if cur.fetchone():
+        enqueue_subscription_refund_review(cur, event_id, proof, "newer_access_change_exists", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "newer_access_change_exists", "telegram_id": telegram_id}
+    cur.execute(
+        """
+        SELECT 1
+        FROM stripe_links
+        WHERE telegram_id = %s
+          AND (
+                (stripe_customer_id IS NOT NULL AND stripe_customer_id IS DISTINCT FROM %s)
+                OR (stripe_subscription_id IS NOT NULL AND stripe_subscription_id IS DISTINCT FROM %s)
+          )
+          AND (is_active IS TRUE OR status IN ('active', 'trialing'))
+        LIMIT 1
+        """,
+        (int(telegram_id), payment_customer_id, payment_subscription_id),
+    )
+    if cur.fetchone():
+        enqueue_subscription_refund_review(cur, event_id, proof, "new_active_subscription_exists", telegram_id=telegram_id, event_type=event_type)
+        return {"result": SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "reason": "new_active_subscription_exists", "telegram_id": telegram_id}
+
+    now = datetime.utcnow()
+    new_expiry = min(old_expiry or now, now)
+    cur.execute(
+        """
+        UPDATE users
+        SET paid = FALSE,
+            expiry_date = LEAST(COALESCE(expiry_date, NOW()), NOW()),
+            auto_renew = FALSE,
+            payment_failed = FALSE,
+            payment_failed_at = NULL,
+            grace_period_end = NULL,
+            reminder_sent = TRUE,
+            stripe_subscription_id = CASE
+                WHEN stripe_subscription_id = %s THEN NULL
+                ELSE stripe_subscription_id
+            END
+        WHERE telegram_id = %s
+        """,
+        (payment_subscription_id, int(telegram_id)),
+    )
+    record_access_event_cur(
+        cur,
+        telegram_id,
+        SUBSCRIPTION_REFUND_REVOKE_EVENT if source == "stripe_webhook" else MANUAL_ACCESS_REVOKED_EVENT,
+        source=source,
+        old_expiry=old_expiry,
+        new_expiry=new_expiry,
+        stripe_event_id=event_id,
+        stripe_subscription_id=payment_subscription_id,
+        notes=f"reconciliation={safe_delivery_hash(reconciliation_key)}; payment_event_id={payment_event_id}; customer_id={safe_log_id(payment_customer_id)}",
+    )
+    cancelled_deliveries = cancel_access_restoration_deliveries_after_revoke(cur, telegram_id, "subscription_refund_reconciled")
+    enqueue_subscription_refund_group_removal(cur, telegram_id, revoke_started_at=now)
+    insert_subscription_refund_reconciliation(
+        cur,
+        event_id,
+        proof,
+        SUBSCRIPTION_REFUND_ACCESS_REVOKED,
+        event_type=event_type,
+        telegram_id=telegram_id,
+        original_payment_event_id=payment_event_id,
+        original_amount=original_amount,
+        access_revoked_at=now,
+    )
+    enqueue_stripe_admin_message(
+        cur,
+        event_id,
+        "subscription_refund_access_revoked",
+        "✅ Subscription refund reconciled\n\n"
+        f"telegram_id: {telegram_id}\n"
+        f"refund_id: {safe_log_id(proof.get('refund_id')) or 'none'}\n"
+        f"subscription_id: {safe_log_id(payment_subscription_id)}\n"
+        f"old_expiry: {old_expiry or 'none'}\n"
+        f"new_expiry: {new_expiry}\n"
+        f"cancelled_deliveries: {cancelled_deliveries}\n"
+        "group_removal: queued",
+        severity="CRITICAL",
+        category="subscription_refund_access_revoked",
+        safe_ref=safe_admin_context_reference("subscription_refund_revoked", event_id, proof.get("refund_id"), proof.get("charge_id"), telegram_id),
+    )
+    return {"result": SUBSCRIPTION_REFUND_ACCESS_REVOKED, "telegram_id": telegram_id, "old_expiry": old_expiry, "new_expiry": new_expiry}
+
+
 def build_gift_buyer_paid_text(row):
     return (
         "🎁 Подарок оплачен\n\n"
@@ -3470,6 +4123,13 @@ def first_purchase_recovery_eligibility_sql(single_user=False, current_delivery_
               FROM payment_events pe
               WHERE pe.telegram_id = u.telegram_id
                 AND pe.payment_status = 'succeeded'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM subscription_refund_reconciliations srr
+              WHERE srr.telegram_id = u.telegram_id
+                AND srr.reconciliation_result IN ('access_revoked', 'review_required')
+                AND srr.created_at >= la.latest_attempt_at
           )
           AND NOT EXISTS (
               SELECT 1
@@ -5062,7 +5722,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
-        SELECT status, lease_until, db_finalized_at
+        SELECT status, lease_until, db_finalized_at, reason
         FROM subscription_removal_events
         WHERE telegram_id = %s
         FOR UPDATE
@@ -5071,7 +5731,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     )
     row = cur.fetchone()
     if row:
-        current_status, current_lease_until, db_finalized_at = row
+        current_status, current_lease_until, db_finalized_at, current_reason = row
         can_start_new_cycle = False
         if current_status == "db_finalized" and db_finalized_at:
             cur.execute(
@@ -5097,7 +5757,11 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                 """
                 UPDATE subscription_removal_events
                 SET status = 'processing',
-                    reason = %s,
+                    reason = CASE
+                        WHEN subscription_removal_events.reason IN ('subscription_refund_reconciled', 'manual_access_revoked')
+                            THEN subscription_removal_events.reason
+                        ELSE %s
+                    END,
                     owner_id = %s,
                     claimed_at = %s,
                     lease_until = %s,
@@ -5149,11 +5813,17 @@ def mark_subscription_removal_status(cur, telegram_id, status, error_text=None):
         "telegram_removed": "telegram_removed_at = COALESCE(telegram_removed_at, NOW()),",
         "db_finalized": "db_finalized_at = COALESCE(db_finalized_at, NOW()),",
     }.get(status, "")
+    lease_fields = (
+        "owner_id = NULL, claimed_at = NULL, lease_until = NULL,"
+        if status in ("cancelled", "not_due", "superseded")
+        else ""
+    )
     cur.execute(
         f"""
         UPDATE subscription_removal_events
         SET status = %s,
             {fields}
+            {lease_fields}
             last_error = LEFT(%s, 1000),
             updated_at = NOW()
         WHERE telegram_id = %s
@@ -5289,6 +5959,99 @@ def mark_subscription_removal_short(telegram_id, status, error_text=None):
     except Exception:
         conn.rollback()
         raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def subscription_refund_group_removal_still_due(telegram_id):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT reason
+            FROM subscription_removal_events
+            WHERE telegram_id = %s
+            """,
+            (int(telegram_id),),
+        )
+        reason_row = cur.fetchone()
+        reason = reason_row[0] if reason_row else None
+        if reason not in ("subscription_refund_reconciled", "manual_access_revoked"):
+            return True
+        if reason == "subscription_refund_reconciled":
+            cur.execute(
+                """
+                SELECT access_revoked_at
+                FROM subscription_refund_reconciliations
+                WHERE telegram_id = %s
+                  AND reconciliation_result = 'access_revoked'
+                ORDER BY access_revoked_at DESC NULLS LAST, updated_at DESC
+                LIMIT 1
+                """,
+                (int(telegram_id),),
+            )
+            reconciliation_row = cur.fetchone()
+            if not reconciliation_row or not reconciliation_row[0]:
+                return False
+            revoked_at = reconciliation_row[0]
+        else:
+            cur.execute(
+                """
+                SELECT created_at
+                FROM access_events
+                WHERE telegram_id = %s
+                  AND event_type = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (int(telegram_id), MANUAL_ACCESS_REVOKED_EVENT),
+            )
+            revoke_event_row = cur.fetchone()
+            if not revoke_event_row or not revoke_event_row[0]:
+                return False
+            revoked_at = revoke_event_row[0]
+        cur.execute(
+            """
+            SELECT paid, expiry_date
+            FROM users
+            WHERE telegram_id = %s
+            """,
+            (int(telegram_id),),
+        )
+        user_row = cur.fetchone()
+        if not user_row:
+            return True
+        paid, expiry_date = user_row
+        if paid is True and expiry_date and expiry_date > datetime.utcnow():
+            return False
+        cur.execute(
+            """
+            SELECT 1
+            FROM payment_events
+            WHERE telegram_id = %s
+              AND payment_status = 'succeeded'
+              AND created_at > %s
+            LIMIT 1
+            """,
+            (int(telegram_id), revoked_at),
+        )
+        if cur.fetchone():
+            return False
+        cur.execute(
+            """
+            SELECT 1
+            FROM access_events
+            WHERE telegram_id = %s
+              AND created_at > %s
+              AND event_type NOT IN (%s, %s)
+              AND (new_expiry IS NULL OR new_expiry > NOW())
+            LIMIT 1
+            """,
+            (int(telegram_id), revoked_at, SUBSCRIPTION_REFUND_REVOKE_EVENT, MANUAL_ACCESS_REVOKED_EVENT),
+        )
+        return cur.fetchone() is None
     finally:
         cur.close()
         conn.close()
@@ -5549,6 +6312,10 @@ async def ban_user_logic(telegram_id, cur=None):
     if stripe_guard_status:
         mark_subscription_removal_short(telegram_id, "pending", stripe_guard_status)
         return stripe_guard_status
+
+    if not subscription_refund_group_removal_still_due(telegram_id):
+        mark_subscription_removal_short(telegram_id, "superseded", "access_revoke_no_longer_current")
+        return "access_revoke_no_longer_current"
 
     try:
         chat_member = await bot.get_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
@@ -9091,6 +9858,146 @@ async def gift_status_command(message: types.Message):
     await message.answer("\n".join(lines))
 
 
+@router.message(Command('revoke_access'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def revoke_access_command(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = (command.args or "").split(maxsplit=1)
+    if len(args) != 2:
+        await message.reply("⚠️ Использование: /revoke_access <telegram_id> <reason>")
+        return
+    try:
+        target_user_id = int(args[0])
+    except ValueError:
+        await message.reply("⚠️ telegram_id должен быть числом.")
+        return
+    reason = args[1].strip()
+    if not reason:
+        await message.reply("⚠️ Укажите причину отзыва доступа.")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT paid, expiry_date, stripe_customer_id, stripe_subscription_id, auto_renew
+            FROM users
+            WHERE telegram_id = %s
+            """,
+            (target_user_id,),
+        )
+        user = cur.fetchone()
+        if not user:
+            conn.rollback()
+            await message.reply("❌ Пользователь не найден.")
+            return
+        paid, expiry_date, customer_id, subscription_id, auto_renew = user
+        action_id = make_action_request(
+            cur,
+            message.from_user.id,
+            "revoke_access",
+            {
+                "telegram_id": target_user_id,
+                "reason": reason,
+                "admin_id": message.from_user.id,
+            },
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    await send_admin_action_confirmation(
+        message,
+        action_id,
+        "Подтвердите отзыв доступа.\n\n"
+        f"telegram_id: {target_user_id}\n"
+        f"paid: {paid}\n"
+        f"expiry: {expiry_date or 'нет'}\n"
+        f"stripe_customer_id: {safe_log_id(customer_id) or 'нет'}\n"
+        f"stripe_subscription_id: {safe_log_id(subscription_id) or 'нет'}\n"
+        f"auto_renew: {auto_renew}\n"
+        f"reason: {reason}\n\n"
+        "Stripe subscription автоматически не отменяется. После Confirm будет поставлено durable удаление из группы.",
+    )
+
+
+@router.message(Command('refund_info'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def refund_info_command(message: types.Message, command: CommandObject):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    query = (command.args or "").strip()
+    if not (query.startswith("re_") or query.startswith("ch_") or query.startswith("pi_")):
+        await message.reply("⚠️ Использование: /refund_info <re_...|ch_...|pi_...>")
+        return
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT refund_id, stripe_event_id, charge_id, payment_intent_id, invoice_id,
+                   customer_id, subscription_id, telegram_id, original_payment_event_id,
+                   amount_refunded, original_amount, currency, refund_status,
+                   is_full_refund, reconciliation_result, review_reason, access_revoked_at
+            FROM subscription_refund_reconciliations
+            WHERE refund_id = %s
+               OR charge_id = %s
+               OR payment_intent_id = %s
+            ORDER BY created_at DESC
+            LIMIT 5
+            """,
+            (query, query, query),
+        )
+        reconciliations = cur.fetchall()
+        payment_ids = sorted({int(row[8]) for row in reconciliations if row[8] is not None})
+        payments = []
+        if payment_ids:
+            cur.execute(
+                """
+                SELECT id, telegram_id, invoice_id, stripe_customer_id, stripe_subscription_id,
+                       payment_kind, amount_paid, currency, period_end, created_at
+                FROM payment_events
+                WHERE id = ANY(%s)
+                ORDER BY created_at DESC, id DESC
+                """,
+                (payment_ids,),
+            )
+            payments = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+    lines = [f"Refund info: {safe_log_id(query)}", ""]
+    if reconciliations:
+        lines.append("Reconciliations:")
+        for row in reconciliations:
+            auto_revoke_safe = row[14] == SUBSCRIPTION_REFUND_ACCESS_REVOKED
+            review_required = row[14] == SUBSCRIPTION_REFUND_REVIEW_REQUIRED
+            lines.append(
+                f"- result={row[14]}, review={row[15] or 'нет'}, original_payment_event_id={row[8] or 'none'}, "
+                f"telegram_id={row[7] or 'unknown'}, "
+                f"refund={safe_log_id(row[0]) or 'none'}, charge={safe_log_id(row[2]) or 'none'}, "
+                f"pi={safe_log_id(row[3]) or 'none'}, full={row[13]}, status={row[12]}, "
+                f"auto_revoke_safe={auto_revoke_safe}, review_required={review_required}, revoked_at={row[16] or 'нет'}"
+            )
+    else:
+        lines.append("Reconciliations: none")
+    if payments:
+        lines.append("")
+        lines.append("Original payments:")
+        for row in payments:
+            lines.append(
+                f"- payment_event_id={row[0]}, telegram_id={row[1]}, kind={row[5]}, "
+                f"amount={row[6]} {row[7] or ''}, customer={safe_log_id(row[3]) or 'none'}, "
+                f"subscription={safe_log_id(row[4]) or 'none'}, period_end={row[8] or 'none'}"
+            )
+    else:
+        lines.append("Original payments: payment match unavailable locally")
+    lines.append("")
+    lines.append("read_only: true")
+    await message.answer("\n".join(lines)[:4000])
+
+
 @router.message(Command('sync_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def sync_stripe_user_command(message: types.Message, command: CommandObject):
@@ -10356,6 +11263,8 @@ ADMIN_MENU_SECTIONS = {
             "/set_expiry <telegram_id> <YYYY-MM-DD> — установить точную дату доступа",
             "/sync_stripe_user <telegram_id> — синхронизировать Stripe",
             "/restore_access <telegram_id> — восстановить вход в закрытый клуб",
+            "/revoke_access <telegram_id> <reason> — отозвать доступ через Confirm",
+            "/refund_info <re_...|ch_...|pi_...> — read-only проверка refund reconciliation",
             "/unlinked_stripe — показать Stripe оплаты без пользователя",
             "/stripe_links <telegram_id> — показать Stripe связи пользователя",
             "/stripe_conflicts — показать unresolved Stripe identity conflicts",
@@ -14241,6 +15150,58 @@ async def stripe_webhook(request):
                     await release_event_processing(event_id)
                 if gift_mark_processed or gift_release_event:
                     return gift_response
+            proof = subscription_refund_proof_from_event(event_type, refund_object)
+            try:
+                proof = await enrich_subscription_refund_proof(proof)
+            except Exception as e:
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="subscription_refund_proof_retrieve_failed",
+                    stage="refund_webhook",
+                    category="stripe_api_unavailable",
+                    exception=e,
+                    stripe_retry="да",
+                    recovery_reminder="не применимо",
+                    safe_ref=safe_admin_error_reference("subscription_refund_proof", e),
+                    note="Refund proof could not be completed. Access unchanged; Stripe may retry.",
+                    severity="CRITICAL",
+                )
+                await release_event_processing(event_id)
+                return web.Response(status=500)
+            refund_conn = get_db_conn()
+            refund_cur = refund_conn.cursor()
+            try:
+                result = apply_subscription_refund_reconciliation(refund_cur, event_id, proof, event_type=event_type)
+                refund_conn.commit()
+                logging.info(
+                    "SUBSCRIPTION_REFUND_RECONCILED: event_id=%s, event.type=%s, result=%s, reason=%s, telegram_id=%s",
+                    safe_log_id(event_id),
+                    event_type,
+                    result.get("result"),
+                    result.get("reason"),
+                    result.get("telegram_id"),
+                )
+            except Exception as e:
+                refund_conn.rollback()
+                await enqueue_admin_payment_problem_now(
+                    event_id=event_id,
+                    purpose="subscription_refund_reconciliation_failed",
+                    stage="refund_webhook",
+                    category="webhook_processing_failed",
+                    exception=e,
+                    stripe_retry="да",
+                    recovery_reminder="не применимо",
+                    safe_ref=safe_admin_error_reference("subscription_refund_reconciliation", e),
+                    note="Refund reconciliation audit/revoke did not commit. Access may be unchanged; Stripe should retry.",
+                    severity="CRITICAL",
+                )
+                await release_event_processing(event_id)
+                return web.Response(status=500)
+            finally:
+                refund_cur.close()
+                refund_conn.close()
+            await mark_event_processed(event_id)
+            return web.Response(status=200)
 
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
@@ -15101,6 +16062,8 @@ async def execute_confirmed_admin_action(action_type, payload):
         return await execute_confirmed_retry_delivery(payload)
     if action_type == "restore_access":
         return await execute_confirmed_restore_access(payload)
+    if action_type == "revoke_access":
+        return await execute_confirmed_revoke_access(payload)
     if action_type == "gift_cancel":
         return await execute_confirmed_gift_cancel(payload)
     if action_type == "gift_reissue":
@@ -15660,6 +16623,49 @@ async def execute_confirmed_gift_reissue(payload):
         cur.close()
         conn.close()
     return {"status": "completed", "public_reference": public_reference, "gift_status": updated["status"]}
+
+
+async def execute_confirmed_revoke_access(payload):
+    telegram_id = int(payload["telegram_id"])
+    reason = payload.get("reason") or "manual_access_revoked"
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        result = apply_manual_access_revoke(
+            cur,
+            telegram_id,
+            reason,
+            admin_id=payload.get("admin_id"),
+            action_id=payload.get("action_id"),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+    if result.get("status") == "failed":
+        return {
+            "status": "failed",
+            "telegram_id": telegram_id,
+            "reason": result.get("reason"),
+            "admin_message": "❌ Доступ не отозван: пользователь не найден.",
+        }
+    return {
+        **result,
+        "admin_message": (
+            "✅ Доступ отозван\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"old_expiry: {result.get('old_expiry') or 'нет'}\n"
+            f"new_expiry: {result.get('new_expiry')}\n"
+            f"stripe_customer_id: {safe_log_id(result.get('customer_id')) or 'нет'}\n"
+            f"stripe_subscription_id: {safe_log_id(result.get('subscription_id')) or 'нет'}\n"
+            f"cancelled_deliveries: {result.get('cancelled_deliveries')}\n"
+            "group_removal: queued\n"
+            "Stripe subscription: not modified"
+        ),
+    }
 
 
 @router.callback_query(F.data.startswith("admin_action:confirm:"), StateFilter('*'))

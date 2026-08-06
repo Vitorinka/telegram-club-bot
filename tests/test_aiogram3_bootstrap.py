@@ -1574,6 +1574,109 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         mark_short.assert_called_with(123, "pending", "active_access_in_db")
         ban.assert_not_awaited()
 
+    def test_manual_revoke_removal_is_not_due_after_new_access(self):
+        revoked_at = datetime.utcnow() - timedelta(hours=2)
+        active_expiry = datetime.utcnow() + timedelta(days=5)
+        conn = FakeConnection(fetches=[
+            ("manual_access_revoked",),
+            (revoked_at,),
+            (True, active_expiry),
+        ])
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            self.assertFalse(self.main.subscription_refund_group_removal_still_due(123))
+
+        queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("manual_access_revoked", str(conn.cursor_obj.queries))
+        self.assertNotIn("subscription_refund_reconciliations", queries)
+
+    def test_new_revoke_reopens_superseded_removal_cycle(self):
+        now = datetime.utcnow()
+        conn = FakeConnection()
+
+        self.main.enqueue_subscription_refund_group_removal(
+            conn.cursor_obj,
+            123,
+            reason="manual_access_revoked",
+            revoke_started_at=now,
+        )
+
+        query, params = conn.cursor_obj.queries[-1]
+        self.assertIn("ON CONFLICT (telegram_id) DO UPDATE", query)
+        self.assertIn("status = 'pending'", query)
+        self.assertIn("owner_id = NULL", query)
+        self.assertIn("claimed_at = NULL", query)
+        self.assertIn("lease_until = NULL", query)
+        self.assertIn("telegram_removed_at = NULL", query)
+        self.assertIn("db_finalized_at = NULL", query)
+        self.assertIn("attempt_count = 0", query)
+        self.assertIn("revoke_started_at = EXCLUDED.revoke_started_at", query)
+        self.assertEqual(params, (123, "manual_access_revoked", now))
+
+    def test_superseded_removal_without_new_revoke_is_not_claimed(self):
+        conn = FakeConnection(fetches=[("superseded", None, None, "manual_access_revoked")])
+
+        result = self.main.claim_subscription_removal(conn.cursor_obj, 123, "subscription_expired")
+
+        self.assertEqual(result, "superseded")
+        queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("SET status = 'processing'", queries)
+
+    async def test_stale_access_revoke_removal_is_superseded_without_telegram_kick(self):
+        claim_conn = FakeConnection(fetches=[])
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 False,
+                 datetime.utcnow() - timedelta(days=1),
+                 None,
+                 False,
+                 None,
+                 None,
+                 False,
+                 None,
+             )), \
+             patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
+             patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=False), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main.bot, "kick_chat_member", AsyncMock(), create=True) as kick:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "access_revoke_no_longer_current")
+        mark_short.assert_called_with(123, "superseded", "access_revoke_no_longer_current")
+        kick.assert_not_awaited()
+
+    async def test_second_revoke_after_superseded_can_reach_telegram_removal(self):
+        claim_conn = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 False,
+                 datetime.utcnow() - timedelta(days=1),
+                 None,
+                 False,
+                 None,
+                 None,
+                 False,
+                 None,
+             )), \
+             patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
+             patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             patch.object(self.main.bot, "send_message", AsyncMock()), \
+             patch.object(self.main.bot, "kick_chat_member", AsyncMock(), create=True) as kick, \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "removed")
+        kick.assert_awaited_once()
+        unban.assert_awaited_once()
+        finalize_db.assert_called_once_with(123)
+        self.assertTrue(any(call.args[:2] == (123, "telegram_removed") for call in mark_short.call_args_list))
+
     async def test_postgres_fsm_storage_module_imports_independently(self):
         import postgres_fsm_storage
 
@@ -2239,7 +2342,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 65)
+        self.assertEqual(len(self.main.router.message.handlers), 67)
         self.assertEqual(len(self.main.router.callback_query.handlers), 25)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -2271,7 +2374,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 65)
+        self.assertEqual(len(message_handlers), 67)
         self.assertEqual(len(callback_handlers), 25)
         self.assertEqual(
             commands,
@@ -2279,7 +2382,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "promo_trial", "cancel", "menu", "ask", "start", "profile",
                 "send_user", "broadcast", "give_access", "set_expiry", "restore_access",
                 "gift_templates", "gift_template_upload", "gift_info", "gift_cancel",
-                "gift_reissue", "gifts_pending", "gift_status", "sync_stripe_user",
+                "gift_reissue", "gifts_pending", "gift_status", "revoke_access",
+                "refund_info", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
                 "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
@@ -6166,6 +6270,404 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await handler(FakeStripeRequest(payload, headers))
 
         self.assertEqual(response.status, 200)
+
+    def refund_payment_row(self, *, payment_id=501, telegram_id=123, amount=5000, currency="usd", subscription_id="sub_refund", period_end=None, created_at=None):
+        return (
+            payment_id,
+            telegram_id,
+            amount,
+            currency,
+            "cus_refund",
+            subscription_id,
+            "recurring",
+            "succeeded",
+            period_end or datetime.utcnow() + timedelta(days=30),
+            created_at or datetime.utcnow() - timedelta(hours=1),
+        )
+
+    def refund_proof(self, **overrides):
+        proof = {
+            "refund_id": "re_full",
+            "charge_id": "ch_full",
+            "payment_intent_id": "pi_full",
+            "invoice_id": "in_full",
+            "customer_id": "cus_refund",
+            "subscription_id": "sub_refund",
+            "amount_refunded": 5000,
+            "refund_status": "succeeded",
+            "currency": "usd",
+        }
+        proof.update(overrides)
+        return proof
+
+    def test_subscription_refund_full_latest_payment_revokes_access_and_queues_removal(self):
+        old_expiry = datetime.utcnow() + timedelta(days=20)
+        conn = FakeConnection(fetches=[
+            None,
+            [self.refund_payment_row()],
+            None,
+            (True, old_expiry, "sub_refund", "cus_refund"),
+            None,
+            None,
+            None,
+            (self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED,),
+        ])
+
+        result = self.main.apply_subscription_refund_reconciliation(
+            conn.cursor_obj,
+            "evt_refund_full",
+            self.refund_proof(),
+        )
+
+        self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED)
+        queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("UPDATE users", queries)
+        self.assertIn("stripe_refund_access_revoked", str(conn.cursor_obj.queries))
+        self.assertIn("UPDATE message_delivery_events", queries)
+        self.assertIn("INSERT INTO subscription_removal_events", queries)
+        self.assertIn("INSERT INTO subscription_refund_reconciliations", queries)
+
+    def test_subscription_refund_partial_or_pending_requires_review_without_revoke(self):
+        cases = (
+            (self.refund_proof(amount_refunded=1000), [None, [self.refund_payment_row()], (self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED,)]),
+            (self.refund_proof(refund_id="re_pending", refund_status="pending"), [None, (self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED,)]),
+        )
+        for proof, fetches in cases:
+            with self.subTest(refund_id=proof["refund_id"]):
+                conn = FakeConnection(fetches=fetches)
+
+                result = self.main.apply_subscription_refund_reconciliation(
+                    conn.cursor_obj,
+                    "evt_" + proof["refund_id"],
+                    proof,
+                )
+
+                self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)
+                queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+                self.assertIn("INSERT INTO subscription_refund_reconciliations", queries)
+                self.assertNotIn("UPDATE users", queries)
+                self.assertIn("stripe_admin_message", str(conn.cursor_obj.queries))
+
+    def test_subscription_refund_duplicate_is_idempotent(self):
+        conn = FakeConnection(fetches=[(self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED,)])
+
+        result = self.main.apply_subscription_refund_reconciliation(
+            conn.cursor_obj,
+            "evt_refund_duplicate",
+            self.refund_proof(),
+        )
+
+        self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_ALREADY_RECONCILED)
+        queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("UPDATE users", queries)
+        self.assertNotIn("INSERT INTO access_events", queries)
+
+    def test_subscription_refund_charge_and_refund_events_share_revoked_payment(self):
+        cases = (
+            (
+                self.refund_proof(refund_id="re_after_charge", charge_id="ch_same"),
+                "charge:ch_same",
+                "evt_refund_after_charge",
+                "refund.updated",
+            ),
+            (
+                self.refund_proof(refund_id=None, charge_id="ch_after_refund"),
+                "refund:re_same",
+                "evt_charge_after_refund",
+                "charge.refunded",
+            ),
+        )
+        for proof, existing_key, event_id, event_type in cases:
+            with self.subTest(event_type=event_type):
+                conn = FakeConnection(fetches=[
+                    None,
+                    [self.refund_payment_row()],
+                    (77, existing_key, self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED),
+                ])
+
+                result = self.main.apply_subscription_refund_reconciliation(
+                    conn.cursor_obj,
+                    event_id,
+                    proof,
+                    event_type=event_type,
+                )
+
+                self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_ALREADY_RECONCILED)
+                self.assertEqual(result["reconciliation_key"], existing_key)
+                queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+                self.assertIn("FROM subscription_refund_reconciliations", queries)
+                self.assertIn("INSERT INTO subscription_refund_events", queries)
+                self.assertNotIn("UPDATE users", queries)
+                self.assertNotIn("INSERT INTO access_events", queries)
+                self.assertNotIn("INSERT INTO subscription_removal_events", queries)
+
+    def test_subscription_refund_review_required_can_be_reprocessed_to_revoke(self):
+        pending = self.refund_proof(refund_status="pending")
+        pending_conn = FakeConnection(fetches=[None, (1, self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)])
+        pending_result = self.main.apply_subscription_refund_reconciliation(
+            pending_conn.cursor_obj,
+            "evt_refund_pending",
+            pending,
+            event_type="refund.created",
+        )
+        self.assertEqual(pending_result["result"], self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)
+
+        period_end = datetime.utcnow() + timedelta(days=30)
+        succeeded_conn = FakeConnection(fetches=[
+            (self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED,),
+            [self.refund_payment_row(period_end=period_end)],
+            None,
+            (True, period_end, "sub_refund", "cus_refund"),
+            None,
+            None,
+            None,
+            (1, self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED),
+        ])
+        succeeded_result = self.main.apply_subscription_refund_reconciliation(
+            succeeded_conn.cursor_obj,
+            "evt_refund_succeeded",
+            self.refund_proof(),
+            event_type="refund.updated",
+        )
+
+        self.assertEqual(succeeded_result["result"], self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED)
+        self.assertIn("UPDATE users", "\n".join(query for query, _ in succeeded_conn.cursor_obj.queries))
+
+    def test_subscription_refund_partial_then_full_revokes_once(self):
+        partial_conn = FakeConnection(fetches=[
+            None,
+            [self.refund_payment_row()],
+            (1, self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED),
+        ])
+        partial_result = self.main.apply_subscription_refund_reconciliation(
+            partial_conn.cursor_obj,
+            "evt_refund_partial",
+            self.refund_proof(amount_refunded=1000),
+            event_type="refund.created",
+        )
+        self.assertEqual(partial_result["result"], self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)
+
+        period_end = datetime.utcnow() + timedelta(days=30)
+        full_conn = FakeConnection(fetches=[
+            (self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED,),
+            [self.refund_payment_row(period_end=period_end)],
+            None,
+            (True, period_end, "sub_refund", "cus_refund"),
+            None,
+            None,
+            None,
+            (1, self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED),
+        ])
+        full_result = self.main.apply_subscription_refund_reconciliation(
+            full_conn.cursor_obj,
+            "evt_refund_full_after_partial",
+            self.refund_proof(),
+            event_type="refund.updated",
+        )
+
+        self.assertEqual(full_result["result"], self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED)
+
+    def test_charge_refunded_multiple_refunds_uses_charge_level_cumulative_key(self):
+        proof = self.main.subscription_refund_proof_from_event(
+            "charge.refunded",
+            {
+                "id": "ch_multi",
+                "payment_intent": "pi_multi",
+                "invoice": "in_multi",
+                "customer": "cus_multi",
+                "amount_refunded": 5000,
+                "refunded": True,
+                "currency": "usd",
+                "refunds": {
+                    "data": [
+                        {"id": "re_part_1", "amount": 2000, "status": "succeeded"},
+                        {"id": "re_part_2", "amount": 3000, "status": "succeeded"},
+                    ]
+                },
+            },
+        )
+
+        self.assertIsNone(proof["refund_id"])
+        self.assertEqual(proof["reconciliation_key"], "charge:ch_multi")
+        self.assertEqual(proof["amount_refunded"], 5000)
+        self.assertEqual(proof["proof_model"], "charge")
+
+    def test_subscription_refund_newer_access_change_requires_review(self):
+        period_end = datetime.utcnow() + timedelta(days=30)
+        conn = FakeConnection(fetches=[
+            None,
+            [self.refund_payment_row(period_end=period_end)],
+            None,
+            (True, period_end, "sub_refund", "cus_refund"),
+            None,
+            (1,),
+            (1, self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED),
+        ])
+
+        result = self.main.apply_subscription_refund_reconciliation(
+            conn.cursor_obj,
+            "evt_refund_newer_access",
+            self.refund_proof(),
+        )
+
+        self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)
+        self.assertEqual(result["reason"], "newer_access_change_exists")
+        self.assertNotIn("UPDATE users", "\n".join(query for query, _ in conn.cursor_obj.queries))
+
+    def test_subscription_refund_current_identity_or_expiry_mismatch_requires_review(self):
+        period_end = datetime.utcnow() + timedelta(days=30)
+        cases = (
+            ((True, period_end, "sub_other", "cus_refund"), "current_subscription_mismatch"),
+            ((True, period_end, "sub_refund", "cus_other"), "current_customer_mismatch"),
+            ((True, period_end + timedelta(hours=1), "sub_refund", "cus_refund"), "current_expiry_exceeds_refunded_period"),
+        )
+        for user_row, expected_reason in cases:
+            with self.subTest(expected_reason=expected_reason):
+                conn = FakeConnection(fetches=[
+                    None,
+                    [self.refund_payment_row(period_end=period_end)],
+                    None,
+                    user_row,
+                    (1, self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED),
+                ])
+
+                result = self.main.apply_subscription_refund_reconciliation(
+                    conn.cursor_obj,
+                    "evt_" + expected_reason,
+                    self.refund_proof(),
+                )
+
+                self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED)
+                self.assertEqual(result["reason"], expected_reason)
+
+    def test_subscription_refund_paid_already_false_does_not_queue_second_removal(self):
+        period_end = datetime.utcnow() + timedelta(days=30)
+        conn = FakeConnection(fetches=[
+            None,
+            [self.refund_payment_row(period_end=period_end)],
+            None,
+            (False, period_end, "sub_refund", "cus_refund"),
+            (1, self.main.SUBSCRIPTION_REFUND_ALREADY_INACTIVE),
+        ])
+
+        result = self.main.apply_subscription_refund_reconciliation(
+            conn.cursor_obj,
+            "evt_refund_already_inactive",
+            self.refund_proof(),
+        )
+
+        self.assertEqual(result["result"], self.main.SUBSCRIPTION_REFUND_ALREADY_INACTIVE)
+        queries = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO subscription_removal_events", queries)
+        self.assertNotIn("UPDATE users", queries)
+
+    def test_revoke_access_command_is_confirm_only_and_refund_info_is_read_only_source(self):
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        revoke_source = source[source.index("async def revoke_access_command"):source.index("@router.message(Command('refund_info')")]
+        refund_source = source[source.index("async def refund_info_command"):source.index("@router.message(Command('sync_stripe_user')")]
+        self.assertIn('"revoke_access"', revoke_source)
+        self.assertIn("make_action_request", revoke_source)
+        self.assertNotIn("UPDATE users", revoke_source)
+        self.assertNotIn("stripe.Subscription.modify", revoke_source)
+        self.assertNotIn("INSERT INTO", refund_source)
+        self.assertNotIn("UPDATE ", refund_source)
+        self.assertIn("read_only: true", refund_source)
+
+    async def test_refund_info_uses_reconciliation_original_payment_for_refund_charge_and_pi(self):
+        reconciliation = (
+            "re_info",
+            "evt_refund_info",
+            "ch_info",
+            "pi_info",
+            "in_info",
+            "cus_info",
+            "sub_info",
+            123,
+            501,
+            5000,
+            5000,
+            "usd",
+            "succeeded",
+            True,
+            self.main.SUBSCRIPTION_REFUND_ACCESS_REVOKED,
+            None,
+            datetime.utcnow(),
+        )
+        payment = (
+            501,
+            123,
+            "in_paid",
+            "cus_info",
+            "sub_info",
+            "recurring",
+            5000,
+            "usd",
+            datetime.utcnow() + timedelta(days=30),
+            datetime.utcnow() - timedelta(days=1),
+        )
+        for query in ("re_info", "ch_info", "pi_info"):
+            with self.subTest(query=query):
+                conn = FakeConnection(fetches=[[reconciliation], [payment]])
+                message = FakeIncomingMessage(user_id=1)
+                command = SimpleNamespace(args=query)
+
+                with patch.object(self.main, "get_db_conn", return_value=conn), \
+                     patch.object(self.main.stripe.Refund, "retrieve", side_effect=AssertionError("Stripe API must not be called")), \
+                     patch.object(self.main.stripe.Charge, "retrieve", side_effect=AssertionError("Stripe API must not be called")):
+                    await self.main.refund_info_command(message, command)
+
+                answer = message.answers[-1][0]
+                self.assertIn("original_payment_event_id=501", answer)
+                self.assertIn("Original payments:", answer)
+                self.assertIn("payment_event_id=501", answer)
+                self.assertIn("kind=recurring", answer)
+                self.assertIn("auto_revoke_safe=True", answer)
+                self.assertIn("review_required=False", answer)
+                self.assertIn("read_only: true", answer)
+                queries = "\n".join(sql for sql, _ in conn.cursor_obj.queries)
+                self.assertIn("WHERE id = ANY", queries)
+                self.assertNotIn("OR stripe_customer_id = %s", queries)
+                self.assertNotIn("INSERT", queries)
+                self.assertNotIn("UPDATE", queries)
+                self.assertNotIn("DELETE", queries)
+
+    async def test_refund_info_without_original_payment_reports_unavailable_locally(self):
+        reconciliation = (
+            "re_no_payment",
+            "evt_refund_info",
+            "ch_no_payment",
+            "pi_no_payment",
+            "in_info",
+            "cus_info",
+            "sub_info",
+            123,
+            None,
+            5000,
+            5000,
+            "usd",
+            "succeeded",
+            False,
+            self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED,
+            "manual_review",
+            None,
+        )
+        conn = FakeConnection(fetches=[[reconciliation]])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main.stripe.Refund, "retrieve", side_effect=AssertionError("Stripe API must not be called")), \
+             patch.object(self.main.stripe.Charge, "retrieve", side_effect=AssertionError("Stripe API must not be called")):
+            await self.main.refund_info_command(message, SimpleNamespace(args="re_no_payment"))
+
+        answer = message.answers[-1][0]
+        self.assertIn("original_payment_event_id=none", answer)
+        self.assertIn("payment match unavailable locally", answer)
+        self.assertIn("review_required=True", answer)
+        queries = "\n".join(sql for sql, _ in conn.cursor_obj.queries)
+        self.assertNotIn("WHERE id = ANY", queries)
+        self.assertNotIn("INSERT", queries)
+        self.assertNotIn("UPDATE", queries)
+        self.assertNotIn("DELETE", queries)
 
 
 if __name__ == "__main__":
