@@ -19,7 +19,15 @@ from aiogram.fsm.storage.base import StorageKey
 from psycopg2 import sql
 from psycopg2.extensions import make_dsn
 
-from db_migrations import MIGRATIONS_DIR, MigrationError, load_migrations, run_migrations
+from db_migrations import (
+    MIGRATIONS_DIR,
+    MigrationError,
+    equivalent_index_structure_exists,
+    index_structure_matches,
+    load_migrations,
+    payment_integrity_index_requirement_matches,
+    run_migrations,
+)
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 
 
@@ -166,6 +174,26 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def query_one(self, query, params=()):
         rows = self.query_all(query, params)
         return rows[0] if rows else None
+
+    def index_columns_unique_predicate(self, index_name):
+        return self.query_one(
+            """
+            SELECT
+                i.indisunique,
+                array_agg(a.attname ORDER BY ord.ordinality),
+                pg_get_expr(i.indpred, i.indrelid)
+            FROM pg_class idx
+            JOIN pg_index i ON i.indexrelid = idx.oid
+            JOIN pg_class tbl ON tbl.oid = i.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
+            JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = ord.attnum
+            WHERE ns.nspname = 'public'
+              AND idx.relname = %s
+            GROUP BY i.indisunique, i.indpred, i.indrelid
+            """,
+            (index_name,),
+        )
 
     def insert_recovery_user(self, telegram_id, **overrides):
         fields = {
@@ -984,6 +1012,218 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.query_one("SELECT to_regclass('public.checkout_retry_events_user_attempt_idx')")[0],
             "checkout_retry_events_user_attempt_idx",
         )
+
+    def test_payment_integrity_guards_created_on_clean_schema_and_idempotent(self):
+        run_migrations(self.get_conn)
+        expected = {
+            "payment_events_unique_stripe_event_id": ("payment_events", ["stripe_event_id"], "(stripe_event_id IS NOT NULL)"),
+            "checkout_sessions_unique_stripe_session_id": ("checkout_sessions", ["stripe_session_id"], "(stripe_session_id IS NOT NULL)"),
+            "checkout_sessions_unique_idempotency_key": ("checkout_sessions", ["idempotency_key"], "(idempotency_key IS NOT NULL)"),
+            "users_unique_stripe_subscription": ("users", ["stripe_subscription_id"], "(stripe_subscription_id IS NOT NULL)"),
+            "users_unique_stripe_customer": ("users", ["stripe_customer_id"], "(stripe_customer_id IS NOT NULL)"),
+            "stripe_links_unique_subscription_user": ("stripe_links", ["stripe_subscription_id"], "(stripe_subscription_id IS NOT NULL)"),
+        }
+        for index_name, (_table, columns, predicate) in expected.items():
+            row = self.index_columns_unique_predicate(index_name)
+            self.assertIsNotNone(row, index_name)
+            self.assertTrue(row[0], index_name)
+            self.assertEqual(row[1], columns)
+            self.assertEqual(row[2], predicate)
+
+        rows = self.query_all("SELECT version, baseline FROM schema_migrations ORDER BY version")
+        self.assertIn(("0006_payment_integrity_guards", False), rows)
+        run_migrations(self.get_conn)
+        rows_after = self.query_all("SELECT version, baseline FROM schema_migrations ORDER BY version")
+        self.assertEqual(rows, rows_after)
+
+    def test_legacy_schema_gets_payment_integrity_guards_without_duplicate_indexes(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP INDEX payment_events_unique_stripe_event_id")
+            cur.execute("CREATE UNIQUE INDEX legacy_payment_event_unique ON payment_events(stripe_event_id) WHERE stripe_event_id IS NOT NULL")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            spec = {
+                "table": "payment_events",
+                "columns": ("stripe_event_id",),
+                "unique": True,
+                "predicate": "stripe_event_id IS NOT NULL",
+            }
+            self.assertTrue(payment_integrity_index_requirement_matches(cur, "payment_events_unique_stripe_event_id", spec))
+        finally:
+            cur.close()
+            conn.close()
+
+        index_count = self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM pg_index i
+            JOIN pg_class tbl ON tbl.oid = i.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
+            JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = ord.attnum
+            WHERE ns.nspname = 'public'
+              AND tbl.relname = 'payment_events'
+              AND i.indisunique
+              AND a.attname = 'stripe_event_id'
+              AND i.indnkeyatts = 1
+              AND pg_get_expr(i.indpred, i.indrelid) = '(stripe_event_id IS NOT NULL)'
+            """
+        )[0]
+        self.assertEqual(index_count, 1)
+
+    def assert_duplicate_blocks_migration(self, setup_sql, expected_message):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(setup_sql)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        with self.assertRaisesRegex(MigrationError, expected_message):
+            run_migrations(self.get_conn)
+
+    def test_duplicate_payment_event_blocks_payment_integrity_migration(self):
+        self.assert_duplicate_blocks_migration(
+            """
+            CREATE TABLE users (telegram_id BIGINT UNIQUE NOT NULL);
+            CREATE TABLE stripe_events (event_id TEXT);
+            CREATE TABLE access_events (id SERIAL PRIMARY KEY);
+            CREATE TABLE stripe_links (telegram_id BIGINT, stripe_subscription_id TEXT, stripe_customer_id TEXT);
+            CREATE TABLE payment_events (stripe_event_id TEXT);
+            CREATE TABLE checkout_sessions (telegram_id BIGINT, tariff_code TEXT, status TEXT, stripe_session_id TEXT, idempotency_key TEXT);
+            CREATE TABLE message_delivery_events (delivery_key TEXT, telegram_id BIGINT, delivery_type TEXT, status TEXT);
+            INSERT INTO payment_events (stripe_event_id) VALUES ('evt_dup'), ('evt_dup');
+            """,
+            "payment_events.stripe_event_id",
+        )
+
+    def test_duplicate_checkout_session_blocks_payment_integrity_migration(self):
+        self.assert_duplicate_blocks_migration(
+            """
+            CREATE TABLE users (telegram_id BIGINT UNIQUE NOT NULL);
+            CREATE TABLE stripe_events (event_id TEXT);
+            CREATE TABLE access_events (id SERIAL PRIMARY KEY);
+            CREATE TABLE stripe_links (telegram_id BIGINT, stripe_subscription_id TEXT, stripe_customer_id TEXT);
+            CREATE TABLE payment_events (stripe_event_id TEXT);
+            CREATE TABLE checkout_sessions (telegram_id BIGINT, tariff_code TEXT, status TEXT, stripe_session_id TEXT, idempotency_key TEXT);
+            CREATE TABLE message_delivery_events (delivery_key TEXT, telegram_id BIGINT, delivery_type TEXT, status TEXT);
+            INSERT INTO checkout_sessions (stripe_session_id, idempotency_key) VALUES ('cs_dup', 'idem_a'), ('cs_dup', 'idem_b');
+            """,
+            "checkout_sessions.stripe_session_id",
+        )
+
+    def test_duplicate_checkout_idempotency_key_blocks_payment_integrity_migration(self):
+        self.assert_duplicate_blocks_migration(
+            """
+            CREATE TABLE users (telegram_id BIGINT UNIQUE NOT NULL);
+            CREATE TABLE stripe_events (event_id TEXT);
+            CREATE TABLE access_events (id SERIAL PRIMARY KEY);
+            CREATE TABLE stripe_links (telegram_id BIGINT, stripe_subscription_id TEXT, stripe_customer_id TEXT);
+            CREATE TABLE payment_events (stripe_event_id TEXT);
+            CREATE TABLE checkout_sessions (telegram_id BIGINT, tariff_code TEXT, status TEXT, stripe_session_id TEXT, idempotency_key TEXT);
+            CREATE TABLE message_delivery_events (delivery_key TEXT, telegram_id BIGINT, delivery_type TEXT, status TEXT);
+            INSERT INTO checkout_sessions (stripe_session_id, idempotency_key) VALUES ('cs_a', 'idem_dup'), ('cs_b', 'idem_dup');
+            """,
+            "checkout_sessions.idempotency_key",
+        )
+
+    def test_payment_integrity_index_structure_rejects_non_unique_and_wrong_predicate(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("DROP INDEX payment_events_unique_stripe_event_id")
+            cur.execute("CREATE INDEX payment_events_unique_stripe_event_id ON payment_events(stripe_event_id) WHERE stripe_event_id IS NOT NULL")
+            conn.commit()
+            self.assertFalse(index_structure_matches(
+                cur,
+                "payment_events_unique_stripe_event_id",
+                "payment_events",
+                ("stripe_event_id",),
+                unique=True,
+                predicate="stripe_event_id IS NOT NULL",
+            ))
+
+            cur.execute("DROP INDEX payment_events_unique_stripe_event_id")
+            cur.execute("CREATE UNIQUE INDEX payment_events_unique_stripe_event_id ON payment_events(stripe_event_id)")
+            conn.commit()
+            self.assertFalse(index_structure_matches(
+                cur,
+                "payment_events_unique_stripe_event_id",
+                "payment_events",
+                ("stripe_event_id",),
+                unique=True,
+                predicate="stripe_event_id IS NOT NULL",
+            ))
+
+            cur.execute("DROP INDEX payment_events_unique_stripe_event_id")
+            cur.execute("CREATE UNIQUE INDEX payment_events_unique_stripe_event_id ON payment_events(stripe_event_id) WHERE stripe_event_id IS NOT NULL")
+            conn.commit()
+            self.assertTrue(index_structure_matches(
+                cur,
+                "payment_events_unique_stripe_event_id",
+                "payment_events",
+                ("stripe_event_id",),
+                unique=True,
+                predicate="stripe_event_id IS NOT NULL",
+            ))
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_payment_integrity_concurrent_duplicate_insert_is_blocked(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO payment_events (stripe_event_id, event_type, payment_status)
+                VALUES ('evt_concurrent_guard', 'checkout.session.completed', 'succeeded')
+                """
+            )
+            conn.commit()
+            with self.assertRaises(psycopg2.errors.UniqueViolation):
+                cur.execute(
+                    """
+                    INSERT INTO payment_events (stripe_event_id, event_type, payment_status)
+                    VALUES ('evt_concurrent_guard', 'checkout.session.completed', 'succeeded')
+                    """
+                )
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_payment_integrity_preflight_sql_is_read_only_and_executes(self):
+        run_migrations(self.get_conn)
+        path = Path(MIGRATIONS_DIR).parent / "ops" / "payment_integrity_preflight.sql"
+        text = path.read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)\b")
+        self.assertNotIn(" AS users_telegram_id", text)
+        self.assertNotIn(" AS stripe_links_telegram_id", text)
+        self.assertNotRegex(text, r"SELECT\s+'[^']+'\s+AS check_name,\s+telegram_id\b")
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for statement in [part.strip() for part in text.split(";") if part.strip()]:
+                self.assertTrue(statement.lstrip().upper().startswith("SELECT"), statement[:80])
+                cur.execute(statement)
+                cur.fetchall()
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
 
     def test_stripe_identity_conflict_audit_uses_schema_0003_unique_text_key(self):
         run_migrations(self.get_conn)

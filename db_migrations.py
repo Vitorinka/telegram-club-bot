@@ -334,6 +334,47 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "gift_access_events_public_reference_idx",
         ),
     },
+    "0006_payment_integrity_guards": {
+        "indexes": {
+            "payment_events_unique_stripe_event_id": {
+                "table": "payment_events",
+                "columns": ("stripe_event_id",),
+                "unique": True,
+                "predicate": "stripe_event_id IS NOT NULL",
+            },
+            "checkout_sessions_unique_stripe_session_id": {
+                "table": "checkout_sessions",
+                "columns": ("stripe_session_id",),
+                "unique": True,
+                "predicate": "stripe_session_id IS NOT NULL",
+            },
+            "checkout_sessions_unique_idempotency_key": {
+                "table": "checkout_sessions",
+                "columns": ("idempotency_key",),
+                "unique": True,
+                "predicate": "idempotency_key IS NOT NULL",
+            },
+            "users_unique_stripe_subscription": {
+                "table": "users",
+                "columns": ("stripe_subscription_id",),
+                "unique": True,
+                "predicate": "stripe_subscription_id IS NOT NULL",
+            },
+            "users_unique_stripe_customer": {
+                "table": "users",
+                "columns": ("stripe_customer_id",),
+                "unique": True,
+                "predicate": "stripe_customer_id IS NOT NULL",
+            },
+            "stripe_links_unique_subscription_user": {
+                "table": "stripe_links",
+                "columns": ("stripe_subscription_id",),
+                "unique": True,
+                "predicate": "stripe_subscription_id IS NOT NULL",
+            },
+        },
+        "requires_payment_integrity_clean": True,
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
@@ -465,6 +506,100 @@ def present_indexes(cur):
     return {row[0] for row in cur.fetchall()}
 
 
+def normalize_index_predicate(predicate):
+    if predicate is None:
+        return None
+    text = re.sub(r"\s+", " ", str(predicate)).strip().lower()
+    while text.startswith("(") and text.endswith(")"):
+        inner = text[1:-1].strip()
+        if inner.count("(") != inner.count(")"):
+            break
+        text = inner
+    return text
+
+
+def index_structure_matches(cur, index_name, table, columns, unique=True, predicate=None):
+    cur.execute(
+        """
+        SELECT
+            i.indisunique,
+            pg_get_expr(i.indpred, i.indrelid) AS predicate,
+            array_agg(a.attname ORDER BY ord.ordinality) AS columns
+        FROM pg_class idx
+        JOIN pg_index i ON i.indexrelid = idx.oid
+        JOIN pg_class tbl ON tbl.oid = i.indrelid
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
+        JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = ord.attnum
+        WHERE ns.nspname = 'public'
+          AND idx.relname = %s
+          AND tbl.relname = %s
+        GROUP BY i.indisunique, i.indpred, i.indrelid
+        """,
+        (index_name, table),
+    )
+    row = cur.fetchone()
+    if not row:
+        return False
+    is_unique, actual_predicate, actual_columns = row
+    return (
+        bool(is_unique) is bool(unique)
+        and tuple(actual_columns or ()) == tuple(columns)
+        and normalize_index_predicate(actual_predicate) == normalize_index_predicate(predicate)
+    )
+
+
+def equivalent_index_structure_exists(cur, table, columns, unique=True, predicate=None):
+    cur.execute(
+        """
+        SELECT
+            idx.relname,
+            i.indisunique,
+            pg_get_expr(i.indpred, i.indrelid) AS predicate,
+            array_agg(a.attname ORDER BY ord.ordinality) AS columns
+        FROM pg_class idx
+        JOIN pg_index i ON i.indexrelid = idx.oid
+        JOIN pg_class tbl ON tbl.oid = i.indrelid
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
+        JOIN pg_attribute a ON a.attrelid = tbl.oid AND a.attnum = ord.attnum
+        WHERE ns.nspname = 'public'
+          AND tbl.relname = %s
+        GROUP BY idx.relname, i.indisunique, i.indpred, i.indrelid
+        """,
+        (table,),
+    )
+    expected_predicate = normalize_index_predicate(predicate)
+    expected_columns = tuple(columns)
+    for _name, is_unique, actual_predicate, actual_columns in cur.fetchall():
+        if (
+            bool(is_unique) is bool(unique)
+            and tuple(actual_columns or ()) == expected_columns
+            and normalize_index_predicate(actual_predicate) == expected_predicate
+        ):
+            return True
+    return False
+
+
+def payment_integrity_index_requirement_matches(cur, index_name, spec):
+    if index_structure_matches(
+        cur,
+        index_name,
+        spec["table"],
+        spec["columns"],
+        unique=spec.get("unique", True),
+        predicate=spec.get("predicate"),
+    ):
+        return True
+    return equivalent_index_structure_exists(
+        cur,
+        spec["table"],
+        spec["columns"],
+        unique=spec.get("unique", True),
+        predicate=spec.get("predicate"),
+    )
+
+
 def assert_no_stripe_identity_conflicts(cur):
     for table in ("users", "stripe_links"):
         cur.execute("SELECT to_regclass(%s)", (f"public.{table}",))
@@ -495,6 +630,36 @@ def assert_no_stripe_identity_conflicts(cur):
         raise MigrationError("Existing database has unresolved Stripe identity conflicts")
 
 
+PAYMENT_INTEGRITY_DUPLICATE_CHECKS = (
+    ("payment_events.stripe_event_id", "payment_events", "stripe_event_id", "COUNT(*)"),
+    ("checkout_sessions.stripe_session_id", "checkout_sessions", "stripe_session_id", "COUNT(*)"),
+    ("checkout_sessions.idempotency_key", "checkout_sessions", "idempotency_key", "COUNT(*)"),
+    ("users.stripe_customer_id", "users", "stripe_customer_id", "COUNT(*)"),
+    ("users.stripe_subscription_id", "users", "stripe_subscription_id", "COUNT(*)"),
+    ("stripe_links.stripe_subscription_id", "stripe_links", "stripe_subscription_id", "COUNT(DISTINCT telegram_id)"),
+    ("stripe_events.event_id", "stripe_events", "event_id", "COUNT(*)"),
+)
+
+
+def assert_no_payment_integrity_duplicates(cur):
+    for label, table, column, count_expr in PAYMENT_INTEGRITY_DUPLICATE_CHECKS:
+        if not table_exists(cur, table) or column not in present_columns(cur, table):
+            continue
+        cur.execute(
+            f"""
+            SELECT {column}
+            FROM {table}
+            WHERE {column} IS NOT NULL
+            GROUP BY {column}
+            HAVING {count_expr} > 1
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            raise MigrationError(f"Payment integrity guard blocked by duplicate {label}")
+
+
 def migration_schema_matches(cur, version):
     requirements = MIGRATION_BASELINE_REQUIREMENTS.get(version)
     if not requirements:
@@ -505,11 +670,19 @@ def migration_schema_matches(cur, version):
     for table, columns in requirements.get("columns", {}).items():
         if not set(columns) <= present_columns(cur, table):
             return False
-    required_indexes = set(requirements.get("indexes", ()))
-    if required_indexes and not required_indexes <= present_indexes(cur):
-        return False
+    required_indexes = requirements.get("indexes", ())
+    if isinstance(required_indexes, dict):
+        for index_name, spec in required_indexes.items():
+            if not payment_integrity_index_requirement_matches(cur, index_name, spec):
+                return False
+    else:
+        required_indexes = set(required_indexes)
+        if required_indexes and not required_indexes <= present_indexes(cur):
+            return False
     if requirements.get("requires_stripe_identity_clean"):
         assert_no_stripe_identity_conflicts(cur)
+    if requirements.get("requires_payment_integrity_clean"):
+        assert_no_payment_integrity_duplicates(cur)
     return True
 
 
@@ -572,6 +745,8 @@ def run_migrations(get_conn, migrations_dir=MIGRATIONS_DIR):
                 continue
             if MIGRATION_BASELINE_REQUIREMENTS.get(migration["version"], {}).get("requires_stripe_identity_clean"):
                 assert_no_stripe_identity_conflicts(cur)
+            if MIGRATION_BASELINE_REQUIREMENTS.get(migration["version"], {}).get("requires_payment_integrity_clean"):
+                assert_no_payment_integrity_duplicates(cur)
             try:
                 apply_migration(cur, migration)
                 conn.commit()
