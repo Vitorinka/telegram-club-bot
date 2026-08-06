@@ -13,6 +13,7 @@ import stripe
 import psycopg2
 import uuid
 from psycopg2 import pool as psycopg2_pool
+from psycopg2 import errors as psycopg2_errors
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -769,6 +770,406 @@ def insert_payment_event(
     ))
 
 
+STRIPE_IDENTITY_CONSTRAINT_MAP = {
+    "users_unique_stripe_subscription": ("users_subscription_conflict", "stripe_subscription_id"),
+    "users_unique_stripe_customer": ("users_customer_conflict", "stripe_customer_id"),
+    "stripe_links_unique_subscription_user": ("stripe_links_subscription_conflict", "stripe_subscription_id"),
+    "stripe_links_unique_customer_user": ("stripe_links_customer_conflict", "stripe_customer_id"),
+}
+
+
+class StripeIdentityConflictError(Exception):
+    def __init__(
+        self,
+        conflict_type,
+        stripe_id,
+        existing_telegram_id,
+        requested_telegram_id,
+        source,
+        constraint_name=None,
+    ):
+        super().__init__(conflict_type)
+        self.conflict_type = conflict_type
+        self.stripe_id = stripe_id
+        self.safe_stripe_id = safe_log_id(stripe_id)
+        self.existing_telegram_id = int(existing_telegram_id) if existing_telegram_id is not None else None
+        self.requested_telegram_id = int(requested_telegram_id) if requested_telegram_id is not None else None
+        self.source = source
+        self.constraint_name = constraint_name
+
+
+def stripe_identity_conflict_from_unique_violation(error, telegram_id, customer_id=None, subscription_id=None, source=None):
+    constraint_name = getattr(getattr(error, "diag", None), "constraint_name", None)
+    mapped = STRIPE_IDENTITY_CONSTRAINT_MAP.get(constraint_name)
+    if not mapped:
+        return None
+    conflict_type, id_kind = mapped
+    stripe_id = subscription_id if id_kind == "stripe_subscription_id" else customer_id
+    return StripeIdentityConflictError(
+        conflict_type,
+        stripe_id,
+        None,
+        telegram_id,
+        source or "unknown",
+        constraint_name=constraint_name,
+    )
+
+
+def stripe_identity_conflict_telegram_ids_text(conflict):
+    telegram_ids = sorted({
+        int(value)
+        for value in (conflict.existing_telegram_id, conflict.requested_telegram_id)
+        if value is not None
+    })
+    return json.dumps(telegram_ids, separators=(",", ":"))
+
+
+def populate_stripe_identity_conflict_owner(cur, conflict):
+    if conflict.existing_telegram_id is not None or not conflict.stripe_id:
+        return conflict
+    if "subscription" in conflict.conflict_type:
+        column = "stripe_subscription_id"
+    elif "customer" in conflict.conflict_type:
+        column = "stripe_customer_id"
+    else:
+        return conflict
+
+    cur.execute(
+        f"""
+        SELECT telegram_id
+        FROM users
+        WHERE {column} = %s
+        UNION
+        SELECT telegram_id
+        FROM stripe_links
+        WHERE {column} = %s
+        ORDER BY telegram_id
+        LIMIT 1
+        """,
+        (conflict.stripe_id, conflict.stripe_id),
+    )
+    row = cur.fetchone()
+    if row:
+        conflict.existing_telegram_id = int(row[0])
+    return conflict
+
+
+def known_stripe_identity_unique_violation_is_same_user(conflict):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        populate_stripe_identity_conflict_owner(cur, conflict)
+        return (
+            conflict.existing_telegram_id is not None
+            and conflict.requested_telegram_id is not None
+            and int(conflict.existing_telegram_id) == int(conflict.requested_telegram_id)
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
+def populate_known_stripe_identity_unique_violation_owner(conflict):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        populate_stripe_identity_conflict_owner(cur, conflict)
+        return conflict
+    finally:
+        cur.close()
+        conn.close()
+
+
+def stripe_identity_already_linked_for_user(telegram_id, customer_id=None, subscription_id=None):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT 1
+            FROM users
+            WHERE telegram_id = %s
+              AND (%s IS NULL OR stripe_customer_id = %s)
+              AND (%s IS NULL OR stripe_subscription_id = %s)
+            UNION
+            SELECT 1
+            FROM stripe_links
+            WHERE telegram_id = %s
+              AND (%s IS NULL OR stripe_customer_id = %s)
+              AND (%s IS NULL OR stripe_subscription_id = %s)
+            LIMIT 1
+            """,
+            (
+                telegram_id,
+                customer_id,
+                customer_id,
+                subscription_id,
+                subscription_id,
+                telegram_id,
+                customer_id,
+                customer_id,
+                subscription_id,
+                subscription_id,
+            ),
+        )
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def raise_stripe_identity_conflict(conflict_type, stripe_id, existing_telegram_id, requested_telegram_id, source):
+    if existing_telegram_id is None or int(existing_telegram_id) == int(requested_telegram_id):
+        return
+    raise StripeIdentityConflictError(
+        conflict_type,
+        stripe_id,
+        existing_telegram_id,
+        requested_telegram_id,
+        source,
+    )
+
+
+def assert_stripe_identity_available(cur, telegram_id, customer_id=None, subscription_id=None, source=None):
+    if not telegram_id:
+        return
+    telegram_id = int(telegram_id)
+    checks = (
+        ("users_subscription_conflict", "users", "stripe_subscription_id", subscription_id),
+        ("users_customer_conflict", "users", "stripe_customer_id", customer_id),
+        ("stripe_links_subscription_conflict", "stripe_links", "stripe_subscription_id", subscription_id),
+        ("stripe_links_customer_conflict", "stripe_links", "stripe_customer_id", customer_id),
+    )
+    for conflict_type, table, column, stripe_id in checks:
+        if not stripe_id:
+            continue
+        cur.execute(
+            f"""
+            SELECT telegram_id
+            FROM {table}
+            WHERE {column} = %s
+            FOR UPDATE
+            """,
+            (stripe_id,),
+        )
+        for (existing_telegram_id,) in cur.fetchall():
+            raise_stripe_identity_conflict(conflict_type, stripe_id, existing_telegram_id, telegram_id, source)
+
+    cur.execute(
+        """
+        SELECT telegram_id, stripe_customer_id, stripe_subscription_id
+        FROM users
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (telegram_id,),
+    )
+    user_row = cur.fetchone()
+
+    cur.execute(
+        """
+        SELECT telegram_id, stripe_customer_id, stripe_subscription_id
+        FROM stripe_links
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (telegram_id,),
+    )
+    cur.fetchall()
+
+
+def insert_stripe_identity_conflict(cur, conflict):
+    telegram_ids_text = stripe_identity_conflict_telegram_ids_text(conflict)
+    details = json.dumps(
+        {
+            "source": conflict.source,
+            "safe_stripe_id": conflict.safe_stripe_id,
+            "existing_telegram_id": conflict.existing_telegram_id,
+            "requested_telegram_id": conflict.requested_telegram_id,
+            "constraint_name": conflict.constraint_name,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    cur.execute(
+        """
+        INSERT INTO stripe_identity_conflicts (
+            conflict_type, stripe_id, telegram_ids, details, resolved, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, FALSE, NOW(), NOW())
+        ON CONFLICT (conflict_type, stripe_id, telegram_ids) WHERE resolved IS NOT TRUE
+        DO UPDATE SET
+            details = COALESCE(stripe_identity_conflicts.details, EXCLUDED.details),
+            updated_at = NOW()
+        """,
+        (
+            conflict.conflict_type,
+            conflict.stripe_id,
+            telegram_ids_text,
+            details,
+        ),
+    )
+
+
+def persist_stripe_identity_conflict_audit(
+    conflict,
+    event_id,
+    event_type,
+    invoice_id=None,
+    checkout_session_id=None,
+    amount_paid=None,
+    currency=None,
+    billing_reason=None,
+    period_end=None,
+):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        populate_stripe_identity_conflict_owner(cur, conflict)
+        insert_stripe_identity_conflict(cur, conflict)
+        save_unlinked_stripe_event(
+            cur,
+            event_id,
+            event_type,
+            invoice_id=invoice_id,
+            stripe_customer_id=conflict.stripe_id if "customer" in conflict.conflict_type else None,
+            stripe_subscription_id=conflict.stripe_id if "subscription" in conflict.conflict_type else None,
+            customer_email=None,
+            amount_paid=amount_paid,
+            currency=currency,
+            billing_reason=billing_reason,
+            period_end=period_end,
+            raw_summary=(
+                f"stripe_identity_conflict; type={conflict.conflict_type}; "
+                f"safe_stripe_id={conflict.safe_stripe_id}; source={conflict.source}"
+            ),
+        )
+        enqueue_admin_payment_problem_safely(
+            cur,
+            event_id=event_id,
+            purpose="stripe_identity_conflict",
+            stage=conflict.source,
+            telegram_id=conflict.requested_telegram_id,
+            category="invalid_checkout_metadata",
+            stripe_retry="нет",
+            recovery_reminder="не применимо",
+            safe_ref=safe_admin_context_reference(
+                "stripe_identity_conflict",
+                conflict.conflict_type,
+                conflict.safe_stripe_id,
+                conflict.existing_telegram_id,
+                conflict.requested_telegram_id,
+            ),
+            note=(
+                f"conflict_type: {conflict.conflict_type}\n"
+                f"stripe_id: {conflict.safe_stripe_id}\n"
+                f"existing_telegram_id: {conflict.existing_telegram_id or 'unknown'}\n"
+                f"requested_telegram_id: {conflict.requested_telegram_id or 'unknown'}\n"
+                "Платёжная транзакция откатилась. Доступ и Stripe-связи не изменены."
+            ),
+            severity="CRITICAL",
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def finalize_stripe_identity_conflict_response(conflict, event_id, event_type, **audit_kwargs):
+    try:
+        persist_stripe_identity_conflict_audit(
+            conflict,
+            event_id,
+            event_type,
+            **audit_kwargs,
+        )
+    except Exception as audit_error:
+        await release_event_processing(event_id)
+        logging.exception(
+            "STRIPE_IDENTITY_CONFLICT_AUDIT_FAILED: event_id=%s, event.type=%s, "
+            "source=%s, conflict_type=%s, stripe_id=%s, error=%s",
+            safe_log_id(event_id),
+            event_type,
+            conflict.source,
+            conflict.conflict_type,
+            conflict.safe_stripe_id,
+            audit_error,
+        )
+        await enqueue_admin_payment_problem_now(
+            event_id=event_id,
+            purpose="stripe_identity_conflict_audit_failed",
+            stage=conflict.source or "webhook",
+            telegram_id=conflict.requested_telegram_id,
+            category="webhook_processing_failed",
+            exception=audit_error,
+            stripe_retry="да",
+            recovery_reminder="не применимо",
+            safe_ref=safe_admin_error_reference("stripe_identity_conflict_audit", audit_error),
+            note="Webhook вернул 500, Stripe повторит событие. Identity conflict audit не сохранён.",
+        )
+        return web.Response(status=500)
+    await mark_event_processed(event_id)
+    return web.Response(status=200)
+
+
+async def finalize_stripe_identity_unique_violation_webhook_response(
+    error,
+    requested_telegram_id,
+    customer_id,
+    subscription_id,
+    source,
+    event_id,
+    event_type,
+    **audit_kwargs,
+):
+    conflict = stripe_identity_conflict_from_unique_violation(
+        error,
+        requested_telegram_id,
+        customer_id=customer_id,
+        subscription_id=subscription_id,
+        source=source,
+    )
+    if not conflict:
+        raise error
+
+    populate_known_stripe_identity_unique_violation_owner(conflict)
+    if conflict.requested_telegram_id is None or conflict.existing_telegram_id is None:
+        logging.warning(
+            "STRIPE_IDENTITY_UNIQUE_OWNER_UNKNOWN: event_id=%s, event.type=%s, "
+            "source=%s, conflict_type=%s, stripe_id=%s; event claim will be released",
+            safe_log_id(event_id),
+            event_type,
+            source,
+            conflict.conflict_type,
+            conflict.safe_stripe_id,
+        )
+        await release_event_processing(event_id)
+        return web.Response(status=500)
+    if int(conflict.existing_telegram_id) == int(conflict.requested_telegram_id):
+        logging.warning(
+            "STRIPE_IDENTITY_SAME_USER_UNIQUE_RACE: event_id=%s, event.type=%s, "
+            "source=%s, conflict_type=%s, stripe_id=%s, telegram_id=%s; "
+            "event claim will be released for Stripe retry",
+            safe_log_id(event_id),
+            event_type,
+            source,
+            conflict.conflict_type,
+            conflict.safe_stripe_id,
+            conflict.requested_telegram_id,
+        )
+        await release_event_processing(event_id)
+        return web.Response(status=500)
+    return await finalize_stripe_identity_conflict_response(
+        conflict,
+        event_id,
+        event_type,
+        **audit_kwargs,
+    )
+
+
 def upsert_stripe_link(
     cur,
     telegram_id,
@@ -788,6 +1189,81 @@ def upsert_stripe_link(
         if isinstance(current_period_end, datetime)
         else stripe_period_to_datetime(current_period_end)
     )
+    if stripe_subscription_id:
+        cur.execute(
+            """
+            SELECT telegram_id
+            FROM stripe_links
+            WHERE stripe_subscription_id = %s
+            FOR UPDATE
+            """,
+            (stripe_subscription_id,),
+        )
+        existing_row = cur.fetchone()
+        if existing_row:
+            existing_telegram_id = int(existing_row[0])
+            if existing_telegram_id != int(telegram_id):
+                raise_stripe_identity_conflict(
+                    "stripe_links_subscription_conflict",
+                    stripe_subscription_id,
+                    existing_telegram_id,
+                    telegram_id,
+                    source,
+                )
+            cur.execute(
+                """
+                UPDATE stripe_links
+                SET stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                    customer_email = COALESCE(%s, customer_email),
+                    status = COALESCE(%s, status),
+                    current_period_end = COALESCE(%s, current_period_end),
+                    is_active = %s,
+                    source = COALESCE(%s, source),
+                    updated_at = NOW()
+                WHERE stripe_subscription_id = %s
+                  AND telegram_id = %s
+                """,
+                (
+                    stripe_customer_id,
+                    customer_email,
+                    status,
+                    current_period_end_dt,
+                    bool(is_active),
+                    source,
+                    stripe_subscription_id,
+                    int(telegram_id),
+                ),
+            )
+            return
+
+        cur.execute(
+            """
+            INSERT INTO stripe_links (
+                telegram_id,
+                stripe_customer_id,
+                stripe_subscription_id,
+                customer_email,
+                status,
+                current_period_end,
+                is_active,
+                source,
+                updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                int(telegram_id),
+                stripe_customer_id,
+                stripe_subscription_id,
+                customer_email,
+                status,
+                current_period_end_dt,
+                bool(is_active),
+                source,
+            ),
+        )
+        return
+
     cur.execute("""
         INSERT INTO stripe_links (
             telegram_id,
@@ -832,6 +1308,32 @@ def mark_stripe_link_subscription_terminal(cur, stripe_subscription_id, status):
             updated_at = NOW()
         WHERE stripe_subscription_id = %s
     """, (status, stripe_subscription_id))
+
+
+def assert_existing_subscription_identity_available(cur, stripe_subscription_id, customer_id=None, source=None):
+    if not stripe_subscription_id:
+        return None
+    cur.execute(
+        """
+        SELECT telegram_id
+        FROM users
+        WHERE stripe_subscription_id = %s
+        FOR UPDATE
+        """,
+        (stripe_subscription_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    telegram_id = row[0]
+    assert_stripe_identity_available(
+        cur,
+        telegram_id,
+        customer_id=customer_id,
+        subscription_id=stripe_subscription_id,
+        source=source,
+    )
+    return telegram_id
 
 
 def find_telegram_id_for_stripe(cur, metadata_telegram_id=None, stripe_subscription_id=None, stripe_customer_id=None):
@@ -9856,6 +10358,7 @@ ADMIN_MENU_SECTIONS = {
             "/restore_access <telegram_id> — восстановить вход в закрытый клуб",
             "/unlinked_stripe — показать Stripe оплаты без пользователя",
             "/stripe_links <telegram_id> — показать Stripe связи пользователя",
+            "/stripe_conflicts — показать unresolved Stripe identity conflicts",
             "/duplicate_subscriptions — показать Stripe customers с несколькими подписками",
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id> — связать Stripe с пользователем",
             "/send_invite_link <telegram_id> — отправить invite link",
@@ -10645,6 +11148,14 @@ async def stripe_webhook(request):
                     )
                     return {"applied": False, "manual_review": True, "reason": checkout_review_reason}
 
+                assert_stripe_identity_available(
+                    cur,
+                    user_id,
+                    customer_id=customer_id,
+                    subscription_id=sub_id,
+                    source=source_event_type,
+                )
+
                 cur.execute("SELECT paid, expiry_date, first_payment_done, payment_failed FROM users WHERE telegram_id = %s", (int(user_id),))
                 row = cur.fetchone()
                 now = datetime.utcnow()
@@ -10860,6 +11371,54 @@ async def stripe_webhook(request):
                     safe_log_id(sub_id),
                 )
                 return {"applied": True, "new_expiry": new_expiry}
+            except StripeIdentityConflictError as conflict:
+                conn.rollback()
+                return {
+                    "applied": False,
+                    "identity_conflict_response": await finalize_stripe_identity_conflict_response(
+                    conflict,
+                    event_id,
+                    event_type,
+                    checkout_session_id=session_id,
+                    amount_paid=stripe_value(session, 'amount_total'),
+                    currency=stripe_value(session, 'currency'),
+                    ),
+                }
+            except psycopg2_errors.UniqueViolation as e:
+                conn.rollback()
+                conflict = stripe_identity_conflict_from_unique_violation(
+                    e,
+                    user_id,
+                    customer_id=customer_id,
+                    subscription_id=sub_id,
+                    source=source_event_type,
+                )
+                if not conflict:
+                    raise
+                if known_stripe_identity_unique_violation_is_same_user(conflict):
+                    logging.warning(
+                        "STRIPE_IDENTITY_SAME_USER_UNIQUE_RACE: event_id=%s, event.type=%s, "
+                        "source=%s, conflict_type=%s, stripe_id=%s, telegram_id=%s; "
+                        "event claim will be released for Stripe retry",
+                        safe_log_id(event_id),
+                        event_type,
+                        source_event_type,
+                        conflict.conflict_type,
+                        conflict.safe_stripe_id,
+                        user_id,
+                    )
+                    raise
+                return {
+                    "applied": False,
+                    "identity_conflict_response": await finalize_stripe_identity_conflict_response(
+                    conflict,
+                    event_id,
+                    event_type,
+                    checkout_session_id=session_id,
+                    amount_paid=stripe_value(session, 'amount_total'),
+                    currency=stripe_value(session, 'currency'),
+                    ),
+                }
             except Exception:
                 conn.rollback()
                 raise
@@ -11065,6 +11624,13 @@ async def stripe_webhook(request):
                 conn = get_db_conn()
                 cur = conn.cursor()
                 try:
+                    assert_stripe_identity_available(
+                        cur,
+                        user_id,
+                        customer_id=customer_id,
+                        subscription_id=sub_id,
+                        source="checkout.session.completed",
+                    )
                     if not sub_id:
                         cur.execute("""
                             INSERT INTO users (
@@ -11157,6 +11723,43 @@ async def stripe_webhook(request):
                     )
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
+                except StripeIdentityConflictError as conflict:
+                    conn.rollback()
+                    return await finalize_stripe_identity_conflict_response(
+                        conflict,
+                        event_id,
+                        event_type,
+                        checkout_session_id=stripe_value(session, 'id'),
+                    )
+                except psycopg2_errors.UniqueViolation as e:
+                    conn.rollback()
+                    conflict = stripe_identity_conflict_from_unique_violation(
+                        e,
+                        user_id,
+                        customer_id=customer_id,
+                        subscription_id=sub_id,
+                        source="checkout.session.completed",
+                    )
+                    if not conflict:
+                        raise
+                    if known_stripe_identity_unique_violation_is_same_user(conflict):
+                        logging.warning(
+                            "STRIPE_IDENTITY_SAME_USER_UNIQUE_RACE: event_id=%s, event.type=%s, "
+                            "source=checkout.session.completed, conflict_type=%s, stripe_id=%s, "
+                            "telegram_id=%s; event claim will be released for Stripe retry",
+                            safe_log_id(event_id),
+                            event_type,
+                            conflict.conflict_type,
+                            conflict.safe_stripe_id,
+                            user_id,
+                        )
+                        raise
+                    return await finalize_stripe_identity_conflict_response(
+                        conflict,
+                        event_id,
+                        event_type,
+                        checkout_session_id=stripe_value(session, 'id'),
+                    )
                 except Exception as e:
                     conn.rollback()
                     logging.exception(
@@ -11344,7 +11947,7 @@ async def stripe_webhook(request):
                 return web.Response(status=200)
 
             try:
-                await apply_paid_checkout_access(
+                checkout_apply_result = await apply_paid_checkout_access(
                     session,
                     user_id,
                     days_to_add,
@@ -11354,6 +11957,8 @@ async def stripe_webhook(request):
                     checkout_action,
                     "checkout.session.completed",
                 )
+                if checkout_apply_result.get("identity_conflict_response"):
+                    return checkout_apply_result["identity_conflict_response"]
             except Exception as e:
                 logging.exception(
                     f"Ошибка обработки checkout.session.completed: event_id={safe_log_id(event_id)}, "
@@ -11412,6 +12017,7 @@ async def stripe_webhook(request):
 
             conn = get_db_conn()
             cur = conn.cursor()
+            linked_telegram_id = None
 
             try:
                 if not sub_id:
@@ -11589,6 +12195,14 @@ async def stripe_webhook(request):
                         await mark_event_processed(event_id)
                         return web.Response(status=200)
 
+                    assert_stripe_identity_available(
+                        cur,
+                        linked_telegram_id,
+                        customer_id=customer_id,
+                        subscription_id=sub_id,
+                        source="invoice.payment_succeeded",
+                    )
+
                     trial_expiry = datetime.utcfromtimestamp(int(trial_end))
                     cur.execute("""
                         WITH target AS (
@@ -11719,7 +12333,23 @@ async def stripe_webhook(request):
                         )
                         metadata_telegram_id = None
 
-                if metadata_telegram_id:
+                linked_telegram_id = metadata_telegram_id
+                link_source = "metadata.telegram_id" if metadata_telegram_id else None
+                if not linked_telegram_id:
+                    linked_telegram_id, link_source = find_telegram_id_for_stripe(
+                        cur,
+                        stripe_subscription_id=sub_id,
+                        stripe_customer_id=customer_id,
+                    )
+
+                if linked_telegram_id:
+                    assert_stripe_identity_available(
+                        cur,
+                        linked_telegram_id,
+                        customer_id=customer_id,
+                        subscription_id=sub_id,
+                        source="invoice.payment_succeeded",
+                    )
                     cur.execute("""
                         WITH target AS (
                             SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
@@ -11750,7 +12380,7 @@ async def stripe_webhook(request):
                         WHERE users.telegram_id = target.telegram_id
                         RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
-                        metadata_telegram_id,
+                        linked_telegram_id,
                         stripe_period_expiry,
                         stripe_period_expiry,
                         sub_id,
@@ -11765,155 +12395,7 @@ async def stripe_webhook(request):
                         old_expiry = row[1]
                         was_payment_failed = row[2]
                         effective_expiry = row[3]
-
-                if not row:
-                    cur.execute("""
-                        WITH target AS (
-                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
-                            FROM users
-                            WHERE stripe_subscription_id = %s
-                        )
-                        UPDATE users
-                        SET expiry_date = CASE
-                                WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                                ELSE %s
-                            END,
-                            paid = TRUE,
-                            stripe_subscription_id = %s,
-                            stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
-                            payment_failed = FALSE,
-                            payment_failed_at = NULL,
-                            last_payment_succeeded_at = NOW(),
-                            last_successful_invoice_created_at = COALESCE(
-                                GREATEST(users.last_successful_invoice_created_at, %s),
-                                users.last_successful_invoice_created_at,
-                                %s
-                            ),
-                            grace_period_end = NULL,
-                            reminder_sent = FALSE,
-                            auto_renew = TRUE,
-                            blocked_bot = FALSE,
-                            first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
-                        FROM target
-                        WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
-                    """, (
-                        sub_id,
-                        stripe_period_expiry,
-                        stripe_period_expiry,
-                        sub_id,
-                        customer_id,
-                        event_created_at,
-                        event_created_at,
-                        payment_kind == "initial_subscription",
-                    ))
-
-                    row = cur.fetchone()
-                    if row:
-                        old_expiry = row[1]
-                        was_payment_failed = row[2]
-                        effective_expiry = row[3]
-
-                if not row and customer_id:
-                    cur.execute("""
-                        WITH target AS (
-                            SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
-                            FROM users
-                            WHERE stripe_customer_id = %s
-                        )
-                        UPDATE users
-                        SET expiry_date = CASE
-                                WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                                ELSE %s
-                            END,
-                            paid = TRUE,
-                            stripe_subscription_id = %s,
-                            stripe_customer_id = %s,
-                            payment_failed = FALSE,
-                            payment_failed_at = NULL,
-                            last_payment_succeeded_at = NOW(),
-                            last_successful_invoice_created_at = COALESCE(
-                                GREATEST(users.last_successful_invoice_created_at, %s),
-                                users.last_successful_invoice_created_at,
-                                %s
-                            ),
-                            grace_period_end = NULL,
-                            reminder_sent = FALSE,
-                            auto_renew = TRUE,
-                            blocked_bot = FALSE,
-                            first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
-                        FROM target
-                        WHERE users.telegram_id = target.telegram_id
-                        RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
-                    """, (
-                        customer_id,
-                        stripe_period_expiry,
-                        stripe_period_expiry,
-                        sub_id,
-                        customer_id,
-                        event_created_at,
-                        event_created_at,
-                        payment_kind == "initial_subscription",
-                    ))
-
-                    row = cur.fetchone()
-                    if row:
-                        old_expiry = row[1]
-                        was_payment_failed = row[2]
-                        effective_expiry = row[3]
-
-                if not row:
-                    linked_telegram_id, link_source = find_telegram_id_for_stripe(
-                        cur,
-                        stripe_subscription_id=sub_id,
-                        stripe_customer_id=customer_id,
-                    )
-                    if linked_telegram_id:
-                        cur.execute("""
-                            WITH target AS (
-                                SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
-                                FROM users
-                                WHERE telegram_id = %s
-                            )
-                            UPDATE users
-                            SET expiry_date = CASE
-                                    WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                                    ELSE %s
-                                END,
-                                paid = TRUE,
-                                stripe_subscription_id = %s,
-                                stripe_customer_id = COALESCE(%s, users.stripe_customer_id),
-                                payment_failed = FALSE,
-                                payment_failed_at = NULL,
-                                last_payment_succeeded_at = NOW(),
-                                last_successful_invoice_created_at = COALESCE(
-                                    GREATEST(users.last_successful_invoice_created_at, %s),
-                                    users.last_successful_invoice_created_at,
-                                    %s
-                                ),
-                                grace_period_end = NULL,
-                                reminder_sent = FALSE,
-                                auto_renew = TRUE,
-                                blocked_bot = FALSE,
-                                first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END
-                            FROM target
-                            WHERE users.telegram_id = target.telegram_id
-                            RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
-                        """, (
-                            linked_telegram_id,
-                            stripe_period_expiry,
-                            stripe_period_expiry,
-                            sub_id,
-                            customer_id,
-                            event_created_at,
-                            event_created_at,
-                            payment_kind == "initial_subscription",
-                        ))
-                        row = cur.fetchone()
-                        if row:
-                            old_expiry = row[1]
-                            was_payment_failed = row[2]
-                            effective_expiry = row[3]
+                        if link_source != "metadata.telegram_id":
                             logging.info(
                                 "STRIPE_USER_RESOLVED_VIA_LINK: event_id=%s, event.type=%s, telegram_id=%s, "
                                 "source=%s, customer_id=%s, subscription_id=%s",
@@ -12195,6 +12677,53 @@ async def stripe_webhook(request):
                     effective_expiry,
                 )
 
+            except StripeIdentityConflictError as conflict:
+                conn.rollback()
+                return await finalize_stripe_identity_conflict_response(
+                    conflict,
+                    event_id,
+                    event_type,
+                    invoice_id=invoice_id,
+                    amount_paid=amount_paid,
+                    currency=stripe_value(invoice, 'currency'),
+                    billing_reason=billing_reason,
+                    period_end=current_period_end,
+                )
+
+            except psycopg2_errors.UniqueViolation as e:
+                conn.rollback()
+                conflict = stripe_identity_conflict_from_unique_violation(
+                    e,
+                    linked_telegram_id,
+                    customer_id=customer_id,
+                    subscription_id=sub_id,
+                    source="invoice.payment_succeeded",
+                )
+                if not conflict:
+                    raise
+                if known_stripe_identity_unique_violation_is_same_user(conflict):
+                    logging.warning(
+                        "STRIPE_IDENTITY_SAME_USER_UNIQUE_RACE: event_id=%s, event.type=%s, "
+                        "source=invoice.payment_succeeded, conflict_type=%s, stripe_id=%s, "
+                        "telegram_id=%s; event claim will be released for Stripe retry",
+                        safe_log_id(event_id),
+                        event_type,
+                        conflict.conflict_type,
+                        conflict.safe_stripe_id,
+                        linked_telegram_id,
+                    )
+                    raise
+                return await finalize_stripe_identity_conflict_response(
+                    conflict,
+                    event_id,
+                    event_type,
+                    invoice_id=invoice_id,
+                    amount_paid=amount_paid,
+                    currency=stripe_value(invoice, 'currency'),
+                    billing_reason=billing_reason,
+                    period_end=current_period_end,
+                )
+
             except Exception as e:
                 conn.rollback()
                 logging.exception(
@@ -12307,7 +12836,14 @@ async def stripe_webhook(request):
                     trial_expiry = datetime.utcfromtimestamp(int(trial_end))
                     conn = get_db_conn()
                     cur = conn.cursor()
+                    payment_failed_requested_telegram_id = None
                     try:
+                        payment_failed_requested_telegram_id = assert_existing_subscription_identity_available(
+                            cur,
+                            sub_id,
+                            customer_id=customer_id_for_db,
+                            source="invoice.payment_failed",
+                        )
                         cur.execute("""
                             UPDATE users
                             SET paid = TRUE,
@@ -12390,6 +12926,32 @@ async def stripe_webhook(request):
                             )
 
                         conn.commit()
+                    except StripeIdentityConflictError as conflict:
+                        conn.rollback()
+                        return await finalize_stripe_identity_conflict_response(
+                            conflict,
+                            event_id,
+                            event_type,
+                            invoice_id=invoice_id,
+                            currency=stripe_value(invoice, 'currency'),
+                            billing_reason=billing_reason,
+                            period_end=trial_end,
+                        )
+                    except psycopg2_errors.UniqueViolation as e:
+                        conn.rollback()
+                        return await finalize_stripe_identity_unique_violation_webhook_response(
+                            e,
+                            payment_failed_requested_telegram_id,
+                            customer_id_for_db,
+                            sub_id,
+                            "invoice.payment_failed",
+                            event_id,
+                            event_type,
+                            invoice_id=invoice_id,
+                            currency=stripe_value(invoice, 'currency'),
+                            billing_reason=billing_reason,
+                            period_end=trial_end,
+                        )
                     except Exception as e:
                         conn.rollback()
                         logging.exception(
@@ -12452,6 +13014,26 @@ async def stripe_webhook(request):
                 stale_payment_failed_alert_key = None
                 conn = get_db_conn()
                 cur = conn.cursor()
+                payment_failed_requested_telegram_id = None
+                try:
+                    payment_failed_requested_telegram_id = assert_existing_subscription_identity_available(
+                        cur,
+                        sub_id,
+                        customer_id=customer_id_for_db,
+                        source="invoice.payment_failed",
+                    )
+                except StripeIdentityConflictError as conflict:
+                    conn.rollback()
+                    cur.close()
+                    conn.close()
+                    return await finalize_stripe_identity_conflict_response(
+                        conflict,
+                        event_id,
+                        event_type,
+                        invoice_id=invoice_id,
+                        currency=stripe_value(invoice, 'currency'),
+                        billing_reason=billing_reason,
+                    )
                 cur.execute(
                     """
                     SELECT last_successful_invoice_created_at
@@ -12518,18 +13100,35 @@ async def stripe_webhook(request):
                     )
                     await mark_event_processed(event_id)
                     return web.Response(status=200)
-                cur.execute("""
-                    UPDATE users
-                    SET payment_failed = TRUE,
-                        payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                        grace_period_end = GREATEST(
-                            COALESCE(grace_period_end, NOW()),
-                            NOW() + (%s * INTERVAL '1 hour')
-                        ),
-                        stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                    WHERE stripe_subscription_id = %s
-                    RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
-                """, (PAYMENT_RETRY_GRACE_HOURS, customer_id_for_db, sub_id))
+                try:
+                    cur.execute("""
+                        UPDATE users
+                        SET payment_failed = TRUE,
+                            payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                            grace_period_end = GREATEST(
+                                COALESCE(grace_period_end, NOW()),
+                                NOW() + (%s * INTERVAL '1 hour')
+                            ),
+                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                        WHERE stripe_subscription_id = %s
+                        RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
+                    """, (PAYMENT_RETRY_GRACE_HOURS, customer_id_for_db, sub_id))
+                except psycopg2_errors.UniqueViolation as e:
+                    conn.rollback()
+                    cur.close()
+                    conn.close()
+                    return await finalize_stripe_identity_unique_violation_webhook_response(
+                        e,
+                        payment_failed_requested_telegram_id,
+                        customer_id_for_db,
+                        sub_id,
+                        "invoice.payment_failed",
+                        event_id,
+                        event_type,
+                        invoice_id=invoice_id,
+                        currency=stripe_value(invoice, 'currency'),
+                        billing_reason=billing_reason,
+                    )
                 row = cur.fetchone()
                 if not row and customer_id_for_db:
                     cur.execute("""
@@ -12541,26 +13140,43 @@ async def stripe_webhook(request):
                     customer_matches = cur.fetchall()
                     customer_match = customer_matches[0] if len(customer_matches) == 1 else None
                     if customer_match and should_apply_failed_invoice_to_user(customer_match[1], sub_id):
-                        cur.execute("""
-                            UPDATE users
-                            SET payment_failed = TRUE,
-                                payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                                grace_period_end = GREATEST(
-                                    COALESCE(grace_period_end, NOW()),
-                                    NOW() + (%s * INTERVAL '1 hour')
-                                ),
-                                stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                            WHERE stripe_customer_id = %s
-                              AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)
-                            RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
-                        """, (
-                            PAYMENT_RETRY_GRACE_HOURS,
-                            sub_id,
-                            customer_id_for_db,
-                            customer_id_for_db,
-                            sub_id,
-                        ))
+                        try:
+                            cur.execute("""
+                                UPDATE users
+                                SET payment_failed = TRUE,
+                                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                                    grace_period_end = GREATEST(
+                                        COALESCE(grace_period_end, NOW()),
+                                        NOW() + (%s * INTERVAL '1 hour')
+                                    ),
+                                    stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
+                                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                                WHERE stripe_customer_id = %s
+                                  AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)
+                                RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
+                            """, (
+                                PAYMENT_RETRY_GRACE_HOURS,
+                                sub_id,
+                                customer_id_for_db,
+                                customer_id_for_db,
+                                sub_id,
+                            ))
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                payment_failed_requested_telegram_id,
+                                customer_id_for_db,
+                                sub_id,
+                                "invoice.payment_failed",
+                                event_id,
+                                event_type,
+                                invoice_id=invoice_id,
+                                currency=stripe_value(invoice, 'currency'),
+                                billing_reason=billing_reason,
+                            )
                         row = cur.fetchone()
                     else:
                         if customer_match:
@@ -12748,11 +13364,10 @@ async def stripe_webhook(request):
                                 ELSE FALSE
                             END,
                             auto_renew = FALSE,
-                            stripe_subscription_id = NULL,
-                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                            stripe_subscription_id = NULL
                         WHERE stripe_subscription_id = %s
                         RETURNING telegram_id, paid, expiry_date
-                    """, (customer_id, sub_id))
+                    """, (sub_id,))
                     row = cur.fetchone()
                     mark_stripe_link_subscription_terminal(cur, sub_id, status or "canceled")
                     conn.commit()
@@ -12863,49 +13478,94 @@ async def stripe_webhook(request):
                             )
                     conn = get_db_conn()
                     cur = conn.cursor()
+                    subscription_update_requested_telegram_id = None
+                    try:
+                        subscription_update_requested_telegram_id = assert_existing_subscription_identity_available(
+                            cur,
+                            sub_id,
+                            customer_id=customer_id,
+                            source="customer.subscription.updated",
+                        )
+                    except StripeIdentityConflictError as conflict:
+                        conn.rollback()
+                        cur.close()
+                        conn.close()
+                        return await finalize_stripe_identity_conflict_response(
+                            conflict,
+                            event_id,
+                            event_type,
+                        )
                     if negative_update_skipped:
-                        cur.execute("""
-                            UPDATE users
-                            SET last_subscription_state_event_created_at = GREATEST(
-                                    COALESCE(last_subscription_state_event_created_at, %s),
-                                    %s
-                                ),
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                            WHERE stripe_subscription_id = %s
-                        """, (event_created_at, event_created_at, customer_id, sub_id))
+                        try:
+                            cur.execute("""
+                                UPDATE users
+                                SET last_subscription_state_event_created_at = GREATEST(
+                                        COALESCE(last_subscription_state_event_created_at, %s),
+                                        %s
+                                    ),
+                                    stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                                WHERE stripe_subscription_id = %s
+                            """, (event_created_at, event_created_at, customer_id, sub_id))
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
                         row = None
                     else:
-                        cur.execute("""
-                            UPDATE users
-                            SET auto_renew = %s,
-                                payment_failed = TRUE,
-                                payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                                grace_period_end = GREATEST(
-                                    COALESCE(grace_period_end, NOW()),
-                                    NOW() + (%s * INTERVAL '1 hour')
-                                ),
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                                last_subscription_state_event_created_at = GREATEST(
-                                    COALESCE(last_subscription_state_event_created_at, %s),
-                                    %s
-                                )
-                            WHERE stripe_subscription_id = %s
-                              AND (
-                                    %s IS NULL
-                                    OR last_subscription_state_event_created_at IS NULL
-                                    OR %s >= last_subscription_state_event_created_at
-                              )
-                            RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
-                        """, (
-                            not cancel_at_period_end,
-                            PAYMENT_RETRY_GRACE_HOURS,
-                            customer_id,
-                            event_created_at,
-                            event_created_at,
-                            sub_id,
-                            event_created_at,
-                            event_created_at,
-                        ))
+                        try:
+                            cur.execute("""
+                                UPDATE users
+                                SET auto_renew = %s,
+                                    payment_failed = TRUE,
+                                    payment_failed_at = COALESCE(payment_failed_at, NOW()),
+                                    grace_period_end = GREATEST(
+                                        COALESCE(grace_period_end, NOW()),
+                                        NOW() + (%s * INTERVAL '1 hour')
+                                    ),
+                                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                                    last_subscription_state_event_created_at = GREATEST(
+                                        COALESCE(last_subscription_state_event_created_at, %s),
+                                        %s
+                                    )
+                                WHERE stripe_subscription_id = %s
+                                  AND (
+                                        %s IS NULL
+                                        OR last_subscription_state_event_created_at IS NULL
+                                        OR %s >= last_subscription_state_event_created_at
+                                  )
+                                RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
+                            """, (
+                                not cancel_at_period_end,
+                                PAYMENT_RETRY_GRACE_HOURS,
+                                customer_id,
+                                event_created_at,
+                                event_created_at,
+                                sub_id,
+                                event_created_at,
+                                event_created_at,
+                            ))
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
                         row = cur.fetchone()
                     logging.warning(
                         "SUBSCRIPTION_RETRY_STATE_MARKED: event_id=%s, event.type=%s, telegram_id=%s, "
@@ -12923,88 +13583,161 @@ async def stripe_webhook(request):
                         row[4] if row else None,
                     )
                     if row:
-                        upsert_stripe_link(
-                            cur,
-                            row[0],
-                            stripe_customer_id=customer_id,
-                            stripe_subscription_id=sub_id,
-                            status=status,
-                            current_period_end=current_period_end,
-                            is_active=False,
-                            source="customer.subscription.updated",
-                        )
+                        try:
+                            upsert_stripe_link(
+                                cur,
+                                row[0],
+                                stripe_customer_id=customer_id,
+                                stripe_subscription_id=sub_id,
+                                status=status,
+                                current_period_end=current_period_end,
+                                is_active=False,
+                                source="customer.subscription.updated",
+                            )
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
                 elif status in ("active", "trialing"):
                     conn = get_db_conn()
                     cur = conn.cursor()
-                    if subscription_expiry:
-                        cur.execute("""
-                            UPDATE users
-                            SET expiry_date = CASE
-                                    WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
-                                    ELSE %s
-                                END,
-                                reminder_sent = FALSE,
-                                auto_renew = %s,
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                                last_subscription_state_event_created_at = GREATEST(
-                                    COALESCE(last_subscription_state_event_created_at, %s),
-                                    %s
-                                )
-                            WHERE stripe_subscription_id = %s
-                              AND (
-                                    %s IS NULL
-                                    OR last_subscription_state_event_created_at IS NULL
-                                    OR %s >= last_subscription_state_event_created_at
-                              )
-                            RETURNING telegram_id, paid, expiry_date
-                        """, (
-                            subscription_expiry,
-                            subscription_expiry,
-                            not cancel_at_period_end,
-                            customer_id,
-                            event_created_at,
-                            event_created_at,
-                            sub_id,
-                            event_created_at,
-                            event_created_at,
-                        ))
-                    else:
-                        cur.execute("""
-                            UPDATE users
-                            SET auto_renew = %s,
-                                stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                                last_subscription_state_event_created_at = GREATEST(
-                                    COALESCE(last_subscription_state_event_created_at, %s),
-                                    %s
-                                )
-                            WHERE stripe_subscription_id = %s
-                              AND (
-                                    %s IS NULL
-                                    OR last_subscription_state_event_created_at IS NULL
-                                    OR %s >= last_subscription_state_event_created_at
-                              )
-                            RETURNING telegram_id, paid, expiry_date
-                        """, (
-                            not cancel_at_period_end,
-                            customer_id,
-                            event_created_at,
-                            event_created_at,
-                            sub_id,
-                            event_created_at,
-                            event_created_at,
-                        ))
-                    row = cur.fetchone()
-                    if row:
-                        upsert_stripe_link(
+                    subscription_update_requested_telegram_id = None
+                    try:
+                        subscription_update_requested_telegram_id = assert_existing_subscription_identity_available(
                             cur,
-                            row[0],
-                            stripe_customer_id=customer_id,
-                            stripe_subscription_id=sub_id,
-                            status=status,
-                            current_period_end=period_value,
-                            is_active=True,
+                            sub_id,
+                            customer_id=customer_id,
                             source="customer.subscription.updated",
                         )
+                    except StripeIdentityConflictError as conflict:
+                        conn.rollback()
+                        cur.close()
+                        conn.close()
+                        return await finalize_stripe_identity_conflict_response(
+                            conflict,
+                            event_id,
+                            event_type,
+                        )
+                    if subscription_expiry:
+                        try:
+                            cur.execute("""
+                                UPDATE users
+                                SET expiry_date = CASE
+                                        WHEN users.expiry_date IS NOT NULL AND users.expiry_date >= %s THEN users.expiry_date
+                                        ELSE %s
+                                    END,
+                                    reminder_sent = FALSE,
+                                    auto_renew = %s,
+                                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                                    last_subscription_state_event_created_at = GREATEST(
+                                        COALESCE(last_subscription_state_event_created_at, %s),
+                                        %s
+                                    )
+                                WHERE stripe_subscription_id = %s
+                                  AND (
+                                        %s IS NULL
+                                        OR last_subscription_state_event_created_at IS NULL
+                                        OR %s >= last_subscription_state_event_created_at
+                                  )
+                                RETURNING telegram_id, paid, expiry_date
+                            """, (
+                                subscription_expiry,
+                                subscription_expiry,
+                                not cancel_at_period_end,
+                                customer_id,
+                                event_created_at,
+                                event_created_at,
+                                sub_id,
+                                event_created_at,
+                                event_created_at,
+                            ))
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
+                    else:
+                        try:
+                            cur.execute("""
+                                UPDATE users
+                                SET auto_renew = %s,
+                                    stripe_customer_id = COALESCE(%s, stripe_customer_id),
+                                    last_subscription_state_event_created_at = GREATEST(
+                                        COALESCE(last_subscription_state_event_created_at, %s),
+                                        %s
+                                    )
+                                WHERE stripe_subscription_id = %s
+                                  AND (
+                                        %s IS NULL
+                                        OR last_subscription_state_event_created_at IS NULL
+                                        OR %s >= last_subscription_state_event_created_at
+                                  )
+                                RETURNING telegram_id, paid, expiry_date
+                            """, (
+                                not cancel_at_period_end,
+                                customer_id,
+                                event_created_at,
+                                event_created_at,
+                                sub_id,
+                                event_created_at,
+                                event_created_at,
+                            ))
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
+                    row = cur.fetchone()
+                    if row:
+                        try:
+                            upsert_stripe_link(
+                                cur,
+                                row[0],
+                                stripe_customer_id=customer_id,
+                                stripe_subscription_id=sub_id,
+                                status=status,
+                                current_period_end=period_value,
+                                is_active=True,
+                                source="customer.subscription.updated",
+                            )
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
                         if subscription_expiry:
                             logging.info(
                                 "SUBSCRIPTION_PERIOD_SYNCED: event_id=%s, event.type=%s, telegram_id=%s, "
@@ -13082,13 +13815,44 @@ async def stripe_webhook(request):
                 else:
                     conn = get_db_conn()
                     cur = conn.cursor()
-                    cur.execute("""
-                        UPDATE users
-                        SET auto_renew = %s,
-                            stripe_customer_id = COALESCE(%s, stripe_customer_id)
-                        WHERE stripe_subscription_id = %s
-                        RETURNING telegram_id, paid, expiry_date
-                    """, (not cancel_at_period_end, customer_id, sub_id))
+                    subscription_update_requested_telegram_id = None
+                    try:
+                        subscription_update_requested_telegram_id = assert_existing_subscription_identity_available(
+                            cur,
+                            sub_id,
+                            customer_id=customer_id,
+                            source="customer.subscription.updated",
+                        )
+                    except StripeIdentityConflictError as conflict:
+                        conn.rollback()
+                        cur.close()
+                        conn.close()
+                        return await finalize_stripe_identity_conflict_response(
+                            conflict,
+                            event_id,
+                            event_type,
+                        )
+                    try:
+                        cur.execute("""
+                            UPDATE users
+                            SET auto_renew = %s,
+                                stripe_customer_id = COALESCE(%s, stripe_customer_id)
+                            WHERE stripe_subscription_id = %s
+                            RETURNING telegram_id, paid, expiry_date
+                        """, (not cancel_at_period_end, customer_id, sub_id))
+                    except psycopg2_errors.UniqueViolation as e:
+                        conn.rollback()
+                        cur.close()
+                        conn.close()
+                        return await finalize_stripe_identity_unique_violation_webhook_response(
+                            e,
+                            subscription_update_requested_telegram_id,
+                            customer_id,
+                            sub_id,
+                            "customer.subscription.updated",
+                            event_id,
+                            event_type,
+                        )
                     row = cur.fetchone()
                     logging.info(
                         "SUBSCRIPTION_UPDATED: event_id=%s, event.type=%s, telegram_id=%s, "
@@ -13105,16 +13869,30 @@ async def stripe_webhook(request):
                         row[2] if row else None,
                     )
                     if row:
-                        upsert_stripe_link(
-                            cur,
-                            row[0],
-                            stripe_customer_id=customer_id,
-                            stripe_subscription_id=sub_id,
-                            status=status,
-                            current_period_end=current_period_end,
-                            is_active=stripe_link_active_for_status(status),
-                            source="customer.subscription.updated",
-                        )
+                        try:
+                            upsert_stripe_link(
+                                cur,
+                                row[0],
+                                stripe_customer_id=customer_id,
+                                stripe_subscription_id=sub_id,
+                                status=status,
+                                current_period_end=current_period_end,
+                                is_active=stripe_link_active_for_status(status),
+                                source="customer.subscription.updated",
+                            )
+                        except psycopg2_errors.UniqueViolation as e:
+                            conn.rollback()
+                            cur.close()
+                            conn.close()
+                            return await finalize_stripe_identity_unique_violation_webhook_response(
+                                e,
+                                subscription_update_requested_telegram_id,
+                                customer_id,
+                                sub_id,
+                                "customer.subscription.updated",
+                                event_id,
+                                event_type,
+                            )
                     if is_terminal_subscription_status(status):
                         mark_stripe_link_subscription_terminal(cur, sub_id, status)
                 if row and old_auto_renew is True and cancel_at_period_end:
@@ -13373,7 +14151,7 @@ async def stripe_webhook(request):
                 return web.Response(status=200)
 
             try:
-                await apply_paid_checkout_access(
+                checkout_apply_result = await apply_paid_checkout_access(
                     session,
                     user_id,
                     days_to_add,
@@ -13383,6 +14161,8 @@ async def stripe_webhook(request):
                     checkout_action,
                     "checkout.session.async_payment_succeeded",
                 )
+                if checkout_apply_result.get("identity_conflict_response"):
+                    return checkout_apply_result["identity_conflict_response"]
             except Exception as e:
                 logging.exception(
                     "Ошибка обработки checkout.session.async_payment_succeeded: event_id=%s, "
@@ -14533,35 +15313,13 @@ async def perform_link_stripe_user(payload):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT telegram_id FROM users
-            WHERE telegram_id <> %s
-              AND (
-                    stripe_customer_id = %s
-                    OR stripe_subscription_id = %s
-                  )
-            LIMIT 1
-            """,
-            (telegram_id, customer_id, subscription_id),
+        assert_stripe_identity_available(
+            cur,
+            telegram_id,
+            customer_id=customer_id,
+            subscription_id=subscription_id,
+            source="manual_link_stripe_user_confirmed",
         )
-        conflict = cur.fetchone()
-        if not conflict:
-            cur.execute(
-                """
-                SELECT telegram_id FROM stripe_links
-                WHERE telegram_id <> %s
-                  AND (
-                        stripe_customer_id = %s
-                        OR stripe_subscription_id = %s
-                      )
-                LIMIT 1
-                """,
-                (telegram_id, customer_id, subscription_id),
-            )
-            conflict = cur.fetchone()
-        if conflict:
-            raise ValueError("Stripe IDs conflict changed before confirmation")
         cur.execute("SELECT expiry_date FROM users WHERE telegram_id = %s", (telegram_id,))
         old_row = cur.fetchone()
         old_expiry = old_row[0] if old_row else None
@@ -14635,6 +15393,84 @@ async def perform_link_stripe_user(payload):
         )
         resolved_unlinked_events = cur.rowcount
         conn.commit()
+    except StripeIdentityConflictError as conflict:
+        conn.rollback()
+        persist_stripe_identity_conflict_audit(
+            conflict,
+            f"manual_link_stripe_user:{safe_delivery_hash(customer_id + ':' + subscription_id)}",
+            "manual_link_stripe_user",
+        )
+        return {
+            "status": "failed",
+            "telegram_id": telegram_id,
+            "reason": "stripe_identity_conflict",
+            "admin_message": (
+                "❌ Stripe-связка не выполнена: найден конфликт identity.\n"
+                f"type: {conflict.conflict_type}\n"
+                f"stripe_id: {conflict.safe_stripe_id}\n"
+                f"requested_telegram_id: {conflict.requested_telegram_id or 'unknown'}\n"
+                "Проверьте /stripe_conflicts и владельца в Stripe Dashboard."
+            ),
+        }
+    except psycopg2_errors.UniqueViolation as e:
+        conn.rollback()
+        conflict = stripe_identity_conflict_from_unique_violation(
+            e,
+            telegram_id,
+            customer_id=customer_id,
+            subscription_id=subscription_id,
+            source="manual_link_stripe_user_confirmed",
+        )
+        if not conflict:
+            raise
+        populate_known_stripe_identity_unique_violation_owner(conflict)
+        if conflict.existing_telegram_id is None:
+            return {
+                "status": "failed",
+                "telegram_id": telegram_id,
+                "reason": "retry_required",
+                "admin_message": (
+                    "⚠️ Stripe-связка не выполнена: конкурентная запись identity не разобрана.\n"
+                    "Повторите команду после проверки текущей связи пользователя."
+                ),
+            }
+        if int(conflict.existing_telegram_id) == int(telegram_id):
+            if stripe_identity_already_linked_for_user(telegram_id, customer_id, subscription_id):
+                return {
+                    "status": "completed",
+                    "telegram_id": telegram_id,
+                    "reason": "already_linked",
+                    "warnings": ["same_user_identity_race"],
+                    "admin_message": (
+                        "✅ Stripe-связка уже установлена для этого пользователя конкурентной операцией.\n"
+                        "Новый conflict audit не создан."
+                    ),
+                }
+            return {
+                "status": "failed",
+                "telegram_id": telegram_id,
+                "reason": "retry_required",
+                "admin_message": (
+                    "⚠️ Stripe-связка не выполнена из-за конкурентной записи same-user identity.\n"
+                    "Повторите команду после повторной проверки текущей связи пользователя."
+                ),
+            }
+        persist_stripe_identity_conflict_audit(
+            conflict,
+            f"manual_link_stripe_user:{safe_delivery_hash(customer_id + ':' + subscription_id)}",
+            "manual_link_stripe_user",
+        )
+        return {
+            "status": "failed",
+            "telegram_id": telegram_id,
+            "reason": "stripe_identity_conflict",
+            "admin_message": (
+                "❌ Stripe-связка не выполнена: найден конфликт identity.\n"
+                f"type: {conflict.conflict_type}\n"
+                f"stripe_id: {conflict.safe_stripe_id}\n"
+                "Проверьте /stripe_conflicts и владельца в Stripe Dashboard."
+            ),
+        }
     finally:
         cur.close()
         conn.close()
@@ -15106,6 +15942,58 @@ async def resolve_checkout_command(message: types.Message, command: CommandObjec
     )
 
 
+@router.message(Command('stripe_conflicts'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def stripe_conflicts_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT conflict_type, stripe_id, telegram_ids, details, created_at
+            FROM stripe_identity_conflicts
+            WHERE resolved IS NOT TRUE
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+    if not rows:
+        await message.reply("✅ Неразрешённых Stripe identity conflicts нет.")
+        return
+
+    lines = ["⚠️ Неразрешённые Stripe identity conflicts:"]
+    for conflict_type, stripe_id, telegram_ids, details, created_at in rows:
+        source = "unknown"
+        if isinstance(details, dict):
+            source = details.get("source") or source
+        elif isinstance(details, str):
+            try:
+                source = json.loads(details).get("source") or source
+            except (TypeError, ValueError, json.JSONDecodeError):
+                source = "unknown"
+        if isinstance(telegram_ids, (list, tuple)):
+            telegram_text = ", ".join(str(value) for value in telegram_ids)
+        else:
+            telegram_text = str(telegram_ids or "unknown")
+        lines.extend([
+            "",
+            f"type: {conflict_type}",
+            f"stripe_id: {safe_log_id(stripe_id)}",
+            f"telegram_ids: {telegram_text}",
+            f"source: {source}",
+            f"created_at: {created_at}",
+            "action: проверьте владельца в Stripe Dashboard и разберите конфликт вручную.",
+        ])
+
+    await message.reply("\n".join(lines))
+
+
 @router.message(Command('link_stripe_user'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def link_stripe_user_command(message: types.Message, command: CommandObject):
@@ -15137,7 +16025,7 @@ async def link_stripe_user_command(message: types.Message, command: CommandObjec
         stripe_customer_id = getattr(subscription, "customer", None)
         stripe_customer_id = stripe_customer_id if isinstance(stripe_customer_id, str) else customer_id
     except Exception as e:
-        logging.exception("LINK_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s", telegram_id)
+        logging.exception("LINK_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s", target_user_id)
         error_ref = safe_admin_error_reference("link_stripe_subscription_retrieve", e)
         await message.reply(f"❌ Не удалось получить Stripe subscription. ref: {error_ref}")
         return
@@ -15155,11 +16043,20 @@ async def link_stripe_user_command(message: types.Message, command: CommandObjec
         display_name = (user_row[1] or user_row[2]) if user_row else "нет в users"
         cur.execute(
             """
-            SELECT COUNT(*) FROM users
-            WHERE telegram_id <> %s
-              AND (stripe_customer_id = %s OR stripe_subscription_id = %s)
+            SELECT COALESCE(SUM(conflict_count), 0)
+            FROM (
+                SELECT COUNT(*) AS conflict_count
+                FROM users
+                WHERE telegram_id <> %s
+                  AND (stripe_customer_id = %s OR stripe_subscription_id = %s)
+                UNION ALL
+                SELECT COUNT(*) AS conflict_count
+                FROM stripe_links
+                WHERE telegram_id <> %s
+                  AND (stripe_customer_id = %s OR stripe_subscription_id = %s)
+            ) conflicts
             """,
-            (target_user_id, customer_id, subscription_id),
+            (target_user_id, customer_id, subscription_id, target_user_id, customer_id, subscription_id),
         )
         conflict_count = cur.fetchone()[0]
         cur.execute(

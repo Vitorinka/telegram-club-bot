@@ -793,12 +793,13 @@ class CriticalBotSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE[MAIN_SOURCE.rfind('cur.execute("""', 0, marker_index):MAIN_SOURCE.index("))", marker_index)]
         sql = source[source.index('cur.execute("""') + len('cur.execute("""'):source.index('""", (')]
         self.assertEqual(sql.count("%s"), 9)
+        compact_source = "\n".join(line.strip() for line in source.splitlines())
         self.assertIn(
             "customer_id,\n"
-            "                            event_created_at,\n"
-            "                            event_created_at,\n"
-            "                            sub_id,\n",
-            source,
+            "event_created_at,\n"
+            "event_created_at,\n"
+            "sub_id,",
+            compact_source,
         )
 
     def test_group_admin_live_status_prevents_removal(self):
@@ -966,10 +967,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_link_stripe_confirm_rechecks_conflicts(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_link_stripe_user"):MAIN_SOURCE.index("async def execute_confirmed_give_access")]
-        self.assertIn("Stripe IDs conflict changed before confirmation", source)
-        self.assertIn("telegram_id <> %s", source)
-        self.assertIn("FROM users", source)
-        self.assertIn("FROM stripe_links", source)
+        self.assertIn("assert_stripe_identity_available", source)
+        self.assertIn("StripeIdentityConflictError", source)
+        self.assertIn('"reason": "stripe_identity_conflict"', source)
+        helper_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def assert_stripe_identity_available"):
+            MAIN_SOURCE.index("def insert_stripe_identity_conflict")
+        ]
+        self.assertIn("FROM users", helper_source)
+        self.assertIn("FROM stripe_links", helper_source)
 
     def test_group_join_handler_checks_live_telegram_status_before_removal(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def delete_join_leave_service_messages"):MAIN_SOURCE.index("GROUP_SERVICE_MESSAGE")]
@@ -1065,8 +1071,14 @@ class CriticalBotSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_link_stripe_user"):MAIN_SOURCE.index("async def execute_confirmed_give_access")]
         self.assertIn("stripe.Subscription.retrieve", source)
         self.assertIn("Stripe subscription customer mismatch", source)
-        self.assertIn("Stripe IDs conflict changed before confirmation", source)
-        self.assertIn("FROM stripe_links", source)
+        self.assertIn("assert_stripe_identity_available", source)
+        self.assertIn("StripeIdentityConflictError", source)
+        self.assertIn('"reason": "stripe_identity_conflict"', source)
+        helper_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def assert_stripe_identity_available"):
+            MAIN_SOURCE.index("def insert_stripe_identity_conflict")
+        ]
+        self.assertIn("FROM stripe_links", helper_source)
         self.assertIn("prepare_manual_link_payment_events", source)
         self.assertIn("backfill_payment_events_for_manual_link", source)
         self.assertIn("UPDATE unlinked_stripe_events", source)
@@ -1445,6 +1457,95 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("stripe_link_active_for_status(status)", source)
         self.assertIn("is_terminal_subscription_status(status)", source)
         self.assertIn("mark_stripe_link_subscription_terminal(cur, sub_id, status)", source)
+
+    def test_stripe_identity_conflicts_are_structured_and_constraint_based(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("class StripeIdentityConflictError"):
+            MAIN_SOURCE.index("def upsert_stripe_link")
+        ]
+        self.assertIn("self.conflict_type", source)
+        self.assertIn("self.safe_stripe_id", source)
+        self.assertIn("self.existing_telegram_id", source)
+        self.assertIn("self.requested_telegram_id", source)
+        self.assertIn("self.constraint_name", source)
+        self.assertIn("error, \"diag\"", source)
+        self.assertIn("constraint_name", source)
+        self.assertIn("separators=(\",\", \":\")", source)
+        self.assertIn("ON CONFLICT (conflict_type, stripe_id, telegram_ids) WHERE resolved IS NOT TRUE", source)
+        self.assertIn("known_stripe_identity_unique_violation_is_same_user", MAIN_SOURCE)
+        self.assertNotIn("pgerror", source)
+        self.assertNotIn("str(error)", source)
+
+    def test_stripe_identity_writes_use_row_lock_guard(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("def assert_stripe_identity_available"):
+            MAIN_SOURCE.index("def insert_stripe_identity_conflict")
+        ]
+        self.assertIn("FROM users", source)
+        self.assertIn("FROM stripe_links", source)
+        self.assertGreaterEqual(source.count("FOR UPDATE"), 3)
+        self.assertIn("SELECT telegram_id", MAIN_SOURCE[MAIN_SOURCE.index("def upsert_stripe_link"):MAIN_SOURCE.index("def mark_stripe_link_subscription_terminal")])
+        self.assertIn("WHERE stripe_subscription_id = %s", MAIN_SOURCE[MAIN_SOURCE.index("def upsert_stripe_link"):MAIN_SOURCE.index("def mark_stripe_link_subscription_terminal")])
+        self.assertIn("UPDATE stripe_links", MAIN_SOURCE[MAIN_SOURCE.index("def upsert_stripe_link"):MAIN_SOURCE.index("def mark_stripe_link_subscription_terminal")])
+        self.assertIn("assert_existing_subscription_identity_available", MAIN_SOURCE)
+        self.assertNotIn("target_user_customer_changed", source)
+        self.assertNotIn("target_user_subscription_changed", source)
+        self.assertNotIn("target_link_customer_changed", source)
+        self.assertNotIn("target_link_subscription_changed", source)
+
+        invoice_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("elif event_type == 'invoice.payment_succeeded'"):
+            MAIN_SOURCE.index("# ---------- 3. ОШИБКА ОПЛАТЫ")
+        ]
+        self.assertIn("assert_stripe_identity_available", invoice_source)
+        self.assertIn("except StripeIdentityConflictError", invoice_source)
+        self.assertIn("except psycopg2_errors.UniqueViolation", invoice_source)
+        self.assertIn("linked_telegram_id", invoice_source)
+        self.assertNotIn("locals().get(\"telegram_id\")", invoice_source)
+
+        checkout_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def apply_paid_checkout_access"):
+            MAIN_SOURCE.index("if event_type == 'checkout.session.completed'")
+        ]
+        self.assertIn("assert_stripe_identity_available", checkout_source)
+        self.assertIn("except StripeIdentityConflictError", checkout_source)
+
+        link_only_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("if checkout_action == \"link_only\":"):
+            MAIN_SOURCE.index("await apply_paid_checkout_access")
+        ]
+        self.assertIn("assert_stripe_identity_available", link_only_source)
+        self.assertIn("except StripeIdentityConflictError", link_only_source)
+        self.assertIn("except psycopg2_errors.UniqueViolation", link_only_source)
+
+        manual_source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def perform_link_stripe_user"):
+            MAIN_SOURCE.index("async def execute_confirmed_give_access")
+        ]
+        self.assertIn("assert_stripe_identity_available", manual_source)
+        self.assertNotIn("Stripe IDs conflict changed before confirmation", manual_source)
+
+    def test_log_access_event_has_no_stripe_webhook_conflict_handling(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def log_access_event"):
+            MAIN_SOURCE.index("def get_obj_value")
+        ]
+        self.assertNotIn("StripeIdentityConflictError", source)
+        self.assertNotIn("release_event_processing", source)
+        self.assertNotIn("mark_event_processed", source)
+        self.assertNotIn("web.Response", source)
+
+    def test_stripe_conflicts_command_is_private_admin_read_only(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("@router.message(Command('stripe_conflicts')"):
+            MAIN_SOURCE.index("@router.message(Command('link_stripe_user')")
+        ]
+        self.assertIn("@admin_private_only(ADMIN_IDS)", source)
+        self.assertIn("WHERE resolved IS NOT TRUE", source)
+        self.assertIn("safe_log_id(stripe_id)", source)
+        self.assertNotIn("INSERT", source)
+        self.assertNotIn("UPDATE", source)
+        self.assertNotIn("DELETE", source)
 
     def test_bot_health_reports_missing_customer_id_and_stale_links(self):
         source = MAIN_SOURCE[

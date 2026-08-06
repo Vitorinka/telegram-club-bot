@@ -183,6 +183,26 @@ class ExecuteFailingConnection(FakeConnection):
         self.closed = False
 
 
+class ConditionalFailingCursor(FakeCursor):
+    def __init__(self, fetches=None, error=None, fail_when=None):
+        super().__init__(fetches=fetches)
+        self.error = error or RuntimeError("execute failed")
+        self.fail_when = fail_when or (lambda query, params: False)
+
+    def execute(self, query, params=None):
+        super().execute(query, params)
+        if self.fail_when(query, params):
+            raise self.error
+
+
+class ConditionalFailingConnection(FakeConnection):
+    def __init__(self, fetches=None, error=None, fail_when=None):
+        self.cursor_obj = ConditionalFailingCursor(fetches=fetches, error=error, fail_when=fail_when)
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+
 def adapted_json_value(value):
     return getattr(value, "adapted", value)
 
@@ -315,7 +335,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
         ])
 
@@ -343,7 +369,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, None, False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:payment_success" % event_id,),
         ])
@@ -375,7 +407,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:renewal_success" % event_id,),
         ])
@@ -413,7 +451,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, effective_expiry, False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:renewal_success" % event_id,),
         ])
@@ -461,7 +505,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             None,
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, effective_expiry, False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:renewal_success" % event_id,),
         ])
@@ -498,7 +548,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, datetime.utcnow() - timedelta(days=1), True, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:payment_recovered" % event_id,),
         ])
@@ -530,7 +586,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         effective_expiry = datetime.utcfromtimestamp(subscription.current_period_end)
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             (123, datetime.utcnow() + timedelta(days=14), False, effective_expiry),
+            None,
             ("stripe:%s:rejoin_invite" % event_id,),
             ("stripe:%s:renewal_success" % event_id,),
         ])
@@ -2177,7 +2239,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 64)
+        self.assertEqual(len(self.main.router.message.handlers), 65)
         self.assertEqual(len(self.main.router.callback_query.handlers), 25)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -2209,7 +2271,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 64)
+        self.assertEqual(len(message_handlers), 65)
         self.assertEqual(len(callback_handlers), 25)
         self.assertEqual(
             commands,
@@ -2224,7 +2286,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
                 "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
                 "stripe_links", "duplicate_subscriptions", "revoke_invite_links",
-                "resolve_checkout", "link_stripe_user", "unban_user",
+                "resolve_checkout", "stripe_conflicts", "link_stripe_user", "unban_user",
             ],
         )
         self.assertEqual(len(commands), len(set(commands)))
@@ -2695,6 +2757,70 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(confirmations), 1)
         self.assertIn(f"delivery_hash: {requested_hash}", confirmations[0][1])
 
+    def stripe_identity_available_fetches(self, include_subscription=False, target_user_row=None, target_link_rows=None):
+        fetches = []
+        if include_subscription:
+            fetches.append([])
+        fetches.append([])
+        if include_subscription:
+            fetches.append([])
+        fetches.append([])
+        fetches.append(target_user_row)
+        fetches.append(target_link_rows or [])
+        return fetches
+
+    def known_unique_violation(self, constraint_name):
+        class KnownUniqueViolation(self.main.psycopg2_errors.UniqueViolation):
+            @property
+            def diag(self):
+                return SimpleNamespace(constraint_name=constraint_name)
+
+        return KnownUniqueViolation("duplicate")
+
+    def subscription_updated_event(self, event_id, status="active"):
+        sub = SimpleNamespace(
+            id=f"sub_{event_id}",
+            customer=f"cus_{event_id}",
+            status=status,
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            trial_end=None,
+            cancel_at_period_end=False,
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="customer.subscription.updated",
+            created=1720000000,
+            data=SimpleNamespace(object=sub),
+        )
+        return event, sub
+
+    def invoice_payment_failed_event(self, event_id):
+        invoice = SimpleNamespace(
+            id=f"in_{event_id}",
+            subscription=f"sub_{event_id}",
+            customer=f"cus_{event_id}",
+            customer_email="failed@example.test",
+            billing_reason="subscription_cycle",
+            status="open",
+            next_payment_attempt=None,
+            metadata={},
+            lines=SimpleNamespace(data=[]),
+        )
+        subscription = SimpleNamespace(
+            id=f"sub_{event_id}",
+            customer=f"cus_{event_id}",
+            status="past_due",
+            trial_end=None,
+            cancel_at_period_end=False,
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="invoice.payment_failed",
+            created=1720000000,
+            data=SimpleNamespace(object=invoice),
+        )
+        return event, invoice, subscription
+
     async def run_checkout_days_webhook(
         self,
         days_marker,
@@ -2708,6 +2834,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         checkout_tariff="sub_1",
         checkout_mode="payment",
         checkout_telegram_id=123,
+        session_subscription=None,
+        db_conns=None,
     ):
         session_id = session_id or f"cs_days_{days_marker if days_marker is not None else 'missing'}"
         session_payload = {
@@ -2715,7 +2843,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "client_reference_id": "123",
             "mode": "payment",
             "customer": f"cus_days_{days_marker if days_marker is not None else 'missing'}",
-            "subscription": None,
+            "subscription": session_subscription,
             "amount_total": 1000,
             "currency": "usd",
         }
@@ -2742,9 +2870,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         mark_processed = AsyncMock()
         conn = conn or FakeConnection(fetches=[
             (checkout_telegram_id, checkout_tariff, checkout_mode, checkout_status),
+            *self.stripe_identity_available_fetches(),
             (False, None, False, False),
         ])
-        get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
+        if db_conns is not None:
+            get_db_conn = Mock(side_effect=db_conns)
+        elif notify_side_effect:
+            get_db_conn = Mock(side_effect=notify_side_effect)
+        else:
+            get_db_conn = Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
              patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
@@ -2803,6 +2937,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
         conn = conn or FakeConnection(fetches=[
             (123, "sub_1", "payment", "payment_pending"),
+            *self.stripe_identity_available_fetches(),
             (False, None, False, False),
         ])
 
@@ -2859,6 +2994,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         mark_processed = AsyncMock()
         conn = FakeConnection(fetches=[
             (123, "sub_trial", "payment", "open"),
+            *self.stripe_identity_available_fetches(),
             (False, None, False, False),
         ])
         get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
@@ -3106,6 +3242,293 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(conn)]
                 self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
 
+    async def test_checkout_completed_stripe_customer_conflict_rolls_back_and_records_audit(self):
+        payment_conn = FakeConnection(fetches=[
+            (123, "sub_1", "payment", "open"),
+            [(999,)],
+        ])
+        audit_conn = FakeConnection()
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=payment_conn,
+            db_conns=[payment_conn, audit_conn],
+            event_id="evt_customer_identity_conflict",
+            session_id="cs_customer_identity_conflict",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with("evt_customer_identity_conflict")
+        self.assertEqual(payment_conn.rollbacks, 1)
+        payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
+        self.assertIn("FOR UPDATE", payment_sql)
+        self.assertNotIn("INSERT INTO users", payment_sql)
+        self.assertNotIn("INSERT INTO payment_events", payment_sql)
+        self.assertNotIn("INSERT INTO access_events", payment_sql)
+
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+        self.assertIn("ON CONFLICT (conflict_type, stripe_id, telegram_ids)", audit_sql)
+        self.assertIn("INSERT INTO unlinked_stripe_events", audit_sql)
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(audit_conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+        self.assertTrue(all(payload["severity"] == "CRITICAL" for payload in admin_payloads))
+        self.assertIn("users_customer_conflict", admin_payloads[0]["text"])
+
+    async def test_known_unique_violation_populates_existing_owner_in_audit_transaction(self):
+        class KnownUniqueViolation(self.main.psycopg2_errors.UniqueViolation):
+            @property
+            def diag(self):
+                return SimpleNamespace(constraint_name="users_unique_stripe_customer")
+
+        payment_conn = ConditionalFailingConnection(
+            fetches=[
+                (123, "sub_1", "payment", "open"),
+                *self.stripe_identity_available_fetches(),
+            ],
+            error=KnownUniqueViolation("duplicate"),
+            fail_when=lambda query, params: "INSERT INTO users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(999,)])
+        audit_conn = FakeConnection(fetches=[(999,)])
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=payment_conn,
+            db_conns=[payment_conn, lookup_conn, audit_conn],
+            event_id="evt_known_unique_identity_conflict",
+            session_id="cs_known_unique_identity_conflict",
+        )
+
+        self.assertEqual(result.response.status, 200)
+        result.mark_processed.assert_awaited_once_with("evt_known_unique_identity_conflict")
+        self.assertEqual(payment_conn.rollbacks, 1)
+        conflict_insert = next(
+            params for query, params in audit_conn.cursor_obj.queries
+            if "INSERT INTO stripe_identity_conflicts" in query
+        )
+        self.assertEqual(conflict_insert[2], "[123,999]")
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(audit_conn)]
+        self.assertIn("existing_telegram_id: 999", admin_payloads[0]["text"])
+
+    async def test_unknown_unique_violation_returns_500_and_releases_event(self):
+        class UnknownUniqueViolation(self.main.psycopg2_errors.UniqueViolation):
+            @property
+            def diag(self):
+                return SimpleNamespace(constraint_name="unknown_unique_constraint")
+
+        payment_conn = ConditionalFailingConnection(
+            fetches=[
+                (123, "sub_1", "payment", "open"),
+                *self.stripe_identity_available_fetches(),
+            ],
+            error=UnknownUniqueViolation("duplicate"),
+            fail_when=lambda query, params: "INSERT INTO users" in query,
+        )
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=payment_conn,
+            db_conns=[payment_conn],
+            event_id="evt_unknown_unique_identity_conflict",
+            session_id="cs_unknown_unique_identity_conflict",
+        )
+
+        self.assertEqual(result.response.status, 500)
+        result.mark_processed.assert_not_awaited()
+        result.release.assert_awaited_once_with("evt_unknown_unique_identity_conflict")
+
+    async def test_identity_conflict_audit_failure_returns_500_without_mark_processed(self):
+        payment_conn = FakeConnection(fetches=[
+            (123, "sub_1", "payment", "open"),
+            [(999,)],
+        ])
+        audit_conn = ExecuteFailingConnection(error=RuntimeError("audit down"))
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=payment_conn,
+            db_conns=[payment_conn, audit_conn],
+            event_id="evt_identity_audit_failure",
+            session_id="cs_identity_audit_failure",
+        )
+
+        self.assertEqual(result.response.status, 500)
+        result.mark_processed.assert_not_awaited()
+        result.release.assert_awaited_once_with("evt_identity_audit_failure")
+        self.assertEqual(payment_conn.rollbacks, 1)
+        self.assertEqual(audit_conn.rollbacks, 1)
+
+    async def test_lawful_new_identity_for_same_user_with_old_history_passes(self):
+        cur = FakeCursor(fetches=[
+            [],
+            [],
+            [],
+            [],
+            (123, "cus_old", "sub_old"),
+            [(123, "cus_old_link", "sub_old_link")],
+        ])
+
+        self.main.assert_stripe_identity_available(
+            cur,
+            123,
+            customer_id="cus_new",
+            subscription_id="sub_new",
+            source="unit",
+        )
+
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("FROM stripe_links", sql)
+        self.assertIn("FOR UPDATE", sql)
+
+    async def test_recurring_invoice_current_subscription_ignores_old_links_same_user(self):
+        cur = FakeCursor(fetches=[
+            [(123,)],
+            [(123,)],
+            [],
+            [],
+            (123, "cus_current", "sub_current"),
+            [(123, "cus_old", "sub_old")],
+        ])
+
+        self.main.assert_stripe_identity_available(
+            cur,
+            123,
+            customer_id="cus_current",
+            subscription_id="sub_current",
+            source="invoice.payment_succeeded",
+        )
+
+    async def test_upsert_stripe_link_updates_same_subscription_same_user(self):
+        cur = FakeCursor(fetches=[(123,)])
+
+        self.main.upsert_stripe_link(
+            cur,
+            123,
+            stripe_customer_id="cus_same",
+            stripe_subscription_id="sub_same",
+            customer_email="same@example.test",
+            status="active",
+            current_period_end=datetime(2026, 8, 7),
+            is_active=True,
+            source="invoice.payment_succeeded",
+        )
+
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("WHERE stripe_subscription_id = %s", sql)
+        self.assertIn("FOR UPDATE", sql)
+        self.assertIn("UPDATE stripe_links", sql)
+        self.assertNotIn("ON CONFLICT (telegram_id, stripe_customer_id, stripe_subscription_id)", sql)
+
+    async def test_upsert_stripe_link_blocks_same_subscription_other_user(self):
+        cur = FakeCursor(fetches=[(999,)])
+
+        with self.assertRaises(self.main.StripeIdentityConflictError) as raised:
+            self.main.upsert_stripe_link(
+                cur,
+                123,
+                stripe_customer_id="cus_other",
+                stripe_subscription_id="sub_same",
+                status="active",
+                source="invoice.payment_succeeded",
+            )
+
+        self.assertEqual(raised.exception.conflict_type, "stripe_links_subscription_conflict")
+        self.assertEqual(raised.exception.existing_telegram_id, 999)
+        self.assertEqual(raised.exception.requested_telegram_id, 123)
+
+    async def test_same_user_unique_violation_releases_event_without_conflict_audit(self):
+        class KnownUniqueViolation(self.main.psycopg2_errors.UniqueViolation):
+            @property
+            def diag(self):
+                return SimpleNamespace(constraint_name="stripe_links_unique_subscription_user")
+
+        payment_conn = ConditionalFailingConnection(
+            fetches=[
+                (123, "sub_1", "payment", "open"),
+                *self.stripe_identity_available_fetches(include_subscription=True),
+                (False, None, False, False),
+                None,
+            ],
+            error=KnownUniqueViolation("duplicate"),
+            fail_when=lambda query, params: "INSERT INTO stripe_links" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(123,)])
+        result = await self.run_checkout_days_webhook(
+            "30",
+            conn=payment_conn,
+            db_conns=[payment_conn, lookup_conn],
+            event_id="evt_same_user_unique_race",
+            session_id="cs_same_user_unique_race",
+            session_subscription="sub_same_user_unique_race",
+        )
+
+        self.assertEqual(result.response.status, 500)
+        result.mark_processed.assert_not_awaited()
+        result.release.assert_awaited_once_with("evt_same_user_unique_race")
+        lookup_sql = "\n".join(query for query, _ in lookup_conn.cursor_obj.queries)
+        self.assertIn("FROM users", lookup_sql)
+        payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO stripe_identity_conflicts", payment_sql)
+
+    async def test_same_customer_and_subscription_same_user_are_idempotent(self):
+        cur = FakeCursor(fetches=[
+            [(123,)],
+            [(123,)],
+            [(123,)],
+            [(123,)],
+            (123, "cus_same", "sub_same"),
+            [(123, "cus_same", "sub_same")],
+        ])
+
+        self.main.assert_stripe_identity_available(
+            cur,
+            123,
+            customer_id="cus_same",
+            subscription_id="sub_same",
+            source="unit",
+        )
+
+        sql = "\n".join(query for query, _ in cur.queries)
+        self.assertIn("FOR UPDATE", sql)
+
+    async def test_subscription_or_customer_other_user_is_controlled_conflict(self):
+        cur = FakeCursor(fetches=[[(456,)]])
+
+        with self.assertRaises(self.main.StripeIdentityConflictError) as raised:
+            self.main.assert_stripe_identity_available(
+                cur,
+                123,
+                customer_id="cus_other",
+                source="unit",
+            )
+
+        self.assertEqual(raised.exception.conflict_type, "users_customer_conflict")
+        self.assertEqual(raised.exception.existing_telegram_id, 456)
+        self.assertEqual(raised.exception.requested_telegram_id, 123)
+        self.assertEqual(raised.exception.safe_stripe_id, self.main.safe_log_id("cus_other"))
+
+    async def test_unique_violation_classifier_uses_constraint_name_only(self):
+        known_error = SimpleNamespace(diag=SimpleNamespace(constraint_name="users_unique_stripe_subscription"))
+        conflict = self.main.stripe_identity_conflict_from_unique_violation(
+            known_error,
+            123,
+            customer_id="cus_known",
+            subscription_id="sub_known",
+            source="unit",
+        )
+        self.assertIsInstance(conflict, self.main.StripeIdentityConflictError)
+        self.assertEqual(conflict.conflict_type, "users_subscription_conflict")
+        self.assertEqual(conflict.stripe_id, "sub_known")
+        self.assertEqual(conflict.constraint_name, "users_unique_stripe_subscription")
+
+        unknown_error = SimpleNamespace(diag=SimpleNamespace(constraint_name="some_other_constraint"))
+        self.assertIsNone(
+            self.main.stripe_identity_conflict_from_unique_violation(
+                unknown_error,
+                123,
+                customer_id="cus_known",
+                subscription_id="sub_known",
+                source="unit",
+            )
+        )
+
     async def test_checkout_completed_then_async_success_same_session_second_is_noop(self):
         completed = await self.run_checkout_days_webhook(
             "30",
@@ -3301,6 +3724,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             (123, "sub_trial", "payment", "open"),
+            *self.stripe_identity_available_fetches(),
             (False, None, False, False),
         ])
 
@@ -4142,6 +4566,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         subscription.status = "past_due"
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
+            (123,),
+            *self.stripe_identity_available_fetches(
+                include_subscription=True,
+                target_user_row=(123, "cus_rejoin", "sub_rejoin"),
+            ),
             None,
             (123, True, datetime.utcnow() + timedelta(days=14), datetime.utcnow(), datetime.utcnow() + timedelta(hours=24)),
             ("stripe:%s:payment_failed" % event_id,),
@@ -4536,6 +4965,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         checkout_tariff = "sub_trial" if days == "7" else "sub_1"
         conn = FakeConnection(fetches=[
             (123, checkout_tariff, "payment", "open"),
+            *self.stripe_identity_available_fetches(),
             (True, datetime.utcnow() - timedelta(days=1), True, payment_failed),
             (success_key,),
             ("stripe:%s:rejoin_invite" % event_id,),
@@ -4583,6 +5013,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             (123, "sub_1", "payment", "open"),
+            *self.stripe_identity_available_fetches(),
             (True, datetime.utcnow() + timedelta(days=14), True),
             ("stripe:evt_checkout_boundary:rejoin_invite",),
         ])
@@ -4762,6 +5193,626 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         queries = [query for query, _ in conn.cursor_obj.queries]
         self.assertFalse(any("INSERT INTO message_delivery_events" in query for query in queries))
 
+    async def test_subscription_checkout_link_only_identity_conflict_records_audit(self):
+        event_id = "evt_checkout_link_identity_conflict"
+        payload = json.dumps(
+            {
+                "id": event_id,
+                "object": "event",
+                "type": "checkout.session.completed",
+                "created": 1720000000,
+                "data": {
+                    "object": {
+                        "id": "cs_link_identity_conflict",
+                        "object": "checkout.session",
+                        "client_reference_id": "123",
+                        "metadata": {},
+                        "mode": "subscription",
+                        "payment_status": "paid",
+                        "customer": "cus_link_identity_conflict",
+                        "subscription": "sub_link_identity_conflict",
+                    }
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        event = SimpleNamespace(
+            id=event_id,
+            type="checkout.session.completed",
+            created=1720000000,
+            data=SimpleNamespace(object=SimpleNamespace(
+                id="cs_link_identity_conflict",
+                client_reference_id="123",
+                metadata={},
+                mode="subscription",
+                payment_status="paid",
+                customer="cus_link_identity_conflict",
+                subscription="sub_link_identity_conflict",
+            )),
+        )
+        payment_conn = FakeConnection(fetches=[[], [(999,)]])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[payment_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
+        self.assertIn("FOR UPDATE", payment_sql)
+        self.assertNotIn("INSERT INTO users", payment_sql)
+        self.assertNotIn("upsert_stripe_link", payment_sql)
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+        self.assertIn("INSERT INTO unlinked_stripe_events", audit_sql)
+        admin_payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(audit_conn)]
+        self.assertEqual(len(admin_payloads), len(self.main.ADMIN_IDS))
+
+    async def test_stripe_conflicts_command_private_admin_read_only_runtime(self):
+        group_message = FakeIncomingMessage(user_id=1)
+        group_message.chat.type = "group"
+        get_db_conn = Mock(return_value=FakeConnection())
+
+        with patch.object(self.main, "get_db_conn", get_db_conn):
+            await self.main.stripe_conflicts_command(group_message)
+
+        get_db_conn.assert_not_called()
+        self.assertIn("личном чате", group_message.replies[0][0])
+
+        private_message = FakeIncomingMessage(user_id=1)
+        conn = FakeConnection(fetches=[[
+            (
+                "users_customer_conflict",
+                "cus_conflict",
+                "[123,999]",
+                json.dumps({"source": "checkout.session.completed"}),
+                datetime(2026, 8, 6, 10, 0),
+            )
+        ]])
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.stripe_conflicts_command(private_message)
+
+        self.assertTrue(conn.closed)
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("SELECT conflict_type, stripe_id, telegram_ids, details, created_at", sql)
+        self.assertNotIn("INSERT", sql)
+        self.assertNotIn("UPDATE", sql)
+        self.assertIn("users_customer_conflict", private_message.replies[0][0])
+        self.assertIn(self.main.safe_log_id("cus_conflict"), private_message.replies[0][0])
+
+    async def test_link_stripe_user_runtime_conflict_does_not_change_user(self):
+        payment_conn = FakeConnection(fetches=[[(999,)]])
+        audit_conn = FakeConnection()
+        subscription = SimpleNamespace(
+            status="active",
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            customer="cus_link_conflict",
+            cancel_at_period_end=False,
+        )
+
+        with patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "prepare_manual_link_payment_events", AsyncMock(return_value=[])), \
+             patch.object(self.main, "get_db_conn", side_effect=[payment_conn, audit_conn]):
+            result = await self.main.perform_link_stripe_user({
+                "telegram_id": 123,
+                "stripe_customer_id": "cus_link_conflict",
+                "stripe_subscription_id": "sub_link_conflict",
+                "admin_id": 1,
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "stripe_identity_conflict")
+        self.assertEqual(payment_conn.rollbacks, 1)
+        payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO users", payment_sql)
+        self.assertNotIn("UPDATE unlinked_stripe_events", payment_sql)
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+        self.assertIn("INSERT INTO unlinked_stripe_events", audit_sql)
+
+    async def test_subscription_updated_identity_conflict_records_audit_and_closes_connections(self):
+        event_id = "evt_subscription_updated_identity_conflict"
+        sub = SimpleNamespace(
+            id="sub_update_conflict",
+            customer="cus_update_conflict",
+            status="active",
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            trial_end=None,
+            cancel_at_period_end=False,
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="customer.subscription.updated",
+            created=1720000000,
+            data=SimpleNamespace(object=sub),
+        )
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = FakeConnection(fetches=[(123,), [(123,)], [(999,)]])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(write_conn.rollbacks, 1)
+        self.assertTrue(write_conn.closed)
+        self.assertTrue(audit_conn.closed)
+        write_sql = "\n".join(query for query, _ in write_conn.cursor_obj.queries)
+        self.assertNotIn("UPDATE users", write_sql)
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+
+    async def test_subscription_updated_identity_conflict_audit_failure_releases_claim(self):
+        event_id = "evt_subscription_updated_identity_audit_failure"
+        sub = SimpleNamespace(
+            id="sub_update_audit_failure",
+            customer="cus_update_audit_failure",
+            status="active",
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            trial_end=None,
+            cancel_at_period_end=False,
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="customer.subscription.updated",
+            created=1720000000,
+            data=SimpleNamespace(object=sub),
+        )
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = FakeConnection(fetches=[(123,), [(123,)], [(999,)]])
+        audit_conn = ExecuteFailingConnection(error=RuntimeError("audit down"))
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        mark_processed.assert_not_awaited()
+        release.assert_awaited_once_with(event_id)
+        self.assertEqual(write_conn.rollbacks, 1)
+        self.assertTrue(write_conn.closed)
+        self.assertTrue(audit_conn.closed)
+
+    async def test_invoice_payment_failed_identity_conflict_records_audit(self):
+        event_id = "evt_payment_failed_identity_conflict"
+        invoice = SimpleNamespace(
+            id="in_failed_conflict",
+            subscription="sub_failed_conflict",
+            customer="cus_failed_conflict",
+            customer_email="failed@example.test",
+            billing_reason="subscription_cycle",
+            status="open",
+            next_payment_attempt=None,
+            metadata={},
+            lines=SimpleNamespace(data=[]),
+        )
+        subscription = SimpleNamespace(
+            id="sub_failed_conflict",
+            customer="cus_failed_conflict",
+            status="past_due",
+            trial_end=None,
+            cancel_at_period_end=False,
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="invoice.payment_failed",
+            created=1720000000,
+            data=SimpleNamespace(object=invoice),
+        )
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        main_conn = FakeConnection(fetches=[(123,), [(123,)], [(999,)]])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", side_effect=[main_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(main_conn.rollbacks, 1)
+        self.assertTrue(main_conn.closed)
+        main_sql = "\n".join(query for query, _ in main_conn.cursor_obj.queries)
+        self.assertNotIn("UPDATE users", main_sql)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", "\n".join(query for query, _ in audit_conn.cursor_obj.queries))
+
+    async def test_subscription_updated_known_unique_other_owner_records_audit(self):
+        event_id = "evt_subscription_updated_unique_other"
+        event, sub = self.subscription_updated_event(event_id)
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", sub.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(999,)])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(write_conn.rollbacks, 1)
+        self.assertTrue(write_conn.closed)
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+
+    async def test_subscription_updated_past_due_known_unique_other_owner_records_audit(self):
+        event_id = "evt_subscription_updated_past_due_unique"
+        event, sub = self.subscription_updated_event(event_id, status="past_due")
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", sub.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(999,)])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertIn(
+            "INSERT INTO stripe_identity_conflicts",
+            "\n".join(query for query, _ in audit_conn.cursor_obj.queries),
+        )
+
+    async def test_subscription_updated_terminal_known_unique_other_owner_records_audit(self):
+        event_id = "evt_subscription_updated_terminal_unique"
+        event, sub = self.subscription_updated_event(event_id, status="canceled")
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", sub.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(999,)])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertIn(
+            "INSERT INTO stripe_identity_conflicts",
+            "\n".join(query for query, _ in audit_conn.cursor_obj.queries),
+        )
+
+    async def test_subscription_updated_known_unique_same_owner_releases_without_audit(self):
+        event_id = "evt_subscription_updated_unique_same"
+        event, sub = self.subscription_updated_event(event_id)
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", sub.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(123,)])
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        mark_processed.assert_not_awaited()
+        release.assert_awaited_once_with(event_id)
+        self.assertEqual(write_conn.rollbacks, 1)
+        lookup_sql = "\n".join(query for query, _ in lookup_conn.cursor_obj.queries)
+        self.assertIn("FROM users", lookup_sql)
+        self.assertIn("FROM stripe_links", lookup_sql)
+
+    async def test_invoice_payment_failed_known_unique_other_owner_records_audit(self):
+        event_id = "evt_invoice_failed_unique_other"
+        event, invoice, subscription = self.invoice_payment_failed_event(event_id)
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        main_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", subscription.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(999,)])
+        audit_conn = FakeConnection()
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", side_effect=[main_conn, lookup_conn, audit_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        release.assert_not_awaited()
+        self.assertEqual(main_conn.rollbacks, 1)
+        main_sql = "\n".join(query for query, _ in main_conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO access_events", main_sql)
+        audit_sql = "\n".join(query for query, _ in audit_conn.cursor_obj.queries)
+        self.assertIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+
+    async def test_invoice_payment_failed_known_unique_same_owner_releases_without_audit(self):
+        event_id = "evt_invoice_failed_unique_same"
+        event, invoice, subscription = self.invoice_payment_failed_event(event_id)
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        main_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", subscription.id),
+                [],
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(123,)])
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "get_db_conn", side_effect=[main_conn, lookup_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        mark_processed.assert_not_awaited()
+        release.assert_awaited_once_with(event_id)
+        self.assertEqual(main_conn.rollbacks, 1)
+
+    async def test_subscription_updated_unknown_unique_constraint_releases_without_audit(self):
+        event_id = "evt_subscription_updated_unique_unknown"
+        event, sub = self.subscription_updated_event(event_id)
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        read_conn = FakeConnection(fetches=[(False, None, None, 123)])
+        write_conn = ConditionalFailingConnection(
+            fetches=[
+                (123,),
+                [(123,)],
+                [],
+                [],
+                [],
+                (123, "cus_existing", sub.id),
+                [],
+            ],
+            error=self.known_unique_violation("unknown_identity_constraint"),
+            fail_when=lambda query, params: "UPDATE users" in query,
+        )
+        mark_processed = AsyncMock()
+        release = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "release_event_processing", release), \
+             patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 500)
+        mark_processed.assert_not_awaited()
+        release.assert_awaited_once_with(event_id)
+        self.assertEqual(write_conn.rollbacks, 1)
+
+    async def test_link_stripe_user_same_user_unique_race_does_not_create_false_conflict(self):
+        payment_conn = ConditionalFailingConnection(
+            fetches=[
+                [],
+                [],
+                [],
+                [],
+                (123, "cus_link_same", "sub_link_same"),
+                [],
+                (datetime.utcnow() - timedelta(days=1),),
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "INSERT INTO users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(123,)])
+        reread_conn = FakeConnection(fetches=[(1,)])
+        subscription = SimpleNamespace(
+            status="active",
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            customer="cus_link_same",
+            cancel_at_period_end=False,
+        )
+
+        with patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "prepare_manual_link_payment_events", AsyncMock(return_value=[])), \
+             patch.object(self.main, "get_db_conn", side_effect=[payment_conn, lookup_conn, reread_conn]):
+            result = await self.main.perform_link_stripe_user({
+                "telegram_id": 123,
+                "stripe_customer_id": "cus_link_same",
+                "stripe_subscription_id": "sub_link_same",
+                "admin_id": 1,
+            })
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["reason"], "already_linked")
+        self.assertEqual(payment_conn.rollbacks, 1)
+        self.assertTrue(payment_conn.closed)
+        audit_sql = "\n".join(query for conn in (payment_conn, lookup_conn, reread_conn) for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("INSERT INTO stripe_identity_conflicts", audit_sql)
+
+    async def test_link_stripe_user_same_user_unique_race_retry_required_when_link_absent(self):
+        payment_conn = ConditionalFailingConnection(
+            fetches=[
+                [],
+                [],
+                [],
+                [],
+                (123, "cus_link_same", "sub_link_same"),
+                [],
+                (datetime.utcnow() - timedelta(days=1),),
+            ],
+            error=self.known_unique_violation("users_unique_stripe_customer"),
+            fail_when=lambda query, params: "INSERT INTO users" in query,
+        )
+        lookup_conn = FakeConnection(fetches=[(123,)])
+        reread_conn = FakeConnection(fetches=[None])
+        subscription = SimpleNamespace(
+            status="active",
+            current_period_end=int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            customer="cus_link_same",
+            cancel_at_period_end=False,
+        )
+
+        with patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(self.main, "prepare_manual_link_payment_events", AsyncMock(return_value=[])), \
+             patch.object(self.main, "get_db_conn", side_effect=[payment_conn, lookup_conn, reread_conn]):
+            result = await self.main.perform_link_stripe_user({
+                "telegram_id": 123,
+                "stripe_customer_id": "cus_link_same",
+                "stripe_subscription_id": "sub_link_same",
+                "admin_id": 1,
+            })
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "retry_required")
+        self.assertNotIn(
+            "INSERT INTO stripe_identity_conflicts",
+            "\n".join(query for conn in (payment_conn, lookup_conn, reread_conn) for query, _ in conn.cursor_obj.queries),
+        )
+
+    async def test_subscription_deleted_does_not_assign_incoming_customer(self):
+        event_id = "evt_subscription_deleted_no_customer_assign"
+        sub = SimpleNamespace(
+            id="sub_deleted",
+            customer="cus_deleted_new",
+            status="canceled",
+        )
+        event = SimpleNamespace(
+            id=event_id,
+            type="customer.subscription.deleted",
+            created=1720000000,
+            data=SimpleNamespace(object=sub),
+        )
+        request = FakeStripeRequest(b"{}", {"Stripe-Signature": "sig", "Content-Type": "application/json"})
+        conn = FakeConnection(fetches=[(123, False, None)])
+        mark_processed = AsyncMock()
+
+        with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "mark_event_processed", mark_processed), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            response = await self.main.stripe_webhook(request)
+
+        self.assertEqual(response.status, 200)
+        mark_processed.assert_awaited_once_with(event_id)
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("stripe_subscription_id = NULL", sql)
+        self.assertNotIn("stripe_customer_id = COALESCE", sql)
+        self.assertIn("UPDATE stripe_links", sql)
+
     async def test_checkout_webhook_duplicate_does_not_create_second_rejoin_check(self):
         payload = json.dumps(
             {
@@ -4789,6 +5840,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         request = FakeStripeRequest(payload, {"Stripe-Signature": "sig", "Content-Type": "application/json"})
         conn = FakeConnection(fetches=[
             (123, "sub_1", "payment", "open"),
+            *self.stripe_identity_available_fetches(),
             (False, datetime.utcnow() - timedelta(days=1), False),
             ("stripe:evt_checkout_duplicate:rejoin_invite",),
         ])

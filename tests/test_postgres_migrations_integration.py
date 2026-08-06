@@ -985,6 +985,265 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "checkout_retry_events_user_attempt_idx",
         )
 
+    def test_stripe_identity_conflict_audit_uses_schema_0003_unique_text_key(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO users (telegram_id, stripe_customer_id) VALUES (999, 'cus_pg_conflict')")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        conflict = main.StripeIdentityConflictError(
+            "users_customer_conflict",
+            "cus_pg_conflict",
+            None,
+            123,
+            "checkout.session.completed",
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            main.persist_stripe_identity_conflict_audit(
+                conflict,
+                "evt_pg_identity_conflict",
+                "checkout.session.completed",
+                checkout_session_id="cs_pg_identity_conflict",
+            )
+
+        row = self.query_one(
+            """
+            SELECT conflict_type, stripe_id, telegram_ids, resolved, created_at, updated_at
+            FROM stripe_identity_conflicts
+            WHERE conflict_type = 'users_customer_conflict'
+              AND stripe_id = 'cus_pg_conflict'
+            """
+        )
+        self.assertEqual(row[2], "[123,999]")
+        self.assertFalse(row[3])
+        first_updated_at = row[5]
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM unlinked_stripe_events WHERE event_id = 'evt_pg_identity_conflict'")[0],
+            1,
+        )
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM message_delivery_events WHERE delivery_type = 'stripe_admin_message'")[0],
+            2,
+        )
+
+        time.sleep(1.05)
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            main.persist_stripe_identity_conflict_audit(
+                main.StripeIdentityConflictError(
+                    "users_customer_conflict",
+                    "cus_pg_conflict",
+                    None,
+                    123,
+                    "checkout.session.completed",
+                ),
+                "evt_pg_identity_conflict",
+                "checkout.session.completed",
+            )
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM stripe_identity_conflicts
+                WHERE conflict_type = 'users_customer_conflict'
+                  AND stripe_id = 'cus_pg_conflict'
+                  AND telegram_ids = '[123,999]'
+                """
+            )[0],
+            1,
+        )
+        self.assertGreater(
+            self.query_one(
+                """
+                SELECT updated_at
+                FROM stripe_identity_conflicts
+                WHERE conflict_type = 'users_customer_conflict'
+                  AND stripe_id = 'cus_pg_conflict'
+                  AND telegram_ids = '[123,999]'
+                """
+            )[0],
+            first_updated_at,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE stripe_identity_conflicts
+                SET resolved = TRUE
+                WHERE conflict_type = 'users_customer_conflict'
+                  AND stripe_id = 'cus_pg_conflict'
+                  AND telegram_ids = '[123,999]'
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            main.persist_stripe_identity_conflict_audit(
+                main.StripeIdentityConflictError(
+                    "users_customer_conflict",
+                    "cus_pg_conflict",
+                    None,
+                    123,
+                    "checkout.session.completed",
+                ),
+                "evt_pg_identity_conflict_new",
+                "checkout.session.completed",
+            )
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM stripe_identity_conflicts
+                WHERE conflict_type = 'users_customer_conflict'
+                  AND stripe_id = 'cus_pg_conflict'
+                  AND telegram_ids = '[123,999]'
+                """
+            )[0],
+            2,
+        )
+
+        before_counts = {
+            "conflicts": self.query_one("SELECT COUNT(*) FROM stripe_identity_conflicts")[0],
+            "unlinked": self.query_one("SELECT COUNT(*) FROM unlinked_stripe_events")[0],
+            "deliveries": self.query_one("SELECT COUNT(*) FROM message_delivery_events")[0],
+        }
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "enqueue_admin_payment_problem_safely", side_effect=RuntimeError("audit delivery failed")):
+            with self.assertRaises(RuntimeError):
+                main.persist_stripe_identity_conflict_audit(
+                    main.StripeIdentityConflictError(
+                        "users_customer_conflict",
+                        "cus_pg_conflict",
+                        None,
+                        123,
+                        "invoice.payment_succeeded",
+                    ),
+                    "evt_pg_identity_conflict_rollback",
+                    "invoice.payment_succeeded",
+                )
+
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM stripe_identity_conflicts")[0], before_counts["conflicts"])
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM unlinked_stripe_events")[0], before_counts["unlinked"])
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM message_delivery_events")[0], before_counts["deliveries"])
+
+    def test_upsert_stripe_link_subscription_unique_same_user_update_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_customer_id, stripe_subscription_id,
+                    status, is_active, source, updated_at
+                )
+                VALUES (123, NULL, 'sub_same_pg', 'incomplete', FALSE, 'seed', NOW())
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.upsert_stripe_link(
+                cur,
+                123,
+                stripe_customer_id="cus_same_pg",
+                stripe_subscription_id="sub_same_pg",
+                status="active",
+                current_period_end=datetime.utcnow() + timedelta(days=30),
+                is_active=True,
+                source="invoice.payment_succeeded",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM stripe_links WHERE stripe_subscription_id = 'sub_same_pg'")[0],
+            1,
+        )
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT telegram_id, stripe_customer_id, status, is_active, source
+                FROM stripe_links
+                WHERE stripe_subscription_id = 'sub_same_pg'
+                """
+            ),
+            (123, "cus_same_pg", "active", True, "invoice.payment_succeeded"),
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM stripe_identity_conflicts")[0], 0)
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            main.upsert_stripe_link(
+                cur,
+                123,
+                stripe_customer_id="cus_same_pg",
+                stripe_subscription_id="sub_same_pg",
+                status="past_due",
+                is_active=False,
+                source="customer.subscription.updated",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM stripe_links WHERE stripe_subscription_id = 'sub_same_pg'")[0],
+            1,
+        )
+        self.assertEqual(
+            self.query_one("SELECT status, is_active FROM stripe_links WHERE stripe_subscription_id = 'sub_same_pg'"),
+            ("past_due", False),
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            with self.assertRaises(main.StripeIdentityConflictError) as raised:
+                main.upsert_stripe_link(
+                    cur,
+                    999,
+                    stripe_customer_id="cus_other_pg",
+                    stripe_subscription_id="sub_same_pg",
+                    status="active",
+                    is_active=True,
+                    source="invoice.payment_succeeded",
+                )
+            conn.rollback()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(raised.exception.conflict_type, "stripe_links_subscription_conflict")
+        self.assertEqual(raised.exception.existing_telegram_id, 123)
+        self.assertEqual(raised.exception.requested_telegram_id, 999)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM stripe_links WHERE stripe_subscription_id = 'sub_same_pg'")[0],
+            1,
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM stripe_identity_conflicts")[0], 0)
+
     def test_postgres_fsm_storage_migration_shape_and_idempotency(self):
         run_migrations(self.get_conn)
 
