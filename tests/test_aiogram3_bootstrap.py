@@ -3767,6 +3767,300 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Оплата уже обрабатывается Stripe", callback.message.answers[-1][0])
         self.assertEqual(state.clear_calls, 1)
 
+    async def test_checkout_first_create_does_not_enqueue_reuse_alert(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        open_conn = FakeConnection()
+        claim_result = {
+            "action": "create",
+            "record": {
+                "id": 71,
+                "stripe_session_id": None,
+                "checkout_url": None,
+                "status": "creating",
+                "expires_at": None,
+                "idempotency_key": "idem_first_create",
+                "created_at": datetime.utcnow(),
+            },
+        }
+        session = SimpleNamespace(
+            id="cs_first_create",
+            url="https://checkout.stripe.test/first-create",
+            expires_at=int(time.time()) + 600,
+        )
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main, "try_enqueue_checkout_preparation_failed_alert", AsyncMock()) as error_alert, \
+             patch.object(self.main, "notify_admins_about_checkout_reuse", AsyncMock()) as reuse_alert, \
+             patch.object(self.main.stripe.checkout.Session, "create", return_value=session) as create_session, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, open_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_called_once()
+        reuse_alert.assert_not_awaited()
+        error_alert.assert_not_awaited()
+        self.assertIn("https://checkout.stripe.test/first-create", callback.message.answers[-1][0])
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_checkout_second_reuse_sends_button_without_admin_alert_or_new_session(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        claim_result = {
+            "action": "reuse_open",
+            "record": {
+                "id": 72,
+                "stripe_session_id": "cs_reuse_second_full",
+                "checkout_url": "https://checkout.stripe.test/stale",
+                "status": "open",
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+                "idempotency_key": "idem_reuse_second",
+                "created_at": datetime.utcnow(),
+            },
+        }
+        live_session = SimpleNamespace(
+            id="cs_reuse_second_full",
+            status="open",
+            url="https://checkout.stripe.test/live-second",
+            expires_at=int(time.time()) + 600,
+        )
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(2, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", return_value=live_session) as retrieve_session, \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "try_enqueue_checkout_preparation_failed_alert", AsyncMock()) as error_alert, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn]), \
+             self.assertLogs(level="INFO") as logs:
+            await self.main.process_payment(callback, state)
+
+        retrieve_session.assert_called_once_with("cs_reuse_second_full")
+        create_session.assert_not_called()
+        error_alert.assert_not_awaited()
+        self.assertIn("https://checkout.stripe.test/live-second", callback.message.answers[-1][0])
+        log_output = "\n".join(logs.output)
+        self.assertIn("CHECKOUT_REUSE_INFO", log_output)
+        self.assertIn("alert_enqueued=False", log_output)
+        self.assertNotIn("cs_reuse_second_full", log_output)
+        self.assertNotIn("https://checkout.stripe.test/live-second", log_output)
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_checkout_third_reuse_enqueues_single_info_alert_without_failure_wording(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        alert_conn = FakeConnection(fetches=[(None,), (73,), ("admin-1",), ("admin-2",)])
+        claim_result = {
+            "action": "reuse_open",
+            "record": {
+                "id": 73,
+                "stripe_session_id": "cs_reuse_third_full",
+                "checkout_url": "https://checkout.stripe.test/stale",
+                "status": "open",
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+                "idempotency_key": "idem_reuse_third",
+                "created_at": datetime.utcnow(),
+            },
+        }
+        live_session = SimpleNamespace(
+            id="cs_reuse_third_full",
+            status="open",
+            url="https://checkout.stripe.test/live-third",
+            expires_at=int(time.time()) + 600,
+        )
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(3, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", return_value=live_session), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, alert_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        payloads = [json.loads(adapted_json_value(params[3])) for params in self.admin_delivery_inserts(alert_conn)]
+        self.assertEqual(len(payloads), len(self.main.ADMIN_IDS))
+        alert_text = payloads[0]["text"]
+        self.assertEqual(payloads[0]["severity"], "INFO")
+        self.assertIn("ℹ️ Повторный запрос ссылки на оплату", alert_text)
+        self.assertIn("Попыток за последние 5 минут: 3", alert_text)
+        self.assertIn("Активная Stripe Checkout ссылка была отправлена пользователю повторно.", alert_text)
+        self.assertNotIn("не удалось создать ссылку оплаты", alert_text)
+        self.assertNotIn("Оплата не завершена", alert_text)
+        self.assertNotIn("Stripe Checkout успешно создан", alert_text)
+        self.assertNotIn("https://checkout.stripe.test/live-third", alert_text)
+        self.assertNotIn("cs_reuse_third_full", alert_text)
+
+    async def test_checkout_fourth_reuse_in_cooldown_dedupes_info_alert(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        alert_conn = FakeConnection(fetches=[(datetime.utcnow(),)])
+        claim_result = {
+            "action": "reuse_open",
+            "record": {
+                "id": 74,
+                "stripe_session_id": "cs_reuse_fourth_full",
+                "checkout_url": "https://checkout.stripe.test/stale",
+                "status": "open",
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+                "idempotency_key": "idem_reuse_fourth",
+                "created_at": datetime.utcnow(),
+            },
+        }
+        live_session = SimpleNamespace(
+            id="cs_reuse_fourth_full",
+            status="open",
+            url="https://checkout.stripe.test/live-fourth",
+            expires_at=int(time.time()) + 600,
+        )
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(4, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", return_value=live_session), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, alert_conn]), \
+             self.assertLogs(level="INFO") as logs:
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        self.assertEqual(self.admin_delivery_inserts(alert_conn), [])
+        self.assertIn("alert_enqueued=False", "\n".join(logs.output))
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_checkout_create_exception_enqueues_preparation_failed_alert(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        failed_conn = FakeConnection()
+        claim_result = {
+            "action": "create",
+            "record": {
+                "id": 75,
+                "stripe_session_id": None,
+                "checkout_url": None,
+                "status": "creating",
+                "expires_at": None,
+                "idempotency_key": "idem_create_failed",
+                "created_at": datetime.utcnow(),
+            },
+        }
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(1, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "create", side_effect=RuntimeError("stripe create boom")), \
+             patch.object(self.main, "try_enqueue_checkout_preparation_failed_alert", AsyncMock()) as error_alert, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn, failed_conn]):
+            await self.main.process_payment(callback, state)
+
+        error_alert.assert_awaited_once()
+        self.assertEqual(error_alert.await_args.args[2], "checkout_preparation_failed")
+        self.assertEqual(callback.answers[-1][0], "Техническая ошибка. Попробуйте позже или напишите @re_tasha")
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+
+    async def test_checkout_reuse_retrieve_exception_enqueues_preparation_failed_alert_without_button(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        claim_result = {
+            "action": "reuse_open",
+            "record": {
+                "id": 76,
+                "stripe_session_id": "cs_retrieve_failed_full",
+                "checkout_url": "https://checkout.stripe.test/stale",
+                "status": "open",
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+                "idempotency_key": "idem_retrieve_failed",
+                "created_at": datetime.utcnow(),
+            },
+        }
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(2, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", side_effect=RuntimeError("stripe retrieve boom")), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "try_enqueue_checkout_preparation_failed_alert", AsyncMock()) as error_alert, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        error_alert.assert_awaited_once()
+        self.assertEqual(error_alert.await_args.args[2], "checkout_session_retrieve_failed")
+        self.assertEqual(callback.message.answers, [])
+        self.assertEqual(callback.answers[-1][0], "Техническая ошибка. Попробуйте позже или напишите @re_tasha")
+
+    async def test_checkout_reuse_missing_url_enqueues_preparation_failed_alert_without_button(self):
+        callback = FakeCallback()
+        callback.data = "sub_1"
+        state = FakeState()
+        initial_conn = FakeConnection(fetches=[(False, None, False, False, None, False, None, False)])
+        claim_conn = FakeConnection()
+        claim_result = {
+            "action": "reuse_open",
+            "record": {
+                "id": 77,
+                "stripe_session_id": "cs_missing_url_full",
+                "checkout_url": "https://checkout.stripe.test/stale",
+                "status": "open",
+                "expires_at": datetime.utcnow() + timedelta(minutes=10),
+                "idempotency_key": "idem_missing_url",
+                "created_at": datetime.utcnow(),
+            },
+        }
+        live_session = SimpleNamespace(
+            id="cs_missing_url_full",
+            status="open",
+            url=None,
+            expires_at=int(time.time()) + 600,
+        )
+
+        with patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main, "register_checkout_attempt", return_value=(2, datetime.utcnow().timestamp())), \
+             patch.object(self.main, "claim_checkout_session_record", return_value=claim_result), \
+             patch.object(self.main.stripe.checkout.Session, "retrieve", return_value=live_session), \
+             patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+             patch.object(self.main, "try_enqueue_checkout_preparation_failed_alert", AsyncMock()) as error_alert, \
+             patch.object(self.main, "get_db_conn", side_effect=[initial_conn, claim_conn]):
+            await self.main.process_payment(callback, state)
+
+        create_session.assert_not_called()
+        error_alert.assert_awaited_once()
+        self.assertEqual(error_alert.await_args.args[2], "checkout_session_missing_url")
+        self.assertEqual(callback.message.answers, [])
+
+    async def test_checkout_preparation_failed_text_is_checkout_specific(self):
+        text = self.main.build_checkout_preparation_failed_text(
+            123,
+            "checkout_session_retrieve_failed",
+            "checkout_preparation_failed:safe-ref",
+        )
+
+        self.assertIn("⚠️ Не удалось подготовить оплату", text)
+        self.assertIn("Этап: Checkout", text)
+        self.assertIn("Причина: checkout_session_retrieve_failed", text)
+        self.assertIn("Error ref: checkout_preparation_failed:safe-ref", text)
+        self.assertNotIn("Оплата не завершена", text)
+        self.assertNotIn("не удалось создать ссылку оплаты", text)
+
     async def test_checkout_creation_pending_other_tariff_does_not_create_new_session(self):
         callback = FakeCallback()
         callback.data = "sub_6"

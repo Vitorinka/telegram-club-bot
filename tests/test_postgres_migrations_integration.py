@@ -1013,6 +1013,149 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "checkout_retry_events_user_attempt_idx",
         )
 
+    def insert_checkout_reuse_attempt_at(self, telegram_id, tariff, attempt_at, last_admin_alert_at=None):
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO checkout_retry_events (
+                    telegram_id, tariff_code, attempt_at, last_admin_alert_at
+                )
+                VALUES (%s, %s, %s, %s)
+                """,
+                (telegram_id, tariff, attempt_at, last_admin_alert_at),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def checkout_reuse_admin_delivery_count(self):
+        return self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM message_delivery_events
+            WHERE delivery_type = 'stripe_admin_message'
+              AND payload_json::text LIKE '%%checkout_open_reused%%'
+            """
+        )[0]
+
+    def test_checkout_reuse_alert_cooldown_checks_all_recent_attempt_rows(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 49001
+        tariff = "sub_1"
+        now = datetime.utcnow()
+        for minutes_ago in (4, 3, 2):
+            self.insert_checkout_reuse_attempt_at(user_id, tariff, now - timedelta(minutes=minutes_ago))
+
+        with mock.patch.object(main, "get_db_conn", self.get_conn), \
+             mock.patch.object(main, "ADMIN_IDS", [1, 2]):
+            asyncio.run(main.notify_admins_about_checkout_reuse(user_id, tariff, 3, "cs_reuse_pg", now.timestamp()))
+
+        self.assertEqual(self.checkout_reuse_admin_delivery_count(), 2)
+
+        self.insert_checkout_reuse_attempt_at(user_id, tariff, now + timedelta(seconds=1))
+        with mock.patch.object(main, "get_db_conn", self.get_conn), \
+             mock.patch.object(main, "ADMIN_IDS", [1, 2]):
+            asyncio.run(main.notify_admins_about_checkout_reuse(
+                user_id,
+                tariff,
+                4,
+                "cs_reuse_pg",
+                (now + timedelta(seconds=1)).timestamp(),
+            ))
+
+        self.assertEqual(self.checkout_reuse_admin_delivery_count(), 2)
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM checkout_retry_events
+                WHERE telegram_id = %s
+                  AND tariff_code = %s
+                  AND last_admin_alert_at IS NOT NULL
+                """,
+                (user_id, tariff),
+            )[0],
+            1,
+        )
+
+    def test_checkout_reuse_alert_concurrent_threshold_calls_enqueue_once(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 49002
+        tariff = "sub_1"
+        now = datetime.utcnow()
+        for minutes_ago in (4, 3, 2):
+            self.insert_checkout_reuse_attempt_at(user_id, tariff, now - timedelta(minutes=minutes_ago))
+
+        errors = []
+
+        def call_helper():
+            try:
+                asyncio.run(main.notify_admins_about_checkout_reuse(
+                    user_id,
+                    tariff,
+                    3,
+                    "cs_reuse_pg_concurrent",
+                    now.timestamp(),
+                ))
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(main, "get_db_conn", self.get_conn), \
+             mock.patch.object(main, "ADMIN_IDS", [1, 2]):
+            threads = [threading.Thread(target=call_helper), threading.Thread(target=call_helper)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(self.checkout_reuse_admin_delivery_count(), 2)
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*)
+                FROM checkout_retry_events
+                WHERE telegram_id = %s
+                  AND tariff_code = %s
+                  AND last_admin_alert_at IS NOT NULL
+                """,
+                (user_id, tariff),
+            )[0],
+            1,
+        )
+
+    def test_checkout_reuse_alert_allowed_again_after_cooldown(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 49003
+        tariff = "sub_1"
+        now = datetime.utcnow()
+        for minutes_ago in (4, 3, 2):
+            self.insert_checkout_reuse_attempt_at(user_id, tariff, now - timedelta(minutes=minutes_ago))
+
+        with mock.patch.object(main, "get_db_conn", self.get_conn), \
+             mock.patch.object(main, "ADMIN_IDS", [1, 2]):
+            asyncio.run(main.notify_admins_about_checkout_reuse(user_id, tariff, 3, "cs_reuse_pg_later", now.timestamp()))
+
+        later = now + timedelta(minutes=31)
+        self.insert_checkout_reuse_attempt_at(user_id, tariff, later)
+        with mock.patch.object(main, "get_db_conn", self.get_conn), \
+             mock.patch.object(main, "ADMIN_IDS", [1, 2]):
+            asyncio.run(main.notify_admins_about_checkout_reuse(
+                user_id,
+                tariff,
+                4,
+                "cs_reuse_pg_later",
+                later.timestamp(),
+            ))
+
+        self.assertEqual(self.checkout_reuse_admin_delivery_count(), 4)
+
     def test_payment_integrity_guards_created_on_clean_schema_and_idempotent(self):
         run_migrations(self.get_conn)
         expected = {

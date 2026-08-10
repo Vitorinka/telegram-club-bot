@@ -192,6 +192,8 @@ def telegram_retry_delay_minutes(error, attempt_count=1):
 CHECKOUT_SESSION_COOLDOWN_SECONDS = 10 * 60
 CHECKOUT_RETRY_WINDOW_SECONDS = 5 * 60
 CHECKOUT_ADMIN_ALERT_COOLDOWN_SECONDS = 15 * 60
+CHECKOUT_REUSE_ADMIN_ALERT_THRESHOLD = 3
+CHECKOUT_REUSE_ADMIN_ALERT_COOLDOWN_SECONDS = 30 * 60
 PAYMENT_RETRY_GRACE_HOURS = int(os.getenv("PAYMENT_RETRY_GRACE_HOURS", "48"))
 FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = 24
 FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "open", "expired", "failed", "completed")
@@ -4640,6 +4642,188 @@ def register_checkout_attempt(telegram_user, sub_type):
     return attempt_count, now.timestamp()
 
 
+class CheckoutPreparationError(Exception):
+    def __init__(self, category, safe_ref, message=None):
+        self.category = str(category or "checkout_preparation_failed")
+        self.safe_ref = safe_ref or safe_admin_context_reference("checkout_preparation_failed", self.category)
+        super().__init__(message or self.category)
+
+
+def checkout_preparation_error_category(error):
+    if isinstance(error, CheckoutPreparationError):
+        return error.category
+    if isinstance(error, (ConnectionError, TimeoutError)):
+        return "stripe_api_unavailable"
+    return "checkout_preparation_failed"
+
+
+def checkout_preparation_error_ref(error, user_id, sub_type):
+    if isinstance(error, CheckoutPreparationError):
+        return error.safe_ref
+    return safe_admin_error_reference("checkout_preparation", error)
+
+
+def build_checkout_reuse_info_text(user_id, sub_type, attempt_count):
+    return (
+        "ℹ️ Повторный запрос ссылки на оплату\n\n"
+        f"Пользователь: {int(user_id)}\n"
+        f"Тариф: {sub_type}\n"
+        f"Попыток за последние 5 минут: {attempt_count}\n\n"
+        "Активная Stripe Checkout ссылка была отправлена пользователю повторно.\n"
+        "Успешной оплаты пока нет.\n\n"
+        "Возможная причина: пользователь вернулся из встроенного браузера Telegram\n"
+        "или повторно нажал кнопку тарифа."
+    )
+
+
+def build_checkout_preparation_failed_text(user_id, category, safe_ref):
+    return (
+        "⚠️ Не удалось подготовить оплату\n\n"
+        "Этап: Checkout\n"
+        f"Пользователь: {int(user_id)}\n"
+        f"Причина: {category}\n"
+        f"Error ref: {safe_ref}"
+    )
+
+
+async def try_enqueue_checkout_preparation_failed_alert(user_id, sub_type, category, safe_ref):
+    conn = None
+    cur = None
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        enqueue_stripe_admin_message(
+            cur,
+            None,
+            "checkout_preparation_failed",
+            build_checkout_preparation_failed_text(user_id, category, safe_ref),
+            severity="WARNING",
+            category=category,
+            safe_ref=safe_ref,
+        )
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        log_admin_payment_enqueue_failure(
+            purpose="checkout_preparation_failed",
+            category=category,
+            safe_ref=safe_ref,
+        )
+        return False
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
+async def notify_admins_about_checkout_reuse(user_id, sub_type, attempt_count, session_id, attempt_timestamp):
+    user_id = int(user_id)
+    alert_enqueued = False
+    if attempt_count < CHECKOUT_REUSE_ADMIN_ALERT_THRESHOLD:
+        logging.info(
+            "CHECKOUT_REUSE_INFO: user_id=%s, sub_type=%s, attempts=%s, session_id=%s, alert_enqueued=%s",
+            user_id,
+            sub_type,
+            attempt_count,
+            safe_log_id(session_id),
+            alert_enqueued,
+        )
+        return
+
+    if not ADMIN_IDS:
+        logging.info(
+            "CHECKOUT_REUSE_INFO: user_id=%s, sub_type=%s, attempts=%s, session_id=%s, alert_enqueued=%s",
+            user_id,
+            sub_type,
+            attempt_count,
+            safe_log_id(session_id),
+            alert_enqueued,
+        )
+        return
+
+    attempt_dt = datetime.utcfromtimestamp(attempt_timestamp)
+    cooldown_before = attempt_dt - timedelta(seconds=CHECKOUT_REUSE_ADMIN_ALERT_COOLDOWN_SECONDS)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"checkout-reuse-alert:{user_id}:{sub_type}",),
+        )
+        cur.execute(
+            """
+            SELECT MAX(last_admin_alert_at)
+            FROM checkout_retry_events
+            WHERE telegram_id = %s
+              AND tariff_code = %s
+            """,
+            (user_id, sub_type),
+        )
+        row = cur.fetchone()
+        last_alert_at = row[0] if row else None
+        if last_alert_at and last_alert_at >= cooldown_before:
+            conn.commit()
+            logging.info(
+                "CHECKOUT_REUSE_INFO: user_id=%s, sub_type=%s, attempts=%s, session_id=%s, alert_enqueued=%s",
+                user_id,
+                sub_type,
+                attempt_count,
+                safe_log_id(session_id),
+                alert_enqueued,
+            )
+            return
+        cur.execute(
+            """
+            WITH latest AS (
+                SELECT id
+                FROM checkout_retry_events
+                WHERE telegram_id = %s
+                  AND tariff_code = %s
+                ORDER BY attempt_at DESC
+                LIMIT 1
+                FOR UPDATE
+            )
+            UPDATE checkout_retry_events
+            SET last_admin_alert_at = %s
+            WHERE id IN (SELECT id FROM latest)
+            RETURNING id
+            """,
+            (user_id, sub_type, attempt_dt),
+        )
+        row = cur.fetchone()
+        if row:
+            safe_ref = safe_admin_context_reference("checkout_open_reused", user_id, sub_type, row[0])
+            enqueue_stripe_admin_message(
+                cur,
+                None,
+                "checkout_open_reused",
+                build_checkout_reuse_info_text(user_id, sub_type, attempt_count),
+                severity="INFO",
+                category="checkout_open_reused",
+                safe_ref=safe_ref,
+            )
+            alert_enqueued = True
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    logging.info(
+        "CHECKOUT_REUSE_INFO: user_id=%s, sub_type=%s, attempts=%s, session_id=%s, alert_enqueued=%s",
+        user_id,
+        sub_type,
+        attempt_count,
+        safe_log_id(session_id),
+        alert_enqueued,
+    )
+
+
 async def notify_admins_about_checkout_retry(user_id, sub_type, attempt_count, session_id, attempt_timestamp):
     user_id = int(user_id)
     if attempt_count < 2:
@@ -9055,6 +9239,7 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 live_session = await asyncio.to_thread(stripe.checkout.Session.retrieve, session_id)
                 live_status = getattr(live_session, "status", None)
                 live_expires_at = getattr(live_session, "expires_at", None)
+                live_url = getattr(live_session, "url", None)
                 if live_status and live_status != "open":
                     terminal_conn = get_db_conn()
                     terminal_cur = terminal_conn.cursor()
@@ -9079,14 +9264,25 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                     await callback.message.answer("Предыдущая ссылка истекла. Нажмите тариф ещё раз, чтобы создать новую.")
                     await state.clear()
                     return
+                if not live_url:
+                    raise CheckoutPreparationError(
+                        "checkout_session_missing_url",
+                        safe_admin_context_reference("checkout_session_missing_url", user_id, sub_type, session_id),
+                    )
+                checkout_url = live_url
             except Exception as e:
+                if isinstance(e, CheckoutPreparationError):
+                    raise
                 logging.warning(
                     "CHECKOUT_REUSE_LIVE_RETRIEVE_FAILED: user_id=%s, session_id=%s, error=%s",
                     user_id,
                     safe_log_id(session_id),
-                    str(e),
-                    exc_info=True,
+                    type(e).__name__,
                 )
+                raise CheckoutPreparationError(
+                    "checkout_session_retrieve_failed",
+                    safe_admin_context_reference("checkout_session_retrieve_failed", user_id, sub_type, session_id),
+                ) from e
             logging.info(
                 "CHECKOUT_OPEN_REUSED: user_id=%s, session_id=%s, sub_type=%s, mode=%s",
                 user_id,
@@ -9168,30 +9364,30 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
             mode,
             reused=reused
         )
-        await notify_admins_about_checkout_retry(
-            user_id,
-            sub_type,
-            attempt_count,
-            session_id,
-            attempt_timestamp
-        )
+        if reused:
+            await notify_admins_about_checkout_reuse(
+                user_id,
+                sub_type,
+                attempt_count,
+                session_id,
+                attempt_timestamp
+            )
         await state.clear()
     except Exception as e:
-        logging.exception(
-            f"Ошибка создания или отправки Stripe Checkout: user_id={user_id}, "
-            f"sub_type={sub_type}, mode={mode}: {e}"
+        error_category = checkout_preparation_error_category(e)
+        safe_ref = checkout_preparation_error_ref(e, user_id, sub_type)
+        logging.error(
+            "CHECKOUT_PREPARATION_FAILED: user_id=%s, sub_type=%s, error_category=%s, safe_ref=%s",
+            user_id,
+            sub_type,
+            error_category,
+            safe_ref,
         )
-        await enqueue_admin_payment_problem_now(
-            event_id=None,
-            purpose="checkout_creation_failed",
-            stage="checkout_creation",
-            telegram_id=user_id,
-            category="checkout_creation_failed",
-            exception=e,
-            stripe_retry="неизвестно",
-            recovery_reminder="неизвестно",
-            safe_ref=safe_admin_error_reference("checkout_creation", e),
-            note=f"Тариф: {sub_type}. Пользователь получил безопасное сообщение.",
+        await try_enqueue_checkout_preparation_failed_alert(
+            user_id,
+            sub_type,
+            error_category,
+            safe_ref,
         )
         await callback.answer(
             "Техническая ошибка. Попробуйте позже или напишите @re_tasha",
