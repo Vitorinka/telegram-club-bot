@@ -3628,23 +3628,16 @@ def enqueue_stripe_admin_message(cur, event_id, purpose, text, severity="WARNING
 
 
 def enqueue_admin_payment_success(cur, event_id, purpose, telegram_id, tariff, amount, currency, effective_expiry, payment_ref):
-    return enqueue_stripe_admin_message(
-        cur,
-        event_id,
+    logging.info(
+        "ADMIN_NOTIFICATION_SUPPRESSED: category=%s, result=payment_recorded, "
+        "telegram_id=%s, tariff=%s, access_until=%s, payment_ref=%s",
         purpose,
-        build_admin_payment_success_text(
-            purpose,
-            telegram_id,
-            tariff,
-            amount,
-            currency,
-            effective_expiry,
-            payment_ref,
-        ),
-        severity="INFO",
-        category=purpose,
-        safe_ref=payment_ref,
+        telegram_id,
+        tariff or "unknown",
+        effective_expiry.isoformat() if effective_expiry else "unknown",
+        safe_log_id(payment_ref) or "none",
     )
+    return 0
 
 
 def enqueue_admin_payment_problem(
@@ -4060,28 +4053,19 @@ def build_first_purchase_recovery_admin_sent_text(telegram_id, payload):
 
 
 def enqueue_first_purchase_recovery_admin_sent_notices(cur, recovery_delivery_key, telegram_id, payload):
-    count = 0
     safe_ref = payload.get("safe_ref") or safe_admin_context_reference(
         "first_purchase_recovery_sent",
         telegram_id,
         payload.get("attempted_at") or payload.get("latest_attempt_at"),
     )
-    text = build_first_purchase_recovery_admin_sent_text(telegram_id, {**payload, "safe_ref": safe_ref})
-    for admin_id in ADMIN_IDS:
-        if enqueue_message_delivery(
-            cur,
-            first_purchase_recovery_admin_sent_delivery_key(recovery_delivery_key, admin_id),
-            int(admin_id),
-            "stripe_admin_message",
-            stripe_delivery_payload(
-                text,
-                severity="INFO",
-                category="first_purchase_recovery_sent",
-                safe_ref=safe_ref,
-            ),
-        ):
-            count += 1
-    return count
+    logging.info(
+        "ADMIN_NOTIFICATION_SUPPRESSED: category=first_purchase_recovery_sent, "
+        "result=user_message_sent, telegram_id=%s, delivery_ref=%s, safe_ref=%s",
+        telegram_id,
+        safe_delivery_hash(recovery_delivery_key),
+        safe_ref,
+    )
+    return 0
 
 
 def enqueue_first_purchase_recovery_admin_sent_notices_safely(cur, recovery_delivery_key, telegram_id, payload):
@@ -6597,20 +6581,17 @@ async def ban_user_logic(telegram_id, cur=None):
                 f"Пользователь {telegram_id} удален из группы, но не удалось снять бан.\n"
                 f"Ошибка: действие не выполнено. ref: {error_ref}"
             )
-        logging.warning(
+        logging.info(
             "USER_REMOVED_FROM_GROUP: telegram_id=%s, username=%s, chat_id=%s, reason=%s, result=%s",
             telegram_id, None, GROUP_ID, reason, unban_result
         )
         mark_subscription_removal_short(telegram_id, "telegram_removed")
-        await notify_admins(
-            "Пользователь удалён из группы ботом.\n\n"
-            f"Telegram ID: {telegram_id}\n"
-            f"Username: нет\n"
-            f"Причина: {reason}\n"
-            f"Подписка до: {expiry_date or 'нет'}\n"
-            f"Grace: {grace or 'нет'}\n"
-            f"Auto-renew: {auto_renew}\n"
-            f"Stripe subscription: {safe_log_id(stripe_subscription_id) or 'нет'}"
+        logging.info(
+            "ADMIN_NOTIFICATION_SUPPRESSED: category=expected_access_removal, "
+            "result=removed, telegram_id=%s, reason=%s, subscription_ref=%s",
+            telegram_id,
+            reason,
+            safe_log_id(stripe_subscription_id) or "none",
         )
     except Exception as e:
         logging.error(
@@ -6666,6 +6647,24 @@ async def ban_user_logic(telegram_id, cur=None):
         )
 
     return status
+
+def subscription_check_requires_admin_notification(removed_total, reminder_errors, telegram_errors):
+    return reminder_errors > 0 or telegram_errors > 0
+
+
+async def notify_subscription_check_admins_if_needed(report_text, removed_total, reminder_errors, telegram_errors):
+    if not subscription_check_requires_admin_notification(removed_total, reminder_errors, telegram_errors):
+        return False
+    try:
+        await notify_admins(report_text)
+        return True
+    except Exception as e:
+        logging.error(
+            "SUBSCRIPTION_CHECK_ADMIN_NOTIFICATION_FAILED: error_ref=%s",
+            safe_admin_error_reference("subscription_check_admin_notification", e),
+        )
+        return False
+
 
 async def check_subscriptions_and_reminders():
     logging.info("--- Запуск ежедневной проверки подписок ---")
@@ -7060,10 +7059,22 @@ async def check_subscriptions_and_reminders():
     report_text += format_report_section("⚠️ Просроченные пользователи", expired_user_details)
     report_text += format_report_section("🚪 Удалены / закрыт доступ", deleted_user_details)
 
-    try:
-        await notify_admins(report_text)
-    except Exception as e:
-        logging.error(f"Не удалось отправить отчет проверки подписок: {e}")
+    logging.info(
+        "SUBSCRIPTION_CHECK_COMPLETED: checked=%s, removed=%s, reminder_errors=%s, "
+        "telegram_errors=%s, reminders_sent=%s, stripe_protected=%s",
+        checked_total,
+        removed_total,
+        reminder_errors,
+        telegram_errors,
+        reminders_sent,
+        stripe_protected,
+    )
+    await notify_subscription_check_admins_if_needed(
+        report_text,
+        removed_total,
+        reminder_errors,
+        telegram_errors,
+    )
 
 async def check_free_lesson_followups():
     logging.info("--- Проверка follow-up после бесплатного урока ---")
@@ -15561,13 +15572,21 @@ async def stripe_webhook(request):
                                 buyer_purpose,
                                 "Похоже, оформление подарка не завершилось. Вы можете создать подарок заново из меню.",
                             )
-                            enqueue_gift_admin_delivery(
-                                cur,
-                                updated_gift["public_reference"],
-                                "gift_admin_problem",
-                                gift_admin_text("⚠️ Gift checkout did not complete", updated_gift, extra=f"event: {event_type}"),
-                                severity="WARNING",
-                            )
+                            if event_type == "checkout.session.expired":
+                                logging.info(
+                                    "ADMIN_NOTIFICATION_SUPPRESSED: category=gift_checkout_expired, "
+                                    "result=cancelled, gift_ref=%s, purchaser_telegram_id=%s",
+                                    safe_log_id(updated_gift["public_reference"]),
+                                    updated_gift["purchaser_telegram_id"],
+                                )
+                            else:
+                                enqueue_gift_admin_delivery(
+                                    cur,
+                                    updated_gift["public_reference"],
+                                    "gift_admin_problem",
+                                    gift_admin_text("⚠️ Gift checkout did not complete", updated_gift, extra=f"event: {event_type}"),
+                                    severity="WARNING",
+                                )
                         else:
                             record_gift_event(cur, gift_row, f"{event_type}_ignored", gift_row["purchaser_telegram_id"], source="stripe_webhook")
                     conn.commit()
@@ -15620,21 +15639,32 @@ async def stripe_webhook(request):
                         "Вы можете выбрать тариф еще раз или написать администратору, если нужна помощь.",
                         keyboard_kind="retry_payment",
                     )
-                enqueue_admin_payment_problem_safely(
-                    cur,
-                    event_id=event_id,
-                    purpose="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
-                    stage="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
-                    telegram_id=user_id,
-                    category="checkout_expired" if event_type == 'checkout.session.expired' else "checkout_async_payment_failed",
-                    stripe_retry="нет",
-                    recovery_reminder=admin_recovery_reminder_status(
-                        immediate_retry_enqueued=bool(user_id),
-                        scheduler_will_check=bool(user_id),
-                    ),
-                    safe_ref=safe_admin_context_reference(event_type, event_id, session_id, user_id),
-                    note="Немедленное сообщение retry_payment поставлено в outbox." if user_id else "telegram_id не определён.",
-                )
+                if event_type == 'checkout.session.expired':
+                    logging.info(
+                        "ADMIN_NOTIFICATION_SUPPRESSED: category=checkout_expired, "
+                        "result=terminal_state_recorded, event_ref=%s, session_ref=%s, "
+                        "telegram_id=%s, retry_message_enqueued=%s",
+                        safe_log_id(event_id),
+                        safe_log_id(session_id),
+                        user_id or "unknown",
+                        bool(user_id),
+                    )
+                else:
+                    enqueue_admin_payment_problem_safely(
+                        cur,
+                        event_id=event_id,
+                        purpose="checkout_async_payment_failed",
+                        stage="checkout_async_payment_failed",
+                        telegram_id=user_id,
+                        category="checkout_async_payment_failed",
+                        stripe_retry="нет",
+                        recovery_reminder=admin_recovery_reminder_status(
+                            immediate_retry_enqueued=bool(user_id),
+                            scheduler_will_check=bool(user_id),
+                        ),
+                        safe_ref=safe_admin_context_reference(event_type, event_id, session_id, user_id),
+                        note="Немедленное сообщение retry_payment поставлено в outbox." if user_id else "telegram_id не определён.",
+                    )
                 conn.commit()
             finally:
                 cur.close()
