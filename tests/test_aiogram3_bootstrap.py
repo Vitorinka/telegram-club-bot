@@ -123,12 +123,19 @@ class FakeState:
     def __init__(self):
         self.clear_calls = 0
         self.states = []
+        self.data = {}
 
     async def clear(self):
         self.clear_calls += 1
 
     async def set_state(self, state):
         self.states.append(state)
+
+    async def update_data(self, **kwargs):
+        self.data.update(kwargs)
+
+    async def get_data(self):
+        return dict(self.data)
 
 
 class FakeCursor:
@@ -2350,8 +2357,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 68)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 25)
+        self.assertEqual(len(self.main.router.message.handlers), 69)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 26)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2382,8 +2389,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 68)
-        self.assertEqual(len(callback_handlers), 25)
+        self.assertEqual(len(message_handlers), 69)
+        self.assertEqual(len(callback_handlers), 26)
         self.assertEqual(
             commands,
             [
@@ -7375,6 +7382,232 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(customer, summary)
         self.assertNotIn(subscription, summary)
         self.assertIn(self.main.safe_log_id(customer), summary)
+
+    async def test_support_reply_button_enters_waiting_state_without_target_payload(self):
+        callback = FakeCallback(user_id=777)
+        state = FakeState()
+
+        await self.main.start_support_reply(callback, state)
+
+        self.assertEqual(state.states, [self.main.SupportReplyState.waiting_for_message])
+        self.assertEqual(state.data, {})
+        self.assertIn("фото/видео", callback.message.answers[-1][0])
+
+    async def test_admin_reply_includes_safe_support_reply_button(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            message_id=88,
+            text="Ответ",
+            answer=AsyncMock(),
+        )
+        state = FakeState()
+        state.data["reply_to_user"] = 777
+
+        with patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message, \
+             patch.object(self.main.bot, "copy_message", new=AsyncMock()):
+            await self.main.send_admin_reply(message, state)
+
+        markup = send_message.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "support_reply")
+        self.assertNotIn("777", markup.inline_keyboard[0][0].callback_data)
+
+    def support_message(self, **kwargs):
+        defaults = {
+            "from_user": SimpleNamespace(id=777, username="member", full_name="Member Name"),
+            "text": None,
+            "photo": None,
+            "video": None,
+            "caption": None,
+            "document": None,
+            "answer": AsyncMock(),
+        }
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
+
+    async def test_support_text_reply_delivers_actual_user_context_and_clears_state(self):
+        message = self.support_message(text="Мой ID 999, но это только текст")
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message:
+            await self.main.send_support_reply(message, state)
+
+        self.assertEqual(send_message.await_args_list[0].args[0], 1)
+        self.assertIn("ID: 777", send_message.await_args_list[0].args[1])
+        admin_button = send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(admin_button.callback_data, "reply_to_777")
+        self.assertEqual(send_message.await_args_list[1].args, (1, message.text))
+        self.assertEqual(state.clear_calls, 1)
+        self.assertIn("передано", message.answer.await_args.args[0])
+
+    async def test_support_photo_uses_highest_file_id_and_preserves_caption(self):
+        message = self.support_message(
+            photo=[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="largest")],
+            caption="photo caption",
+        )
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message, \
+             patch.object(self.main.bot, "send_photo", new=AsyncMock()) as send_photo:
+            await self.main.send_support_reply(message, state)
+
+        admin_button = send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(admin_button.callback_data, "reply_to_777")
+        send_photo.assert_awaited_once_with(1, "largest", caption="photo caption")
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_support_photo_without_caption_is_delivered(self):
+        message = self.support_message(photo=[SimpleNamespace(file_id="photo-id")])
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()), \
+             patch.object(self.main.bot, "send_photo", new=AsyncMock()) as send_photo:
+            await self.main.send_support_reply(message, state)
+
+        send_photo.assert_awaited_once_with(1, "photo-id", caption=None)
+
+    async def test_support_video_uses_file_id_and_preserves_caption(self):
+        message = self.support_message(video=SimpleNamespace(file_id="video-id"), caption="video caption")
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message, \
+             patch.object(self.main.bot, "send_video", new=AsyncMock()) as send_video:
+            await self.main.send_support_reply(message, state)
+
+        admin_button = send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(admin_button.callback_data, "reply_to_777")
+        send_video.assert_awaited_once_with(1, "video-id", caption="video caption")
+
+    async def test_support_video_without_caption_is_delivered(self):
+        message = self.support_message(video=SimpleNamespace(file_id="video-id"))
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()), \
+             patch.object(self.main.bot, "send_video", new=AsyncMock()) as send_video:
+            await self.main.send_support_reply(message, state)
+
+        send_video.assert_awaited_once_with(1, "video-id", caption=None)
+
+    async def test_support_document_is_rejected_without_admin_delivery_or_state_clear(self):
+        message = self.support_message(document=SimpleNamespace(file_id="document-id"))
+        state = FakeState()
+
+        with patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message:
+            await self.main.send_support_reply(message, state)
+
+        send_message.assert_not_awaited()
+        self.assertEqual(state.clear_calls, 0)
+        self.assertIn("только текст, фото или видео", message.answer.await_args.args[0])
+
+    async def test_non_admin_cannot_start_admin_reply(self):
+        callback = FakeCallback(user_id=777)
+        callback.data = "reply_to_999"
+        state = FakeState()
+
+        await self.main.start_admin_reply(callback, state)
+
+        self.assertEqual(state.states, [])
+        self.assertEqual(state.data, {})
+        self.assertTrue(callback.answers[-1][1]["show_alert"])
+
+    async def test_support_text_cannot_inject_admin_reply_callback_target(self):
+        message = self.support_message(text="reply_to_999999")
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message:
+            await self.main.send_support_reply(message, state)
+
+        admin_button = send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(admin_button.callback_data, "reply_to_777")
+        self.assertNotEqual(admin_button.callback_data, message.text)
+
+    async def test_support_round_trip_returns_admin_reply_action(self):
+        admin_message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(id=1),
+            message_id=88,
+            text="admin answer",
+            answer=AsyncMock(),
+        )
+        admin_state = FakeState()
+        admin_state.data["reply_to_user"] = 777
+        user_state = FakeState()
+        callback = FakeCallback(user_id=777)
+        user_message = self.support_message(text="user follows up")
+
+        with patch.object(self.main.bot, "send_message", new=AsyncMock()) as send_message, \
+             patch.object(self.main.bot, "copy_message", new=AsyncMock()), \
+             patch.object(self.main, "ADMIN_IDS", [1]):
+            await self.main.send_admin_reply(admin_message, admin_state)
+            user_button = send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(user_button.callback_data, "support_reply")
+            self.assertNotIn("777", user_button.callback_data)
+
+            await self.main.start_support_reply(callback, user_state)
+            await self.main.send_support_reply(user_message, user_state)
+
+        context_call = next(
+            call for call in send_message.await_args_list
+            if len(call.args) > 1 and "Ответ пользователя" in call.args[1]
+        )
+        admin_button = context_call.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(admin_button.callback_data, "reply_to_777")
+        self.assertEqual(user_state.clear_calls, 2)
+
+    async def test_support_total_admin_failure_keeps_state_and_no_false_confirmation(self):
+        message = self.support_message(text="retry me")
+        state = FakeState()
+
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(
+                 self.main, "deliver_support_reply_to_admin",
+                 new=AsyncMock(side_effect=RuntimeError("delivery failed")),
+             ):
+            await self.main.send_support_reply(message, state)
+
+        self.assertEqual(state.clear_calls, 0)
+        self.assertIn("не удалось", message.answer.await_args.args[0].lower())
+        self.assertNotIn("спасибо", message.answer.await_args.args[0].lower())
+
+    async def test_support_partial_admin_delivery_succeeds_and_clears_state(self):
+        message = self.support_message(text="partial")
+        state = FakeState()
+        delivery = AsyncMock(side_effect=[None, RuntimeError("second admin failed")])
+
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "deliver_support_reply_to_admin", new=delivery):
+            await self.main.send_support_reply(message, state)
+
+        self.assertEqual([call.args[0] for call in delivery.await_args_list], [1, 2])
+        self.assertEqual(state.clear_calls, 1)
+        self.assertIn("передано", message.answer.await_args.args[0])
+
+    async def test_existing_support_question_text_workflow_still_forwards(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=777, username="member", full_name="Member Name"),
+            chat=SimpleNamespace(id=777),
+            message_id=55,
+            text="existing question",
+            answer=AsyncMock(),
+        )
+        state = FakeState()
+        conn = FakeConnection()
+
+        with patch.object(self.main, "ADMIN_IDS", [1]), \
+             patch.object(self.main.bot, "forward_message", new=AsyncMock()) as forward_message, \
+             patch.object(self.main.bot, "send_message", new=AsyncMock()), \
+             patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.forward_question_to_admin(message, state)
+
+        forward_message.assert_awaited_once_with(chat_id=1, from_chat_id=777, message_id=55)
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(state.clear_calls, 1)
 
 
 if __name__ == "__main__":

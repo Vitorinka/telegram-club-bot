@@ -145,6 +145,10 @@ class ContactState(StatesGroup):
 class ReplyState(StatesGroup):
     waiting_for_reply = State()
 
+
+class SupportReplyState(StatesGroup):
+    waiting_for_message = State()
+
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info("Начинаю подключение к базе данных...")
@@ -8023,7 +8027,13 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(
             int(target_user_id),
-            "💬 Ответ администратора:"
+            "💬 Ответ администратора:",
+            reply_markup=inline_keyboard([[
+                InlineKeyboardButton(
+                    text="Ответить администратору",
+                    callback_data="support_reply",
+                )
+            ]]),
         )
 
         await bot.copy_message(
@@ -8057,6 +8067,98 @@ async def send_admin_reply(message: types.Message, state: FSMContext):
         error_ref = safe_admin_error_reference("admin_reply_send", e)
         await message.answer(f"❌ Не удалось отправить ответ. ref: {error_ref}")
         await state.clear()
+
+
+@router.callback_query(F.data == "support_reply", StateFilter('*'))
+async def start_support_reply(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(SupportReplyState.waiting_for_message)
+    await callback.message.answer(
+        "Напишите сообщение или отправьте фото/видео, и я передам его администратору."
+    )
+    await callback.answer()
+
+
+def support_reply_kind(message):
+    if getattr(message, "photo", None):
+        return "photo"
+    if getattr(message, "video", None):
+        return "video"
+    if getattr(message, "text", None):
+        return "text"
+    return None
+
+
+def support_reply_is_within_telegram_limits(message, kind):
+    if kind == "text":
+        return len(message.text) <= 4096
+    return len(getattr(message, "caption", None) or "") <= 1024
+
+
+def build_support_reply_context(user):
+    username = f"@{user.username}" if getattr(user, "username", None) else "username не указан"
+    display_name = getattr(user, "full_name", None) or "имя не указано"
+    return (
+        "💬 Ответ пользователя по обращению\n\n"
+        f"ID: {user.id}\n"
+        f"Username: {username}\n"
+        f"Имя: {display_name}"
+    )
+
+
+async def deliver_support_reply_to_admin(admin_id, message, kind, context):
+    await bot.send_message(
+        admin_id,
+        context,
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(
+                text="✍️ Ответить",
+                callback_data=f"reply_to_{message.from_user.id}",
+            )
+        ]]),
+    )
+    if kind == "text":
+        await bot.send_message(admin_id, message.text)
+    elif kind == "photo":
+        await bot.send_photo(admin_id, message.photo[-1].file_id, caption=getattr(message, "caption", None))
+    else:
+        await bot.send_video(admin_id, message.video.file_id, caption=getattr(message, "caption", None))
+
+
+@router.message(StateFilter(SupportReplyState.waiting_for_message))
+async def send_support_reply(message: types.Message, state: FSMContext):
+    kind = support_reply_kind(message)
+    if kind is None:
+        await message.answer("Можно отправить только текст, фото или видео.")
+        return
+    if not support_reply_is_within_telegram_limits(message, kind):
+        await message.answer("Сообщение слишком длинное. Сократите текст и попробуйте снова.")
+        return
+
+    user = message.from_user
+    context = build_support_reply_context(user)
+    delivered_admin_ids = []
+    for admin_id in ADMIN_IDS:
+        try:
+            await deliver_support_reply_to_admin(admin_id, message, kind, context)
+            delivered_admin_ids.append(admin_id)
+        except Exception as e:
+            logging.error(
+                "SUPPORT_REPLY_DELIVERY_FAILED: user_id=%s, admin_id=%s, ref=%s",
+                user.id, admin_id, safe_admin_error_reference("support_reply_delivery", e),
+            )
+
+    if not delivered_admin_ids:
+        await message.answer("❌ Не удалось передать сообщение. Попробуйте ещё раз.")
+        return
+
+    await state.clear()
+    await message.answer(
+        "Спасибо, сообщение передано администратору.",
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="Ответить ещё", callback_data="support_reply")
+        ]]),
+    )
 
 @router.message(Command('ask'), StateFilter('*'))
 async def ask_command(message: types.Message, state: FSMContext):
