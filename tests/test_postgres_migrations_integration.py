@@ -29,6 +29,10 @@ from db_migrations import (
     run_migrations,
 )
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
+from access_mismatch_observability import (
+    load_access_mismatch_counts,
+    load_access_mismatch_samples,
+)
 from scheduled_jobs import (
     claim_pending_message_deliveries,
     enqueue_message_delivery,
@@ -1869,6 +1873,230 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         ))
         self.assertFalse(link_states["incomplete"])
         self.assertTrue(link_states["active"])
+
+    def test_active_subscription_access_mismatch_queries_real_postgres(self):
+        run_migrations(self.get_conn)
+        now = datetime.utcnow()
+        future = now + timedelta(days=30)
+        expired = now - timedelta(days=1)
+        conn = self.get_conn()
+        cur = conn.cursor()
+
+        def add_user(user_id, paid, expiry, subscription_id=None, customer_id=None):
+            subscription_id = subscription_id or f"sub_mismatch_{user_id}"
+            customer_id = customer_id or f"cus_mismatch_{user_id}"
+            cur.execute(
+                """
+                INSERT INTO users (
+                    telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (user_id, paid, expiry, subscription_id, customer_id),
+            )
+            return subscription_id, customer_id
+
+        def add_link(user_id, subscription_id, customer_id, status="active", is_active=True, updated_at=None):
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, stripe_customer_id,
+                    status, is_active, current_period_end, source, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'test', COALESCE(%s, NOW()))
+                """,
+                (user_id, subscription_id, customer_id, status, is_active, future, updated_at),
+            )
+
+        def add_payment(user_id, subscription_id, customer_id, event_id, **overrides):
+            values = {
+                "event_type": "invoice.payment_succeeded",
+                "payment_status": "succeeded",
+                "payment_kind": "recurring",
+                "amount_paid": 5000,
+                "period_end": future,
+                "invoice_id": f"in_{event_id}",
+            }
+            values.update(overrides)
+            cur.execute(
+                """
+                INSERT INTO payment_events (
+                    stripe_event_id, event_type, telegram_id, invoice_id,
+                    stripe_customer_id, stripe_subscription_id,
+                    payment_status, payment_kind, amount_paid, period_end
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    event_id, values["event_type"], user_id, values["invoice_id"],
+                    customer_id, subscription_id, values["payment_status"],
+                    values["payment_kind"], values["amount_paid"], values["period_end"],
+                ),
+            )
+
+        sub, cus = add_user(61001, False, future); add_link(61001, sub, cus)
+        sub, cus = add_user(61002, True, future); add_link(61002, sub, cus)
+        sub, cus = add_user(61003, False, future); add_link(61003, sub, cus, status="canceled", is_active=False)
+        sub, cus = add_user(61004, False, None); add_link(61004, sub, cus)
+        sub, cus = add_user(61005, True, expired); add_link(61005, sub, cus)
+        sub, cus = add_user(61006, False, future); add_link(61006, sub, cus)
+        add_payment(61006, sub, cus, "evt_mismatch_valid")
+
+        sub, cus = add_user(61007, False, future); add_link(61007, sub, cus)
+        add_payment(61007, sub, cus, "evt_mismatch_failed", payment_status="failed")
+        add_payment(61007, sub, cus, "evt_mismatch_zero", amount_paid=0)
+        add_payment(61007, sub, cus, "evt_mismatch_gift", payment_kind="gift", amount_paid=5000)
+        add_payment(61007, sub, cus, "evt_mismatch_stale", period_end=expired)
+        add_payment(61007, sub, cus, "evt_mismatch_admin", event_type="customer.subscription.updated")
+
+        user_sub, user_cus = add_user(61009, False, future, "sub_identity_user", "cus_identity_user")
+        add_link(61009, "sub_identity_other", "cus_identity_other")
+        add_payment(61009, "sub_identity_other", "cus_identity_other", "evt_mismatch_identity")
+
+        sub, cus = add_user(61010, False, future); add_link(61010, sub, cus)
+        add_link(61010, "sub_historical_terminal", cus, status="canceled", is_active=False, updated_at=now + timedelta(days=1))
+        conn.commit()
+
+        counts = load_access_mismatch_counts(cur)
+        samples = load_access_mismatch_samples(cur, limit=50)
+        cur.close()
+        conn.close()
+
+        self.assertEqual(counts, {
+            "active_local_unpaid": 5,
+            "active_missing_or_stale_expiry": 2,
+            "active_unpaid_with_local_payment_proof": 1,
+        })
+        sample_by_user = {row[0]: row for row in samples}
+        self.assertNotIn(61002, sample_by_user)
+        self.assertNotIn(61003, sample_by_user)
+        self.assertNotIn(61009, sample_by_user)
+        self.assertEqual(sample_by_user[61004][4], None)
+        self.assertEqual(sample_by_user[61005][3], True)
+        self.assertEqual(sample_by_user[61006][5], "evt_mismatch_valid")
+        self.assertIsNone(sample_by_user[61007][5])
+        self.assertEqual(sum(1 for row in samples if row[0] == 61010), 1)
+
+    def test_bot_health_reports_mismatch_counts_db_only_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        raw_subscription = "sub_health_mismatch_sensitive_123456"
+        raw_customer = "cus_health_mismatch_sensitive_654321"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO users (
+                telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id
+            ) VALUES (61101, FALSE, NULL, %s, %s)
+            """,
+            (raw_subscription, raw_customer),
+        )
+        main.upsert_stripe_link(
+            cur,
+            61101,
+            stripe_customer_id=raw_customer,
+            stripe_subscription_id=raw_subscription,
+            status="active",
+            current_period_end=datetime.utcnow() + timedelta(days=30),
+            is_active=True,
+            source="customer.subscription.updated",
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        class HealthMessage:
+            def __init__(self):
+                self.from_user = SimpleNamespace(id=1)
+                self.chat = SimpleNamespace(type="private")
+                self.answers = []
+
+            async def answer(self, text, **kwargs):
+                self.answers.append(text)
+
+        message = HealthMessage()
+        stripe_balance = mock.Mock(side_effect=AssertionError("Stripe API called from health"))
+        stripe_price = mock.Mock(side_effect=AssertionError("Stripe API called from health"))
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_me", mock.AsyncMock(return_value=SimpleNamespace(id=1))), \
+             mock.patch.object(main.bot, "get_webhook_info", mock.AsyncMock(return_value=SimpleNamespace(pending_update_count=0, last_error_message=None))), \
+             mock.patch.object(main.stripe.Balance, "retrieve", stripe_balance), \
+             mock.patch.object(main.stripe.Price, "retrieve", stripe_price):
+            asyncio.run(main.bot_health_command(message))
+
+        output = message.answers[0]
+        self.assertIn("active link + paid=False: 1", output)
+        self.assertIn("active link + missing/stale expiry: 1", output)
+        self.assertIn("active unpaid with local payment proof: 0", output)
+        self.assertNotIn(raw_subscription, output)
+        self.assertNotIn(raw_customer, output)
+        stripe_balance.assert_not_called()
+        stripe_price.assert_not_called()
+
+    def test_mismatch_ranking_filters_identity_before_newer_conflicting_link_real_postgres(self):
+        run_migrations(self.get_conn)
+        future = datetime.utcnow() + timedelta(days=30)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO users (
+                telegram_id, paid, expiry_date, stripe_subscription_id, stripe_customer_id
+            ) VALUES (61201, FALSE, %s, 'sub_rank_A', 'cus_rank_A')
+            """,
+            (future,),
+        )
+        cur.execute(
+            """
+            INSERT INTO stripe_links (
+                telegram_id, stripe_subscription_id, stripe_customer_id,
+                status, is_active, current_period_end, source, updated_at
+            ) VALUES
+                (61201, 'sub_rank_A', 'cus_rank_A', 'active', TRUE, %s, 'matching', NOW() - INTERVAL '1 day'),
+                (61201, 'sub_rank_B', 'cus_rank_B', 'active', TRUE, %s, 'conflicting', NOW())
+            """,
+            (future, future),
+        )
+        cur.execute(
+            """
+            INSERT INTO payment_events (
+                stripe_event_id, event_type, telegram_id, invoice_id,
+                stripe_customer_id, stripe_subscription_id,
+                payment_status, payment_kind, amount_paid, period_end
+            ) VALUES
+                ('evt_rank_A', 'invoice.payment_succeeded', 61201, 'in_rank_A',
+                 'cus_rank_A', 'sub_rank_A', 'succeeded', 'recurring', 5000, %s),
+                ('evt_rank_B', 'invoice.payment_succeeded', 61201, 'in_rank_B',
+                 'cus_rank_B', 'sub_rank_B', 'succeeded', 'recurring', 5000, %s)
+            """,
+            (future, future),
+        )
+        conn.commit()
+
+        counts = load_access_mismatch_counts(cur)
+        samples = load_access_mismatch_samples(cur, limit=20)
+        matching_rows = [row for row in samples if row[0] == 61201]
+        self.assertEqual(counts["active_local_unpaid"], 1)
+        self.assertEqual(counts["active_unpaid_with_local_payment_proof"], 1)
+        self.assertEqual(len(matching_rows), 1)
+        self.assertEqual(matching_rows[0][1], "sub_rank_A")
+        self.assertEqual(matching_rows[0][5], "evt_rank_A")
+        self.assertNotEqual(matching_rows[0][5], "evt_rank_B")
+
+        # The schema prevents multiple rows for the exact same current identity.
+        with self.assertRaises(psycopg2.errors.UniqueViolation):
+            cur.execute(
+                """
+                INSERT INTO stripe_links (
+                    telegram_id, stripe_subscription_id, stripe_customer_id,
+                    status, is_active, current_period_end, source, updated_at
+                ) VALUES (61201, 'sub_rank_A', 'cus_rank_A', 'active', TRUE, %s, 'duplicate', NOW())
+                """,
+                (future,),
+            )
+        conn.rollback()
+        samples_after_duplicate = load_access_mismatch_samples(cur, limit=20)
+        self.assertEqual(sum(1 for row in samples_after_duplicate if row[0] == 61201), 1)
+        cur.close()
+        conn.close()
 
     def test_first_purchase_recovery_completed_checkout_with_payment_proof_is_not_eligible(self):
         run_migrations(self.get_conn)

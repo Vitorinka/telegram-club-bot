@@ -2377,7 +2377,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 67)
+        self.assertEqual(len(self.main.router.message.handlers), 68)
         self.assertEqual(len(self.main.router.callback_query.handlers), 25)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -2409,7 +2409,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 67)
+        self.assertEqual(len(message_handlers), 68)
         self.assertEqual(len(callback_handlers), 25)
         self.assertEqual(
             commands,
@@ -2420,7 +2420,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "gift_reissue", "gifts_pending", "gift_status", "revoke_access",
                 "refund_info", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
-                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "admin", "admin_help", "expiring_users",
+                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "access_mismatches", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
                 "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
                 "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
@@ -5810,6 +5810,40 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("UPDATE", sql)
         self.assertIn("users_customer_conflict", private_message.replies[0][0])
         self.assertIn(self.main.safe_log_id("cus_conflict"), private_message.replies[0][0])
+
+    async def test_access_mismatches_command_is_private_admin_read_only_and_redacted(self):
+        non_admin = FakeIncomingMessage(user_id=999)
+        group_admin = FakeIncomingMessage(user_id=1)
+        group_admin.chat.type = "group"
+        get_db_conn = Mock(return_value=FakeConnection())
+
+        with patch.object(self.main, "get_db_conn", get_db_conn):
+            await self.main.access_mismatches_command(non_admin)
+            await self.main.access_mismatches_command(group_admin)
+
+        get_db_conn.assert_not_called()
+        self.assertIn("личном чате", group_admin.replies[0][0])
+
+        raw_subscription = "sub_access_mismatch_sensitive_123456"
+        raw_event = "evt_access_mismatch_sensitive_654321"
+        private_admin = FakeIncomingMessage(user_id=1)
+        conn = FakeConnection(fetches=[
+            (1, 1, 1),
+            [(123456789, raw_subscription, "active", False, None, raw_event, datetime.utcnow() + timedelta(days=30))],
+        ])
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe API called")):
+            await self.main.access_mismatches_command(private_admin)
+
+        output = private_admin.answers[0][0]
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotIn("INSERT", sql)
+        self.assertNotIn("UPDATE", sql)
+        self.assertNotIn("DELETE", sql)
+        self.assertNotIn(raw_subscription, output)
+        self.assertNotIn(raw_event, output)
+        self.assertIn(self.main.safe_log_id(raw_subscription), output)
+        self.assertIn("local_payment_proof: yes", output)
 
     async def test_link_stripe_user_runtime_conflict_does_not_change_user(self):
         payment_conn = FakeConnection(fetches=[[(999,)]])

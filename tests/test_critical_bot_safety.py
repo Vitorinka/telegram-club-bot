@@ -1563,6 +1563,24 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("status IN ('canceled', 'incomplete_expired')", source)
         self.assertIn("first_purchase_recovery_stats", source)
         self.assertIn("outbox_stats", source)
+        self.assertIn("Active subscription mismatches", source)
+        self.assertIn("load_access_mismatch_counts", source)
+        self.assertNotIn("stripe.Balance.retrieve", source)
+        self.assertNotIn("stripe.Price.retrieve", source)
+
+    def test_access_mismatches_command_is_private_admin_and_read_only(self):
+        source = MAIN_SOURCE[
+            MAIN_SOURCE.index("@router.message(Command('access_mismatches')"):
+            MAIN_SOURCE.index("ADMIN_MENU_SECTIONS")
+        ]
+        self.assertIn("@admin_private_only(ADMIN_IDS)", source)
+        self.assertIn("load_access_mismatch_counts", source)
+        self.assertIn("load_access_mismatch_samples", source)
+        self.assertIn("safe_log_id", source)
+        self.assertNotIn("stripe.", source)
+        self.assertNotIn("INSERT", source)
+        self.assertNotIn("UPDATE", source)
+        self.assertNotIn("DELETE", source)
 
 
 if __name__ == "__main__":
