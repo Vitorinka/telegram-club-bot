@@ -83,6 +83,10 @@ from checkout_safety import (
     subscription_status_action,
 )
 from db_migrations import run_migrations
+from access_mismatch_observability import (
+    load_access_mismatch_counts,
+    load_access_mismatch_samples,
+)
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -11215,6 +11219,11 @@ async def bot_health_command(message: types.Message):
         "created_24h": "нет",
         "failed_deliveries": "нет",
     }
+    access_mismatch_stats = {
+        "active_local_unpaid": "нет",
+        "active_missing_or_stale_expiry": "нет",
+        "active_unpaid_with_local_payment_proof": "нет",
+    }
     conn = None
     cur = None
 
@@ -11261,6 +11270,7 @@ async def bot_health_command(message: types.Message):
               AND status IN ('canceled', 'incomplete_expired')
         """)
         user_stats["stale_active_stripe_links"] = cur.fetchone()[0]
+        access_mismatch_stats = load_access_mismatch_counts(cur)
 
         cur.execute("SELECT COUNT(*) FROM access_events;")
         access_stats["total"] = cur.fetchone()[0]
@@ -11383,17 +11393,7 @@ async def bot_health_command(message: types.Message):
         error_ref = safe_admin_error_reference("bot_health_telegram", e)
         telegram_status = f"ERROR ref: {error_ref}"
 
-    try:
-        await asyncio.wait_for(asyncio.to_thread(stripe.Balance.retrieve), timeout=5)
-        for env_name in ("PRICE_TRIAL", "PRICE_1M", "PRICE_6M", "PRICE_12M"):
-            await asyncio.wait_for(asyncio.to_thread(stripe.Price.retrieve, os.getenv(env_name)), timeout=5)
-        for env_name in gift_required_price_envs():
-            if os.getenv(env_name):
-                await asyncio.wait_for(asyncio.to_thread(stripe.Price.retrieve, os.getenv(env_name)), timeout=5)
-        stripe_status = "OK"
-    except Exception as e:
-        error_ref = safe_admin_error_reference("bot_health_stripe", e)
-        stripe_status = f"ERROR ref: {error_ref}"
+    stripe_status = "CONFIGURED (API not probed)" if os.getenv("STRIPE_API_KEY") else "MISSING"
 
     text = (
         "🩺 Bot health\n\n"
@@ -11446,6 +11446,11 @@ async def bot_health_command(message: types.Message):
         f"stripe_subscription_id без stripe_customer_id: {user_stats['missing_stripe_customer_id']}"
         f" ({', '.join(user_stats['missing_stripe_customer_ids']) or 'нет'})\n"
         f"active stripe_links с terminal status: {user_stats['stale_active_stripe_links']}\n\n"
+        "Active subscription mismatches:\n"
+        f"active link + paid=False: {access_mismatch_stats['active_local_unpaid']}\n"
+        f"active link + missing/stale expiry: {access_mismatch_stats['active_missing_or_stale_expiry']}\n"
+        "active unpaid with local payment proof: "
+        f"{access_mismatch_stats['active_unpaid_with_local_payment_proof']}\n\n"
         "Access events:\n"
         f"Всего: {access_stats['total']}\n"
         f"За 24ч: {access_stats['last_24h']}\n"
@@ -11456,6 +11461,61 @@ async def bot_health_command(message: types.Message):
         text = text[:3997] + "..."
 
     await message.answer(text)
+
+
+@router.message(Command('access_mismatches'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def access_mismatches_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        counts = load_access_mismatch_counts(cur)
+        samples = load_access_mismatch_samples(cur, limit=20)
+    finally:
+        cur.close()
+        conn.close()
+
+    lines = [
+        "⚠️ Active subscription / local access mismatches",
+        "",
+        f"active_local_unpaid: {counts['active_local_unpaid']}",
+        f"active_missing_or_stale_expiry: {counts['active_missing_or_stale_expiry']}",
+        "active_unpaid_with_local_payment_proof: "
+        f"{counts['active_unpaid_with_local_payment_proof']}",
+        "",
+        "read_only: true",
+    ]
+    if samples:
+        lines.extend(["", "Samples (max 20):"])
+    now = datetime.utcnow()
+    for (
+        telegram_id,
+        subscription_id,
+        link_status,
+        paid,
+        expiry_date,
+        payment_event_id,
+        payment_period_end,
+    ) in samples:
+        if expiry_date is None:
+            expiry_state = "missing"
+        elif expiry_date <= now:
+            expiry_state = "stale"
+        else:
+            expiry_state = "future"
+        lines.extend([
+            "",
+            f"telegram: {safe_log_id(str(telegram_id))}",
+            f"subscription: {safe_log_id(subscription_id)}",
+            f"link_status: {link_status}",
+            f"paid: {bool(paid)}",
+            f"expiry_state: {expiry_state}",
+            f"local_payment_proof: {'yes' if payment_event_id else 'no'}",
+            f"payment_event: {safe_log_id(payment_event_id) if payment_event_id else 'none'}",
+            f"proof_period_end: {payment_period_end.strftime('%d.%m.%Y') if payment_period_end else 'none'}",
+        ])
+    text = "\n".join(lines)
+    await message.answer(text[:4000])
 
 ADMIN_MENU_SECTIONS = {
     "stats": {
@@ -11498,6 +11558,7 @@ ADMIN_MENU_SECTIONS = {
             "/unlinked_stripe — показать Stripe оплаты без пользователя",
             "/stripe_links <telegram_id> — показать Stripe связи пользователя",
             "/stripe_conflicts — показать unresolved Stripe identity conflicts",
+            "/access_mismatches — read-only active subscription/local access mismatches",
             "/duplicate_subscriptions — показать Stripe customers с несколькими подписками",
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id> — связать Stripe с пользователем",
             "/send_invite_link <telegram_id> — отправить invite link",
