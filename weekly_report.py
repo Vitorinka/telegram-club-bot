@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -352,6 +353,23 @@ def parse_admin_ids(value):
     ]
 
 
+def parse_weekly_report_error_state(value):
+    if not value:
+        return {"permanent_admin_ids": []}
+    try:
+        state = json.loads(value)
+    except (TypeError, ValueError):
+        return {"permanent_admin_ids": []}
+    if not isinstance(state, dict):
+        return {"permanent_admin_ids": []}
+    return {
+        "permanent_admin_ids": [
+            int(admin_id)
+            for admin_id in state.get("permanent_admin_ids", [])
+        ],
+    }
+
+
 def should_create_manual_link_payment_event(amount_paid):
     return int(amount_paid or 0) > 0
 
@@ -386,27 +404,38 @@ def claim_weekly_report_run_record(cur, key, period_start_utc, period_end_utc, n
             period_start = EXCLUDED.period_start,
             period_end = EXCLUDED.period_end,
             updated_at = EXCLUDED.updated_at,
-            error_text = NULL
+            completed_at = NULL
         WHERE weekly_report_runs.status = 'failed'
            OR (
                 weekly_report_runs.status = 'processing'
                 AND COALESCE(weekly_report_runs.updated_at, weekly_report_runs.created_at) < %s
            )
-        RETURNING status, sent_admin_ids
+        RETURNING status, sent_admin_ids, error_text
         """,
         (key, period_start_utc, period_end_utc, now_utc, now_utc, stale_before),
     )
     row = cur.fetchone()
     if row:
+        error_state = parse_weekly_report_error_state(row[2] if len(row) > 2 else None)
         return {
             "status": "claimed",
             "sent_admin_ids": parse_admin_ids(row[1] if len(row) > 1 else None),
+            "permanent_admin_ids": error_state["permanent_admin_ids"],
         }
 
-    cur.execute("SELECT status, sent_admin_ids FROM weekly_report_runs WHERE report_key = %s", (key,))
+    cur.execute("SELECT status, sent_admin_ids, error_text FROM weekly_report_runs WHERE report_key = %s", (key,))
     row = cur.fetchone()
+    error_state = parse_weekly_report_error_state(row[2] if row and len(row) > 2 else None)
     if row and row[0] == "completed":
-        return {"status": "duplicate_completed", "sent_admin_ids": parse_admin_ids(row[1])}
+        return {
+            "status": "duplicate_completed",
+            "sent_admin_ids": parse_admin_ids(row[1]),
+            "permanent_admin_ids": error_state["permanent_admin_ids"],
+        }
     if row and row[0] == "processing":
-        return {"status": "already_processing", "sent_admin_ids": parse_admin_ids(row[1])}
-    return {"status": "already_processing", "sent_admin_ids": []}
+        return {
+            "status": "already_processing",
+            "sent_admin_ids": parse_admin_ids(row[1]),
+            "permanent_admin_ids": error_state["permanent_admin_ids"],
+        }
+    return {"status": "already_processing", "sent_admin_ids": [], "permanent_admin_ids": []}

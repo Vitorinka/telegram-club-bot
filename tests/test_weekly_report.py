@@ -17,6 +17,7 @@ from weekly_report import (
     format_period_title,
     get_current_week_bounds,
     get_last_completed_week_bounds,
+    parse_weekly_report_error_state,
     report_key,
     sanitize_csv_cell,
     should_create_manual_link_payment_event,
@@ -46,7 +47,7 @@ class FakeWeeklyReportCursor:
                     "updated_at": now,
                     "sent_admin_ids": None,
                 }
-                self.results.append(("processing", None))
+                self.results.append(("processing", None, None))
             elif self.row["status"] == "failed" or (
                 self.row["status"] == "processing"
                 and (self.row.get("updated_at") or self.row.get("created_at")) < stale_before
@@ -56,15 +57,16 @@ class FakeWeeklyReportCursor:
                     "period_start": period_start,
                     "period_end": period_end,
                     "updated_at": now,
+                    "completed_at": None,
                 })
-                self.results.append(("processing", self.row.get("sent_admin_ids")))
+                self.results.append(("processing", self.row.get("sent_admin_ids"), self.row.get("error_text")))
             else:
                 self.results.append(None)
         elif normalized.startswith("SELECT STATUS"):
             if self.row is None:
                 self.results.append(None)
             else:
-                self.results.append((self.row["status"], self.row.get("sent_admin_ids")))
+                self.results.append((self.row["status"], self.row.get("sent_admin_ids"), self.row.get("error_text")))
 
     def fetchone(self):
         return self.results.pop(0)
@@ -304,17 +306,54 @@ class WeeklyReportTest(unittest.TestCase):
         start = datetime(2026, 7, 13, 21, 0)
         end = datetime(2026, 7, 20, 21, 0)
         fresh = {"status": "processing", "created_at": now - timedelta(minutes=10), "updated_at": now - timedelta(minutes=10), "sent_admin_ids": "1"}
-        stale = {"status": "processing", "created_at": now - timedelta(hours=1), "updated_at": now - timedelta(hours=1), "sent_admin_ids": "1"}
-        completed = {"status": "completed", "created_at": now, "updated_at": now, "sent_admin_ids": "1,2"}
-        failed = {"status": "failed", "created_at": now, "updated_at": now, "sent_admin_ids": ""}
+        old_completed_at = now - timedelta(minutes=5)
+        stale = {
+            "status": "processing",
+            "created_at": now - timedelta(hours=1),
+            "updated_at": now - timedelta(hours=1),
+            "sent_admin_ids": "1",
+            "completed_at": old_completed_at,
+        }
+        completed = {
+            "status": "completed",
+            "created_at": now,
+            "updated_at": now,
+            "sent_admin_ids": "1,2",
+            "completed_at": old_completed_at,
+        }
+        failed = {
+            "status": "failed",
+            "created_at": now,
+            "updated_at": now,
+            "sent_admin_ids": "1",
+            "error_text": '{"version": 1, "permanent_admin_ids": [2]}',
+            "completed_at": old_completed_at,
+        }
 
         self.assertEqual(claim_weekly_report_run_record(FakeWeeklyReportCursor(), "2026-07-13", start, end, now)["status"], "claimed")
         self.assertEqual(claim_weekly_report_run_record(FakeWeeklyReportCursor(fresh), "2026-07-13", start, end, now)["status"], "already_processing")
-        self.assertEqual(claim_weekly_report_run_record(FakeWeeklyReportCursor(stale), "2026-07-13", start, end, now)["status"], "claimed")
-        self.assertEqual(claim_weekly_report_run_record(FakeWeeklyReportCursor(failed), "2026-07-13", start, end, now)["status"], "claimed")
-        claimed_completed = claim_weekly_report_run_record(FakeWeeklyReportCursor(completed), "2026-07-13", start, end, now)
+        stale_cursor = FakeWeeklyReportCursor(stale)
+        self.assertEqual(claim_weekly_report_run_record(stale_cursor, "2026-07-13", start, end, now)["status"], "claimed")
+        self.assertIsNone(stale_cursor.row["completed_at"])
+        failed_cursor = FakeWeeklyReportCursor(failed)
+        claimed_failed = claim_weekly_report_run_record(failed_cursor, "2026-07-13", start, end, now)
+        self.assertEqual(claimed_failed["status"], "claimed")
+        self.assertEqual(claimed_failed["sent_admin_ids"], [1])
+        self.assertEqual(claimed_failed["permanent_admin_ids"], [2])
+        self.assertIsNone(failed_cursor.row["completed_at"])
+        completed_cursor = FakeWeeklyReportCursor(completed)
+        claimed_completed = claim_weekly_report_run_record(completed_cursor, "2026-07-13", start, end, now)
         self.assertEqual(claimed_completed["status"], "duplicate_completed")
         self.assertEqual(claimed_completed["sent_admin_ids"], [1, 2])
+        self.assertEqual(completed_cursor.row["completed_at"], old_completed_at)
+
+    def test_weekly_report_error_state_is_version_tolerant(self):
+        self.assertEqual(parse_weekly_report_error_state(None), {"permanent_admin_ids": []})
+        self.assertEqual(parse_weekly_report_error_state("legacy error"), {"permanent_admin_ids": []})
+        self.assertEqual(
+            parse_weekly_report_error_state('{"version": 1, "permanent_admin_ids": [2]}'),
+            {"permanent_admin_ids": [2]},
+        )
 
     def test_group_service_handler_processes_all_new_members(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"

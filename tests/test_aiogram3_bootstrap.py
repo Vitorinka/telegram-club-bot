@@ -4902,6 +4902,107 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         notify.assert_awaited_once_with("warning")
 
+    async def test_weekly_report_all_admins_succeed_and_complete(self):
+        conns = [FakeConnection() for _ in range(4)]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send_message:
+            result = await self.main.send_weekly_admin_report()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["sent_admin_ids"], [1, 2])
+        self.assertEqual(send_message.await_count, 2)
+        final_sql = "\n".join(query for query, _ in conns[-1].cursor_obj.queries)
+        self.assertIn("status = 'completed'", final_sql)
+
+    async def test_weekly_report_partial_retry_only_sends_missing_admin(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        first_conns = [FakeConnection() for _ in range(3)]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=first_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=[
+                 None, TelegramNetworkError(method=None, message="temporary"),
+             ])):
+            first = await self.main.send_weekly_admin_report()
+
+        self.assertEqual(first["status"], "partial")
+        self.assertEqual(first["sent_admin_ids"], [1])
+        final_params = first_conns[-1].cursor_obj.queries[-1][1]
+        self.assertEqual(final_params[0], "1")
+
+        retry_conns = [FakeConnection() for _ in range(3)]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [1], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=retry_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as retry_send:
+            retry = await self.main.send_weekly_admin_report()
+
+        self.assertEqual(retry["status"], "completed")
+        retry_send.assert_awaited_once()
+        self.assertEqual(retry_send.await_args.args[0], 2)
+
+    async def test_weekly_report_permanent_admin_is_durably_resolved(self):
+        from aiogram.exceptions import TelegramForbiddenError
+
+        conns = [FakeConnection() for _ in range(4)]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=[
+                 None, TelegramForbiddenError(method=None, message="blocked"),
+             ])):
+            result = await self.main.send_weekly_admin_report()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["sent_admin_ids"], [1])
+        self.assertEqual(result["permanent_admin_ids"], [2])
+        final_params = conns[-1].cursor_obj.queries[-1][1]
+        self.assertIn('"permanent_admin_ids": [2]', final_params[1])
+
+    async def test_weekly_report_crash_after_saved_recipient_skips_it_on_reclaim(self):
+        crash_conns = [FakeConnection(), FakeConnection()]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=crash_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock(side_effect=[None, KeyboardInterrupt()])), \
+             self.assertRaises(KeyboardInterrupt):
+            await self.main.send_weekly_admin_report()
+
+        saved_params = crash_conns[1].cursor_obj.queries[-1][1]
+        self.assertEqual(saved_params[0], "1")
+
+        retry_conns = [FakeConnection() for _ in range(3)]
+        with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
+             patch.object(self.main, "claim_weekly_report_run", return_value={
+                 "status": "claimed", "sent_admin_ids": [1], "permanent_admin_ids": [],
+             }), \
+             patch.object(self.main, "build_weekly_admin_report", AsyncMock(return_value=("report", []))), \
+             patch.object(self.main, "get_db_conn", side_effect=retry_conns), \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as retry_send:
+            result = await self.main.send_weekly_admin_report()
+
+        self.assertEqual(result["status"], "completed")
+        retry_send.assert_awaited_once()
+        self.assertEqual(retry_send.await_args.args[0], 2)
+
     async def test_stripeobject_metadata_gift_checkout_completed_uses_gift_branch(self):
         event_id = "evt_stripeobject_gift_completed"
         gift_id = "gift-id-completed"
