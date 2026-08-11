@@ -449,6 +449,13 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "message_delivery_events": ("claim_generation",),
         },
     },
+    "0010_message_delivery_due_indexes": {
+        "tables": ("message_delivery_events",),
+        "indexes": (
+            "message_delivery_events_pending_failed_due_idx",
+            "message_delivery_events_processing_lease_idx",
+        ),
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
