@@ -3,9 +3,12 @@ import ast
 import hashlib
 import hmac
 import importlib
+import io
 import json
+import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -75,10 +78,11 @@ def import_main():
 
 
 class FakeTelegramRequest:
-    headers = {}
-
-    def __init__(self, payload):
+    def __init__(self, payload, secret_token=TEST_ENV["WEBHOOK_SECRET"]):
         self.payload = payload
+        self.headers = {}
+        if secret_token is not None:
+            self.headers["X-Telegram-Bot-Api-Secret-Token"] = secret_token
 
     async def json(self, loads=json.loads):
         return self.payload
@@ -243,6 +247,27 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             if route.method == method and getattr(route.resource, "canonical", None) == path:
                 return route.handler
         self.fail(f"route not found: {method} {path}")
+
+    def assert_invalid_telegram_webhook_secret_fails_closed(self, raw_secret):
+        env = os.environ.copy()
+        env.update(TEST_ENV)
+        env["WEBHOOK_SECRET"] = raw_secret
+        result = subprocess.run(
+            [sys.executable, "-c", "import main"],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "WEBHOOK_SECRET is incompatible with Telegram webhook secret_token requirements",
+            output,
+        )
+        self.assertNotIn(raw_secret, output)
 
     def delivery_inserts(self, conn):
         return [
@@ -6415,6 +6440,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(init_db.call_count, 2)
         self.assertEqual(set_commands.await_count, 2)
         self.assertEqual(set_webhook.await_count, 2)
+        for call in set_webhook.await_args_list:
+            self.assertEqual(call.kwargs["secret_token"], TEST_ENV["WEBHOOK_SECRET"])
         self.assertEqual(get_info.await_count, 2)
         self.assertEqual(len(fake_scheduler.jobs), 8)
         self.assertNotIn(
@@ -6422,6 +6449,30 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             [args[0] for args, _ in fake_scheduler.jobs],
         )
         self.assertEqual(fake_scheduler.start_calls, 1)
+
+    async def test_telegram_webhook_uses_same_validated_secret_for_setup_and_handler(self):
+        handler_instance = Mock()
+        handler_class = Mock(return_value=handler_instance)
+
+        with patch.object(self.main, "SimpleRequestHandler", handler_class):
+            app = self.main.create_app()
+
+        handler_class.assert_called_once_with(
+            dispatcher=self.main.dp,
+            bot=self.main.bot,
+            secret_token=self.main.WEBHOOK_SECRET,
+        )
+        handler_instance.register.assert_called_once_with(
+            app,
+            path=f"/webhook/{self.main.WEBHOOK_SECRET}",
+        )
+        self.assertEqual(self.main.WEBHOOK_SECRET, TEST_ENV["WEBHOOK_SECRET"])
+
+    async def test_invalid_character_in_telegram_webhook_secret_fails_closed_without_leak(self):
+        self.assert_invalid_telegram_webhook_secret_fails_closed("invalid.secret/value")
+
+    async def test_overlong_telegram_webhook_secret_fails_closed_without_leak(self):
+        self.assert_invalid_telegram_webhook_secret_fails_closed("a" * 257)
 
     async def test_shutdown_closes_bot_session_and_is_repeatable(self):
         fake_scheduler = FakeScheduler()
@@ -6509,9 +6560,48 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         handler = self.route_handler(app, "POST", self.main.get_telegram_webhook_path())
-        response = await handler(FakeTelegramRequest(update))
+        with patch.object(self.main.dp, "feed_raw_update", AsyncMock(return_value=None)) as dispatch:
+            response = await handler(FakeTelegramRequest(update))
+            await asyncio.sleep(0)
 
         self.assertEqual(response.status, 200)
+        dispatch.assert_awaited_once_with(bot=self.main.bot, update=update)
+
+    async def test_telegram_webhook_rejects_missing_secret_before_dispatch(self):
+        app = self.main.create_app()
+        app.on_startup.clear()
+        app.on_shutdown.clear()
+        handler = self.route_handler(app, "POST", self.main.get_telegram_webhook_path())
+        request = FakeTelegramRequest({"update_id": 1003}, secret_token=None)
+
+        with patch.object(self.main.dp, "feed_raw_update", AsyncMock()) as dispatch:
+            response = await handler(request)
+
+        self.assertEqual(response.status, 401)
+        dispatch.assert_not_awaited()
+
+    async def test_telegram_webhook_rejects_wrong_secret_before_dispatch_without_leaking_secret(self):
+        app = self.main.create_app()
+        app.on_startup.clear()
+        app.on_shutdown.clear()
+        handler = self.route_handler(app, "POST", self.main.get_telegram_webhook_path())
+        raw_secret = TEST_ENV["WEBHOOK_SECRET"]
+        request = FakeTelegramRequest({"update_id": 1004}, secret_token="wrong-token")
+
+        log_stream = io.StringIO()
+        log_handler = logging.StreamHandler(log_stream)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(log_handler)
+        try:
+            with patch.object(self.main.dp, "feed_raw_update", AsyncMock()) as dispatch:
+                response = await handler(request)
+        finally:
+            root_logger.removeHandler(log_handler)
+
+        self.assertEqual(response.status, 401)
+        dispatch.assert_not_awaited()
+        self.assertNotIn(raw_secret, response.text)
+        self.assertNotIn(raw_secret, log_stream.getvalue())
 
     async def test_unknown_callback_passes_through_dispatcher_without_payment_or_admin_action(self):
         app = self.main.create_app()

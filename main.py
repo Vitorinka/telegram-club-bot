@@ -7,6 +7,7 @@ import json
 import hashlib
 import hmac
 import html
+import re
 import secrets
 import shutil
 import stripe
@@ -164,6 +165,16 @@ REQUIRED_ENV_VARS = (
 missing_env_vars = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
 if missing_env_vars:
     raise ValueError("Критическая ошибка: отсутствуют переменные окружения: " + ", ".join(missing_env_vars))
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+if (
+    not WEBHOOK_SECRET
+    or len(WEBHOOK_SECRET) > 256
+    or re.fullmatch(r"[A-Za-z0-9_-]+", WEBHOOK_SECRET) is None
+):
+    raise ValueError(
+        "WEBHOOK_SECRET is incompatible with Telegram webhook secret_token requirements"
+    )
 
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
@@ -17327,17 +17338,11 @@ async def unban_user(message: types.Message, command: CommandObject):
 
 # --- ЗАПУСК И ВЕБХУК TELEGRAM ---
 def get_telegram_webhook_path():
-    secret = os.getenv("WEBHOOK_SECRET")
-    if secret:
-        return f"/webhook/{secret}"
-    return "/webhook"
+    return f"/webhook/{WEBHOOK_SECRET}"
 
 
 def get_safe_telegram_webhook_path():
-    secret = os.getenv("WEBHOOK_SECRET")
-    if secret:
-        return "/webhook/***"
-    return "/webhook"
+    return "/webhook/***"
 
 
 async def run_scheduled_with_lock(job_name, schedule_slot, func, lease_minutes=30):
@@ -18094,7 +18099,7 @@ async def on_startup(app):
     safe_webhook_path = get_safe_telegram_webhook_path()
     webhook_url = f"{domain}{webhook_path}"
 
-    await bot.set_webhook(webhook_url)
+    await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET)
     webhook_info = await bot.get_webhook_info()
     actual_url = getattr(webhook_info, "url", "")
     pending_update_count = getattr(webhook_info, "pending_update_count", None)
@@ -18146,7 +18151,11 @@ def create_app():
     app = web.Application()
     telegram_path = get_telegram_webhook_path()
     if not _route_exists(app, "POST", telegram_path):
-        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=telegram_path)
+        SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+            secret_token=WEBHOOK_SECRET,
+        ).register(app, path=telegram_path)
     if not _route_exists(app, "POST", "/stripe-payment"):
         app.router.add_post('/stripe-payment', stripe_webhook)
     if not _route_exists(app, "GET", "/health"):
