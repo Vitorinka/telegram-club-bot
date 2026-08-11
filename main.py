@@ -5915,8 +5915,8 @@ async def send_existing_subscription_action(callback, user_id, stripe_subscripti
         "Checkout заблокирован, потому что у пользователя уже есть Stripe subscription, "
         "но не удалось создать invoice/billing portal ссылку.\n\n"
         f"telegram_id: {user_id}\n"
-        f"stripe_customer_id: {stripe_customer_id or 'нет'}\n"
-        f"stripe_subscription_id: {stripe_subscription_id or 'нет'}\n"
+        f"stripe_customer_id: {safe_log_id(stripe_customer_id) or 'нет'}\n"
+        f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}\n"
         f"status: {status or 'нет'}"
     )
     logging.warning(
@@ -6405,7 +6405,7 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
         error_ref = safe_admin_error_reference("stripe_recheck_before_removal", e)
         await notify_admins(
             f"Не смогла перепроверить Stripe перед удалением пользователя {telegram_id}.\n"
-            f"subscription_id: {stripe_subscription_id}\n"
+            f"subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}\n"
             f"Ошибка: временный сбой проверки. ref: {error_ref}\n\n"
             "Пользователь пока НЕ удален автоматически. Проверьте вручную."
         )
@@ -6507,8 +6507,8 @@ async def ban_user_logic(telegram_id, cur=None):
             f"paid: {paid}\n"
             f"expiry_date: {expiry_date}\n"
             f"grace_period_end: {grace_period_end or 'нет'}\n"
-            f"stripe_customer_id: {stripe_customer_id or 'нет'}\n"
-            f"stripe_subscription_id: {stripe_subscription_id or 'нет'}\n\n"
+            f"stripe_customer_id: {safe_log_id(stripe_customer_id) or 'нет'}\n"
+            f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}\n\n"
             "Нужно вручную проверить Stripe и связать пользователя командой "
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id>."
         )
@@ -6610,7 +6610,7 @@ async def ban_user_logic(telegram_id, cur=None):
             f"Подписка до: {expiry_date or 'нет'}\n"
             f"Grace: {grace or 'нет'}\n"
             f"Auto-renew: {auto_renew}\n"
-            f"Stripe subscription: {stripe_subscription_id or 'нет'}"
+            f"Stripe subscription: {safe_log_id(stripe_subscription_id) or 'нет'}"
         )
     except Exception as e:
         logging.error(
@@ -6796,8 +6796,8 @@ async def check_subscriptions_and_reminders():
                 f"   username: {report_username(user_info)}",
                 f"   имя: {report_name(user_info)}",
                 f"   подписка до: {fmt_report_dt(user_info.get('subscription_end'))}",
-                f"   stripe_customer_id: {user_info.get('stripe_customer_id') or 'нет'}",
-                f"   stripe_subscription_id: {user_info.get('stripe_subscription_id') or 'нет'}",
+                f"   stripe_customer_id: {safe_log_id(user_info.get('stripe_customer_id')) or 'нет'}",
+                f"   stripe_subscription_id: {safe_log_id(user_info.get('stripe_subscription_id')) or 'нет'}",
             ])
             if user_info.get("reason"):
                 lines.append(f"   причина: {user_info['reason']}")
@@ -9859,8 +9859,8 @@ def restore_access_user_summary(telegram_id, user):
         f"payment_failed: {payment_failed}\n"
         f"grace_period_end: {grace_period_end or 'нет'}\n"
         f"blocked_bot: {blocked_bot}\n"
-        f"stripe_subscription_id: {stripe_subscription_id or 'нет'}\n"
-        f"stripe_customer_id: {stripe_customer_id or 'нет'}\n"
+        f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}\n"
+        f"stripe_customer_id: {safe_log_id(stripe_customer_id) or 'нет'}\n"
         f"auto_renew: {auto_renew}"
     )
 
@@ -10399,8 +10399,8 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                         f"expiry_date: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n"
                         f"auto_renew: {auto_renew}\n"
                         f"period_source: {period_source}\n"
-                        f"stripe_subscription_id: {current_subscription_id}\n"
-                        f"stripe_customer_id: {customer_id or current_customer_id or 'нет'}"
+                        f"stripe_subscription_id: {safe_log_id(current_subscription_id) or 'нет'}\n"
+                        f"stripe_customer_id: {safe_log_id(customer_id or current_customer_id) or 'нет'}"
                     )
         elif status in ('active', 'trialing') and not current_period_end:
             write_conn = get_db_conn()
@@ -10445,8 +10445,8 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                         f"telegram_id: {target_user_id}\n"
                         f"status: {status}\n"
                         f"auto_renew: {auto_renew}\n"
-                        f"stripe_subscription_id: {current_subscription_id}\n"
-                        f"stripe_customer_id: {customer_id or current_customer_id or 'нет'}"
+                        f"stripe_subscription_id: {safe_log_id(current_subscription_id) or 'нет'}\n"
+                        f"stripe_customer_id: {safe_log_id(customer_id or current_customer_id) or 'нет'}"
                     )
         else:
             reply_text = (
@@ -10625,8 +10625,8 @@ async def user_command(message: types.Message, command: CommandObject):
         def fmt_dt(value):
             return value.strftime("%d.%m.%Y %H:%M") if value else "нет"
 
-        stripe_text = stripe_subscription_id if stripe_subscription_id else "нет"
-        stripe_customer_text = stripe_customer_id if stripe_customer_id else "нет"
+        stripe_text = safe_log_id(stripe_subscription_id) or "нет"
+        stripe_customer_text = safe_log_id(stripe_customer_id) or "нет"
 
         text = (
             f"👤 Пользователь {telegram_id}\n\n"
@@ -10730,8 +10730,8 @@ async def access_history_command(message: types.Message, command: CommandObject)
                 f"source: {source or 'нет'}",
                 f"old_expiry: {fmt_dt(old_expiry)}",
                 f"new_expiry: {fmt_dt(new_expiry)}",
-                f"stripe_event_id: {stripe_event_id or 'нет'}",
-                f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                f"stripe_event_id: {safe_log_id(stripe_event_id) or 'нет'}",
+                f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}",
                 f"notes: {notes or 'нет'}",
                 ""
             ])
@@ -10807,8 +10807,8 @@ async def recent_access_events_command(message: types.Message):
                 f"source: {source or 'нет'}",
                 f"old_expiry: {fmt_dt(old_expiry)}",
                 f"new_expiry: {fmt_dt(new_expiry)}",
-                f"stripe_event_id: {stripe_event_id or 'нет'}",
-                f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                f"stripe_event_id: {safe_log_id(stripe_event_id) or 'нет'}",
+                f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}",
                 f"notes: {notes or 'нет'}",
                 ""
             ])
@@ -11086,10 +11086,10 @@ async def find_by_stripe_command(message: types.Message, command: CommandObject)
         events = cur.fetchall()
 
         if not users and not events:
-            await message.answer(f"Ничего не найдено по Stripe ID:\n{query_id}")
+            await message.answer(f"Ничего не найдено по Stripe ID:\n{safe_log_id(query_id)}")
             return
 
-        lines = [f"🔎 Найдено по Stripe ID: {query_id}\n"]
+        lines = [f"🔎 Найдено по Stripe ID: {safe_log_id(query_id)}\n"]
 
         if users:
             lines.append("Users:")
@@ -11108,8 +11108,8 @@ async def find_by_stripe_command(message: types.Message, command: CommandObject)
                     f"telegram_id: {telegram_id}",
                     f"paid: {paid}",
                     f"expiry_date: {fmt_dt(expiry_date)}",
-                    f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
-                    f"stripe_customer_id: {stripe_customer_id or 'нет'}",
+                    f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}",
+                    f"stripe_customer_id: {safe_log_id(stripe_customer_id) or 'нет'}",
                     f"auto_renew: {auto_renew}",
                     f"payment_failed: {payment_failed}",
                     f"grace_period_end: {fmt_dt(grace_period_end)}",
@@ -11137,8 +11137,8 @@ async def find_by_stripe_command(message: types.Message, command: CommandObject)
                     f"source: {source or 'нет'}",
                     f"old_expiry: {fmt_dt(old_expiry)}",
                     f"new_expiry: {fmt_dt(new_expiry)}",
-                    f"stripe_event_id: {stripe_event_id or 'нет'}",
-                    f"stripe_subscription_id: {stripe_subscription_id or 'нет'}",
+                    f"stripe_event_id: {safe_log_id(stripe_event_id) or 'нет'}",
+                    f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}",
                     f"notes: {notes or 'нет'}",
                     ""
                 ])
@@ -15911,18 +15911,17 @@ async def unlinked_stripe_command(message: types.Message):
             ) = row
             lines.extend([
                 "",
-                f"{index}) event_id: {event_id}",
+                f"{index}) event_id: {safe_log_id(event_id) or 'нет'}",
                 f"event_type: {event_type or 'нет'}",
-                f"invoice_id: {invoice_id or 'нет'}",
-                f"customer: {customer_id or 'нет'}",
-                f"subscription: {subscription_id or 'нет'}",
-                f"email: {customer_email or 'нет'}",
+                f"invoice_id: {safe_log_id(invoice_id) or 'нет'}",
+                f"customer: {safe_log_id(customer_id) or 'нет'}",
+                f"subscription: {safe_log_id(subscription_id) or 'нет'}",
+                f"email: {safe_log_email(customer_email) or 'нет'}",
                 f"amount: {amount_paid if amount_paid is not None else 'нет'} {currency or ''}".strip(),
                 f"billing_reason: {billing_reason or 'нет'}",
                 f"period_end: {period_end or 'нет'}",
                 f"created_at: {created_at}",
-                "Связать: /link_stripe_user <telegram_id> "
-                f"{customer_id or '<customer_id>'} {subscription_id or '<subscription_id>'}",
+                "Связать: /link_stripe_user <telegram_id> <customer_id> <subscription_id>",
             ])
 
         await message.reply("\n".join(lines))
@@ -15993,9 +15992,9 @@ async def stripe_links_command(message: types.Message, command: CommandObject):
             ) = row
             lines.extend([
                 "",
-                f"{index}) customer_id: {customer_id or 'нет'}",
-                f"subscription_id: {subscription_id or 'нет'}",
-                f"email: {customer_email or 'нет'}",
+                f"{index}) customer_id: {safe_log_id(customer_id) or 'нет'}",
+                f"subscription_id: {safe_log_id(subscription_id) or 'нет'}",
+                f"email: {safe_log_email(customer_email) or 'нет'}",
                 f"status: {status or 'нет'}",
                 f"current_period_end: {current_period_end or 'нет'}",
                 f"is_active: {is_active}",
@@ -17141,8 +17140,8 @@ async def duplicate_subscriptions_command(message: types.Message):
             for customer_id, subscriptions in live_duplicates:
                 lines.extend([
                     "",
-                    f"customer_id: {customer_id}",
-                    "subscriptions: " + ", ".join(getattr(sub, "id", "") for sub in subscriptions),
+                    f"customer_id: {safe_log_id(customer_id)}",
+                    "subscriptions: " + ", ".join(safe_log_id(getattr(sub, "id", "")) or "нет" for sub in subscriptions),
                     f"count: {len(subscriptions)}",
                 ])
         if live_errors:
@@ -17154,8 +17153,8 @@ async def duplicate_subscriptions_command(message: types.Message):
         for customer_id, subscriptions, telegram_ids, count in rows:
             lines.extend([
                 "",
-                f"customer_id: {customer_id}",
-                f"subscriptions: {', '.join(x for x in subscriptions if x)}",
+                f"customer_id: {safe_log_id(customer_id)}",
+                f"subscriptions: {', '.join(safe_log_id(x) for x in subscriptions if x)}",
                 f"telegram_ids: {', '.join(str(x) for x in telegram_ids if x)}",
                 f"count: {count}",
             ])

@@ -768,7 +768,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Подтвердите восстановление доступа", text)
         self.assertIn("telegram_id: 123", text)
         self.assertIn("paid: True", text)
-        self.assertIn("stripe_subscription_id: sub_test", text)
+        self.assertIn(f"stripe_subscription_id: {self.main.safe_log_id('sub_test')}", text)
         self.assertIn("reply_markup", kwargs)
         self.assertEqual(closed_during_confirmation, [True])
 
@@ -7199,6 +7199,99 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("INSERT", queries)
         self.assertNotIn("UPDATE", queries)
         self.assertNotIn("DELETE", queries)
+
+    async def test_refund_info_accepts_full_identifier_without_echoing_it(self):
+        raw_refund = "re_privacy_full_identifier_123456"
+        reconciliation = (
+            raw_refund, "evt_privacy_123456", "ch_privacy_123456", "pi_privacy_123456",
+            "in_privacy_123456", "cus_privacy_123456", "sub_privacy_123456", 123, None,
+            5000, 5000, "usd", "succeeded", True,
+            self.main.SUBSCRIPTION_REFUND_REVIEW_REQUIRED, "manual_review", None,
+        )
+        conn = FakeConnection(fetches=[[reconciliation]])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.refund_info_command(message, SimpleNamespace(args=raw_refund))
+
+        answer = message.answers[-1][0]
+        self.assertNotIn(raw_refund, answer)
+        self.assertIn(self.main.safe_log_id(raw_refund), answer)
+        self.assertEqual(conn.cursor_obj.queries[0][1], (raw_refund, raw_refund, raw_refund))
+
+    async def test_unlinked_stripe_admin_output_redacts_ids_email_and_command_echo(self):
+        raw_values = {
+            "event": "evt_privacy_event_123456",
+            "invoice": "in_privacy_invoice_123456",
+            "customer": "cus_privacy_customer_123456",
+            "subscription": "sub_privacy_subscription_123456",
+            "email": "private.person@example.com",
+        }
+        row = (
+            raw_values["event"], "invoice.payment_succeeded", raw_values["invoice"],
+            raw_values["customer"], raw_values["subscription"], raw_values["email"],
+            5000, "usd", "subscription_cycle", datetime.utcnow(), datetime.utcnow(),
+        )
+        conn = FakeConnection(fetches=[[row]])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.unlinked_stripe_command(message)
+
+        answer = message.replies[-1][0]
+        for raw in raw_values.values():
+            self.assertNotIn(raw, answer)
+        self.assertIn(self.main.safe_log_id(raw_values["customer"]), answer)
+        self.assertIn(self.main.safe_log_email(raw_values["email"]), answer)
+        self.assertIn("/link_stripe_user <telegram_id> <customer_id> <subscription_id>", answer)
+
+    async def test_stripe_links_admin_output_redacts_identity_and_email(self):
+        customer = "cus_privacy_links_123456"
+        subscription = "sub_privacy_links_123456"
+        email = "stripe.links@example.com"
+        row = (customer, subscription, email, "active", datetime.utcnow(), True, "test", datetime.utcnow(), datetime.utcnow())
+        conn = FakeConnection(fetches=[[row]])
+        message = FakeIncomingMessage(user_id=1)
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.stripe_links_command(message, SimpleNamespace(args="123"))
+
+        answer = message.replies[-1][0]
+        self.assertNotIn(customer, answer)
+        self.assertNotIn(subscription, answer)
+        self.assertNotIn(email, answer)
+        self.assertIn(self.main.safe_log_id(customer), answer)
+        self.assertIn(self.main.safe_log_email(email), answer)
+
+    async def test_checkout_failure_admin_alert_redacts_stripe_identity(self):
+        customer = "cus_checkout_alert_private_123456"
+        subscription = "sub_checkout_alert_private_123456"
+        callback = SimpleNamespace(message=SimpleNamespace(answer=AsyncMock()))
+
+        with patch.object(self.main, "get_open_invoice_url_for_subscription", new=AsyncMock(return_value=(None, None))), \
+             patch.object(self.main, "create_billing_portal_url", new=AsyncMock(return_value=None)), \
+             patch.object(self.main, "notify_admins", new=AsyncMock()) as notify:
+            result = await self.main.send_existing_subscription_action(
+                callback, 123, subscription, customer, "active"
+            )
+
+        self.assertTrue(result)
+        alert = notify.await_args.args[0]
+        self.assertNotIn(customer, alert)
+        self.assertNotIn(subscription, alert)
+        self.assertNotIn("https://checkout.stripe.com/", alert)
+        self.assertIn(self.main.safe_log_id(customer), alert)
+
+    def test_restore_access_summary_redacts_stripe_identity(self):
+        customer = "cus_restore_private_123456"
+        subscription = "sub_restore_private_123456"
+        summary = self.main.restore_access_user_summary(
+            123,
+            (True, datetime.utcnow(), False, None, False, subscription, customer, True),
+        )
+        self.assertNotIn(customer, summary)
+        self.assertNotIn(subscription, summary)
+        self.assertIn(self.main.safe_log_id(customer), summary)
 
 
 if __name__ == "__main__":
