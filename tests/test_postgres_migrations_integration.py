@@ -29,6 +29,11 @@ from db_migrations import (
     run_migrations,
 )
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
+from stripe_invoice_rules import (
+    claim_stripe_event,
+    mark_stripe_event_processed,
+    release_stripe_event_claim,
+)
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -3938,6 +3943,212 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """
         )}
         self.assertIn("revoke_started_at", removal_columns)
+
+    def test_stripe_event_claim_fencing_migration_fresh_and_idempotent(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0008_stripe_event_claim_fencing", first["applied"])
+        self.assertIn("0008_stripe_event_claim_fencing", second["applied"])
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_name = 'stripe_events'
+                  AND column_name = 'claim_generation'
+                """
+            ),
+            ("bigint", "NO", "0"),
+        )
+
+    def test_stripe_event_claim_fencing_upgrades_legacy_rows_without_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for migration in sorted(Path(MIGRATIONS_DIR).glob("*.sql")):
+                if migration.name >= "0008_":
+                    continue
+                (Path(tmp) / migration.name).write_text(
+                    migration.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            run_migrations(self.get_conn, migrations_dir=tmp)
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO stripe_events (event_id, processed, processed_at)
+                VALUES
+                    ('evt_legacy_processed', TRUE, NOW()),
+                    ('evt_legacy_unprocessed', FALSE, NOW() - INTERVAL '11 minutes')
+                """
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        run_migrations(self.get_conn)
+        self.assertEqual(
+            self.query_one(
+                "SELECT processed, claim_generation FROM stripe_events WHERE event_id = %s",
+                ("evt_legacy_processed",),
+            ),
+            (True, 0),
+        )
+        self.assertEqual(
+            self.query_one(
+                "SELECT processed, claim_generation FROM stripe_events WHERE event_id = %s",
+                ("evt_legacy_unprocessed",),
+            ),
+            (False, 0),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertEqual(
+                claim_stripe_event(cur, "evt_legacy_processed"),
+                ("duplicate_processed", None),
+            )
+            self.assertEqual(
+                claim_stripe_event(cur, "evt_legacy_unprocessed"),
+                ("claimed", 1),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_stripe_event_claim_generation_fences_real_concurrent_owners(self):
+        run_migrations(self.get_conn)
+        event_id = "evt_pg_claim_fencing"
+
+        a = self.get_conn()
+        a_cur = a.cursor()
+        self.assertEqual(claim_stripe_event(a_cur, event_id), ("claimed", 1))
+        a.commit()
+        a_cur.close()
+        a.close()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE stripe_events SET processed_at = NOW() - INTERVAL '11 minutes' WHERE event_id = %s",
+            (event_id,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        b = self.get_conn()
+        b_cur = b.cursor()
+        self.assertEqual(claim_stripe_event(b_cur, event_id), ("claimed", 2))
+
+        late_release = {"result": None, "error": None}
+
+        def release_a():
+            release_conn = self.get_conn()
+            release_cur = release_conn.cursor()
+            try:
+                late_release["result"] = release_stripe_event_claim(
+                    release_cur,
+                    event_id,
+                    1,
+                )
+                release_conn.commit()
+            except Exception as error:
+                late_release["error"] = error
+            finally:
+                release_cur.close()
+                release_conn.close()
+
+        thread = threading.Thread(target=release_a)
+        thread.start()
+        time.sleep(0.2)
+        self.assertTrue(thread.is_alive())
+        b.commit()
+        b_cur.close()
+        b.close()
+        thread.join(timeout=5)
+
+        self.assertIsNone(late_release["error"])
+        self.assertEqual(late_release["result"], "not_owner")
+        self.assertEqual(
+            self.query_one(
+                "SELECT processed, claim_generation FROM stripe_events WHERE event_id = %s",
+                (event_id,),
+            ),
+            (False, 2),
+        )
+
+        c = self.get_conn()
+        c_cur = c.cursor()
+        self.assertEqual(
+            claim_stripe_event(c_cur, event_id),
+            ("duplicate_processing", None),
+        )
+        c.rollback()
+        c_cur.close()
+        c.close()
+
+        stale_mark = self.get_conn()
+        stale_mark_cur = stale_mark.cursor()
+        self.assertEqual(
+            mark_stripe_event_processed(stale_mark_cur, event_id, 1),
+            "not_owner",
+        )
+        stale_mark.commit()
+        stale_mark_cur.close()
+        stale_mark.close()
+
+        owner = self.get_conn()
+        owner_cur = owner.cursor()
+        self.assertEqual(
+            mark_stripe_event_processed(owner_cur, event_id, 2),
+            "processed",
+        )
+        owner.commit()
+        owner_cur.close()
+        owner.close()
+
+        late = self.get_conn()
+        late_cur = late.cursor()
+        self.assertEqual(
+            release_stripe_event_claim(late_cur, event_id, 2),
+            "not_owner",
+        )
+        late.commit()
+        late_cur.close()
+        late.close()
+
+        final_c = self.get_conn()
+        final_c_cur = final_c.cursor()
+        self.assertEqual(
+            claim_stripe_event(final_c_cur, event_id),
+            ("duplicate_processed", None),
+        )
+        final_c.rollback()
+        final_c_cur.close()
+        final_c.close()
+
+    def test_stripe_event_claim_generation_increases_monotonically(self):
+        run_migrations(self.get_conn)
+        event_id = "evt_pg_claim_generation_monotonic"
+        generations = []
+        for expected in (1, 2, 3):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            if expected > 1:
+                cur.execute(
+                    "UPDATE stripe_events SET processed_at = NOW() - INTERVAL '11 minutes' WHERE event_id = %s",
+                    (event_id,),
+                )
+            result = claim_stripe_event(cur, event_id)
+            conn.commit()
+            cur.close()
+            conn.close()
+            generations.append(result[1])
+        self.assertEqual(generations, [1, 2, 3])
 
     def test_subscription_refund_reconciliation_unique_guards_block_duplicates(self):
         run_migrations(self.get_conn)

@@ -540,20 +540,16 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         self.assertIn("conn.rollback()", block)
         self.assertIn("raise", block)
 
-    def test_claim_exception_releases_event_and_reraises(self):
+    def test_claim_exception_does_not_release_without_confirmed_generation(self):
         calls = []
 
         async def claim(event_id, **kwargs):
             calls.append(("claim", event_id, kwargs))
             raise RuntimeError("db down")
 
-        async def release(event_id):
-            calls.append(("release", event_id))
-
         async def run_claim():
             await claim_normalized_stripe_event(
                 claim,
-                release,
                 "evt_claim_error",
                 event_created_at=None,
                 event_type="invoice.payment_succeeded",
@@ -563,53 +559,11 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             asyncio.run(run_claim())
 
-        self.assertEqual(calls[0][0], "claim")
-        self.assertEqual(calls[1], ("release", "evt_claim_error"))
-
-    def test_claim_exception_reraises_when_release_also_fails(self):
-        calls = []
-
-        async def claim(event_id, **kwargs):
-            calls.append(("claim", event_id))
-            raise RuntimeError("claim failed")
-
-        async def release(event_id):
-            calls.append(("release", event_id))
-            raise RuntimeError("release failed")
-
-        async def run_claim():
-            await claim_normalized_stripe_event(claim, release, "evt_release_error")
-
-        with self.assertLogs(level="ERROR"):
-            with self.assertRaises(RuntimeError) as ctx:
-                asyncio.run(run_claim())
-
-        self.assertEqual(str(ctx.exception), "claim failed")
-        self.assertEqual(calls, [("claim", "evt_release_error"), ("release", "evt_release_error")])
-
-    def test_claim_release_failure_logs_safe_event_id_and_reraises_claim_error(self):
-        raw_event_id = "evt_m2_safe_logging_unique_1234567890abcdef"
-        safe_event_id = "evt_***abcdef"
-
-        async def claim(event_id, **kwargs):
-            raise RuntimeError("claim failed")
-
-        async def release(event_id):
-            raise RuntimeError("release failed")
-
-        async def run_claim():
-            await claim_normalized_stripe_event(claim, release, raw_event_id)
-
-        with self.assertLogs(level="ERROR") as logs:
-            with self.assertRaises(RuntimeError) as ctx:
-                asyncio.run(run_claim())
-
-        log_text = "\n".join(logs.output)
-        self.assertEqual(str(ctx.exception), "claim failed")
-        self.assertNotIn(raw_event_id, log_text)
-        self.assertIn(safe_event_id, log_text)
-        self.assertNotIn(SECRET_PREFIX, log_text)
-        self.assertNotIn("Stripe-Signature", log_text)
+        self.assertEqual(calls, [("claim", "evt_claim_error", {
+            "event_created_at": None,
+            "event_type": "invoice.payment_succeeded",
+            "object_id": "in_test",
+        })])
 
     def test_real_stripe_webhook_empty_event_id_returns_500_without_claim_or_business_logic(self):
         secret = SECRET_PREFIX + "real_handler_empty_id"
@@ -636,7 +590,7 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         mark_processed.assert_not_called()
         checkout_action.assert_not_called()
 
-    def test_real_stripe_webhook_claim_exception_returns_500_releases_and_skips_business_logic(self):
+    def test_real_stripe_webhook_claim_exception_returns_500_without_release_or_business_logic(self):
         secret = SECRET_PREFIX + "real_handler_claim_error"
         payload = stripe_payload(
             "evt_real_handler_claim_exception_123456",
@@ -666,7 +620,7 @@ class StripeWebhookSafetyTests(unittest.TestCase):
 
         self.assertEqual(response.status, 500)
         claim.assert_awaited_once()
-        release.assert_awaited_once_with("evt_real_handler_claim_exception_123456")
+        release.assert_not_awaited()
         mark_processed.assert_not_called()
         checkout_action.assert_not_called()
 
@@ -675,17 +629,14 @@ class StripeWebhookSafetyTests(unittest.TestCase):
 
         async def claim(event_id, **kwargs):
             calls.append(("claim", event_id))
-            return "duplicate_processed"
-
-        async def release(event_id):
-            calls.append(("release", event_id))
+            return "duplicate_processed", None
 
         async def run_claim():
-            return await claim_normalized_stripe_event(claim, release, "evt_duplicate")
+            return await claim_normalized_stripe_event(claim, "evt_duplicate")
 
         result = asyncio.run(run_claim())
 
-        self.assertEqual(result, "duplicate_processed")
+        self.assertEqual(result, ("duplicate_processed", None))
         self.assertEqual(calls, [("claim", "evt_duplicate")])
 
 

@@ -454,22 +454,26 @@ async def claim_event_processing(event_id, event_created_at=None, event_type=Non
         cur.close()
         conn.close()
 
-async def mark_event_processed(event_id):
+async def mark_event_processed(event_id, claim_generation):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        mark_stripe_event_processed(cur, event_id)
+        result = mark_stripe_event_processed(cur, event_id, claim_generation)
         conn.commit()
+        if result != "processed":
+            raise RuntimeError("Stripe event claim ownership lost before mark_processed")
+        return result
     finally:
         cur.close()
         conn.close()
 
-async def release_event_processing(event_id):
+async def release_event_processing(event_id, claim_generation):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        release_stripe_event_claim(cur, event_id)
+        result = release_stripe_event_claim(cur, event_id, claim_generation)
         conn.commit()
+        return result
     finally:
         cur.close()
         conn.close()
@@ -1107,7 +1111,14 @@ def persist_stripe_identity_conflict_audit(
         conn.close()
 
 
-async def finalize_stripe_identity_conflict_response(conflict, event_id, event_type, **audit_kwargs):
+async def finalize_stripe_identity_conflict_response(
+    conflict,
+    event_id,
+    event_type,
+    *,
+    claim_generation,
+    **audit_kwargs,
+):
     try:
         persist_stripe_identity_conflict_audit(
             conflict,
@@ -1116,7 +1127,7 @@ async def finalize_stripe_identity_conflict_response(conflict, event_id, event_t
             **audit_kwargs,
         )
     except Exception as audit_error:
-        await release_event_processing(event_id)
+        await release_event_processing(event_id, claim_generation)
         logging.exception(
             "STRIPE_IDENTITY_CONFLICT_AUDIT_FAILED: event_id=%s, event.type=%s, "
             "source=%s, conflict_type=%s, stripe_id=%s, error=%s",
@@ -1140,7 +1151,7 @@ async def finalize_stripe_identity_conflict_response(conflict, event_id, event_t
             note="Webhook вернул 500, Stripe повторит событие. Identity conflict audit не сохранён.",
         )
         return web.Response(status=500)
-    await mark_event_processed(event_id)
+    await mark_event_processed(event_id, claim_generation)
     return web.Response(status=200)
 
 
@@ -1152,6 +1163,8 @@ async def finalize_stripe_identity_unique_violation_webhook_response(
     source,
     event_id,
     event_type,
+    *,
+    claim_generation,
     **audit_kwargs,
 ):
     conflict = stripe_identity_conflict_from_unique_violation(
@@ -1175,7 +1188,7 @@ async def finalize_stripe_identity_unique_violation_webhook_response(
             conflict.conflict_type,
             conflict.safe_stripe_id,
         )
-        await release_event_processing(event_id)
+        await release_event_processing(event_id, claim_generation)
         return web.Response(status=500)
     if int(conflict.existing_telegram_id) == int(conflict.requested_telegram_id):
         logging.warning(
@@ -1189,12 +1202,13 @@ async def finalize_stripe_identity_unique_violation_webhook_response(
             conflict.safe_stripe_id,
             conflict.requested_telegram_id,
         )
-        await release_event_processing(event_id)
+        await release_event_processing(event_id, claim_generation)
         return web.Response(status=500)
     return await finalize_stripe_identity_conflict_response(
         conflict,
         event_id,
         event_type,
+        claim_generation=claim_generation,
         **audit_kwargs,
     )
 
@@ -12048,9 +12062,8 @@ async def stripe_webhook(request):
     logging.info(f"Stripe webhook event: event_id={safe_log_id(event_id)}, event.type={event_type}")
 
     try:
-        claim_result = await claim_normalized_stripe_event(
+        claim_result, claim_generation = await claim_normalized_stripe_event(
             claim_event_processing,
-            release_event_processing,
             event_id,
             event_created_at=event_created_at,
             event_type=event_type,
@@ -12495,6 +12508,7 @@ async def stripe_webhook(request):
                     conflict,
                     event_id,
                     event_type,
+                    claim_generation=claim_generation,
                     checkout_session_id=session_id,
                     amount_paid=stripe_value(session, 'amount_total'),
                     currency=stripe_value(session, 'currency'),
@@ -12530,6 +12544,7 @@ async def stripe_webhook(request):
                     conflict,
                     event_id,
                     event_type,
+                    claim_generation=claim_generation,
                     checkout_session_id=session_id,
                     amount_paid=stripe_value(session, 'amount_total'),
                     currency=stripe_value(session, 'currency'),
@@ -12565,7 +12580,7 @@ async def stripe_webhook(request):
                         note="Gift checkout payment proof could not be verified. Stripe may retry.",
                         severity="CRITICAL",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
@@ -12638,11 +12653,11 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
                 if gift_mark_processed:
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                 if gift_admin_problem:
                     await enqueue_admin_payment_problem_now(**gift_admin_problem)
                 if gift_release_event:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 return gift_response
             user_id = resolve_checkout_telegram_id(session)
             metadata_obj = stripe_value(session, 'metadata') or {}
@@ -12691,7 +12706,7 @@ async def stripe_webhook(request):
                         exc_info=True,
                     )
                 finally:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500, text="Invalid checkout Telegram identity")
 
             sub_id = stripe_object_id(stripe_value(session, 'subscription'))
@@ -12795,7 +12810,7 @@ async def stripe_webhook(request):
                             safe_ref=safe_admin_context_reference("checkout_missing_subscription_id", event_id, session_id, customer_id),
                             note="Доступ НЕ выдан. Webhook вернул 500, Stripe повторит событие.",
                         )
-                        await release_event_processing(event_id)
+                        await release_event_processing(event_id, claim_generation)
                         return web.Response(status=500)
 
                     cur.execute("""
@@ -12837,7 +12852,7 @@ async def stripe_webhook(request):
                         safe_log_id(customer_id),
                         safe_log_id(sub_id),
                     )
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
                 except StripeIdentityConflictError as conflict:
                     conn.rollback()
@@ -12845,6 +12860,7 @@ async def stripe_webhook(request):
                         conflict,
                         event_id,
                         event_type,
+                        claim_generation=claim_generation,
                         checkout_session_id=stripe_value(session, 'id'),
                     )
                 except psycopg2_errors.UniqueViolation as e:
@@ -12874,6 +12890,7 @@ async def stripe_webhook(request):
                         conflict,
                         event_id,
                         event_type,
+                        claim_generation=claim_generation,
                         checkout_session_id=stripe_value(session, 'id'),
                     )
                 except Exception as e:
@@ -12899,7 +12916,7 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference("checkout_subscription_link", e),
                         note="Подписочный Checkout не связан. Операция не выполнена.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
                 finally:
                     cur.close()
@@ -12940,7 +12957,7 @@ async def stripe_webhook(request):
                         exc_info=True,
                     )
                 finally:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500, text="Invalid checkout metadata.days")
 
             session_id = stripe_value(session, 'id')
@@ -12986,7 +13003,7 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference("checkout_payment_status_retrieve", e),
                         note="Не удалось повторно получить Checkout Session. Доступ не выдан.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
 
             if payment_decision["action"] in ("payment_pending", "review_required"):
@@ -13037,13 +13054,13 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference("checkout_payment_status_gate", e),
                         note="Payment status gate failed before access grant. Access not granted.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
 
-                await mark_event_processed(event_id)
+                await mark_event_processed(event_id, claim_generation)
                 return web.Response(status=200)
 
             if payment_decision["action"] != "grant_access":
@@ -13059,7 +13076,7 @@ async def stripe_webhook(request):
                     note="Payment status decision did not allow access. Access not granted.",
                     severity="CRITICAL",
                 )
-                await mark_event_processed(event_id)
+                await mark_event_processed(event_id, claim_generation)
                 return web.Response(status=200)
 
             try:
@@ -13092,7 +13109,7 @@ async def stripe_webhook(request):
                     safe_ref=safe_admin_error_reference("checkout_completed_processing", e),
                     note="Операция не выполнена. Webhook вернул 500.",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500)
 
         # ---------- 2. УСПЕШНОЕ АВТОПРОДЛЕНИЕ (invoice.payment_succeeded) ----------
@@ -13158,7 +13175,7 @@ async def stripe_webhook(request):
                     )
                     await notify_unlinked_invoice(invoice)
                     conn.commit()
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 subscription = await asyncio.to_thread(stripe.Subscription.retrieve, sub_id)
@@ -13214,7 +13231,7 @@ async def stripe_webhook(request):
                             note="Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся.",
                         )
                         conn.rollback()
-                        await release_event_processing(event_id)
+                        await release_event_processing(event_id, claim_generation)
                         return web.Response(status=500)
 
                 invoice_action = successful_invoice_action(
@@ -13251,7 +13268,7 @@ async def stripe_webhook(request):
                         trial_end,
                     )
                     conn.commit()
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 if invoice_action == "sync_trial":
@@ -13308,7 +13325,7 @@ async def stripe_webhook(request):
                             trial_end,
                         )
                         await notify_unlinked_invoice(invoice, subscription_id=sub_id, period_end_override=trial_end)
-                        await mark_event_processed(event_id)
+                        await mark_event_processed(event_id, claim_generation)
                         return web.Response(status=200)
 
                     assert_stripe_identity_available(
@@ -13378,7 +13395,7 @@ async def stripe_webhook(request):
                             trial_row[2],
                             link_source,
                         )
-                        await mark_event_processed(event_id)
+                        await mark_event_processed(event_id, claim_generation)
                         return web.Response(status=200)
 
                     conn.commit()
@@ -13394,7 +13411,7 @@ async def stripe_webhook(request):
                         linked_telegram_id,
                     )
                     await notify_unlinked_invoice(invoice, subscription_id=sub_id, period_end_override=trial_end)
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 current_period_end = stripe_value(subscription, 'current_period_end')
@@ -13426,7 +13443,7 @@ async def stripe_webhook(request):
                         note="Webhook не упал, но доступ автоматически не обновлен. Проверьте подписку вручную.",
                     )
                     conn.commit()
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 stripe_period_expiry = datetime.utcfromtimestamp(current_period_end)
@@ -13549,7 +13566,7 @@ async def stripe_webhook(request):
                     )
 
                     await notify_unlinked_invoice(invoice, subscription_id=sub_id, period_end_override=current_period_end)
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 telegram_id = row[0]
@@ -13713,7 +13730,7 @@ async def stripe_webhook(request):
                         )
                     conn.commit()
                     reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 if invoice_access_confirmed:
@@ -13737,7 +13754,7 @@ async def stripe_webhook(request):
                     )
                     conn.commit()
                     reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 cur.execute("""
@@ -13799,6 +13816,7 @@ async def stripe_webhook(request):
                     conflict,
                     event_id,
                     event_type,
+                    claim_generation=claim_generation,
                     invoice_id=invoice_id,
                     amount_paid=amount_paid,
                     currency=stripe_value(invoice, 'currency'),
@@ -13833,6 +13851,7 @@ async def stripe_webhook(request):
                     conflict,
                     event_id,
                     event_type,
+                    claim_generation=claim_generation,
                     invoice_id=invoice_id,
                     amount_paid=amount_paid,
                     currency=stripe_value(invoice, 'currency'),
@@ -13858,7 +13877,7 @@ async def stripe_webhook(request):
                     safe_ref=safe_admin_error_reference("invoice_payment_succeeded", e),
                     note="Webhook вернул 500, Stripe повторит событие. Операция не выполнена.",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500)
 
             finally:
@@ -13910,7 +13929,7 @@ async def stripe_webhook(request):
                     safe_ref=safe_admin_context_reference("invoice_payment_failed_missing_subscription", event_id, invoice_id, customer_id),
                     note="payment_failed в БД не обновлен. Проверьте вручную.",
                 )
-                await mark_event_processed(event_id)
+                await mark_event_processed(event_id, claim_generation)
                 return web.Response(status=200)
 
             if sub_id:
@@ -13939,7 +13958,7 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference('payment_failed_subscription_retrieve', e),
                         note="Webhook вернул 500, Stripe повторит событие. Доступ в БД не менялся.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
 
                 subscription_status = stripe_value(subscription, 'status')
@@ -14048,6 +14067,7 @@ async def stripe_webhook(request):
                             conflict,
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                             invoice_id=invoice_id,
                             currency=stripe_value(invoice, 'currency'),
                             billing_reason=billing_reason,
@@ -14063,6 +14083,7 @@ async def stripe_webhook(request):
                             "invoice.payment_failed",
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                             invoice_id=invoice_id,
                             currency=stripe_value(invoice, 'currency'),
                             billing_reason=billing_reason,
@@ -14093,7 +14114,7 @@ async def stripe_webhook(request):
                             safe_ref=safe_admin_error_reference('payment_failed_trial_sync', e),
                             note="Webhook вернул 500, Stripe повторит событие. Trial sync не выполнен.",
                         )
-                        await release_event_processing(event_id)
+                        await release_event_processing(event_id, claim_generation)
                         return web.Response(status=500)
                     finally:
                         cur.close()
@@ -14123,7 +14144,7 @@ async def stripe_webhook(request):
                         safe_log_id(invoice_id),
                         safe_log_id(sub_id),
                     )
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
                 stale_payment_failed_alert = None
@@ -14146,6 +14167,7 @@ async def stripe_webhook(request):
                         conflict,
                         event_id,
                         event_type,
+                        claim_generation=claim_generation,
                         invoice_id=invoice_id,
                         currency=stripe_value(invoice, 'currency'),
                         billing_reason=billing_reason,
@@ -14214,7 +14236,7 @@ async def stripe_webhook(request):
                         event_created_at,
                         last_success_created_at,
                     )
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
                 try:
                     cur.execute("""
@@ -14241,6 +14263,7 @@ async def stripe_webhook(request):
                         "invoice.payment_failed",
                         event_id,
                         event_type,
+                        claim_generation=claim_generation,
                         invoice_id=invoice_id,
                         currency=stripe_value(invoice, 'currency'),
                         billing_reason=billing_reason,
@@ -14289,6 +14312,7 @@ async def stripe_webhook(request):
                                 "invoice.payment_failed",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                                 invoice_id=invoice_id,
                                 currency=stripe_value(invoice, 'currency'),
                                 billing_reason=billing_reason,
@@ -14610,6 +14634,7 @@ async def stripe_webhook(request):
                             conflict,
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                         )
                     if negative_update_skipped:
                         try:
@@ -14634,6 +14659,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                         row = None
                     else:
@@ -14681,6 +14707,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                         row = cur.fetchone()
                     logging.warning(
@@ -14722,6 +14749,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                 elif status in ("active", "trialing"):
                     conn = get_db_conn()
@@ -14742,6 +14770,7 @@ async def stripe_webhook(request):
                             conflict,
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                         )
                     if subscription_expiry:
                         try:
@@ -14788,6 +14817,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                     else:
                         try:
@@ -14827,6 +14857,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                     row = cur.fetchone()
                     if row:
@@ -14853,6 +14884,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                         if subscription_expiry:
                             logging.info(
@@ -14947,6 +14979,7 @@ async def stripe_webhook(request):
                             conflict,
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                         )
                     try:
                         cur.execute("""
@@ -14968,6 +15001,7 @@ async def stripe_webhook(request):
                             "customer.subscription.updated",
                             event_id,
                             event_type,
+                            claim_generation=claim_generation,
                         )
                     row = cur.fetchone()
                     logging.info(
@@ -15008,6 +15042,7 @@ async def stripe_webhook(request):
                                 "customer.subscription.updated",
                                 event_id,
                                 event_type,
+                                claim_generation=claim_generation,
                             )
                     if is_terminal_subscription_status(status):
                         mark_stripe_link_subscription_terminal(cur, sub_id, status)
@@ -15064,7 +15099,7 @@ async def stripe_webhook(request):
                         note="Gift async success payment proof could not be verified. Stripe may retry.",
                         severity="CRITICAL",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
                 conn = get_db_conn()
                 cur = conn.cursor()
@@ -15107,11 +15142,11 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
                 if gift_mark_processed:
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                 if gift_admin_problem:
                     await enqueue_admin_payment_problem_now(**gift_admin_problem)
                 if gift_release_event:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 return gift_response
 
             user_id = resolve_checkout_telegram_id(session)
@@ -15137,7 +15172,7 @@ async def stripe_webhook(request):
                     note="client_reference_id/metadata.telegram_id missing, invalid, or conflicting\naccess_granted: false",
                     severity="CRITICAL",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500, text="Invalid checkout Telegram identity")
 
             sub_id = stripe_object_id(stripe_value(session, 'subscription'))
@@ -15185,7 +15220,7 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference("checkout_async_success_retrieve", e),
                         note="Не удалось повторно получить Checkout Session. Доступ не выдан.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
 
             days_to_add = parse_checkout_days(metadata_raw)
@@ -15202,7 +15237,7 @@ async def stripe_webhook(request):
                     note="metadata.days missing or invalid\naccess_granted: false",
                     severity="CRITICAL",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500, text="Invalid checkout metadata.days")
 
             checkout_action = checkout_completion_action(checkout_mode, sub_id)
@@ -15213,7 +15248,7 @@ async def stripe_webhook(request):
                     safe_log_id(session_id),
                     user_id,
                 )
-                await mark_event_processed(event_id)
+                await mark_event_processed(event_id, claim_generation)
                 return web.Response(status=200)
 
             if payment_decision["action"] != "grant_access":
@@ -15258,12 +15293,12 @@ async def stripe_webhook(request):
                         safe_ref=safe_admin_error_reference("checkout_async_success_gate", e),
                         note="Payment status gate failed before access grant. Access not granted.",
                     )
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                     return web.Response(status=500)
                 finally:
                     cur.close()
                     conn.close()
-                await mark_event_processed(event_id)
+                await mark_event_processed(event_id, claim_generation)
                 return web.Response(status=200)
 
             try:
@@ -15300,10 +15335,10 @@ async def stripe_webhook(request):
                     safe_ref=safe_admin_error_reference("checkout_async_success_processing", e),
                     note="Операция не выполнена. Webhook вернул 500.",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500)
 
-            await mark_event_processed(event_id)
+            await mark_event_processed(event_id, claim_generation)
             return web.Response(status=200)
 
         elif event_type in ("charge.refunded", "refund.created", "refund.updated"):
@@ -15350,11 +15385,11 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
                 if gift_mark_processed:
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                 if gift_admin_problem:
                     await enqueue_admin_payment_problem_now(**gift_admin_problem)
                 if gift_release_event:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 if gift_mark_processed or gift_release_event:
                     return gift_response
             proof = subscription_refund_proof_from_event(event_type, refund_object)
@@ -15373,7 +15408,7 @@ async def stripe_webhook(request):
                     note="Refund proof could not be completed. Access unchanged; Stripe may retry.",
                     severity="CRITICAL",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500)
             refund_conn = get_db_conn()
             refund_cur = refund_conn.cursor()
@@ -15402,12 +15437,12 @@ async def stripe_webhook(request):
                     note="Refund reconciliation audit/revoke did not commit. Access may be unchanged; Stripe should retry.",
                     severity="CRITICAL",
                 )
-                await release_event_processing(event_id)
+                await release_event_processing(event_id, claim_generation)
                 return web.Response(status=500)
             finally:
                 refund_cur.close()
                 refund_conn.close()
-            await mark_event_processed(event_id)
+            await mark_event_processed(event_id, claim_generation)
             return web.Response(status=200)
 
         # ---------- 5. СЕССИЯ ОПЛАТЫ ИСТЕКЛА ИЛИ НЕ УДАЛАСЬ ----------
@@ -15488,11 +15523,11 @@ async def stripe_webhook(request):
                     cur.close()
                     conn.close()
                 if gift_mark_processed:
-                    await mark_event_processed(event_id)
+                    await mark_event_processed(event_id, claim_generation)
                 if gift_admin_problem:
                     await enqueue_admin_payment_problem_now(**gift_admin_problem)
                 if gift_release_event:
-                    await release_event_processing(event_id)
+                    await release_event_processing(event_id, claim_generation)
                 return gift_response
             user_id = getattr(session, 'client_reference_id', None)
             session_id = stripe_value(session, 'id')
@@ -15538,10 +15573,10 @@ async def stripe_webhook(request):
             if user_id:
                 clear_cached_checkout_sessions_for_user(user_id)
 
-        await mark_event_processed(event_id)
+        await mark_event_processed(event_id, claim_generation)
         return web.Response(status=200)
     except Exception as e:
-        await release_event_processing(event_id)
+        await release_event_processing(event_id, claim_generation)
         logging.exception(
             "STRIPE_WEBHOOK_UNHANDLED_EXCEPTION: event_id=%s, event.type=%s, error=%s",
             safe_log_id(event_id),

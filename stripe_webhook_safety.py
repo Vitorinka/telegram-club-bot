@@ -109,30 +109,18 @@ def safe_log_identifier(value):
 
 async def claim_normalized_stripe_event(
     claim_event_processing,
-    release_event_processing,
     event_id,
     *,
     event_created_at=None,
     event_type=None,
     object_id=None,
 ):
-    try:
-        return await claim_event_processing(
-            event_id,
-            event_created_at=event_created_at,
-            event_type=event_type,
-            object_id=object_id,
-        )
-    except Exception:
-        try:
-            await release_event_processing(event_id)
-        except Exception as release_error:
-            logging.exception(
-                "Stripe webhook event release after claim failure also failed: event_id=%s, error=%s",
-                safe_log_identifier(event_id),
-                release_error,
-            )
-        raise
+    return await claim_event_processing(
+        event_id,
+        event_created_at=event_created_at,
+        event_type=event_type,
+        object_id=object_id,
+    )
 
 
 def stripe_webhook_diagnostics(request, payload, sig_header, webhook_secret, env=None):
