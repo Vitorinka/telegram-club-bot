@@ -3792,6 +3792,58 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Оплата уже обрабатывается Stripe", callback.message.answers[-1][0])
         self.assertEqual(state.clear_calls, 1)
 
+    async def test_unknown_subscription_callbacks_fail_safely_before_side_effects(self):
+        invalid_callbacks = (
+            "sub_foo",
+            "sub_",
+            "sub_unknown",
+            "sub_24",
+        )
+
+        for callback_data in invalid_callbacks:
+            with self.subTest(callback_data=callback_data):
+                callback = FakeCallback()
+                callback.data = callback_data
+                state = FakeState()
+
+                with patch.object(self.main, "save_telegram_user_profile") as save_profile, \
+                     patch.object(self.main, "get_db_conn") as get_db_conn, \
+                     patch.object(self.main, "register_checkout_attempt") as register_attempt, \
+                     patch.object(self.main, "claim_checkout_session_record") as claim_checkout, \
+                     patch.object(self.main.stripe.checkout.Session, "create") as create_session, \
+                     patch.object(self.main.stripe.checkout.Session, "retrieve") as retrieve_session, \
+                     patch.object(self.main.stripe.Subscription, "list") as list_subscriptions, \
+                     patch.object(self.main.stripe.Subscription, "retrieve") as retrieve_subscription, \
+                     patch.object(
+                         self.main,
+                         "enqueue_admin_payment_problem_now",
+                         AsyncMock(),
+                     ) as admin_alert, \
+                     patch.object(
+                         self.main,
+                         "try_enqueue_checkout_preparation_failed_alert",
+                         AsyncMock(),
+                     ) as preparation_alert:
+                    await self.main.process_payment(callback, state)
+
+                self.assertEqual(len(callback.answers), 1)
+                alert_text, alert_kwargs = callback.answers[0]
+                self.assertTrue(alert_kwargs.get("show_alert"))
+                self.assertIn("тариф больше недоступен", alert_text.lower())
+                self.assertNotIn(callback_data, alert_text)
+                self.assertEqual(callback.message.answers, [])
+                self.assertEqual(state.clear_calls, 0)
+                save_profile.assert_not_called()
+                get_db_conn.assert_not_called()
+                register_attempt.assert_not_called()
+                claim_checkout.assert_not_called()
+                create_session.assert_not_called()
+                retrieve_session.assert_not_called()
+                list_subscriptions.assert_not_called()
+                retrieve_subscription.assert_not_called()
+                admin_alert.assert_not_awaited()
+                preparation_alert.assert_not_awaited()
+
     async def test_checkout_first_create_does_not_enqueue_reuse_alert(self):
         callback = FakeCallback()
         callback.data = "sub_1"
