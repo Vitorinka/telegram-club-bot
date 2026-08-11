@@ -8775,8 +8775,21 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith('sub_'), StateFilter('*'))
 async def process_payment(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer("⏳ Проверяем...")
     sub_type = callback.data
+    price_map = {
+        "sub_trial": "PRICE_TRIAL",
+        "sub_1": "PRICE_1M",
+        "sub_6": "PRICE_6M",
+        "sub_12": "PRICE_12M"
+    }
+    if sub_type not in price_map:
+        await callback.answer(
+            "Этот тариф больше недоступен. Пожалуйста, выберите тариф заново.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("⏳ Проверяем...")
     user_id = callback.from_user.id
     save_telegram_user_profile(callback.from_user)
 
@@ -9159,12 +9172,6 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         # (весь код ниже для sub_trial, но он такой же, как для остальных тарифов, поэтому вынесем общую логику)
 
     # Обработка всех тарифов (включая sub_trial, если прошли проверку)
-    price_map = {
-        "sub_trial": "PRICE_TRIAL",
-        "sub_1": "PRICE_1M",
-        "sub_6": "PRICE_6M",
-        "sub_12": "PRICE_12M"
-    }
     days_map = {
         "sub_trial": 7,
         "sub_1": 30,
