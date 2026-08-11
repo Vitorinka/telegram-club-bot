@@ -186,48 +186,62 @@ def claim_stripe_event(cur, event_id, lease_seconds=600, event_created_at=None, 
     """Atomically claim a Stripe event before side effects."""
     cur.execute(
         """
-        INSERT INTO stripe_events (event_id, processed, processed_at, event_created_at, event_type, object_id)
-        VALUES (%s, FALSE, NOW(), %s, %s, %s)
+        INSERT INTO stripe_events (
+            event_id, processed, processed_at, event_created_at, event_type, object_id, claim_generation
+        )
+        VALUES (%s, FALSE, NOW(), %s, %s, %s, 1)
         ON CONFLICT (event_id) DO UPDATE SET
             processed = FALSE,
             processed_at = NOW(),
+            claim_generation = stripe_events.claim_generation + 1,
             event_created_at = COALESCE(EXCLUDED.event_created_at, stripe_events.event_created_at),
             event_type = COALESCE(EXCLUDED.event_type, stripe_events.event_type),
             object_id = COALESCE(EXCLUDED.object_id, stripe_events.object_id)
         WHERE stripe_events.processed IS NOT TRUE
           AND stripe_events.processed_at < NOW() - (%s * INTERVAL '1 second')
-        RETURNING event_id
+        RETURNING claim_generation
         """,
         (event_id, event_created_at, event_type, object_id, lease_seconds),
     )
-    if cur.fetchone():
-        return "claimed"
+    claimed_row = cur.fetchone()
+    if claimed_row:
+        return "claimed", claimed_row[0]
 
     cur.execute("SELECT processed FROM stripe_events WHERE event_id = %s", (event_id,))
     row = cur.fetchone()
     if row and row[0]:
-        return "duplicate_processed"
-    return "duplicate_processing"
+        return "duplicate_processed", None
+    return "duplicate_processing", None
 
 
-def mark_stripe_event_processed(cur, event_id):
+def mark_stripe_event_processed(cur, event_id, claim_generation):
     cur.execute(
         """
-        INSERT INTO stripe_events (event_id, processed, processed_at)
-        VALUES (%s, TRUE, NOW())
-        ON CONFLICT (event_id) DO UPDATE SET
-            processed = TRUE,
+        UPDATE stripe_events
+        SET processed = TRUE,
             processed_at = NOW()
+        WHERE event_id = %s
+          AND processed IS NOT TRUE
+          AND claim_generation = %s
+        RETURNING event_id
         """,
-        (event_id,),
+        (event_id, claim_generation),
     )
+    return "processed" if cur.fetchone() else "not_owner"
 
 
-def release_stripe_event_claim(cur, event_id):
+def release_stripe_event_claim(cur, event_id, claim_generation):
     cur.execute(
-        "DELETE FROM stripe_events WHERE event_id = %s AND processed IS NOT TRUE",
-        (event_id,),
+        """
+        DELETE FROM stripe_events
+        WHERE event_id = %s
+          AND processed IS NOT TRUE
+          AND claim_generation = %s
+        RETURNING event_id
+        """,
+        (event_id, claim_generation),
     )
+    return "released" if cur.fetchone() else "not_owner"
 
 
 def redact_email(email):

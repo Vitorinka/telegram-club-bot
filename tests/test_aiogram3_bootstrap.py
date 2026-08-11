@@ -371,7 +371,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -406,7 +406,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -444,7 +444,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -488,7 +488,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -542,7 +542,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -585,7 +585,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -623,7 +623,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
@@ -634,7 +634,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertEqual(conn.rollbacks, 0)
         self.assertEqual(conn.commits, 1)
@@ -3010,7 +3010,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             get_db_conn = Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "notify_admins", notify), \
@@ -3036,7 +3036,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn=None,
         event_id="evt_async_success",
         session_id="cs_async_success",
-        claim_result="claimed",
+        claim_result=("claimed", 1),
     ):
         session_payload = {
             "id": session_id,
@@ -3129,7 +3129,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         get_db_conn = Mock(side_effect=notify_side_effect) if notify_side_effect else Mock(return_value=conn)
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "notify_admins", notify), \
@@ -3160,7 +3160,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
 
                 self.assertEqual(result.response.status, 200)
-                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_awaited_once_with(result.event_id, 1)
                 result.release.assert_not_awaited()
                 result.notify.assert_not_awaited()
                 sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
@@ -3179,7 +3179,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.run_checkout_identity_webhook(client_reference_id, metadata_telegram_id)
 
                 self.assertEqual(result.response.status, 500)
-                result.release.assert_awaited_once_with(result.event_id)
+                result.release.assert_awaited_once_with(result.event_id, 1)
                 result.mark_processed.assert_not_awaited()
                 result.get_db_conn.assert_called_once()
                 result.notify.assert_not_awaited()
@@ -3200,7 +3200,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_checkout_identity_webhook(None, None, notify_side_effect=RuntimeError("notify down"))
 
         self.assertEqual(result.response.status, 500)
-        result.release.assert_awaited_once_with(result.event_id)
+        result.release.assert_awaited_once_with(result.event_id, 1)
         result.mark_processed.assert_not_awaited()
         result.get_db_conn.assert_called_once()
 
@@ -3210,7 +3210,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.run_checkout_days_webhook(days_marker)
 
                 self.assertEqual(result.response.status, 500)
-                result.release.assert_awaited_once_with(result.event_id)
+                result.release.assert_awaited_once_with(result.event_id, 1)
                 result.mark_processed.assert_not_awaited()
                 result.get_db_conn.assert_called_once()
                 result.notify.assert_not_awaited()
@@ -3230,7 +3230,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_checkout_days_webhook("abc", notify_side_effect=RuntimeError("notify down"))
 
         self.assertEqual(result.response.status, 500)
-        result.release.assert_awaited_once_with(result.event_id)
+        result.release.assert_awaited_once_with(result.event_id, 1)
         result.mark_processed.assert_not_awaited()
         result.get_db_conn.assert_called_once()
 
@@ -3240,7 +3240,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.run_checkout_days_webhook("30", payment_status=payment_status)
 
                 self.assertEqual(result.response.status, 200)
-                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_awaited_once_with(result.event_id, 1)
                 result.release.assert_not_awaited()
                 sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
                 self.assertTrue(any(params and params[0] == "payment_pending" for _, params in result.conn.cursor_obj.queries))
@@ -3252,7 +3252,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_checkout_days_webhook("30", payment_status="no_payment_required")
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertTrue(any(params and params[0] == "manual_review_required" for _, params in result.conn.cursor_obj.queries))
@@ -3280,7 +3280,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response.status, 200)
         result.retrieve.assert_called_once()
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertTrue(any(params and params[0] == "payment_pending" for _, params in result.conn.cursor_obj.queries))
         self.assertNotIn("INSERT INTO users", sql)
@@ -3295,7 +3295,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
@@ -3314,7 +3314,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with("evt_completed_repeated_after_commit")
+        result.mark_processed.assert_awaited_once_with("evt_completed_repeated_after_commit", 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
@@ -3333,7 +3333,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertNotIn("INSERT INTO users", sql)
@@ -3362,7 +3362,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(result.response.status, 200)
-                result.mark_processed.assert_awaited_once_with(result.event_id)
+                result.mark_processed.assert_awaited_once_with(result.event_id, 1)
                 result.release.assert_not_awaited()
                 sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
                 self.assertNotIn("INSERT INTO users", sql)
@@ -3386,7 +3386,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with("evt_customer_identity_conflict")
+        result.mark_processed.assert_awaited_once_with("evt_customer_identity_conflict", 1)
         self.assertEqual(payment_conn.rollbacks, 1)
         payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
         self.assertIn("FOR UPDATE", payment_sql)
@@ -3428,7 +3428,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with("evt_known_unique_identity_conflict")
+        result.mark_processed.assert_awaited_once_with("evt_known_unique_identity_conflict", 1)
         self.assertEqual(payment_conn.rollbacks, 1)
         conflict_insert = next(
             params for query, params in audit_conn.cursor_obj.queries
@@ -3462,7 +3462,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response.status, 500)
         result.mark_processed.assert_not_awaited()
-        result.release.assert_awaited_once_with("evt_unknown_unique_identity_conflict")
+        result.release.assert_awaited_once_with("evt_unknown_unique_identity_conflict", 1)
 
     async def test_identity_conflict_audit_failure_returns_500_without_mark_processed(self):
         payment_conn = FakeConnection(fetches=[
@@ -3480,7 +3480,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response.status, 500)
         result.mark_processed.assert_not_awaited()
-        result.release.assert_awaited_once_with("evt_identity_audit_failure")
+        result.release.assert_awaited_once_with("evt_identity_audit_failure", 1)
         self.assertEqual(payment_conn.rollbacks, 1)
         self.assertEqual(audit_conn.rollbacks, 1)
 
@@ -3590,7 +3590,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response.status, 500)
         result.mark_processed.assert_not_awaited()
-        result.release.assert_awaited_once_with("evt_same_user_unique_race")
+        result.release.assert_awaited_once_with("evt_same_user_unique_race", 1)
         lookup_sql = "\n".join(query for query, _ in lookup_conn.cursor_obj.queries)
         self.assertIn("FROM users", lookup_sql)
         payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
@@ -3676,7 +3676,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(async_result.response.status, 200)
-        async_result.mark_processed.assert_awaited_once_with("evt_async_after_completed")
+        async_result.mark_processed.assert_awaited_once_with("evt_async_after_completed", 1)
         sql = "\n".join(query for query, _ in async_conn.cursor_obj.queries)
         self.assertNotIn("INSERT INTO users", sql)
         self.assertNotIn("INSERT INTO payment_events", sql)
@@ -3686,7 +3686,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_checkout_async_success_webhook()
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
@@ -3704,7 +3704,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("SELECT telegram_id, tariff_code, mode, status", sql)
@@ -3716,7 +3716,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_checkout_async_success_webhook(payment_status="processing")
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertTrue(any(params and params[0] == "manual_review_required" for _, params in result.conn.cursor_obj.queries))
@@ -3747,14 +3747,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn = FakeConnection()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "get_db_conn", return_value=conn):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertTrue(any(params and params[0] == "failed" for _, params in conn.cursor_obj.queries))
@@ -4114,7 +4114,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.response.status, 200)
-        result.mark_processed.assert_awaited_once_with(result.event_id)
+        result.mark_processed.assert_awaited_once_with(result.event_id, 1)
         result.release.assert_not_awaited()
         sql = "\n".join(query for query, _ in result.conn.cursor_obj.queries)
         self.assertNotIn("INSERT INTO users", sql)
@@ -4152,7 +4152,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "claim_trial_redemption", return_value=True), \
@@ -4161,7 +4161,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with("evt_days_valid_7")
+        mark_processed.assert_awaited_once_with("evt_days_valid_7", 1)
         release.assert_not_awaited()
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("INSERT INTO users", sql)
@@ -4660,7 +4660,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "get_db_conn", side_effect=[
@@ -4671,7 +4671,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 500)
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
         mark_processed.assert_not_awaited()
         log_output = "\n".join(logs.output)
         self.assertIn("ADMIN_PAYMENT_NOTIFICATION_ENQUEUE_FAILED", log_output)
@@ -4716,14 +4716,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "get_db_conn", return_value=conn):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         user_payload = json.loads(adapted_json_value(self.user_delivery_inserts(conn)[0][3]))
         self.assertEqual(user_payload["keyboard_kind"], "retry_payment")
@@ -4757,14 +4757,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "get_db_conn", return_value=conn):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertTrue(self.user_delivery_inserts(conn))
 
@@ -4810,7 +4810,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=["claimed", "duplicate"])), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=[("claimed", 1), ("duplicate_processing", None)])), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "gift_row_dict", side_effect=[gift_row, updated_row]), \
@@ -4820,7 +4820,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response1.status, 200)
         self.assertEqual(response2.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         update_queries = [query for query, _ in conn.cursor_obj.queries if "UPDATE gift_access_grants" in query]
         self.assertTrue(update_queries)
@@ -4855,7 +4855,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn = FakeConnection(fetches=[("select gift",)])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "fetch_gift_checkout_payment_proof", return_value=(session, {"quantity": 1}, {"id": "price_gift_1m"})), \
              patch.object(self.main, "gift_row_dict", return_value=gift_row), \
              patch.object(self.main, "mark_gift_paid_and_enqueue", return_value={**gift_row, "status": "paid_unclaimed"}) as mark_gift, \
@@ -4866,7 +4866,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         mark_gift.assert_called_once()
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
 
     async def test_stripeobject_metadata_gift_async_payment_succeeded_uses_gift_branch(self):
@@ -4894,7 +4894,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn = FakeConnection(fetches=[("select gift",)])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "fetch_gift_checkout_payment_proof", return_value=(session, {"quantity": 1}, {"id": "price_gift_1m"})), \
              patch.object(self.main, "gift_row_dict", return_value=gift_row), \
              patch.object(self.main, "mark_gift_paid_and_enqueue", return_value={**gift_row, "status": "paid_unclaimed"}) as mark_gift, \
@@ -4905,7 +4905,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         mark_gift.assert_called_once()
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
 
     async def test_stripeobject_metadata_regular_checkout_completed_uses_subscription_path(self):
@@ -4933,7 +4933,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn = FakeConnection()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
@@ -4941,7 +4941,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
 
     async def test_stripeobject_metadata_gift_error_path_reads_purchaser_safely(self):
@@ -4966,7 +4966,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "fetch_gift_checkout_payment_proof", side_effect=RuntimeError("proof failed")), \
              patch.object(self.main, "enqueue_admin_payment_problem_now", AsyncMock()) as admin_problem, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release:
@@ -4975,7 +4975,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 500)
         admin_problem.assert_awaited_once()
         self.assertEqual(admin_problem.await_args.kwargs["telegram_id"], "123")
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
 
     async def test_invoice_payment_failed_admin_alert_does_not_claim_24h_reminder(self):
         event_id = "evt_invoice_failed_retry_status"
@@ -5002,7 +5002,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         ])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "release_event_processing", AsyncMock()) as release, \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -5010,7 +5010,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         admin_payload = json.loads(adapted_json_value(self.admin_delivery_inserts(conn)[0][3]))
         self.assertIn("Напоминание через 24 часа: не применимо", admin_payload["text"])
@@ -5393,7 +5393,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             (success_key,),
             ("stripe:%s:rejoin_invite" % event_id,),
         ])
-        claim_results = ["claimed", "duplicate"] if duplicate else ["claimed"]
+        claim_results = [("claimed", 1), ("duplicate_processing", None)] if duplicate else [("claimed", 1)]
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
              patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=claim_results)), \
@@ -5459,7 +5459,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock()) as get_member, \
@@ -5605,7 +5605,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main, "get_db_conn", return_value=conn):
@@ -5660,14 +5660,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[payment_conn, audit_conn]):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         payment_sql = "\n".join(query for query, _ in payment_conn.cursor_obj.queries)
         self.assertIn("FOR UPDATE", payment_sql)
@@ -5766,14 +5766,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, audit_conn]):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertEqual(write_conn.rollbacks, 1)
         self.assertTrue(write_conn.closed)
@@ -5807,7 +5807,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, audit_conn]):
@@ -5815,7 +5815,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 500)
         mark_processed.assert_not_awaited()
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
         self.assertEqual(write_conn.rollbacks, 1)
         self.assertTrue(write_conn.closed)
         self.assertTrue(audit_conn.closed)
@@ -5853,7 +5853,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -5861,7 +5861,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertEqual(main_conn.rollbacks, 1)
         self.assertTrue(main_conn.closed)
@@ -5893,14 +5893,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertEqual(write_conn.rollbacks, 1)
         self.assertTrue(write_conn.closed)
@@ -5931,14 +5931,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertIn(
             "INSERT INTO stripe_identity_conflicts",
@@ -5969,14 +5969,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn, audit_conn]):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertIn(
             "INSERT INTO stripe_identity_conflicts",
@@ -6006,7 +6006,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn, lookup_conn]):
@@ -6014,7 +6014,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 500)
         mark_processed.assert_not_awaited()
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
         self.assertEqual(write_conn.rollbacks, 1)
         lookup_sql = "\n".join(query for query, _ in lookup_conn.cursor_obj.queries)
         self.assertIn("FROM users", lookup_sql)
@@ -6043,7 +6043,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -6051,7 +6051,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         release.assert_not_awaited()
         self.assertEqual(main_conn.rollbacks, 1)
         main_sql = "\n".join(query for query, _ in main_conn.cursor_obj.queries)
@@ -6081,7 +6081,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -6090,7 +6090,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 500)
         mark_processed.assert_not_awaited()
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
         self.assertEqual(main_conn.rollbacks, 1)
 
     async def test_subscription_updated_unknown_unique_constraint_releases_without_audit(self):
@@ -6115,7 +6115,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "release_event_processing", release), \
              patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]):
@@ -6123,7 +6123,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 500)
         mark_processed.assert_not_awaited()
-        release.assert_awaited_once_with(event_id)
+        release.assert_awaited_once_with(event_id, 1)
         self.assertEqual(write_conn.rollbacks, 1)
 
     async def test_link_stripe_user_same_user_unique_race_does_not_create_false_conflict(self):
@@ -6224,13 +6224,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         mark_processed = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", mark_processed), \
              patch.object(self.main, "get_db_conn", return_value=conn):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with(event_id)
+        mark_processed.assert_awaited_once_with(event_id, 1)
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
         self.assertIn("stripe_subscription_id = NULL", sql)
         self.assertNotIn("stripe_customer_id = COALESCE", sql)
@@ -6286,7 +6286,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=["claimed", "duplicate"])), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(side_effect=[("claimed", 1), ("duplicate_processing", None)])), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "reset_checkout_retry_state_after_success"), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock()) as get_member, \
@@ -6371,7 +6371,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         conn = FakeConnection(fetches=[None, None, None, None, None, None])
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()), \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -6397,7 +6397,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         notify_admins = AsyncMock()
 
         with patch.object(self.main, "construct_verified_stripe_event", return_value=event), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="claimed")), \
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("claimed", 1))), \
              patch.object(self.main, "mark_event_processed", AsyncMock()) as mark_processed, \
              patch.object(self.main, "notify_admins", notify_admins), \
              patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
@@ -6405,7 +6405,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             response = await self.main.stripe_webhook(request)
 
         self.assertEqual(response.status, 200)
-        mark_processed.assert_awaited_once_with("evt_invoice_missing_period")
+        mark_processed.assert_awaited_once_with("evt_invoice_missing_period", 1)
         notify_admins.assert_not_awaited()
         queries = [query for query, _ in conn.cursor_obj.queries]
         self.assertFalse(any("UPDATE users" in query for query in queries))
@@ -6424,6 +6424,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.route_count(app, "POST", telegram_path), 1)
         self.assertEqual(self.route_count(app, "POST", "/stripe-payment"), 1)
         self.assertNotEqual(telegram_path, "/stripe-payment")
+
+    async def test_mark_event_processed_lost_generation_fails_closed(self):
+        conn = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(
+                 self.main,
+                 "mark_stripe_event_processed",
+                 return_value="not_owner",
+             ) as mark:
+            with self.assertRaisesRegex(RuntimeError, "claim ownership lost"):
+                await self.main.mark_event_processed("evt_lost_owner", 7)
+
+        mark.assert_called_once_with(conn.cursor_obj, "evt_lost_owner", 7)
+        self.assertEqual(conn.commits, 1)
 
     async def test_startup_sets_db_commands_webhook_verifies_url_and_registers_jobs_once(self):
         fake_scheduler = FakeScheduler()
@@ -6649,7 +6663,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "Content-Type": "application/json",
         }
         with patch.dict(os.environ, TEST_ENV, clear=False), \
-             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value="duplicate")):
+             patch.object(self.main, "claim_normalized_stripe_event", AsyncMock(return_value=("duplicate_processing", None))):
             handler = self.route_handler(app, "POST", "/stripe-payment")
             response = await handler(FakeStripeRequest(payload, headers))
 

@@ -10,6 +10,7 @@ from stripe_invoice_rules import (
     invoice_payment_kind,
     is_paid_out_of_band_invoice,
     is_zero_subscription_update_invoice,
+    mark_stripe_event_processed,
     merge_expiry_without_regression,
     redact_email,
     redact_identifier,
@@ -24,9 +25,10 @@ from stripe_invoice_rules import (
 
 
 class FakeStripeEventCursor:
-    def __init__(self, processed=None, stale=False):
+    def __init__(self, processed=None, stale=False, claim_generation=0):
         self.processed = processed
         self.stale = stale
+        self.claim_generation = claim_generation
         self.results = []
         self.queries = []
 
@@ -37,17 +39,28 @@ class FakeStripeEventCursor:
             if self.processed is None:
                 self.processed = False
                 self.stale = False
-                self.results.append((params[0],))
+                self.claim_generation = 1
+                self.results.append((self.claim_generation,))
             elif self.processed is False and self.stale:
                 self.stale = False
-                self.results.append((params[0],))
+                self.claim_generation += 1
+                self.results.append((self.claim_generation,))
             else:
                 self.results.append(None)
         elif normalized.startswith("SELECT PROCESSED"):
             self.results.append((self.processed,))
         elif normalized.startswith("DELETE FROM STRIPE_EVENTS"):
-            if self.processed is False:
+            if self.processed is False and self.claim_generation == params[1]:
                 self.processed = None
+                self.results.append((params[0],))
+            else:
+                self.results.append(None)
+        elif normalized.startswith("UPDATE STRIPE_EVENTS"):
+            if self.processed is False and self.claim_generation == params[1]:
+                self.processed = True
+                self.results.append((params[0],))
+            else:
+                self.results.append(None)
 
     def fetchone(self):
         return self.results.pop(0)
@@ -335,7 +348,7 @@ class StripeInvoiceRulesTest(unittest.TestCase):
     def test_presynced_invoice_duplicate_event_is_blocked_by_claim(self):
         presynced_expiry = self.now + timedelta(days=30)
         cursor = FakeStripeEventCursor()
-        self.assertEqual(claim_stripe_event(cursor, "evt_presynced_invoice"), "claimed")
+        self.assertEqual(claim_stripe_event(cursor, "evt_presynced_invoice"), ("claimed", 1))
         cursor.processed = True
         self.assertFalse(
             should_skip_invoice_notice_for_current_expiry(
@@ -353,7 +366,7 @@ class StripeInvoiceRulesTest(unittest.TestCase):
         )
         self.assertEqual(
             claim_stripe_event(cursor, "evt_presynced_invoice"),
-            "duplicate_processed",
+            ("duplicate_processed", None),
         )
 
     def test_checkout_subscription_only_links_until_invoice(self):
@@ -446,28 +459,38 @@ class StripeInvoiceRulesTest(unittest.TestCase):
 
     def test_atomic_event_claim_allows_only_first_processor(self):
         cursor = FakeStripeEventCursor()
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "claimed")
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "duplicate_processing")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("claimed", 1))
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("duplicate_processing", None))
 
     def test_fresh_processing_claim_is_not_reclaimed(self):
         cursor = FakeStripeEventCursor(processed=False, stale=False)
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "duplicate_processing")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("duplicate_processing", None))
 
     def test_stale_processing_claim_can_be_reclaimed(self):
         cursor = FakeStripeEventCursor(processed=False, stale=True)
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "claimed")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("claimed", 1))
         self.assertFalse(cursor.stale)
 
     def test_processed_event_claim_is_duplicate_processed(self):
         cursor = FakeStripeEventCursor(processed=True)
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "duplicate_processed")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("duplicate_processed", None))
 
     def test_failed_event_claim_can_be_released_for_retry(self):
         cursor = FakeStripeEventCursor()
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "claimed")
-        release_stripe_event_claim(cursor, "evt_123")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("claimed", 1))
+        self.assertEqual(release_stripe_event_claim(cursor, "evt_123", 1), "released")
         self.assertIsNone(cursor.processed)
-        self.assertEqual(claim_stripe_event(cursor, "evt_123"), "claimed")
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("claimed", 1))
+
+    def test_stale_owner_cannot_release_or_mark_new_generation(self):
+        cursor = FakeStripeEventCursor(processed=False, stale=True, claim_generation=1)
+        self.assertEqual(claim_stripe_event(cursor, "evt_123"), ("claimed", 2))
+        self.assertEqual(release_stripe_event_claim(cursor, "evt_123", 1), "not_owner")
+        self.assertEqual(mark_stripe_event_processed(cursor, "evt_123", 1), "not_owner")
+        self.assertFalse(cursor.processed)
+        self.assertEqual(mark_stripe_event_processed(cursor, "evt_123", 2), "processed")
+        self.assertTrue(cursor.processed)
+        self.assertEqual(release_stripe_event_claim(cursor, "evt_123", 2), "not_owner")
 
     def test_subscription_updated_active_does_not_set_paid_true(self):
         main_py = Path(__file__).resolve().parents[1] / "main.py"
@@ -485,9 +508,12 @@ class StripeInvoiceRulesTest(unittest.TestCase):
         source = main_py.read_text()
         self.assertIn("from stripe_webhook_safety import", source)
         self.assertNotIn("        def stripe_value", source)
-        self.assertIn("except Exception as e:\n        await release_event_processing(event_id)", source)
+        self.assertIn(
+            "except Exception as e:\n        await release_event_processing(event_id, claim_generation)",
+            source,
+        )
         self.assertNotIn("claim_released", source)
-        self.assertIn("await release_event_processing(event_id)", source)
+        self.assertIn("await release_event_processing(event_id, claim_generation)", source)
         self.assertIn("STRIPE_WEBHOOK_UNHANDLED_EXCEPTION", source)
 
     def test_presynced_invoice_path_uses_payment_kind_before_expiry_skip(self):
