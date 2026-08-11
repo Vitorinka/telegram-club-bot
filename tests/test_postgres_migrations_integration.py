@@ -409,7 +409,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn("None", payload["text"])
         self.assertEqual(payload["new_expiry"], "2026-09-01T00:00:00")
 
-    def test_admin_payment_notifications_are_durable_and_deduplicated_real_postgres(self):
+    def test_routine_payment_success_is_log_only_but_payment_problem_is_durable_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
         conn = self.get_conn()
@@ -429,7 +429,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                         datetime(2026, 9, 1, 0, 0),
                         "evt_pg_admin_success",
                     ),
-                    2,
+                    0,
                 )
                 duplicate_result = main.enqueue_admin_payment_success(
                     cur,
@@ -442,7 +442,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     datetime(2026, 9, 1, 0, 0),
                     "evt_pg_admin_success",
                 )
-                self.assertEqual(duplicate_result, len(admin_ids))
+                self.assertEqual(duplicate_result, 0)
                 cur.execute(
                     """
                     SELECT COUNT(*), COUNT(DISTINCT telegram_id), COUNT(DISTINCT delivery_key)
@@ -451,7 +451,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                       AND delivery_key LIKE 'stripe-admin:evt_pg_admin_success:payment_success:%'
                     """
                 )
-                self.assertEqual(cur.fetchone(), (2, 2, 2))
+                self.assertEqual(cur.fetchone(), (0, 0, 0))
                 self.assertEqual(
                     main.enqueue_admin_payment_problem(
                         cur,
@@ -477,7 +477,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ORDER BY delivery_key
             """
         )
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 2)
         self.assertEqual({row[1] for row in rows}, {111, 222})
         self.assertEqual({row[2] for row in rows}, {"stripe_admin_message"})
         self.assertEqual({row[3] for row in rows}, {"pending"})
@@ -486,8 +486,6 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             [
                 "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:111",
                 "stripe-admin:evt_pg_admin_failed:invoice_payment_failed:222",
-                "stripe-admin:evt_pg_admin_success:payment_success:111",
-                "stripe-admin:evt_pg_admin_success:payment_success:222",
             ],
         )
         row_counts = self.query_all(
@@ -499,7 +497,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ORDER BY telegram_id
             """
         )
-        self.assertEqual(row_counts, [(111, 2), (222, 2)])
+        self.assertEqual(row_counts, [(111, 1), (222, 1)])
         key_counts = self.query_all(
             """
             SELECT delivery_key, COUNT(*)
@@ -510,7 +508,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(all(count == 1 for _, count in key_counts))
         payloads = [json.loads(row[4]) for row in rows]
-        self.assertTrue(any("Тип: первая оплата" in payload["text"] for payload in payloads))
+        self.assertFalse(any("Тип: первая оплата" in payload["text"] for payload in payloads))
         self.assertTrue(any("банк отклонил карту" in payload["text"] for payload in payloads))
         self.assertTrue(all("None" not in payload["text"] for payload in payloads))
 
@@ -2703,7 +2701,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["reason_category"], "payment_confirmation_pending")
         self.assertEqual(payload["attempt_error_context"], "unknown")
 
-    def test_first_purchase_recovery_worker_success_creates_user_and_admin_deliveries_once(self):
+    def test_first_purchase_recovery_worker_success_is_log_only_for_admins(self):
         run_migrations(self.get_conn)
         main = import_main()
         user_id = 9703
@@ -2735,19 +2733,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """,
             ("%first_purchase_recovery_sent%",),
         )
-        self.assertEqual(len(admin_rows), 2)
-        self.assertEqual([row[1] for row in admin_rows], [1, 2])
-        self.assertTrue(all(row[3] == "pending" for row in admin_rows))
-        self.assertEqual(len({row[0] for row in admin_rows}), 2)
-        for delivery_key, _, delivery_type, _, payload_json in admin_rows:
-            self.assertEqual(delivery_type, "stripe_admin_message")
-            payload = json.loads(payload_json)
-            self.assertEqual(payload["category"], "first_purchase_recovery_sent")
-            self.assertEqual(payload["severity"], "INFO")
-            self.assertIn("🔁 Повторная попытка оплаты предложена", payload["text"])
-            self.assertIn("Последняя попытка:", payload["text"])
-            self.assertIn("Напоминание: отправлено", payload["text"])
-            self.assertNotIn(str(user_id), delivery_key)
+        self.assertEqual(admin_rows, [])
 
     def test_first_purchase_recovery_retryable_failure_does_not_create_admin_sent_notice(self):
         from aiogram.exceptions import TelegramNetworkError
