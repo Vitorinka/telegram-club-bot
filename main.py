@@ -5466,36 +5466,64 @@ def claim_weekly_report_run(cur, key, period_start, period_end):
     )
 
 
-def complete_weekly_report_run(cur, key, sent_admin_ids):
+def weekly_report_error_state(permanent_admin_ids, errors):
+    return json.dumps({
+        "version": 1,
+        "permanent_admin_ids": sorted({int(admin_id) for admin_id in permanent_admin_ids}),
+        "errors": [str(error)[:120] for error in errors[-5:]],
+    }, ensure_ascii=True, sort_keys=True)
+
+
+def complete_weekly_report_run(cur, key, sent_admin_ids, permanent_admin_ids=None, errors=None):
+    permanent_admin_ids = permanent_admin_ids or []
+    errors = errors or []
     cur.execute("""
         UPDATE weekly_report_runs
         SET status = 'completed',
             sent_admin_ids = %s,
             updated_at = NOW(),
             completed_at = NOW(),
-            error_text = NULL
+            error_text = %s
         WHERE report_key = %s
-    """, (",".join(str(admin_id) for admin_id in sent_admin_ids), key))
+    """, (
+        ",".join(str(admin_id) for admin_id in sent_admin_ids),
+        weekly_report_error_state(permanent_admin_ids, errors) if permanent_admin_ids else None,
+        key,
+    ))
 
 
-def fail_weekly_report_run(cur, key, error_text):
+def fail_weekly_report_run(cur, key, sent_admin_ids, permanent_admin_ids, errors):
     cur.execute("""
         UPDATE weekly_report_runs
         SET status = 'failed',
+            sent_admin_ids = %s,
             updated_at = NOW(),
             completed_at = NOW(),
             error_text = %s
         WHERE report_key = %s
-    """, (str(error_text)[:500], key))
+    """, (
+        ",".join(str(admin_id) for admin_id in sent_admin_ids),
+        weekly_report_error_state(permanent_admin_ids, errors),
+        key,
+    ))
 
 
-def save_weekly_report_sent_admin(cur, key, sent_admin_ids):
+def save_weekly_report_recipient_progress(cur, key, sent_admin_ids, permanent_admin_ids, errors):
     cur.execute("""
         UPDATE weekly_report_runs
         SET sent_admin_ids = %s,
+            error_text = %s,
             updated_at = NOW()
         WHERE report_key = %s
-    """, (",".join(str(admin_id) for admin_id in sent_admin_ids), key))
+    """, (
+        ",".join(str(admin_id) for admin_id in sent_admin_ids),
+        weekly_report_error_state(permanent_admin_ids, errors),
+        key,
+    ))
+
+
+def weekly_report_recipient_error_is_permanent(error):
+    return isinstance(error, TelegramForbiddenError) or is_undeliverable_user_error(error)
 
 
 async def send_weekly_admin_report():
@@ -5525,16 +5553,18 @@ async def send_weekly_admin_report():
             "status": claim_result["status"],
             "report_key": key,
             "sent_admin_ids": claim_result.get("sent_admin_ids", []),
+            "permanent_admin_ids": claim_result.get("permanent_admin_ids", []),
             "errors": [],
         }
 
     sent_admin_ids = list(claim_result.get("sent_admin_ids", []))
+    permanent_admin_ids = list(claim_result.get("permanent_admin_ids", []))
     errors = []
     try:
         text, _ = await build_weekly_admin_report(period_start, period_end)
         keyboard = _weekly_report_keyboard(key)
         for admin_id in ADMIN_IDS:
-            if admin_id in sent_admin_ids:
+            if admin_id in sent_admin_ids or admin_id in permanent_admin_ids:
                 continue
             try:
                 await bot.send_message(admin_id, text, reply_markup=keyboard)
@@ -5542,38 +5572,91 @@ async def send_weekly_admin_report():
                 conn = get_db_conn()
                 cur = conn.cursor()
                 try:
-                    save_weekly_report_sent_admin(cur, key, sent_admin_ids)
+                    save_weekly_report_recipient_progress(
+                        cur,
+                        key,
+                        sent_admin_ids,
+                        permanent_admin_ids,
+                        errors,
+                    )
                     conn.commit()
                 finally:
                     cur.close()
                     conn.close()
             except Exception as e:
-                logging.error("WEEKLY_ADMIN_REPORT_SEND_FAILED: admin_id=%s, report_key=%s, error=%s", admin_id, key, e)
-                errors.append(f"{admin_id}: {e}")
+                error_ref = safe_admin_error_reference("weekly_report_send", e)
+                permanent = weekly_report_recipient_error_is_permanent(e)
+                error_summary = f"{admin_id}:{type(e).__name__}:{error_ref}"
+                errors.append(error_summary)
+                logging.error(
+                    "WEEKLY_ADMIN_REPORT_SEND_FAILED: admin_id=%s, report_key=%s, "
+                    "error_class=%s, permanent=%s, error_ref=%s",
+                    admin_id,
+                    key,
+                    type(e).__name__,
+                    permanent,
+                    error_ref,
+                )
+                if permanent:
+                    permanent_admin_ids.append(admin_id)
+                    conn = get_db_conn()
+                    cur = conn.cursor()
+                    try:
+                        save_weekly_report_recipient_progress(
+                            cur,
+                            key,
+                            sent_admin_ids,
+                            permanent_admin_ids,
+                            errors,
+                        )
+                        conn.commit()
+                    finally:
+                        cur.close()
+                        conn.close()
     except Exception as e:
-        logging.exception("WEEKLY_ADMIN_REPORT_BUILD_FAILED: report_key=%s, error=%s", key, e)
-        errors.append(str(e))
+        error_ref = safe_admin_error_reference("weekly_report_build", e)
+        logging.exception(
+            "WEEKLY_ADMIN_REPORT_BUILD_FAILED: report_key=%s, error_class=%s, error_ref=%s",
+            key,
+            type(e).__name__,
+            error_ref,
+        )
+        errors.append(f"build:{type(e).__name__}:{error_ref}")
 
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        if sent_admin_ids:
-            complete_weekly_report_run(cur, key, sent_admin_ids)
+        resolved_admin_ids = set(sent_admin_ids) | set(permanent_admin_ids)
+        if set(ADMIN_IDS).issubset(resolved_admin_ids):
+            complete_weekly_report_run(
+                cur,
+                key,
+                sent_admin_ids,
+                permanent_admin_ids,
+                errors,
+            )
         else:
-            fail_weekly_report_run(cur, key, "; ".join(errors) or "unknown error")
+            fail_weekly_report_run(
+                cur,
+                key,
+                sent_admin_ids,
+                permanent_admin_ids,
+                errors or ["unknown_error"],
+            )
         conn.commit()
     finally:
         cur.close()
         conn.close()
     status = "failed"
-    if sent_admin_ids and errors:
-        status = "partial"
-    elif sent_admin_ids:
+    if set(ADMIN_IDS).issubset(set(sent_admin_ids) | set(permanent_admin_ids)):
         status = "completed"
+    elif sent_admin_ids and errors:
+        status = "partial"
     return {
         "status": status,
         "report_key": key,
         "sent_admin_ids": sent_admin_ids,
+        "permanent_admin_ids": permanent_admin_ids,
         "errors": errors,
     }
 

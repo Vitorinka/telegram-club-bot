@@ -512,6 +512,55 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertTrue(any("банк отклонил карту" in payload["text"] for payload in payloads))
         self.assertTrue(all("None" not in payload["text"] for payload in payloads))
 
+    def test_weekly_report_partial_recipient_state_reclaims_only_missing_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        key = "2026-08-03"
+        start = datetime(2026, 8, 2, 21, 0)
+        end = datetime(2026, 8, 9, 21, 0)
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            first = main.claim_weekly_report_run(cur, key, start, end)
+            self.assertEqual(first["status"], "claimed")
+            main.save_weekly_report_recipient_progress(
+                cur,
+                key,
+                [1],
+                [3],
+                ["2:TelegramNetworkError:safe_ref"],
+            )
+            main.fail_weekly_report_run(
+                cur,
+                key,
+                [1],
+                [3],
+                ["2:TelegramNetworkError:safe_ref"],
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            reclaimed = main.claim_weekly_report_run(cur, key, start, end)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(reclaimed["status"], "claimed")
+        self.assertEqual(reclaimed["sent_admin_ids"], [1])
+        self.assertEqual(reclaimed["permanent_admin_ids"], [3])
+        completed_at = self.query_one(
+            "SELECT completed_at FROM weekly_report_runs WHERE report_key = %s",
+            (key,),
+        )[0]
+        self.assertIsNone(completed_at)
+
     def test_payment_success_message_renewal_and_duplicate_dedupe_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
