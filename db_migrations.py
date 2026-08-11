@@ -443,6 +443,12 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "stripe_events": ("claim_generation",),
         },
     },
+    "0009_message_delivery_claim_fencing": {
+        "tables": ("message_delivery_events",),
+        "columns": {
+            "message_delivery_events": ("claim_generation",),
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

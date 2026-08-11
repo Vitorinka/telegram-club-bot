@@ -135,11 +135,20 @@ class FakeCursor:
     def __init__(self, fetches=None):
         self.queries = []
         self.fetches = list(fetches or [])
+        self.outbox_result = None
 
     def execute(self, query, params=None):
         self.queries.append((query, params))
+        if "UPDATE message_delivery_events" in query and "RETURNING delivery_key" in query:
+            self.outbox_result = (params[-2] if "claim_generation" in query else params[-1],)
+        elif "UPDATE message_delivery_events" in query and "RETURNING invite_link" in query:
+            self.outbox_result = (params[0],)
 
     def fetchone(self):
+        if self.outbox_result is not None:
+            result = self.outbox_result
+            self.outbox_result = None
+            return result
         return self.fetches.pop(0) if self.fetches else None
 
     def fetchall(self):
@@ -926,7 +935,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         key = "access-restore:act1:123"
         payload = json.dumps({"effective_expiry": expired.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expired, True, grace)])
 
         with patch.object(self.main, "get_db_conn", side_effect=[claim_conn, recheck_conn]), \
@@ -970,7 +979,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         key = "access-restore:act1:123"
         expiry = datetime.utcnow() + timedelta(days=5)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, True, datetime.utcnow() + timedelta(days=1))])
         already_conn = FakeConnection()
 
@@ -1185,7 +1194,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         key = "access-restore:act1:123"
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, "https://t.me/+saved")]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, "https://t.me/+saved", 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
         sent_conn = FakeConnection(fetches=[(expiry,)])
 
@@ -1266,7 +1275,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "effective_expiry": (datetime.utcnow() - timedelta(days=1)).isoformat(),
             "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN,
         })
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, datetime.utcnow() - timedelta(days=1), False, None)])
 
         with patch.object(self.main, "get_db_conn", side_effect=[claim_conn, recheck_conn]), \
@@ -1281,7 +1290,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         key = "access-restore:act1:123"
         expiry = datetime.utcnow() + timedelta(days=5)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
         already_conn = FakeConnection()
 
@@ -1300,7 +1309,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         key = "access-restore:act1:123"
         expiry = datetime(2026, 9, 1, 12, 0)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN, "admin_action_id": "act1"})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None)]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
         link_conn = FakeConnection()
         sent_conn = FakeConnection(fetches=[(expiry,)])
@@ -1334,7 +1343,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         key = "access-restore:act1:123"
         expiry = datetime.utcnow() + timedelta(days=5)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, "https://t.me/+saved")]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, "https://t.me/+saved", 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
         fail_conn = FakeConnection()
 
@@ -1359,7 +1368,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         key = "access-restore:act1:123"
         expiry = datetime.utcnow() + timedelta(days=5)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN})
-        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 2, "https://t.me/+saved")]])
+        claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 2, "https://t.me/+saved", 2)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
         fail_conn = FakeConnection()
 
@@ -1888,6 +1897,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"text": "retry", "keyboard_kind": "retry_payment"}),
             1,
             None,
+            1,
         )
         claim_conn = FakeConnection(fetches=[[delivery]])
         check_conn = FakeConnection(fetches=[None])
@@ -2240,7 +2250,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "tariff_code": "sub_1",
             "safe_ref": "first_purchase_recovery:test",
         })
-        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None, 1)
         claim_conn = FakeConnection(fetches=[[delivery]])
         check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), "sub_1", "expired", "checkout_session", None)])
         sent_conn = FakeConnection(fetches=[("admin1",), ("admin2",)])
@@ -2268,7 +2278,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         delivery_key = self.main.first_purchase_recovery_delivery_key(123)
         payload = json.dumps({"text": "retry", "keyboard_kind": "retry_payment"})
-        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None)
+        delivery = (delivery_key, 123, "first_purchase_recovery_reminder", payload, 1, None, 1)
         claim_conn = FakeConnection(fetches=[[delivery]])
         check_conn = FakeConnection(fetches=[(123, datetime(2026, 7, 30, 10, 0), None, None, None, None)])
         fail_conn = FakeConnection()
@@ -2490,14 +2500,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             connections.append(conn)
             return conn
 
-        def fake_mark_failed(cur, delivery_key, error, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, error, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(error).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
-             patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key1", 123, "notice", '{"text":"hi"}', 1, None)]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key1", 123, "notice", '{"text":"hi"}', 1, None, 1)]), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -2523,14 +2534,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     connections.append(conn)
                     return conn
 
-                def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+                def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
                     failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+                    return "permanently_failed" if permanently_failed else "failed"
 
                 with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
-                     patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key2", 123, "notice", '{"text":"hi"}', 1, None)]), \
+                     patch.object(self.main, "claim_pending_message_deliveries", return_value=[("key2", 123, "notice", '{"text":"hi"}', 1, None, 1)]), \
                      patch.object(self.main.bot, "send_message", AsyncMock(side_effect=error)), \
                      patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-                     patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+                     patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
                      patch.object(self.main, "notify_admins", AsyncMock()):
                     result = await self.main.process_pending_message_deliveries()
 
@@ -2544,10 +2556,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("key_retry", 123, "stripe_user_message", '{"text":"retry","keyboard_kind":"retry_payment"}', 1, None)
+                 ("key_retry", 123, "stripe_user_message", '{"text":"retry","keyboard_kind":"retry_payment"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", send_message), \
-             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent"), \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -2555,13 +2567,34 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         markup = send_message.await_args.kwargs["reply_markup"]
         self.assertEqual(markup.inline_keyboard[0][0].callback_data, "retry_payment")
 
+    async def test_stale_generic_delivery_cannot_finalize_newer_claim_after_send(self):
+        send_message = AsyncMock()
+        sent_conn = FakeConnection()
+
+        with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), sent_conn]), \
+             patch.object(self.main, "claim_pending_message_deliveries", return_value=[
+                 ("stale_generic", 123, "stripe_user_message", '{"text":"sent before ownership loss"}', 2, None, 7)
+             ]), \
+             patch.object(self.main.bot, "send_message", send_message), \
+             patch.object(self.main, "mark_delivery_sent", return_value="not_owner") as mark_sent, \
+             patch.object(self.main, "notify_admins", AsyncMock()):
+            with self.assertLogs(level="WARNING") as logs:
+                result = await self.main.process_pending_message_deliveries()
+
+        send_message.assert_awaited_once()
+        mark_sent.assert_called_once_with(sent_conn.cursor_obj, "stale_generic", 7)
+        self.assertEqual(sent_conn.commits, 0)
+        self.assertEqual(sent_conn.rollbacks, 1)
+        self.assertEqual(result, {"sent": 0, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
+        self.assertIn("MESSAGE_DELIVERY_STALE_CLAIM", "\n".join(logs.output))
+
     async def test_legacy_free_lesson_null_payload_sends_video_with_trial_button(self):
         send_video = AsyncMock()
 
         with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson:123", 123, "free_lesson", None, 1, None)
+                 ("free_lesson:123", 123, "free_lesson", None, 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_video", send_video), \
              patch.object(self.main, "notify_admins", AsyncMock()):
@@ -2578,7 +2611,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson_followup:123", 123, "free_lesson_followup", None, 1, None)
+                 ("free_lesson_followup:123", 123, "free_lesson_followup", None, 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", send_message), \
              patch.object(self.main, "notify_admins", AsyncMock()):
@@ -2604,7 +2637,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
              patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None)
+                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_video", AsyncMock(side_effect=send_video_side_effect)), \
              patch.object(self.main, "notify_admins", AsyncMock()):
@@ -2630,7 +2663,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=fake_conn), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", 1, None)
+                 ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=send_message_side_effect)), \
              patch.object(self.main, "notify_admins", AsyncMock()):
@@ -2715,7 +2748,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 connections = [FakeConnection(), FakeConnection()]
                 with patch.object(self.main, "get_db_conn", side_effect=connections), \
                      patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                         ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", attempt_count, None)
+                         ("free_lesson_followup:123", 123, "free_lesson_followup", "{}", attempt_count, None, 1)
                      ]), \
                      patch.object(self.main.bot, "send_message", AsyncMock(side_effect=error)), \
                      patch.object(self.main, "notify_admins", AsyncMock()):
@@ -2739,7 +2772,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {}, clear=False), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None)
+                 ("free_lesson:123", 123, "free_lesson", "{}", 1, None, 1)
              ]), \
              patch.object(self.main, "notify_admins", notify_admins):
             os.environ.pop("FREE_LESSON_VIDEO_ID", None)
@@ -2752,7 +2785,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {}, clear=False), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("free_lesson:123", 123, "free_lesson", "{}", self.main.OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT, None)
+                 ("free_lesson:123", 123, "free_lesson", "{}", self.main.OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT, None, 1)
              ]), \
              patch.object(self.main, "notify_admins", notify_admins):
             os.environ.pop("FREE_LESSON_VIDEO_ID", None)
@@ -4425,17 +4458,18 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         failed_calls = []
         send_message = AsyncMock()
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("bad_payload", 123, "stripe_user_message", "{bad json", 1, None),
-                 ("good_payload", 124, "stripe_user_message", '{"text":"ok"}', 1, None),
+                 ("bad_payload", 123, "stripe_user_message", "{bad json", 1, None, 1),
+                 ("good_payload", 124, "stripe_user_message", '{"text":"ok"}', 1, None, 1),
              ]), \
              patch.object(self.main.bot, "send_message", send_message), \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent"), \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -4448,10 +4482,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin ok"}', 1, None)
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin ok"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", send_message), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -4464,14 +4498,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection()]
         with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
              patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None)
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="bot blocked"))), \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
@@ -4493,19 +4528,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 raise TelegramForbiddenError(method=None, message="bot blocked")
             sent_calls.append((chat_id, text, parse_mode))
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection(), FakeConnection()]
         with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
              patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin 1"}', 1, None),
-                 ("stripe-admin:evt_admin:payment_success:2", 2, "stripe_admin_message", '{"text":"admin 2"}', 1, None),
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin 1"}', 1, None, 1),
+                 ("stripe-admin:evt_admin:payment_success:2", 2, "stripe_admin_message", '{"text":"admin 2"}', 1, None, 1),
              ]), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=fake_send_message)) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -4521,13 +4557,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None)
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{"text":"admin"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
@@ -4540,13 +4577,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_stripe_admin_message_invalid_payload_is_terminal(self):
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, str(exc), retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "ADMIN_IDS", [1, 2]), \
              patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{}', 1, None)
+                 ("stripe-admin:evt_admin:payment_success:1", 1, "stripe_admin_message", '{}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
@@ -4599,11 +4637,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                      json.dumps(payload, ensure_ascii=False),
                      1,
                      None,
+                     1,
                  )
              ]), \
              patch.object(self.main, "fetch_gift_by_public_reference_version", return_value=gift_row), \
              patch.object(self.main.bot, "send_photo", send_photo), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5099,12 +5138,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                      '{"text":"link {invite_link}","source":"invoice.payment_succeeded","stripe_event_id":"evt_1"}',
                      1,
                      "https://t.me/+saved",
+                     1,
                  )
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
              patch.object(self.main.bot, "create_chat_invite_link", AsyncMock()) as create_link, \
              patch.object(self.main.bot, "send_message", send_message), \
-             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent"), \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5119,17 +5159,18 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         connections = [FakeConnection(), FakeConnection()]
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_network_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_network_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network down"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5143,17 +5184,18 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_retry_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_retry_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramRetryAfter(method=None, message="retry", retry_after=125))), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5167,18 +5209,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection()]
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_group_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_group_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="not enough rights"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5193,19 +5236,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection()]
         notify_admins = AsyncMock()
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_group_limit_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}","stripe_event_id":"evt_group_limit_secret"}', 3, None)
+                 ("stripe:evt_group_limit_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}","stripe_event_id":"evt_group_limit_secret"}', 3, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="not enough rights"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", notify_admins):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5225,19 +5269,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection()]
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_bot_admin_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_bot_admin_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="bot is not an administrator"))), \
              patch.object(self.main.bot, "create_chat_invite_link", AsyncMock()) as create_link, \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5254,13 +5299,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         invite = SimpleNamespace(invite_link="https://t.me/+new")
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_admin_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_admin_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="user is an administrator"))), \
              patch.object(self.main.bot, "create_chat_invite_link", AsyncMock(return_value=invite)) as create_link, \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed") as mark_failed, \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5275,18 +5320,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, retry_delay_minutes, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_member_timeout:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_member_timeout:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network down"))), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5301,14 +5347,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_member_ok:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}"}', 1, None)
+                 ("stripe:evt_member_ok:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=member)), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
              patch.object(self.main.bot, "create_chat_invite_link", AsyncMock()) as create_link, \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed") as mark_failed, \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5325,14 +5371,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_kicked:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}","stripe_event_id":"evt_kicked"}', 1, None)
+                 ("stripe:evt_kicked:rejoin_invite", 123, "stripe_rejoin_check", '{"text":"link {invite_link}","stripe_event_id":"evt_kicked"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=member)), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
              patch.object(self.main.bot, "create_chat_invite_link", AsyncMock(return_value=invite)) as create_link, \
              patch.object(self.main.bot, "send_message", AsyncMock()) as send_message, \
              patch.object(self.main, "mark_delivery_failed") as mark_failed, \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5349,18 +5395,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         failed_calls = []
 
-        def fake_mark_failed(cur, delivery_key, exc, retry_delay_minutes=None, permanently_failed=False):
+        def fake_mark_failed(cur, delivery_key, claim_generation, exc, retry_delay_minutes=None, permanently_failed=False):
             failed_calls.append((delivery_key, type(exc).__name__, permanently_failed))
+            return "permanently_failed" if permanently_failed else "failed"
 
         connections = [FakeConnection(), FakeConnection()]
         with patch.object(self.main, "get_db_conn", side_effect=connections), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_send_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, "https://t.me/+saved")
+                 ("stripe:evt_send_secret:rejoin_invite", 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, "https://t.me/+saved", 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()), \
              patch.object(self.main.bot, "send_message", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="bot was blocked"))), \
              patch.object(self.main, "mark_delivery_failed", side_effect=fake_mark_failed), \
-             patch.object(self.main, "mark_delivery_sent") as mark_sent, \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent") as mark_sent, \
              patch.object(self.main, "notify_admins", AsyncMock()):
             result = await self.main.process_pending_message_deliveries()
 
@@ -5375,12 +5422,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         full_key = "stripe:evt_full_secret_identifier_123456789:rejoin_invite"
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 (full_key, 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None)
+                 (full_key, 123, "stripe_rejoin_invite", '{"text":"link {invite_link}"}', 1, None, 1)
              ]), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramBadRequest(method=None, message="not enough rights"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()), \
              patch.object(self.main, "mark_delivery_failed"), \
-             patch.object(self.main, "mark_delivery_sent"), \
+             patch.object(self.main, "mark_delivery_sent", return_value="sent"), \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              self.assertLogs(level="WARNING") as logs:
             await self.main.process_pending_message_deliveries()
@@ -6360,7 +6407,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_invoice_future_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+                 ("stripe:evt_invoice_future_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
@@ -6379,7 +6426,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_invoice_future_member:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+                 ("stripe:evt_invoice_future_member:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \
@@ -6401,7 +6448,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "get_db_conn", side_effect=[FakeConnection(), FakeConnection(), FakeConnection()]), \
              patch.object(self.main, "claim_pending_message_deliveries", return_value=[
-                 ("stripe:evt_invoice_oob_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None)
+                 ("stripe:evt_invoice_oob_kicked:rejoin_invite", 123, "stripe_rejoin_check", payload_json, 1, None, 1)
              ]), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban, \

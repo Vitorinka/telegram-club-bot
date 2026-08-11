@@ -92,12 +92,14 @@ from group_access import (
 )
 from scheduled_jobs import (
     OWNER_ID,
+    cancel_message_delivery,
     claim_message_delivery,
     claim_pending_message_deliveries,
     claim_scheduled_job,
     complete_scheduled_job,
     enqueue_message_delivery,
     fail_scheduled_job,
+    log_stale_delivery_claim,
     mark_delivery_cancelled,
     mark_delivery_failed,
     mark_delivery_sent,
@@ -2366,7 +2368,7 @@ def fetch_gift_checkout_payment_proof(session_id):
 
 def cancel_gift_certificate_deliveries_for_version(cur, public_reference, token_version, reason):
     for delivery_type, kind in ((GIFT_CERTIFICATE_BUYER, "buyer"), (GIFT_CERTIFICATE_RECIPIENT, "recipient")):
-        mark_delivery_cancelled(
+        cancel_message_delivery(
             cur,
             gift_delivery_key(public_reference, delivery_type, token_version=token_version, recipient_kind=kind),
             reason,
@@ -4274,7 +4276,7 @@ def first_purchase_recovery_reminder_still_due(cur, telegram_id, current_deliver
 
 
 def cancel_first_purchase_recovery_delivery(cur, delivery_key, reason):
-    mark_delivery_cancelled(cur, delivery_key, reason=reason)
+    cancel_message_delivery(cur, delivery_key, reason=reason)
 
 
 def cancel_first_purchase_recovery_deliveries(cur, telegram_id, reason="first_payment_succeeded"):
@@ -16847,7 +16849,7 @@ async def execute_confirmed_gift_reissue(payload):
         new_token_version = int(gift_row["token_version"]) + 1
         new_token_hash = gift_token_hash_for_reference(public_reference, new_token_version)
         for delivery_type, kind in ((GIFT_CERTIFICATE_BUYER, "buyer"), (GIFT_CERTIFICATE_RECIPIENT, "recipient")):
-            mark_delivery_cancelled(
+            cancel_message_delivery(
                 cur,
                 gift_delivery_key(public_reference, delivery_type, token_version=gift_row["token_version"], recipient_kind=kind),
                 "gift_certificate_reissued",
@@ -17516,7 +17518,15 @@ async def process_pending_message_deliveries(limit=25):
     permanently_failed = 0
     blocked = 0
 
-    for delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link in deliveries:
+    for (
+        delivery_key,
+        telegram_id,
+        delivery_type,
+        payload_json,
+        attempt_count,
+        invite_link,
+        claim_generation,
+    ) in deliveries:
         sending_user_message = False
         payload = {}
         try:
@@ -17554,6 +17564,7 @@ async def process_pending_message_deliveries(limit=25):
                     telegram_id,
                     delivery_type,
                     lambda: send_free_lesson_delivery(telegram_id, payload),
+                    claim_generation,
                     blocked_exc=(TelegramForbiddenError,),
                     attempt_count=attempt_count,
                     classify_error_func=classify_delivery_error,
@@ -17583,6 +17594,7 @@ async def process_pending_message_deliveries(limit=25):
                     telegram_id,
                     delivery_type,
                     lambda: send_free_lesson_followup_delivery(telegram_id, payload),
+                    claim_generation,
                     blocked_exc=(TelegramForbiddenError,),
                     success_update_sql="""
                     UPDATE users
@@ -17626,12 +17638,26 @@ async def process_pending_message_deliveries(limit=25):
                     """, (int(telegram_id),))
                     access_row = recheck_cur.fetchone()
                     if not access_row:
-                        mark_delivery_cancelled(recheck_cur, delivery_key, "access_restore_user_not_found")
-                        recheck_conn.commit()
+                        cancel_result = mark_delivery_cancelled(
+                            recheck_cur,
+                            delivery_key,
+                            claim_generation,
+                            "access_restore_user_not_found",
+                        )
+                        if cancel_result == "cancelled":
+                            recheck_conn.commit()
+                        else:
+                            recheck_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "mark_cancelled")
                         continue
                     paid, db_expiry, payment_failed, grace_period_end = access_row
                     if not has_restorable_group_access(paid, db_expiry):
-                        mark_delivery_cancelled(recheck_cur, delivery_key, "access_restore_inactive")
+                        cancel_result = mark_delivery_cancelled(
+                            recheck_cur,
+                            delivery_key,
+                            claim_generation,
+                            "access_restore_inactive",
+                        )
                         record_access_event_cur(
                             recheck_cur,
                             telegram_id,
@@ -17640,7 +17666,11 @@ async def process_pending_message_deliveries(limit=25):
                             new_expiry=db_expiry,
                             notes=f"delivery_key={safe_delivery_hash(delivery_key)}",
                         )
-                        recheck_conn.commit()
+                        if cancel_result == "cancelled":
+                            recheck_conn.commit()
+                        else:
+                            recheck_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "mark_cancelled")
                         continue
                     effective_expiry = db_expiry
                     recheck_conn.commit()
@@ -17664,8 +17694,13 @@ async def process_pending_message_deliveries(limit=25):
                             new_expiry=effective_expiry,
                             notes=f"status={member_status}; delivery_key={safe_delivery_hash(delivery_key)}",
                         )
-                        mark_delivery_sent(already_cur, delivery_key)
-                        already_conn.commit()
+                        sent_result = mark_delivery_sent(already_cur, delivery_key, claim_generation)
+                        if sent_result == "sent":
+                            already_conn.commit()
+                        else:
+                            already_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "mark_sent")
+                            continue
                     finally:
                         already_cur.close()
                         already_conn.close()
@@ -17688,7 +17723,17 @@ async def process_pending_message_deliveries(limit=25):
                     link_conn = get_db_conn()
                     link_cur = link_conn.cursor()
                     try:
-                        save_delivery_invite_link(link_cur, delivery_key, link)
+                        invite_result, persisted_link = save_delivery_invite_link(
+                            link_cur,
+                            delivery_key,
+                            claim_generation,
+                            link,
+                        )
+                        if invite_result != "saved":
+                            link_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "save_invite_link")
+                            continue
+                        link = persisted_link
                         save_bot_invite_link(
                             link_cur,
                             link,
@@ -17765,7 +17810,17 @@ async def process_pending_message_deliveries(limit=25):
                         link_conn = get_db_conn()
                         link_cur = link_conn.cursor()
                         try:
-                            save_delivery_invite_link(link_cur, delivery_key, link)
+                            invite_result, persisted_link = save_delivery_invite_link(
+                                link_cur,
+                                delivery_key,
+                                claim_generation,
+                                link,
+                            )
+                            if invite_result != "saved":
+                                link_conn.rollback()
+                                log_stale_delivery_claim(delivery_key, "save_invite_link")
+                                continue
+                            link = persisted_link
                             save_bot_invite_link(
                                 link_cur,
                                 link,
@@ -17807,13 +17862,31 @@ async def process_pending_message_deliveries(limit=25):
                         for_update=False,
                     )
                     if not gift_row or gift_row["status"] not in ("paid_unclaimed", "reserved"):
-                        mark_delivery_cancelled(cert_cur, delivery_key, "gift_certificate_stale_or_unavailable")
-                        cert_conn.commit()
+                        cancel_result = mark_delivery_cancelled(
+                            cert_cur,
+                            delivery_key,
+                            claim_generation,
+                            "gift_certificate_stale_or_unavailable",
+                        )
+                        if cancel_result == "cancelled":
+                            cert_conn.commit()
+                        else:
+                            cert_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "mark_cancelled")
                         continue
                     expected_hash = gift_token_hash_for_reference(public_reference, token_version)
                     if not hmac.compare_digest(str(gift_row.get("token_hash") or ""), expected_hash):
-                        mark_delivery_cancelled(cert_cur, delivery_key, "gift_certificate_token_version_mismatch")
-                        cert_conn.commit()
+                        cancel_result = mark_delivery_cancelled(
+                            cert_cur,
+                            delivery_key,
+                            claim_generation,
+                            "gift_certificate_token_version_mismatch",
+                        )
+                        if cancel_result == "cancelled":
+                            cert_conn.commit()
+                        else:
+                            cert_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "mark_cancelled")
                         continue
                     cert_conn.commit()
                 finally:
@@ -17903,7 +17976,11 @@ async def process_pending_message_deliveries(limit=25):
                         new_expiry=effective_expiry,
                         notes=f"delivery_key={safe_delivery_hash(delivery_key)}; admin_action_id={payload.get('admin_action_id') or 'none'}",
                     )
-                mark_delivery_sent(sent_cur, delivery_key)
+                sent_result = mark_delivery_sent(sent_cur, delivery_key, claim_generation)
+                if sent_result != "sent":
+                    sent_conn.rollback()
+                    log_stale_delivery_claim(delivery_key, "mark_sent")
+                    continue
                 if delivery_type == "first_purchase_recovery_reminder" and sending_user_message:
                     enqueue_first_purchase_recovery_admin_sent_notices_safely(
                         sent_cur,
@@ -17961,14 +18038,20 @@ async def process_pending_message_deliveries(limit=25):
                 retry_delay = decision.get("retry_delay_minutes")
                 if retry_delay is None and not decision.get("permanently_failed", False):
                     retry_delay = 15
-                mark_delivery_failed(
+                failed_result = mark_delivery_failed(
                     fail_cur,
                     delivery_key,
+                    claim_generation,
                     e,
                     retry_delay_minutes=retry_delay,
                     permanently_failed=decision.get("permanently_failed", False),
                 )
-                fail_conn.commit()
+                if failed_result in ("failed", "permanently_failed"):
+                    fail_conn.commit()
+                else:
+                    fail_conn.rollback()
+                    log_stale_delivery_claim(delivery_key, "mark_failed")
+                    continue
             finally:
                 fail_cur.close()
                 fail_conn.close()
