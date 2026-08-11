@@ -4519,6 +4519,189 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ("legacy_0008_processing", 6, 1),
         )
 
+    def test_message_delivery_due_indexes_fresh_repeat_and_0009_upgrade(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0010_message_delivery_due_indexes", first["applied"])
+        self.assertIn("0010_message_delivery_due_indexes", second["applied"])
+
+        expected_indexes = {
+            "message_delivery_events_pending_failed_due_idx": (
+                ["next_attempt_at", "delivery_key"],
+                "(status = ANY (ARRAY['pending'::text, 'failed'::text]))",
+            ),
+            "message_delivery_events_processing_lease_idx": (
+                ["lease_until", "delivery_key"],
+                "(status = 'processing'::text)",
+            ),
+        }
+        rows = self.query_all(
+            """
+            SELECT idx.relname,
+                   array_agg(att.attname ORDER BY key.ordinality),
+                   pg_get_expr(ind.indpred, ind.indrelid)
+            FROM pg_class idx
+            JOIN pg_index ind ON ind.indexrelid = idx.oid
+            JOIN pg_class tbl ON tbl.oid = ind.indrelid
+            JOIN unnest(ind.indkey) WITH ORDINALITY AS key(attnum, ordinality) ON TRUE
+            JOIN pg_attribute att ON att.attrelid = tbl.oid AND att.attnum = key.attnum
+            WHERE tbl.relname = 'message_delivery_events'
+              AND idx.relname = ANY(%s)
+            GROUP BY idx.relname, ind.indpred, ind.indrelid
+            ORDER BY idx.relname
+            """,
+            (list(expected_indexes),),
+        )
+        self.assertEqual({name: (columns, predicate) for name, columns, predicate in rows}, expected_indexes)
+
+        legacy_name, legacy_dsn = create_temp_db(prefix="codex_pg_outbox_0009")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                for migration in sorted(Path(MIGRATIONS_DIR).glob("*.sql")):
+                    if migration.name >= "0010_":
+                        continue
+                    (Path(tmp) / migration.name).write_text(
+                        migration.read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                run_migrations(lambda: connect(legacy_dsn), migrations_dir=tmp)
+
+            legacy = connect(legacy_dsn)
+            legacy_cur = legacy.cursor()
+            legacy_cur.execute(
+                """
+                INSERT INTO message_delivery_events (
+                    delivery_key, telegram_id, delivery_type, status, attempt_count,
+                    next_attempt_at, claim_generation
+                ) VALUES ('legacy_0009_due', 1, 'notice', 'failed', 3, NOW(), 4)
+                """
+            )
+            legacy.commit()
+            legacy_cur.close()
+            legacy.close()
+
+            result = run_migrations(lambda: connect(legacy_dsn))
+            self.assertIn("0010_message_delivery_due_indexes", result["applied"])
+            legacy = connect(legacy_dsn)
+            legacy_cur = legacy.cursor()
+            legacy_cur.execute(
+                "SELECT status, attempt_count, claim_generation FROM message_delivery_events WHERE delivery_key = 'legacy_0009_due'"
+            )
+            self.assertEqual(legacy_cur.fetchone(), ("failed", 3, 4))
+            legacy_cur.execute(
+                """
+                SELECT COUNT(*) FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND indexname IN (
+                    'message_delivery_events_pending_failed_due_idx',
+                    'message_delivery_events_processing_lease_idx'
+                  )
+                """
+            )
+            self.assertEqual(legacy_cur.fetchone()[0], 2)
+            legacy_cur.close()
+            legacy.close()
+        finally:
+            drop_temp_db(legacy_name)
+
+    def test_message_delivery_due_indexes_are_used_and_claim_semantics_hold(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, next_attempt_at,
+                claimed_at, lease_until
+            )
+            SELECT 'terminal_' || g, g, 'notice', 'sent', NULL, NULL, NULL
+            FROM generate_series(1, 50000) AS g
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, next_attempt_at,
+                claimed_at, lease_until
+            ) VALUES
+                ('due_pending', 60001, 'notice', 'pending', NOW() - INTERVAL '1 minute', NULL, NULL),
+                ('due_failed', 60002, 'notice', 'failed', NOW() - INTERVAL '1 minute', NULL, NULL),
+                ('future_pending', 60003, 'notice', 'pending', NOW() + INTERVAL '1 day', NULL, NULL),
+                ('stale_processing', 60004, 'notice', 'processing', NULL, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '1 minute'),
+                ('active_processing', 60005, 'notice', 'processing', NULL, NOW(), NOW() + INTERVAL '10 minutes')
+            """
+        )
+        cur.execute("ANALYZE message_delivery_events")
+        cur.execute(
+            """
+            EXPLAIN (COSTS OFF)
+            SELECT delivery_key
+            FROM message_delivery_events
+            WHERE (
+                    status IN ('pending', 'failed')
+                    AND COALESCE(next_attempt_at, NOW()) <= NOW()
+                  )
+               OR (
+                    status = 'processing'
+                    AND lease_until < NOW()
+                  )
+            ORDER BY next_attempt_at NULLS FIRST, delivery_key
+            LIMIT 25
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+        plan = "\n".join(row[0] for row in cur.fetchall())
+        conn.commit()
+        self.assertIn("message_delivery_events_pending_failed_due_idx", plan)
+        self.assertIn("message_delivery_events_processing_lease_idx", plan)
+
+        claimed = claim_pending_message_deliveries(cur, limit=10)
+        conn.commit()
+        claimed_by_key = {row[0]: row for row in claimed}
+        self.assertEqual(set(claimed_by_key), {"due_pending", "due_failed", "stale_processing"})
+        self.assertEqual(claimed_by_key["due_pending"][6], 1)
+        self.assertEqual(claimed_by_key["due_failed"][6], 1)
+        self.assertEqual(claimed_by_key["stale_processing"][6], 1)
+        self.assertEqual(
+            self.query_one("SELECT status FROM message_delivery_events WHERE delivery_key = 'future_pending'"),
+            ("pending",),
+        )
+        self.assertEqual(
+            self.query_one("SELECT status FROM message_delivery_events WHERE delivery_key = 'active_processing'"),
+            ("processing",),
+        )
+        cur.close()
+        conn.close()
+
+    def test_message_delivery_due_indexes_preserve_two_worker_skip_locked(self):
+        run_migrations(self.get_conn)
+        setup = self.get_conn()
+        setup_cur = setup.cursor()
+        for key in ("skip_locked_a", "skip_locked_b"):
+            self.assertTrue(enqueue_message_delivery(setup_cur, key, 123, "notice", {"text": key}))
+        setup.commit()
+        setup_cur.close()
+        setup.close()
+
+        worker_a = self.get_conn()
+        worker_a_cur = worker_a.cursor()
+        claimed_a = claim_pending_message_deliveries(worker_a_cur, limit=1)
+        self.assertEqual(len(claimed_a), 1)
+
+        worker_b = self.get_conn()
+        worker_b_cur = worker_b.cursor()
+        claimed_b = claim_pending_message_deliveries(worker_b_cur, limit=1)
+        self.assertEqual(len(claimed_b), 1)
+        self.assertNotEqual(claimed_a[0][0], claimed_b[0][0])
+        self.assertEqual((claimed_a[0][6], claimed_b[0][6]), (1, 1))
+
+        worker_b.commit()
+        worker_b_cur.close()
+        worker_b.close()
+        worker_a.commit()
+        worker_a_cur.close()
+        worker_a.close()
+
     def test_message_delivery_generation_fences_all_finalizers_real_postgres(self):
         run_migrations(self.get_conn)
 

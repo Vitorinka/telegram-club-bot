@@ -109,6 +109,34 @@ def write_migration(directory, name, sql):
 
 
 class DbMigrationTests(unittest.TestCase):
+    def test_message_delivery_due_indexes_migration_is_required(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0010_message_delivery_due_indexes"]
+        self.assertEqual(migration["tables"], ("message_delivery_events",))
+        self.assertEqual(
+            migration["indexes"],
+            (
+                "message_delivery_events_pending_failed_due_idx",
+                "message_delivery_events_processing_lease_idx",
+            ),
+        )
+
+    def test_message_delivery_due_indexes_migration_has_exact_sql(self):
+        root = Path(__file__).resolve().parents[1]
+        migration_sql = (root / "migrations" / "0010_message_delivery_due_indexes.sql").read_text()
+        self.assertEqual(
+            migration_sql,
+            """CREATE INDEX IF NOT EXISTS message_delivery_events_pending_failed_due_idx
+ON message_delivery_events
+(next_attempt_at ASC NULLS FIRST, delivery_key)
+WHERE status IN ('pending', 'failed');
+
+CREATE INDEX IF NOT EXISTS message_delivery_events_processing_lease_idx
+ON message_delivery_events
+(lease_until, delivery_key)
+WHERE status = 'processing';
+""",
+        )
+
     def test_postgres_fsm_storage_migration_is_required(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0004_postgres_fsm_storage"]
         self.assertIn("aiogram_fsm_states", migration["tables"])
