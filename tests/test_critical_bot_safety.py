@@ -43,6 +43,7 @@ from group_access import (
     save_bot_invite_link,
 )
 from scheduled_jobs import (
+    cancel_message_delivery,
     claim_message_delivery,
     claim_pending_message_deliveries,
     claim_scheduled_job,
@@ -94,6 +95,7 @@ class FakeConn:
     def __init__(self, cursor):
         self._cursor = cursor
         self.commits = 0
+        self.rollbacks = 0
         self.closed = False
 
     def cursor(self):
@@ -101,6 +103,9 @@ class FakeConn:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
     def close(self):
         self.closed = True
@@ -141,7 +146,7 @@ class AdminActionCursor(FakeCursor):
 
 
 class DeliveryCursor(FakeCursor):
-    def __init__(self, claim_fetch=("free_lesson:1",), status_fetch=None):
+    def __init__(self, claim_fetch=(1,), status_fetch=None):
         super().__init__()
         self.claim_fetch = claim_fetch
         self.status_fetch = status_fetch
@@ -149,7 +154,7 @@ class DeliveryCursor(FakeCursor):
 
     def fetchone(self):
         query, _ = self.queries[-1]
-        if "RETURNING delivery_key" in query:
+        if "RETURNING claim_generation" in query:
             return self.claim_fetch
         if "SELECT status FROM message_delivery_events" in query:
             return self.status_fetch
@@ -255,7 +260,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
     def test_message_delivery_claim_has_sent_and_stale_paths(self):
         cur = FakeCursor(fetches=[None, ("sent",)])
         result = claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson")
-        self.assertEqual(result, "already_sent")
+        self.assertEqual(result, ("already_sent", None))
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("message_delivery_events", sql)
         self.assertIn("lease_until < %s", sql)
@@ -277,7 +282,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_message_delivery_cancelled_is_terminal_status(self):
         cur = FakeCursor()
-        mark_delivery_cancelled(cur, "first_purchase_recovery:key", "no_longer_due")
+        cancel_message_delivery(cur, "first_purchase_recovery:key", "no_longer_due")
 
         sql, params = cur.queries[-1]
         self.assertIn("status = 'cancelled'", sql)
@@ -285,7 +290,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertEqual(params, ("no_longer_due", "first_purchase_recovery:key"))
 
     def test_message_delivery_outbox_claims_due_rows_with_skip_locked(self):
-        cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None)]])
+        cur = FakeCursor(fetches=[[("stripe:evt_1:payment_success_notice", 1, "stripe_payment_success", "{}", 1, None, 1)]])
         rows = claim_pending_message_deliveries(cur, limit=5)
         self.assertEqual(rows[0][0], "stripe:evt_1:payment_success_notice")
         sql = "\n".join(query for query, _ in cur.queries)
@@ -298,7 +303,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_permanent_message_delivery_failure_is_terminal(self):
         cur = FakeCursor()
-        mark_delivery_failed(cur, "stripe:evt_1:notice", "blocked", permanently_failed=True)
+        mark_delivery_failed(cur, "stripe:evt_1:notice", 1, "blocked", permanently_failed=True)
         sql, params = cur.queries[-1]
         self.assertIn("SET status = %s", sql)
         self.assertIn("next_attempt_at = NULL", sql)
@@ -706,15 +711,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_delivery_claim_sent_does_not_repeat(self):
         cur = DeliveryCursor(claim_fetch=None, status_fetch=("sent",))
-        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), "already_sent")
+        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), ("already_sent", None))
 
     def test_delivery_claim_fresh_processing_does_not_repeat(self):
         cur = DeliveryCursor(claim_fetch=None, status_fetch=("processing",))
-        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), "already_processing")
+        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), ("already_processing", None))
 
     def test_delivery_claim_failed_rows_respect_next_attempt_at_backoff(self):
         cur = DeliveryCursor(claim_fetch=None, status_fetch=("failed",))
-        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), "failed")
+        self.assertEqual(claim_message_delivery(cur, "free_lesson:1", 1, "free_lesson"), ("failed", None))
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertIn("message_delivery_events.status = 'failed'", sql)
         self.assertIn("COALESCE(message_delivery_events.next_attempt_at, %s) <= %s", sql)
@@ -724,7 +729,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         cur = DeliveryCursor(claim_fetch=None, status_fetch=("failed",))
         result = claim_message_delivery(cur, "free_lesson:future", 1, "free_lesson")
 
-        self.assertEqual(result, "failed")
+        self.assertEqual(result, ("failed", None))
         self.assertEqual(len(cur.queries), 2)
         update_sql = cur.queries[0][0]
         self.assertIn("attempt_count = message_delivery_events.attempt_count + 1", update_sql)
@@ -732,21 +737,21 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("SELECT status FROM message_delivery_events", cur.queries[1][0])
 
     def test_delivery_claim_due_failed_and_expired_processing_are_claimed(self):
-        due_failed = DeliveryCursor(claim_fetch=("free_lesson:1",))
-        self.assertEqual(claim_message_delivery(due_failed, "free_lesson:1", 1, "free_lesson"), "claimed")
+        due_failed = DeliveryCursor(claim_fetch=(3,))
+        self.assertEqual(claim_message_delivery(due_failed, "free_lesson:1", 1, "free_lesson"), ("claimed", 3))
 
-        expired_processing = DeliveryCursor(claim_fetch=("free_lesson:2",))
-        self.assertEqual(claim_message_delivery(expired_processing, "free_lesson:2", 2, "free_lesson"), "claimed")
+        expired_processing = DeliveryCursor(claim_fetch=(4,))
+        self.assertEqual(claim_message_delivery(expired_processing, "free_lesson:2", 2, "free_lesson"), ("claimed", 4))
         sql = "\n".join(query for query, _ in expired_processing.queries)
         self.assertIn("message_delivery_events.status = 'processing'", sql)
         self.assertIn("message_delivery_events.lease_until < %s", sql)
 
     def test_delivery_claim_sent_and_permanently_failed_do_not_auto_claim(self):
         sent = DeliveryCursor(claim_fetch=None, status_fetch=("sent",))
-        self.assertEqual(claim_message_delivery(sent, "free_lesson:1", 1, "free_lesson"), "already_sent")
+        self.assertEqual(claim_message_delivery(sent, "free_lesson:1", 1, "free_lesson"), ("already_sent", None))
 
         permanent = DeliveryCursor(claim_fetch=None, status_fetch=("permanently_failed",))
-        self.assertEqual(claim_message_delivery(permanent, "free_lesson:2", 2, "free_lesson"), "permanently_failed")
+        self.assertEqual(claim_message_delivery(permanent, "free_lesson:2", 2, "free_lesson"), ("permanently_failed", None))
 
     def test_confirmed_manual_retry_sets_now_for_worker_backoff(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def execute_confirmed_retry_delivery"):MAIN_SOURCE.index("async def execute_confirmed_admin_action")]
@@ -755,7 +760,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("status IN ('failed', 'permanently_failed')", source)
 
     def test_process_claimed_delivery_commits_claim_before_send(self):
-        cursors = [DeliveryCursor(claim_fetch=("free_lesson:1",)), FakeCursor()]
+        cursors = [DeliveryCursor(claim_fetch=(1,)), FakeCursor(fetches=[("free_lesson:1",)])]
         claim_conn = FakeConn(cursors[0])
         conns = [claim_conn, FakeConn(cursors[1])]
         sends = []

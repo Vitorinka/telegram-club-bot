@@ -1,11 +1,22 @@
 from datetime import datetime, timedelta
+import hashlib
 import json
+import logging
 import os
 import socket
 import uuid
 
 
 OWNER_ID = os.getenv("RAILWAY_REPLICA_ID") or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def log_stale_delivery_claim(delivery_key, action):
+    delivery_hash = hashlib.sha256(str(delivery_key).encode("utf-8")).hexdigest()[:16]
+    logging.warning(
+        "MESSAGE_DELIVERY_STALE_CLAIM: action=%s, delivery_key_hash=%s",
+        action,
+        delivery_hash,
+    )
 
 
 def claim_scheduled_job(cur, job_key, job_name, schedule_slot, owner_id=None, now=None, lease_minutes=30, manual_retry=False):
@@ -73,14 +84,16 @@ def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=No
     cur.execute(
         """
         INSERT INTO message_delivery_events (
-            delivery_key, telegram_id, delivery_type, status, attempt_count, claimed_at, lease_until
+            delivery_key, telegram_id, delivery_type, status, attempt_count, claimed_at, lease_until,
+            claim_generation
         )
-        VALUES (%s, %s, %s, 'processing', 1, %s, %s)
+        VALUES (%s, %s, %s, 'processing', 1, %s, %s, 1)
         ON CONFLICT (delivery_key) DO UPDATE SET
             status = 'processing',
             attempt_count = message_delivery_events.attempt_count + 1,
             claimed_at = EXCLUDED.claimed_at,
             lease_until = EXCLUDED.lease_until,
+            claim_generation = message_delivery_events.claim_generation + 1,
             last_error = NULL
         WHERE (
                 message_delivery_events.status = 'failed'
@@ -90,19 +103,20 @@ def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=No
                 message_delivery_events.status = 'processing'
                 AND message_delivery_events.lease_until < %s
            )
-        RETURNING delivery_key
+        RETURNING claim_generation
         """,
         (delivery_key, int(telegram_id), delivery_type, now, lease_until, now, now, now),
     )
-    if cur.fetchone():
-        return "claimed"
+    claimed_row = cur.fetchone()
+    if claimed_row:
+        return "claimed", claimed_row[0]
     cur.execute("SELECT status FROM message_delivery_events WHERE delivery_key = %s", (delivery_key,))
     row = cur.fetchone()
     if row and row[0] == "sent":
-        return "already_sent"
+        return "already_sent", None
     if row and row[0] == "processing":
-        return "already_processing"
-    return row[0] if row else "not_claimed"
+        return "already_processing", None
+    return (row[0] if row else "not_claimed"), None
 
 
 def enqueue_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload=None, next_attempt_at=None):
@@ -151,16 +165,18 @@ def claim_pending_message_deliveries(cur, limit=25, now=None, lease_minutes=10):
             attempt_count = attempt_count + 1,
             claimed_at = %s,
             lease_until = %s,
+            claim_generation = claim_generation + 1,
             last_error = NULL
         WHERE delivery_key IN (SELECT delivery_key FROM due)
-        RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link
+        RETURNING delivery_key, telegram_id, delivery_type, payload_json, attempt_count, invite_link,
+                  claim_generation
         """,
         (limit, now, lease_until),
     )
     return cur.fetchall()
 
 
-def mark_delivery_sent(cur, delivery_key):
+def mark_delivery_sent(cur, delivery_key, claim_generation):
     cur.execute(
         """
         UPDATE message_delivery_events
@@ -169,12 +185,16 @@ def mark_delivery_sent(cur, delivery_key):
             lease_until = NULL,
             next_attempt_at = NULL
         WHERE delivery_key = %s
+          AND status = 'processing'
+          AND claim_generation = %s
+        RETURNING delivery_key
         """,
-        (delivery_key,),
+        (delivery_key, claim_generation),
     )
+    return "sent" if cur.fetchone() else "not_owner"
 
 
-def mark_delivery_cancelled(cur, delivery_key, reason="cancelled"):
+def mark_delivery_cancelled(cur, delivery_key, claim_generation, reason="cancelled"):
     cur.execute(
         """
         UPDATE message_delivery_events
@@ -183,18 +203,47 @@ def mark_delivery_cancelled(cur, delivery_key, reason="cancelled"):
             lease_until = NULL,
             next_attempt_at = NULL
         WHERE delivery_key = %s
+          AND status = 'processing'
+          AND claim_generation = %s
+        RETURNING delivery_key
+        """,
+        (str(reason), delivery_key, claim_generation),
+    )
+    return "cancelled" if cur.fetchone() else "not_owner"
+
+
+def cancel_message_delivery(cur, delivery_key, reason="cancelled"):
+    """Cancel a logical delivery due to external business state, not claim ownership."""
+    cur.execute(
+        """
+        UPDATE message_delivery_events
+        SET status = 'cancelled',
+            last_error = LEFT(%s, 500),
+            lease_until = NULL,
+            next_attempt_at = NULL
+        WHERE delivery_key = %s
+          AND status IN ('pending', 'failed', 'processing')
+        RETURNING delivery_key
         """,
         (str(reason), delivery_key),
     )
+    return "cancelled" if cur.fetchone() else "unchanged"
 
 
-def mark_delivery_failed(cur, delivery_key, error_text, retry_delay_minutes=15, permanently_failed=False):
+def mark_delivery_failed(
+    cur,
+    delivery_key,
+    claim_generation,
+    error_text,
+    retry_delay_minutes=15,
+    permanently_failed=False,
+):
     status = "permanently_failed" if permanently_failed else "failed"
     next_attempt_sql = "NULL" if permanently_failed else "NOW() + (%s * INTERVAL '1 minute')"
     params = (
-        (status, str(error_text), delivery_key)
+        (status, str(error_text), delivery_key, claim_generation)
         if permanently_failed
-        else (status, str(error_text), retry_delay_minutes, delivery_key)
+        else (status, str(error_text), retry_delay_minutes, delivery_key, claim_generation)
     )
     cur.execute(
         f"""
@@ -204,23 +253,29 @@ def mark_delivery_failed(cur, delivery_key, error_text, retry_delay_minutes=15, 
             lease_until = NULL,
             next_attempt_at = {next_attempt_sql}
         WHERE delivery_key = %s
+          AND status = 'processing'
+          AND claim_generation = %s
+        RETURNING delivery_key
         """,
         params,
     )
+    return status if cur.fetchone() else "not_owner"
 
 
-def save_delivery_invite_link(cur, delivery_key, invite_link):
+def save_delivery_invite_link(cur, delivery_key, claim_generation, invite_link):
     cur.execute(
         """
         UPDATE message_delivery_events
         SET invite_link = COALESCE(invite_link, %s)
         WHERE delivery_key = %s
+          AND status = 'processing'
+          AND claim_generation = %s
         RETURNING invite_link
         """,
-        (invite_link, delivery_key),
+        (invite_link, delivery_key, claim_generation),
     )
     row = cur.fetchone()
-    return row[0] if row else invite_link
+    return ("saved", row[0]) if row else ("not_owner", None)
 
 
 async def process_claimed_delivery(
@@ -240,7 +295,12 @@ async def process_claimed_delivery(
     claim_conn = get_conn()
     claim_cur = claim_conn.cursor()
     try:
-        claim = claim_message_delivery(claim_cur, delivery_key, telegram_id, delivery_type)
+        claim, claim_generation = claim_message_delivery(
+            claim_cur,
+            delivery_key,
+            telegram_id,
+            delivery_type,
+        )
         claimed_attempt_count = None
         if claim == "claimed":
             claim_cur.execute("SELECT attempt_count FROM message_delivery_events WHERE delivery_key = %s", (delivery_key,))
@@ -263,6 +323,7 @@ async def process_claimed_delivery(
         telegram_id,
         delivery_type,
         send_func,
+        claim_generation,
         blocked_exc=blocked_exc,
         success_update_sql=success_update_sql,
         success_update_params=success_update_params,
@@ -279,6 +340,7 @@ async def process_already_claimed_delivery(
     telegram_id,
     delivery_type,
     send_func,
+    claim_generation,
     blocked_exc=(),
     success_update_sql=None,
     success_update_params=None,
@@ -305,6 +367,7 @@ async def process_already_claimed_delivery(
             telegram_id,
             delivery_type,
             attempt_count,
+            claim_generation,
             exc,
             decision,
             log_failure_func,
@@ -326,6 +389,7 @@ async def process_already_claimed_delivery(
             telegram_id,
             delivery_type,
             attempt_count,
+            claim_generation,
             exc,
             decision,
             log_failure_func,
@@ -345,8 +409,13 @@ async def process_already_claimed_delivery(
             """,
             success_update_params or (int(telegram_id),),
         )
-        mark_delivery_sent(sent_cur, delivery_key)
-        sent_conn.commit()
+        sent_result = mark_delivery_sent(sent_cur, delivery_key, claim_generation)
+        if sent_result == "sent":
+            sent_conn.commit()
+        else:
+            sent_conn.rollback()
+            log_stale_delivery_claim(delivery_key, "mark_sent")
+            return "stale_claim"
     finally:
         sent_cur.close()
         sent_conn.close()
@@ -359,6 +428,7 @@ async def _mark_claimed_delivery_failed(
     telegram_id,
     delivery_type,
     attempt_count,
+    claim_generation,
     exc,
     decision,
     log_failure_func=None,
@@ -374,14 +444,20 @@ async def _mark_claimed_delivery_failed(
         retry_delay = decision.get("retry_delay_minutes")
         if retry_delay is None and not decision.get("permanently_failed", False):
             retry_delay = 15
-        mark_delivery_failed(
+        failed_result = mark_delivery_failed(
             fail_cur,
             delivery_key,
+            claim_generation,
             exc,
             retry_delay_minutes=retry_delay,
             permanently_failed=decision.get("permanently_failed", False),
         )
-        fail_conn.commit()
+        if failed_result in ("failed", "permanently_failed"):
+            fail_conn.commit()
+        else:
+            fail_conn.rollback()
+            log_stale_delivery_claim(delivery_key, "mark_failed")
+            return "stale_claim"
     finally:
         fail_cur.close()
         fail_conn.close()

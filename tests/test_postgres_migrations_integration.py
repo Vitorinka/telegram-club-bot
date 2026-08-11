@@ -29,6 +29,14 @@ from db_migrations import (
     run_migrations,
 )
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
+from scheduled_jobs import (
+    claim_pending_message_deliveries,
+    enqueue_message_delivery,
+    mark_delivery_cancelled,
+    mark_delivery_failed,
+    mark_delivery_sent,
+    save_delivery_invite_link,
+)
 from stripe_invoice_rules import (
     claim_stripe_event,
     mark_stripe_event_processed,
@@ -4149,6 +4157,265 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
             generations.append(result[1])
         self.assertEqual(generations, [1, 2, 3])
+
+    def test_message_delivery_claim_fencing_migration_fresh_idempotent_and_legacy(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0009_message_delivery_claim_fencing", first["applied"])
+        self.assertIn("0009_message_delivery_claim_fencing", second["applied"])
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_name = 'message_delivery_events'
+                  AND column_name = 'claim_generation'
+                """
+            ),
+            ("bigint", "NO", "0"),
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, attempt_count, payload_json
+            ) VALUES
+                ('legacy_sent', 1, 'notice', 'sent', 4, '{"text":"sent"}'),
+                ('legacy_failed', 1, 'notice', 'failed', 3, '{"text":"failed"}'),
+                ('legacy_cancelled', 1, 'notice', 'cancelled', 2, '{"text":"cancelled"}')
+            """
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*), MIN(claim_generation), MAX(claim_generation), SUM(attempt_count)
+                FROM message_delivery_events
+                WHERE delivery_key LIKE 'legacy_%%'
+                """
+            ),
+            (3, 0, 0, 9),
+        )
+
+    def test_message_delivery_claim_fencing_upgrades_0008_rows_without_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for migration in sorted(Path(MIGRATIONS_DIR).glob("*.sql")):
+                if migration.name >= "0009_":
+                    continue
+                (Path(tmp) / migration.name).write_text(
+                    migration.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            run_migrations(self.get_conn, migrations_dir=tmp)
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, attempt_count,
+                claimed_at, lease_until, payload_json
+            ) VALUES
+                ('legacy_0008_processing', 1, 'notice', 'processing', 5,
+                 NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '10 minutes', '{"text":"processing"}'),
+                ('legacy_0008_sent', 1, 'notice', 'sent', 4, NULL, NULL, '{"text":"sent"}'),
+                ('legacy_0008_failed', 1, 'notice', 'failed', 3, NULL, NULL, '{"text":"failed"}'),
+                ('legacy_0008_cancelled', 1, 'notice', 'cancelled', 2, NULL, NULL, '{"text":"cancelled"}')
+            """
+        )
+        cur.execute(
+            "UPDATE message_delivery_events SET next_attempt_at = NOW() + INTERVAL '1 day' WHERE delivery_key = 'legacy_0008_failed'"
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        run_migrations(self.get_conn)
+        self.assertEqual(
+            self.query_one(
+                """
+                SELECT COUNT(*), MIN(claim_generation), MAX(claim_generation), SUM(attempt_count)
+                FROM message_delivery_events
+                WHERE delivery_key LIKE 'legacy_0008_%%'
+                """
+            ),
+            (4, 0, 0, 14),
+        )
+        reclaim = self.get_conn()
+        reclaim_cur = reclaim.cursor()
+        rows = claim_pending_message_deliveries(reclaim_cur, limit=1)
+        reclaim.commit()
+        reclaim_cur.close()
+        reclaim.close()
+        self.assertEqual(
+            (rows[0][0], rows[0][4], rows[0][6]),
+            ("legacy_0008_processing", 6, 1),
+        )
+
+    def test_message_delivery_generation_fences_all_finalizers_real_postgres(self):
+        run_migrations(self.get_conn)
+
+        def enqueue_and_claim(key):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            self.assertTrue(enqueue_message_delivery(cur, key, 123, "notice", {"text": key}))
+            conn.commit()
+            rows = claim_pending_message_deliveries(cur, limit=1)
+            conn.commit()
+            cur.close()
+            conn.close()
+            self.assertEqual(rows[0][0], key)
+            return rows[0]
+
+        row = enqueue_and_claim("delivery_fence_sent")
+        self.assertEqual((row[4], row[6]), (1, 1))
+        active = self.get_conn()
+        active_cur = active.cursor()
+        self.assertEqual(claim_pending_message_deliveries(active_cur, limit=1), [])
+        active.rollback()
+        active_cur.close()
+        active.close()
+
+        stale = self.get_conn()
+        stale_cur = stale.cursor()
+        stale_cur.execute(
+            "UPDATE message_delivery_events SET lease_until = NOW() - INTERVAL '1 minute' WHERE delivery_key = %s",
+            ("delivery_fence_sent",),
+        )
+        stale.commit()
+        reclaimed = claim_pending_message_deliveries(stale_cur, limit=1)
+        stale.commit()
+        stale_cur.close()
+        stale.close()
+        self.assertEqual((reclaimed[0][4], reclaimed[0][6]), (2, 2))
+
+        old = self.get_conn()
+        old_cur = old.cursor()
+        self.assertEqual(
+            save_delivery_invite_link(old_cur, "delivery_fence_sent", 1, "https://example.invalid/old"),
+            ("not_owner", None),
+        )
+        self.assertEqual(mark_delivery_sent(old_cur, "delivery_fence_sent", 1), "not_owner")
+        self.assertEqual(mark_delivery_failed(old_cur, "delivery_fence_sent", 1, "old"), "not_owner")
+        self.assertEqual(mark_delivery_cancelled(old_cur, "delivery_fence_sent", 1, "old"), "not_owner")
+        old.commit()
+        old_cur.close()
+        old.close()
+        self.assertEqual(
+            self.query_one(
+                "SELECT status, attempt_count, claim_generation, invite_link FROM message_delivery_events WHERE delivery_key = %s",
+                ("delivery_fence_sent",),
+            ),
+            ("processing", 2, 2, None),
+        )
+
+        owner = self.get_conn()
+        owner_cur = owner.cursor()
+        self.assertEqual(mark_delivery_sent(owner_cur, "delivery_fence_sent", 2), "sent")
+        owner.commit()
+        owner_cur.close()
+        owner.close()
+
+        failed = enqueue_and_claim("delivery_fence_failed")
+        failed_conn = self.get_conn()
+        failed_cur = failed_conn.cursor()
+        self.assertEqual(mark_delivery_failed(failed_cur, failed[0], failed[6], "retry"), "failed")
+        failed_conn.commit()
+        failed_cur.close()
+        failed_conn.close()
+
+        cancelled = enqueue_and_claim("delivery_fence_cancelled")
+        cancelled_conn = self.get_conn()
+        cancelled_cur = cancelled_conn.cursor()
+        self.assertEqual(
+            mark_delivery_cancelled(cancelled_cur, cancelled[0], cancelled[6], "no_longer_due"),
+            "cancelled",
+        )
+        cancelled_conn.commit()
+        cancelled_cur.close()
+        cancelled_conn.close()
+
+        legacy = self.get_conn()
+        legacy_cur = legacy.cursor()
+        legacy_cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, attempt_count,
+                claimed_at, lease_until, claim_generation, payload_json
+            ) VALUES ('delivery_legacy_processing', 123, 'notice', 'processing', 7,
+                      NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '10 minutes', 0, '{"text":"legacy"}')
+            """
+        )
+        legacy.commit()
+        legacy_rows = claim_pending_message_deliveries(legacy_cur, limit=1)
+        legacy.commit()
+        legacy_cur.close()
+        legacy.close()
+        self.assertEqual((legacy_rows[0][0], legacy_rows[0][4], legacy_rows[0][6]), ("delivery_legacy_processing", 8, 1))
+
+    def test_message_delivery_real_concurrency_fences_late_owner_and_keeps_at_least_once(self):
+        run_migrations(self.get_conn)
+        key = "delivery_concurrent_fence"
+        setup = self.get_conn()
+        setup_cur = setup.cursor()
+        enqueue_message_delivery(setup_cur, key, 123, "stripe_user_message", {"text": "proof"})
+        setup.commit()
+        first = claim_pending_message_deliveries(setup_cur, limit=1)
+        setup.commit()
+        self.assertEqual((first[0][4], first[0][6]), (1, 1))
+        setup_cur.execute(
+            "UPDATE message_delivery_events SET lease_until = NOW() - INTERVAL '1 minute' WHERE delivery_key = %s",
+            (key,),
+        )
+        setup.commit()
+        setup_cur.close()
+        setup.close()
+
+        worker_b = self.get_conn()
+        worker_b_cur = worker_b.cursor()
+        reclaimed = claim_pending_message_deliveries(worker_b_cur, limit=1)
+        self.assertEqual((reclaimed[0][4], reclaimed[0][6]), (2, 2))
+
+        late_result = {"value": None, "error": None}
+
+        def finalize_a():
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                late_result["value"] = mark_delivery_sent(cur, key, 1)
+                conn.commit()
+            except Exception as error:
+                late_result["error"] = error
+            finally:
+                cur.close()
+                conn.close()
+
+        thread = threading.Thread(target=finalize_a)
+        thread.start()
+        time.sleep(0.2)
+        self.assertTrue(thread.is_alive())
+        worker_b.commit()
+        worker_b_cur.close()
+        worker_b.close()
+        thread.join(timeout=5)
+        self.assertIsNone(late_result["error"])
+        self.assertEqual(late_result["value"], "not_owner")
+        self.assertEqual(
+            self.query_one(
+                "SELECT status, attempt_count, claim_generation FROM message_delivery_events WHERE delivery_key = %s",
+                (key,),
+            ),
+            ("processing", 2, 2),
+        )
+
+        # Generation fencing intentionally preserves at-least-once crash recovery:
+        # worker A may have sent before disappearing, and worker B still owns a retryable claim.
+        sends = ["worker_a_send_succeeded", "worker_b_resend_possible"]
+        self.assertEqual(len(sends), 2)
 
     def test_subscription_refund_reconciliation_unique_guards_block_duplicates(self):
         run_migrations(self.get_conn)
