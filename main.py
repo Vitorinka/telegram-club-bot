@@ -35,6 +35,7 @@ from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 from storage_diagnostics import collect_storage_diagnostics, render_storage_diagnostics
+from constraint_audit import collect_constraint_audit, render_constraint_audit
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -11850,6 +11851,31 @@ async def storage_diagnostics_command(message: types.Message):
             type(error).__name__, error_ref,
         )
         await message.answer(f"❌ Storage diagnostics unavailable. ref: {error_ref}")
+    finally:
+        if conn:
+            conn.close()
+
+
+@router.message(Command('constraint_audit'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def constraint_audit_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = None
+    try:
+        conn = get_db_conn()
+        audit = await asyncio.to_thread(collect_constraint_audit, conn)
+        for page in render_constraint_audit(audit):
+            await message.answer(page)
+    except Exception as error:
+        if conn:
+            conn.rollback()
+        error_ref = safe_admin_error_reference("constraint_audit", error)
+        logging.error(
+            "CONSTRAINT_AUDIT_FAILED: error_class=%s ref=%s",
+            type(error).__name__, error_ref,
+        )
+        await message.answer(f"❌ Constraint audit unavailable. ref: {error_ref}")
     finally:
         if conn:
             conn.close()
