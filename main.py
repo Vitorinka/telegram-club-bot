@@ -18590,15 +18590,6 @@ async def apply_reserved_gifts(limit=50):
     return {"applied": 0, "skipped": 0}
 
 
-async def scheduled_apply_reserved_gifts():
-    return await run_scheduled_with_lock(
-        "apply_reserved_gifts",
-        datetime.utcnow().strftime("%Y%m%d%H"),
-        apply_reserved_gifts,
-        lease_minutes=60,
-    )
-
-
 def register_scheduler_jobs_once():
     global SCHEDULER_JOBS_REGISTERED
     if SCHEDULER_JOBS_REGISTERED:
