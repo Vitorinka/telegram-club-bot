@@ -18,6 +18,7 @@ from psycopg2 import errors as psycopg2_errors
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -317,7 +318,8 @@ storage = PostgresFSMStorage(lambda: get_db_conn())
 router = Router()
 dp = Dispatcher(storage=storage)
 dp.include_router(router)
-scheduler = AsyncIOScheduler()
+SCHEDULER_TZ = ZoneInfo("UTC")
+scheduler = AsyncIOScheduler(timezone=SCHEDULER_TZ)
 
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
 class TrackedThreadedConnectionPool:
@@ -18660,6 +18662,7 @@ def register_scheduler_jobs_once():
 def start_scheduler_once():
     if not getattr(scheduler, "running", False):
         scheduler.start()
+        logging.info("Scheduler started: timezone=%s", SCHEDULER_TZ.key)
 
 
 async def on_startup(app):
