@@ -228,7 +228,14 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             UNION ALL SELECT 'payment', COUNT(*) FROM payment_events
             ORDER BY 1
         """)
-        result = run_migrations(self.get_conn)
+        with tempfile.TemporaryDirectory() as migration_dir:
+            for migration in load_migrations():
+                if migration["version"] >= "0012_":
+                    continue
+                (Path(migration_dir) / migration["path"].name).write_text(
+                    migration["sql"], encoding="utf-8"
+                )
+            result = run_migrations(self.get_conn, migrations_dir=migration_dir)
         self.assertIn("0011_core_safety_check_constraints", result["applied"])
         after = self.query_all("""
             SELECT 'delivery', COUNT(*) FROM message_delivery_events
@@ -259,9 +266,36 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         try:
             with verify_conn.cursor() as cur:
                 self.assertTrue(migration_schema_matches(cur, "0011_core_safety_check_constraints"))
+                self.assertFalse(migration_schema_matches(cur, "0012_validate_core_safety_check_constraints"))
                 cur.execute("ALTER TABLE stripe_events DROP CONSTRAINT stripe_events_processed_timestamp_check")
                 self.assertFalse(migration_schema_matches(cur, "0011_core_safety_check_constraints"))
                 verify_conn.rollback()
+        finally:
+            verify_conn.close()
+
+        result = run_migrations(self.get_conn)
+        self.assertIn("0012_validate_core_safety_check_constraints", result["applied"])
+        constraints = self.query_all("""
+            SELECT conname, convalidated
+            FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            )
+            ORDER BY conname
+        """)
+        self.assertEqual(len(constraints), 8)
+        self.assertTrue(all(validated is True for _name, validated in constraints))
+        verify_conn = self.get_conn()
+        try:
+            with verify_conn.cursor() as cur:
+                self.assertTrue(migration_schema_matches(cur, "0012_validate_core_safety_check_constraints"))
         finally:
             verify_conn.close()
 
@@ -294,6 +328,118 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ORDER BY 1
         """)
         self.assertEqual(before, final_rows)
+
+    def test_core_safety_validation_failure_rolls_back_and_retries_real_postgres(self):
+        with tempfile.TemporaryDirectory() as migration_dir:
+            for migration in load_migrations():
+                if migration["version"] >= "0011_":
+                    continue
+                (Path(migration_dir) / migration["path"].name).write_text(
+                    migration["sql"], encoding="utf-8"
+                )
+            run_migrations(self.get_conn, migrations_dir=migration_dir)
+
+        seed = self.get_conn()
+        with seed.cursor() as cur:
+            cur.execute("""
+                INSERT INTO message_delivery_events
+                    (delivery_key, telegram_id, delivery_type, status, claim_generation)
+                VALUES ('legacy-processing-without-lease', 901, 'notice', 'processing', 0)
+            """)
+            cur.execute("""
+                INSERT INTO stripe_events (event_id, processed, processed_at, claim_generation)
+                VALUES ('legacy-processed-without-timestamp', TRUE, NULL, 0)
+            """)
+        seed.commit()
+        seed.close()
+
+        with tempfile.TemporaryDirectory() as migration_dir:
+            for migration in load_migrations():
+                if migration["version"] >= "0012_":
+                    continue
+                (Path(migration_dir) / migration["path"].name).write_text(
+                    migration["sql"], encoding="utf-8"
+                )
+            run_migrations(self.get_conn, migrations_dir=migration_dir)
+
+        before = self.query_all("""
+            SELECT 'delivery', delivery_key, status, lease_until::text
+            FROM message_delivery_events
+            WHERE delivery_key = 'legacy-processing-without-lease'
+            UNION ALL
+            SELECT 'stripe', event_id, processed::text, processed_at::text
+            FROM stripe_events
+            WHERE event_id = 'legacy-processed-without-timestamp'
+            ORDER BY 1
+        """)
+        unvalidated = self.query_one("""
+            SELECT COUNT(*)
+            FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            ) AND NOT convalidated
+        """)[0]
+        self.assertEqual(unvalidated, 8)
+
+        with self.assertRaises(psycopg2.errors.CheckViolation):
+            run_migrations(self.get_conn)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM schema_migrations WHERE version = '0012_validate_core_safety_check_constraints'")[0],
+            0,
+        )
+        self.assertEqual(before, self.query_all("""
+            SELECT 'delivery', delivery_key, status, lease_until::text
+            FROM message_delivery_events
+            WHERE delivery_key = 'legacy-processing-without-lease'
+            UNION ALL
+            SELECT 'stripe', event_id, processed::text, processed_at::text
+            FROM stripe_events
+            WHERE event_id = 'legacy-processed-without-timestamp'
+            ORDER BY 1
+        """))
+        self.assertEqual(self.query_one("""
+            SELECT COUNT(*) FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            ) AND NOT convalidated
+        """)[0], 8)
+
+        cleanup = self.get_conn()
+        with cleanup.cursor() as cur:
+            cur.execute("DELETE FROM message_delivery_events WHERE delivery_key = 'legacy-processing-without-lease'")
+            cur.execute("DELETE FROM stripe_events WHERE event_id = 'legacy-processed-without-timestamp'")
+        cleanup.commit()
+        cleanup.close()
+
+        result = run_migrations(self.get_conn)
+        self.assertIn("0012_validate_core_safety_check_constraints", result["applied"])
+        self.assertEqual(self.query_one("""
+            SELECT COUNT(*) FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            ) AND convalidated
+        """)[0], 8)
 
     def test_constraint_audit_is_read_only_and_detects_corruption_real_postgres(self):
         run_migrations(self.get_conn)
@@ -1301,8 +1447,42 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
+        self.assertEqual(len(migrations), 12)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
+        self.assertEqual(self.query_one("""
+            SELECT COUNT(*) FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            ) AND convalidated
+        """)[0], 8)
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO message_delivery_events
+                    (delivery_key, telegram_id, delivery_type, status, lease_until, sent_at, claim_generation)
+                VALUES
+                    ('fresh-processing', 801, 'notice', 'processing', NOW(), NULL, 1),
+                    ('fresh-sent', 802, 'notice', 'sent', NULL, NOW(), 2)
+            """)
+            cur.execute("""
+                INSERT INTO stripe_events (event_id, processed, processed_at, claim_generation)
+                VALUES ('fresh-processed', TRUE, NOW(), 1)
+            """)
+            cur.execute("""
+                INSERT INTO payment_events (stripe_event_id, event_type, payment_status)
+                VALUES ('fresh-payment', 'local.test', 'succeeded')
+            """)
+        conn.commit()
+        conn.close()
 
         run_migrations(self.get_conn)
         rows_after = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
@@ -4798,13 +4978,13 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """
             INSERT INTO message_delivery_events (
                 delivery_key, telegram_id, delivery_type, status, attempt_count,
-                claimed_at, lease_until, payload_json
+                claimed_at, lease_until, payload_json, sent_at
             ) VALUES
                 ('legacy_0008_processing', 1, 'notice', 'processing', 5,
-                 NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '10 minutes', '{"text":"processing"}'),
-                ('legacy_0008_sent', 1, 'notice', 'sent', 4, NULL, NULL, '{"text":"sent"}'),
-                ('legacy_0008_failed', 1, 'notice', 'failed', 3, NULL, NULL, '{"text":"failed"}'),
-                ('legacy_0008_cancelled', 1, 'notice', 'cancelled', 2, NULL, NULL, '{"text":"cancelled"}')
+                 NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '10 minutes', '{"text":"processing"}', NULL),
+                ('legacy_0008_sent', 1, 'notice', 'sent', 4, NULL, NULL, '{"text":"sent"}', NOW()),
+                ('legacy_0008_failed', 1, 'notice', 'failed', 3, NULL, NULL, '{"text":"failed"}', NULL),
+                ('legacy_0008_cancelled', 1, 'notice', 'cancelled', 2, NULL, NULL, '{"text":"cancelled"}', NULL)
             """
         )
         cur.execute(

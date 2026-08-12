@@ -110,6 +110,24 @@ def write_migration(directory, name, sql):
 
 
 class DbMigrationTests(unittest.TestCase):
+    def test_core_safety_validation_migration_is_validation_only(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0012_validate_core_safety_check_constraints"]
+        expected = set(MIGRATION_BASELINE_REQUIREMENTS["0011_core_safety_check_constraints"]["constraints"])
+        self.assertEqual(set(migration["constraints"]), expected)
+        self.assertTrue(all(spec["validated"] is True for spec in migration["constraints"].values()))
+
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0012_validate_core_safety_check_constraints.sql").read_text()
+        self.assertEqual(sql.count("VALIDATE CONSTRAINT"), 8)
+        self.assertEqual(sql.count("ALTER TABLE"), 8)
+        for constraint_name in expected:
+            self.assertEqual(sql.count(f"VALIDATE CONSTRAINT {constraint_name}"), 1)
+        for forbidden in (
+            "ADD CONSTRAINT", "DROP CONSTRAINT", "ALTER COLUMN", "UPDATE ",
+            "DELETE ", "INSERT ", "CREATE INDEX",
+        ):
+            self.assertNotIn(forbidden, sql.upper())
+
     def test_core_safety_constraints_migration_is_narrow_and_not_valid(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0011_core_safety_check_constraints"]
         self.assertEqual(
@@ -150,6 +168,10 @@ class DbMigrationTests(unittest.TestCase):
 
         valid = Cursor(("CHECK ((claim_generation >= 0)) NOT VALID", False))
         self.assertTrue(check_constraint_matches(valid, "constraint_name", "stripe_events", ("claim_generation", ">=", "0")))
+        self.assertTrue(check_constraint_matches(valid, "constraint_name", "stripe_events", validated=False))
+        self.assertFalse(check_constraint_matches(valid, "constraint_name", "stripe_events", validated=True))
+        validated = Cursor(("CHECK ((claim_generation >= 0))", True))
+        self.assertTrue(check_constraint_matches(validated, "constraint_name", "stripe_events", validated=True))
         self.assertEqual(valid.params, ("stripe_events", "constraint_name"))
         wrong = Cursor(("CHECK ((claim_generation < 0)) NOT VALID", False))
         self.assertFalse(check_constraint_matches(wrong, "constraint_name", "stripe_events", ("claim_generation", ">=", "0")))

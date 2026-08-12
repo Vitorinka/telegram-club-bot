@@ -1,0 +1,23 @@
+ALTER TABLE message_delivery_events
+VALIDATE CONSTRAINT message_delivery_events_status_check;
+
+ALTER TABLE message_delivery_events
+VALIDATE CONSTRAINT message_delivery_events_claim_generation_nonnegative_check;
+
+ALTER TABLE message_delivery_events
+VALIDATE CONSTRAINT message_delivery_events_attempt_count_nonnegative_check;
+
+ALTER TABLE message_delivery_events
+VALIDATE CONSTRAINT message_delivery_events_processing_lease_check;
+
+ALTER TABLE message_delivery_events
+VALIDATE CONSTRAINT message_delivery_events_sent_timestamp_check;
+
+ALTER TABLE stripe_events
+VALIDATE CONSTRAINT stripe_events_claim_generation_nonnegative_check;
+
+ALTER TABLE stripe_events
+VALIDATE CONSTRAINT stripe_events_processed_timestamp_check;
+
+ALTER TABLE payment_events
+VALIDATE CONSTRAINT payment_events_payment_status_check;
