@@ -59,6 +59,9 @@ class ConstraintAuditTests(unittest.TestCase):
     def test_every_closed_group_has_expected_values_and_external_domains_do_not(self):
         self.assertEqual(set(audit.GROUPED_QUERIES), set(audit.EXPECTED_VALUES))
         self.assertTrue(set(audit.OPEN_DOMAIN_QUERIES).isdisjoint(audit.EXPECTED_VALUES))
+        self.assertTrue(set(audit.LEGACY_ALLOWED_VALUES).issubset(audit.EXPECTED_VALUES))
+        for name, legacy_values in audit.LEGACY_ALLOWED_VALUES.items():
+            self.assertTrue(legacy_values.isdisjoint(audit.EXPECTED_VALUES[name]))
 
     def test_sql_is_fixed_and_select_only(self):
         sql_texts = [
@@ -123,6 +126,42 @@ class ConstraintAuditTests(unittest.TestCase):
         self.assertIn("unexpected_action (1)", rendered)
         self.assertIn("unexpected_conflict (1)", rendered)
         self.assertNotIn("observed-only candidate", rendered)
+
+    def test_legacy_identity_conflict_is_visible_allowed_and_excluded_from_summary(self):
+        legacy = "users_duplicate_subscription"
+        self.assertNotIn(legacy, audit.EXPECTED_VALUES["stripe_identity_conflicts.conflict_type"])
+        self.assertEqual(
+            audit.LEGACY_ALLOWED_VALUES["stripe_identity_conflicts.conflict_type"],
+            frozenset((legacy,)),
+        )
+        results = clean_results()
+        results[normalized(audit.GROUPED_QUERIES["stripe_identity_conflicts.conflict_type"])] = [
+            ("users_subscription_conflict", 2),
+            (legacy, 1),
+        ]
+        data = audit.collect_constraint_audit(FakeConnection(results))
+        self.assertNotIn("stripe_identity_conflicts.conflict_type", audit.unexpected_values(data))
+        rendered = "\n".join(audit.render_constraint_audit(data))
+        self.assertIn("unexpected closed-set values: 0", rendered)
+        self.assertIn("legacy allowed: users_duplicate_subscription", rendered)
+        self.assertIn("users_duplicate_subscription: 1", rendered)
+        self.assertIn("unexpected: none", rendered)
+
+    def test_unknown_identity_conflict_remains_unexpected_alongside_legacy(self):
+        results = clean_results()
+        results[normalized(audit.GROUPED_QUERIES["stripe_identity_conflicts.conflict_type"])] = [
+            ("users_duplicate_subscription", 1),
+            ("unknown_conflict_type", 3),
+        ]
+        data = audit.collect_constraint_audit(FakeConnection(results))
+        self.assertEqual(
+            audit.unexpected_values(data)["stripe_identity_conflicts.conflict_type"],
+            [("unknown_conflict_type", 3)],
+        )
+        rendered = "\n".join(audit.render_constraint_audit(data))
+        self.assertIn("unexpected closed-set values: 1", rendered)
+        self.assertIn("unknown_conflict_type (3)", rendered)
+        self.assertIn("users_duplicate_subscription: 1", rendered)
 
     def test_external_values_are_not_closed_set_violations(self):
         data = audit.collect_constraint_audit(FakeConnection(clean_results()))

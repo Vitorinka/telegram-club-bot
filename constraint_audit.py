@@ -44,6 +44,12 @@ EXPECTED_VALUES = {
     )),
 }
 
+LEGACY_ALLOWED_VALUES = {
+    "stripe_identity_conflicts.conflict_type": frozenset((
+        "users_duplicate_subscription",
+    )),
+}
+
 STRUCTURAL_QUERIES = {
     "stripe_events": """
         SELECT
@@ -151,7 +157,8 @@ def unexpected_values(data):
         rows = data.get("grouped", {}).get(name)
         if rows is None:
             continue
-        unexpected = [(value, int(count)) for value, count in rows if value not in expected]
+        allowed = expected | LEGACY_ALLOWED_VALUES.get(name, frozenset())
+        unexpected = [(value, int(count)) for value, count in rows if value not in allowed]
         if unexpected:
             result[name] = unexpected
     return result
@@ -214,7 +221,9 @@ def render_constraint_audit(data, message_limit=3900):
         lines.append(f"- {name}")
         if name in EXPECTED_VALUES:
             expected = sorted(_safe_value(value) for value in EXPECTED_VALUES[name])
-            lines.append(f"  expected: {', '.join(expected)}")
+            lines.append(f"  current expected: {', '.join(expected)}")
+            legacy = sorted(_safe_value(value) for value in LEGACY_ALLOWED_VALUES.get(name, ()))
+            lines.append(f"  legacy allowed: {', '.join(legacy) if legacy else 'none'}")
         else:
             lines.append("  expected: observed-only candidate")
         if rows is None:
