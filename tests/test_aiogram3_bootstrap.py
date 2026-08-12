@@ -248,6 +248,30 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.main.bot.session.close()
 
+    async def test_storage_diagnostics_private_admin_only(self):
+        diagnostic_data = {"tables": [], "operational": {}, "retention": {}}
+        private_admin = FakeIncomingMessage(user_id=1)
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection()), \
+             patch.object(self.main, "collect_storage_diagnostics", return_value=diagnostic_data), \
+             patch.object(self.main, "render_storage_diagnostics", return_value=["safe aggregate"]):
+            await self.main.storage_diagnostics_command(private_admin)
+        self.assertEqual(private_admin.answers, [("safe aggregate", {})])
+
+        non_admin = FakeIncomingMessage(user_id=777)
+        with patch.object(self.main, "get_db_conn") as get_conn:
+            await self.main.storage_diagnostics_command(non_admin)
+        get_conn.assert_not_called()
+        self.assertEqual(non_admin.answers, [])
+
+    async def test_storage_diagnostics_group_admin_gets_no_database_information(self):
+        group_admin = FakeIncomingMessage(user_id=1)
+        group_admin.chat.type = "group"
+        with patch.object(self.main, "get_db_conn") as get_conn:
+            await self.main.storage_diagnostics_command(group_admin)
+        get_conn.assert_not_called()
+        self.assertEqual(group_admin.answers, [])
+        self.assertIn("личном чате", group_admin.replies[0][0])
+
     def stripe_object(self, payload):
         return stripe.StripeObject.construct_from(payload, None)
 
@@ -2357,7 +2381,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 69)
+        self.assertEqual(len(self.main.router.message.handlers), 70)
         self.assertEqual(len(self.main.router.callback_query.handlers), 26)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
@@ -2389,7 +2413,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 69)
+        self.assertEqual(len(message_handlers), 70)
         self.assertEqual(len(callback_handlers), 26)
         self.assertEqual(
             commands,
@@ -2400,7 +2424,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 "gift_reissue", "gifts_pending", "gift_status", "revoke_access",
                 "refund_info", "sync_stripe_user",
                 "expired_users", "user", "access_history", "recent_access_events",
-                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "access_mismatches", "admin", "admin_help", "expiring_users",
+                "outbox_status", "retry_delivery", "find_by_stripe", "bot_health", "storage_diagnostics", "access_mismatches", "admin", "admin_help", "expiring_users",
                 "test_followup", "help", "stats", "weekly_report", "weekly_report_current",
                 "weekly_report_send", "test_expiry", "test_grace", "test_auto_lesson",
                 "test_backup", "unblock_user", "send_invite_link", "unlinked_stripe",
