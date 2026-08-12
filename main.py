@@ -34,6 +34,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
+from storage_diagnostics import collect_storage_diagnostics, render_storage_diagnostics
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -11827,6 +11828,31 @@ async def bot_health_command(message: types.Message):
         text = text[:3997] + "..."
 
     await message.answer(text)
+
+
+@router.message(Command('storage_diagnostics'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def storage_diagnostics_command(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    conn = None
+    try:
+        conn = get_db_conn()
+        diagnostics = await asyncio.to_thread(collect_storage_diagnostics, conn)
+        for page in render_storage_diagnostics(diagnostics):
+            await message.answer(page)
+    except Exception as error:
+        if conn:
+            conn.rollback()
+        error_ref = safe_admin_error_reference("storage_diagnostics", error)
+        logging.error(
+            "STORAGE_DIAGNOSTICS_FAILED: error_class=%s ref=%s",
+            type(error).__name__, error_ref,
+        )
+        await message.answer(f"❌ Storage diagnostics unavailable. ref: {error_ref}")
+    finally:
+        if conn:
+            conn.close()
 
 
 @router.message(Command('access_mismatches'), StateFilter('*'))

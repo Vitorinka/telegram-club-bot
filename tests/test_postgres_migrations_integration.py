@@ -46,6 +46,7 @@ from stripe_invoice_rules import (
     mark_stripe_event_processed,
     release_stripe_event_claim,
 )
+from storage_diagnostics import APPLICATION_TABLES, collect_storage_diagnostics
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -180,6 +181,81 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
+
+    def test_storage_diagnostics_is_read_only_on_empty_and_representative_database(self):
+        run_migrations(self.get_conn)
+        empty_conn = self.get_conn()
+        empty = collect_storage_diagnostics(empty_conn)
+        empty_conn.close()
+        self.assertEqual({row["table"] for row in empty["tables"]}, set(APPLICATION_TABLES))
+        self.assertTrue(all(row["available"] for row in empty["tables"]))
+
+        seed = self.get_conn()
+        seed_cur = seed.cursor()
+        seed_cur.execute("""
+            INSERT INTO message_delivery_events
+                (delivery_key, telegram_id, delivery_type, status, sent_at)
+            VALUES ('storage-test-sent', 123, 'notice', 'sent', NOW())
+        """)
+        seed_cur.execute("""
+            INSERT INTO trial_redemptions (telegram_id, stripe_event_id, redeemed_at)
+            VALUES (123, 'evt_storage_trial', NOW())
+        """)
+        seed_cur.execute("""
+            INSERT INTO admin_alerts (alert_key, severity, text, status, created_at)
+            VALUES ('outbox-permanent:storage-safe-hash', 'CRITICAL', 'private', 'delivered',
+                    NOW() - INTERVAL '100 days')
+        """)
+        seed_cur.execute("""
+            INSERT INTO checkout_sessions
+                (telegram_id, tariff_code, mode, idempotency_key, status, created_at, updated_at)
+            VALUES
+                (123, 'sub_1', 'payment', 'storage-checkout-with-payment', 'completed',
+                 NOW() - INTERVAL '100 days', NOW() - INTERVAL '100 days'),
+                (456, 'sub_1', 'payment', 'storage-checkout-without-payment', 'completed',
+                 NOW() - INTERVAL '100 days', NOW() - INTERVAL '100 days')
+        """)
+        seed_cur.execute("""
+            INSERT INTO payment_events
+                (stripe_event_id, event_type, telegram_id, payment_status, payment_kind, tariff_code, created_at)
+            VALUES ('evt_storage_payment', 'checkout.session.completed', 123,
+                    'succeeded', 'initial_subscription', 'sub_1', NOW() - INTERVAL '100 days')
+        """)
+        seed_cur.execute("""
+            INSERT INTO bot_invite_links
+                (invite_link, source, status, created_at, expires_at, revoked_at)
+            VALUES
+                ('https://example.invalid/storage-active', 'test', 'active',
+                 NOW() - INTERVAL '120 days', NOW() - INTERVAL '100 days', NULL),
+                ('https://example.invalid/storage-inactive', 'test', 'expired',
+                 NOW() - INTERVAL '120 days', NOW() - INTERVAL '100 days', NULL),
+                ('https://example.invalid/storage-revoked', 'test', 'revoked',
+                 NOW() - INTERVAL '120 days', NULL, NOW() - INTERVAL '100 days')
+        """)
+        seed.commit()
+        seed_cur.close()
+        seed.close()
+
+        before = self.query_all("""
+            SELECT 'message_delivery_events', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'trial_redemptions', COUNT(*) FROM trial_redemptions
+            UNION ALL SELECT 'admin_alerts', COUNT(*) FROM admin_alerts
+            ORDER BY 1
+        """)
+        conn = self.get_conn()
+        result = collect_storage_diagnostics(conn)
+        conn.close()
+        after = self.query_all("""
+            SELECT 'message_delivery_events', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'trial_redemptions', COUNT(*) FROM trial_redemptions
+            UNION ALL SELECT 'admin_alerts', COUNT(*) FROM admin_alerts
+            ORDER BY 1
+        """)
+        self.assertEqual(before, after)
+        self.assertEqual(result["operational"]["outbox_states"], (0, 1))
+        self.assertEqual(result["retention"]["ordinary terminal admin alerts (>90d)"], 0)
+        self.assertEqual(result["retention"]["existing terminal checkout predicate (>30d)"], 1)
+        self.assertEqual(result["retention"]["expired/revoked invite links (>90d)"], 2)
 
     def query_all(self, query, params=()):
         conn = self.get_conn()
