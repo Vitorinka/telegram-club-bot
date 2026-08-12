@@ -176,7 +176,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         drop_temp_db(self.db_name)
 
     def get_conn(self):
-        return connect(self.dsn)
+        conn = connect(self.dsn)
+        with conn.cursor() as cur:
+            cur.execute("SET TIME ZONE 'UTC'")
+        return conn
 
     def query_all(self, query, params=()):
         conn = self.get_conn()
