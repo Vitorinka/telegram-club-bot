@@ -25,6 +25,7 @@ from db_migrations import (
     equivalent_index_structure_exists,
     index_structure_matches,
     load_migrations,
+    migration_schema_matches,
     payment_integrity_index_requirement_matches,
     run_migrations,
 )
@@ -183,6 +184,117 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
 
+    def test_core_safety_checks_upgrade_and_reject_invalid_rows_real_postgres(self):
+        with tempfile.TemporaryDirectory() as migration_dir:
+            for migration in load_migrations():
+                if migration["version"] >= "0011_":
+                    continue
+                (Path(migration_dir) / migration["path"].name).write_text(
+                    migration["sql"], encoding="utf-8"
+                )
+            run_migrations(self.get_conn, migrations_dir=migration_dir)
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO message_delivery_events
+                    (delivery_key, telegram_id, delivery_type, status, attempt_count,
+                     lease_until, sent_at, claim_generation)
+                VALUES
+                    ('check-pending', 1, 'notice', 'pending', NULL, NULL, NULL, 0),
+                    ('check-processing', 2, 'notice', 'processing', 1, NOW(), NULL, 1),
+                    ('check-sent', 3, 'notice', 'sent', 1, NULL, NOW(), 2),
+                    ('check-failed', 4, 'notice', 'failed', 1, NULL, NULL, 3),
+                    ('check-permanent', 5, 'notice', 'permanently_failed', 1, NULL, NULL, 4)
+            """)
+            cur.execute("""
+                INSERT INTO stripe_events (event_id, processed, processed_at, claim_generation)
+                VALUES
+                    ('check-stripe-pending', FALSE, NULL, 0),
+                    ('check-stripe-processed', TRUE, NOW(), 1)
+            """)
+            cur.execute("""
+                INSERT INTO payment_events (stripe_event_id, event_type, payment_status)
+                VALUES
+                    ('check-payment-succeeded', 'local.test', 'succeeded'),
+                    ('check-payment-failed', 'local.test', 'failed')
+            """)
+        conn.commit()
+        conn.close()
+
+        before = self.query_all("""
+            SELECT 'delivery', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'stripe', COUNT(*) FROM stripe_events
+            UNION ALL SELECT 'payment', COUNT(*) FROM payment_events
+            ORDER BY 1
+        """)
+        result = run_migrations(self.get_conn)
+        self.assertIn("0011_core_safety_check_constraints", result["applied"])
+        after = self.query_all("""
+            SELECT 'delivery', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'stripe', COUNT(*) FROM stripe_events
+            UNION ALL SELECT 'payment', COUNT(*) FROM payment_events
+            ORDER BY 1
+        """)
+        self.assertEqual(before, after)
+
+        constraints = self.query_all("""
+            SELECT conname, convalidated
+            FROM pg_constraint
+            WHERE conname IN (
+                'message_delivery_events_status_check',
+                'message_delivery_events_claim_generation_nonnegative_check',
+                'message_delivery_events_attempt_count_nonnegative_check',
+                'message_delivery_events_processing_lease_check',
+                'message_delivery_events_sent_timestamp_check',
+                'stripe_events_claim_generation_nonnegative_check',
+                'stripe_events_processed_timestamp_check',
+                'payment_events_payment_status_check'
+            )
+            ORDER BY conname
+        """)
+        self.assertEqual(len(constraints), 8)
+        self.assertTrue(all(validated is False for _name, validated in constraints))
+        verify_conn = self.get_conn()
+        try:
+            with verify_conn.cursor() as cur:
+                self.assertTrue(migration_schema_matches(cur, "0011_core_safety_check_constraints"))
+                cur.execute("ALTER TABLE stripe_events DROP CONSTRAINT stripe_events_processed_timestamp_check")
+                self.assertFalse(migration_schema_matches(cur, "0011_core_safety_check_constraints"))
+                verify_conn.rollback()
+        finally:
+            verify_conn.close()
+
+        invalid_statements = (
+            "INSERT INTO message_delivery_events (delivery_key, telegram_id, delivery_type, status, claim_generation) VALUES ('bad-status', 10, 'notice', 'unknown', 0)",
+            "INSERT INTO message_delivery_events (delivery_key, telegram_id, delivery_type, status, claim_generation) VALUES ('bad-generation', 11, 'notice', 'pending', -1)",
+            "INSERT INTO message_delivery_events (delivery_key, telegram_id, delivery_type, status, attempt_count, claim_generation) VALUES ('bad-attempt', 12, 'notice', 'pending', -1, 0)",
+            "INSERT INTO message_delivery_events (delivery_key, telegram_id, delivery_type, status, claim_generation) VALUES ('bad-lease', 13, 'notice', 'processing', 0)",
+            "INSERT INTO message_delivery_events (delivery_key, telegram_id, delivery_type, status, claim_generation) VALUES ('bad-sent', 14, 'notice', 'sent', 0)",
+            "INSERT INTO stripe_events (event_id, processed, processed_at, claim_generation) VALUES ('bad-stripe-generation', FALSE, NULL, -1)",
+            "INSERT INTO stripe_events (event_id, processed, processed_at, claim_generation) VALUES ('bad-stripe-timestamp', TRUE, NULL, 0)",
+            "INSERT INTO payment_events (stripe_event_id, event_type, payment_status) VALUES ('bad-payment-status', 'local.test', 'unknown')",
+        )
+        for statement in invalid_statements:
+            with self.subTest(statement=statement):
+                conn = self.get_conn()
+                try:
+                    with conn.cursor() as cur:
+                        with self.assertRaises(psycopg2.errors.CheckViolation):
+                            cur.execute(statement)
+                    conn.rollback()
+                finally:
+                    conn.close()
+
+        run_migrations(self.get_conn)
+        final_rows = self.query_all("""
+            SELECT 'delivery', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'stripe', COUNT(*) FROM stripe_events
+            UNION ALL SELECT 'payment', COUNT(*) FROM payment_events
+            ORDER BY 1
+        """)
+        self.assertEqual(before, final_rows)
+
     def test_constraint_audit_is_read_only_and_detects_corruption_real_postgres(self):
         run_migrations(self.get_conn)
 
@@ -216,6 +328,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         corrupt = self.get_conn()
         with corrupt.cursor() as cur:
+            for table, constraint_name in (
+                ("message_delivery_events", "message_delivery_events_status_check"),
+                ("message_delivery_events", "message_delivery_events_claim_generation_nonnegative_check"),
+                ("message_delivery_events", "message_delivery_events_attempt_count_nonnegative_check"),
+                ("message_delivery_events", "message_delivery_events_processing_lease_check"),
+                ("message_delivery_events", "message_delivery_events_sent_timestamp_check"),
+                ("stripe_events", "stripe_events_claim_generation_nonnegative_check"),
+                ("stripe_events", "stripe_events_processed_timestamp_check"),
+                ("payment_events", "payment_events_payment_status_check"),
+            ):
+                cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT {constraint_name}")
             cur.execute("""
                 INSERT INTO message_delivery_events
                     (delivery_key, telegram_id, delivery_type, status, attempt_count, claim_generation)
@@ -4637,11 +4760,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         cur.execute(
             """
             INSERT INTO message_delivery_events (
-                delivery_key, telegram_id, delivery_type, status, attempt_count, payload_json
+                delivery_key, telegram_id, delivery_type, status, attempt_count, payload_json, sent_at
             ) VALUES
-                ('legacy_sent', 1, 'notice', 'sent', 4, '{"text":"sent"}'),
-                ('legacy_failed', 1, 'notice', 'failed', 3, '{"text":"failed"}'),
-                ('legacy_cancelled', 1, 'notice', 'cancelled', 2, '{"text":"cancelled"}')
+                ('legacy_sent', 1, 'notice', 'sent', 4, '{"text":"sent"}', NOW()),
+                ('legacy_failed', 1, 'notice', 'failed', 3, '{"text":"failed"}', NULL),
+                ('legacy_cancelled', 1, 'notice', 'cancelled', 2, '{"text":"cancelled"}', NULL)
             """
         )
         conn.commit()
@@ -4806,9 +4929,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             """
             INSERT INTO message_delivery_events (
                 delivery_key, telegram_id, delivery_type, status, next_attempt_at,
-                claimed_at, lease_until
+                claimed_at, lease_until, sent_at
             )
-            SELECT 'terminal_' || g, g, 'notice', 'sent', NULL, NULL, NULL
+            SELECT 'terminal_' || g, g, 'notice', 'sent', NULL, NULL, NULL, NOW()
             FROM generate_series(1, 50000) AS g
             """
         )

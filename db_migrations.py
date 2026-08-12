@@ -456,6 +456,46 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "message_delivery_events_processing_lease_idx",
         ),
     },
+    "0011_core_safety_check_constraints": {
+        "tables": ("message_delivery_events", "stripe_events", "payment_events"),
+        "constraints": {
+            "message_delivery_events_status_check": {
+                "table": "message_delivery_events",
+                "definition_contains": (
+                    "status", "pending", "processing", "failed", "sent",
+                    "cancelled", "permanently_failed",
+                ),
+            },
+            "message_delivery_events_claim_generation_nonnegative_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("claim_generation", ">=", "0"),
+            },
+            "message_delivery_events_attempt_count_nonnegative_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("attempt_count", "is null", ">=", "0"),
+            },
+            "message_delivery_events_processing_lease_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("status", "processing", "lease_until", "is not null"),
+            },
+            "message_delivery_events_sent_timestamp_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("status", "sent", "sent_at", "is not null"),
+            },
+            "stripe_events_claim_generation_nonnegative_check": {
+                "table": "stripe_events",
+                "definition_contains": ("claim_generation", ">=", "0"),
+            },
+            "stripe_events_processed_timestamp_check": {
+                "table": "stripe_events",
+                "definition_contains": ("processed", "is not true", "processed_at", "is not null"),
+            },
+            "payment_events_payment_status_check": {
+                "table": "payment_events",
+                "definition_contains": ("payment_status", "succeeded", "failed"),
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
@@ -585,6 +625,27 @@ def present_indexes(cur):
         """
     )
     return {row[0] for row in cur.fetchall()}
+
+
+def check_constraint_matches(cur, constraint_name, table, definition_contains=()):
+    cur.execute(
+        """
+        SELECT pg_get_constraintdef(c.oid), c.convalidated
+        FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = t.relnamespace
+        WHERE n.nspname = 'public'
+          AND t.relname = %s
+          AND c.conname = %s
+          AND c.contype = 'c'
+        """,
+        (table, constraint_name),
+    )
+    row = cur.fetchone()
+    if not row:
+        return False
+    definition = re.sub(r"\s+", " ", str(row[0])).strip().lower()
+    return all(str(fragment).lower() in definition for fragment in definition_contains)
 
 
 def normalize_index_predicate(predicate):
@@ -759,6 +820,14 @@ def migration_schema_matches(cur, version):
     else:
         required_indexes = set(required_indexes)
         if required_indexes and not required_indexes <= present_indexes(cur):
+            return False
+    for constraint_name, spec in requirements.get("constraints", {}).items():
+        if not check_constraint_matches(
+            cur,
+            constraint_name,
+            spec["table"],
+            definition_contains=spec.get("definition_contains", ()),
+        ):
             return False
     if requirements.get("requires_stripe_identity_clean"):
         assert_no_stripe_identity_conflicts(cur)

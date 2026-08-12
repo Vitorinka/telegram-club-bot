@@ -7,6 +7,7 @@ from db_migrations import (
     BASELINE_REQUIRED_TABLES,
     MIGRATION_BASELINE_REQUIREMENTS,
     MigrationError,
+    check_constraint_matches,
     load_migrations,
     run_migrations,
 )
@@ -109,6 +110,51 @@ def write_migration(directory, name, sql):
 
 
 class DbMigrationTests(unittest.TestCase):
+    def test_core_safety_constraints_migration_is_narrow_and_not_valid(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0011_core_safety_check_constraints"]
+        self.assertEqual(
+            set(migration["constraints"]),
+            {
+                "message_delivery_events_status_check",
+                "message_delivery_events_claim_generation_nonnegative_check",
+                "message_delivery_events_attempt_count_nonnegative_check",
+                "message_delivery_events_processing_lease_check",
+                "message_delivery_events_sent_timestamp_check",
+                "stripe_events_claim_generation_nonnegative_check",
+                "stripe_events_processed_timestamp_check",
+                "payment_events_payment_status_check",
+            },
+        )
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0011_core_safety_check_constraints.sql").read_text()
+        self.assertEqual(sql.count("ADD CONSTRAINT"), 8)
+        self.assertEqual(sql.count("NOT VALID"), 8)
+        self.assertNotIn("VALIDATE CONSTRAINT", sql)
+        for forbidden_table in (
+            "stripe_identity_conflicts", "checkout_sessions", "weekly_report_runs",
+            "admin_action_requests", "scheduled_job_runs", "subscription_removal_events",
+        ):
+            self.assertNotIn(forbidden_table, sql)
+
+    def test_constraint_matcher_requires_check_on_exact_table_and_definition(self):
+        class Cursor:
+            def __init__(self, row):
+                self.row = row
+                self.params = None
+
+            def execute(self, _query, params):
+                self.params = params
+
+            def fetchone(self):
+                return self.row
+
+        valid = Cursor(("CHECK ((claim_generation >= 0)) NOT VALID", False))
+        self.assertTrue(check_constraint_matches(valid, "constraint_name", "stripe_events", ("claim_generation", ">=", "0")))
+        self.assertEqual(valid.params, ("stripe_events", "constraint_name"))
+        wrong = Cursor(("CHECK ((claim_generation < 0)) NOT VALID", False))
+        self.assertFalse(check_constraint_matches(wrong, "constraint_name", "stripe_events", ("claim_generation", ">=", "0")))
+        self.assertFalse(check_constraint_matches(Cursor(None), "constraint_name", "stripe_events", ()))
+
     def test_message_delivery_due_indexes_migration_is_required(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0010_message_delivery_due_indexes"]
         self.assertEqual(migration["tables"], ("message_delivery_events",))
