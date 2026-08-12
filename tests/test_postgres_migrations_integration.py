@@ -47,6 +47,7 @@ from stripe_invoice_rules import (
     release_stripe_event_claim,
 )
 from storage_diagnostics import APPLICATION_TABLES, collect_storage_diagnostics
+from constraint_audit import collect_constraint_audit, unexpected_values
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -181,6 +182,114 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
+
+    def test_constraint_audit_is_read_only_and_detects_corruption_real_postgres(self):
+        run_migrations(self.get_conn)
+
+        empty_conn = self.get_conn()
+        empty = collect_constraint_audit(empty_conn)
+        empty_conn.close()
+        self.assertEqual(unexpected_values(empty), {})
+        self.assertTrue(all(sum(row or ()) == 0 for row in empty["structural"].values()))
+
+        seed = self.get_conn()
+        with seed.cursor() as cur:
+            cur.execute("""
+                INSERT INTO message_delivery_events
+                    (delivery_key, telegram_id, delivery_type, status, attempt_count, claim_generation, sent_at)
+                VALUES ('constraint-valid', 1, 'notice', 'sent', 1, 1, NOW())
+            """)
+            cur.execute("""
+                INSERT INTO stripe_links
+                    (telegram_id, stripe_customer_id, stripe_subscription_id, status, is_active)
+                VALUES (1, 'cus_constraint_local', 'sub_constraint_local', 'future_stripe_status', FALSE)
+            """)
+        seed.commit()
+        seed.close()
+
+        valid_conn = self.get_conn()
+        valid = collect_constraint_audit(valid_conn)
+        valid_conn.close()
+        self.assertEqual(unexpected_values(valid), {})
+        self.assertTrue(all(sum(row or ()) == 0 for row in valid["structural"].values()))
+        self.assertIn(("future_stripe_status", 1), valid["external"]["stripe_links.status"])
+
+        corrupt = self.get_conn()
+        with corrupt.cursor() as cur:
+            cur.execute("""
+                INSERT INTO message_delivery_events
+                    (delivery_key, telegram_id, delivery_type, status, attempt_count, claim_generation)
+                VALUES ('constraint-invalid', 2, 'notice', 'unexpected_status', -1, -1)
+            """)
+            cur.execute("""
+                INSERT INTO stripe_events
+                    (event_id, processed, processed_at, claim_generation)
+                VALUES ('evt_constraint_invalid', TRUE, NULL, -1)
+            """)
+            cur.execute("""
+                INSERT INTO weekly_report_runs
+                    (report_key, period_start, period_end, status, completed_at)
+                VALUES ('constraint-invalid', NOW(), NOW() - INTERVAL '1 hour', 'completed', NULL)
+            """)
+            cur.execute("""
+                INSERT INTO payment_events
+                    (stripe_event_id, event_type, payment_status, amount_paid, amount_due,
+                     period_start, period_end)
+                VALUES ('evt_constraint_payment', 'local.test', 'succeeded', -1, -2,
+                        NOW(), NOW() - INTERVAL '1 hour')
+            """)
+            cur.execute("""
+                INSERT INTO admin_action_requests
+                    (action_id, admin_id, action_type, payload_json, status, created_at, expires_at)
+                VALUES ('00000000-0000-0000-0000-000000000001', 1, 'unexpected_action', '{}',
+                        'pending', NOW(), NOW() + INTERVAL '1 hour')
+            """)
+            cur.execute("""
+                INSERT INTO stripe_identity_conflicts
+                    (conflict_type, stripe_id, telegram_ids, details, resolved)
+                VALUES ('unexpected_conflict', 'local-only', '[1,2]', '{}', FALSE)
+            """)
+        corrupt.commit()
+        corrupt.close()
+
+        before = self.query_all("""
+            SELECT 'message_delivery_events', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'stripe_events', COUNT(*) FROM stripe_events
+            UNION ALL SELECT 'weekly_report_runs', COUNT(*) FROM weekly_report_runs
+            UNION ALL SELECT 'payment_events', COUNT(*) FROM payment_events
+            UNION ALL SELECT 'admin_action_requests', COUNT(*) FROM admin_action_requests
+            UNION ALL SELECT 'stripe_identity_conflicts', COUNT(*) FROM stripe_identity_conflicts
+            ORDER BY 1
+        """)
+        audit_conn = self.get_conn()
+        result = collect_constraint_audit(audit_conn)
+        audit_conn.close()
+        after = self.query_all("""
+            SELECT 'message_delivery_events', COUNT(*) FROM message_delivery_events
+            UNION ALL SELECT 'stripe_events', COUNT(*) FROM stripe_events
+            UNION ALL SELECT 'weekly_report_runs', COUNT(*) FROM weekly_report_runs
+            UNION ALL SELECT 'payment_events', COUNT(*) FROM payment_events
+            UNION ALL SELECT 'admin_action_requests', COUNT(*) FROM admin_action_requests
+            UNION ALL SELECT 'stripe_identity_conflicts', COUNT(*) FROM stripe_identity_conflicts
+            ORDER BY 1
+        """)
+        self.assertEqual(before, after)
+        self.assertEqual(
+            unexpected_values(result)["message_delivery_events.status"],
+            [("unexpected_status", 1)],
+        )
+        self.assertEqual(
+            unexpected_values(result)["admin_action_requests.action_type"],
+            [("unexpected_action", 1)],
+        )
+        self.assertEqual(
+            unexpected_values(result)["stripe_identity_conflicts.conflict_type"],
+            [("unexpected_conflict", 1)],
+        )
+        self.assertEqual(result["structural"]["stripe_events"], (1, 1))
+        self.assertEqual(result["structural"]["message_delivery_events"][:2], (1, 1))
+        self.assertEqual(result["structural"]["weekly_report_runs"], (1, 1))
+        self.assertEqual(result["structural"]["payment_events"], (1, 1, 1))
 
     def test_storage_diagnostics_is_read_only_on_empty_and_representative_database(self):
         run_migrations(self.get_conn)
