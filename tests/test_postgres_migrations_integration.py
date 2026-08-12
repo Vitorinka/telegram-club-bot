@@ -247,7 +247,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.execute("""
                 INSERT INTO stripe_identity_conflicts
                     (conflict_type, stripe_id, telegram_ids, details, resolved)
-                VALUES ('unexpected_conflict', 'local-only', '[1,2]', '{}', FALSE)
+                VALUES
+                    ('unexpected_conflict', 'local-only', '[1,2]', '{}', FALSE),
+                    ('users_duplicate_subscription', 'legacy-local-only', '[3,4]', '{}', TRUE)
             """)
         corrupt.commit()
         corrupt.close()
@@ -285,6 +287,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(
             unexpected_values(result)["stripe_identity_conflicts.conflict_type"],
             [("unexpected_conflict", 1)],
+        )
+        self.assertIn(
+            ("users_duplicate_subscription", 1),
+            result["grouped"]["stripe_identity_conflicts.conflict_type"],
         )
         self.assertEqual(result["structural"]["stripe_events"], (1, 1))
         self.assertEqual(result["structural"]["message_delivery_events"][:2], (1, 1))
