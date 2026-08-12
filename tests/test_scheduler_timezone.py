@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import unittest
@@ -23,6 +24,8 @@ os.environ.update({
     "PRICE_12M": "price_12m",
 })
 
+SCHEDULER_IMPORT_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(SCHEDULER_IMPORT_LOOP)
 import main
 
 
@@ -44,8 +47,21 @@ def process_timezone(name):
 
 
 class SchedulerTimezoneTests(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        if not SCHEDULER_IMPORT_LOOP.is_closed():
+            SCHEDULER_IMPORT_LOOP.close()
+        asyncio.set_event_loop(None)
+
+    def setUp(self):
+        self.created_schedulers = []
+
+    def tearDown(self):
+        self.assertTrue(all(not scheduler.running for scheduler in self.created_schedulers))
+
     def registered_scheduler(self):
         scheduler = AsyncIOScheduler(timezone=main.SCHEDULER_TZ)
+        self.created_schedulers.append(scheduler)
         with patch.object(main, "scheduler", scheduler), \
              patch.object(main, "SCHEDULER_JOBS_REGISTERED", False):
             main.register_scheduler_jobs_once()
@@ -118,6 +134,21 @@ class SchedulerTimezoneTests(unittest.TestCase):
         self.assertEqual(set(by_func), set(expected_fragments))
         for func, fragment in expected_fragments.items():
             self.assertIn(fragment, by_func[func])
+
+    def test_manual_event_loop_cleanup_closes_loop_and_restores_global_state(self):
+        previous_policy = asyncio.get_event_loop_policy()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            self.assertIs(asyncio.get_event_loop(), loop)
+            self.assertFalse(loop.is_closed())
+        finally:
+            loop.close()
+            asyncio.set_event_loop_policy(previous_policy)
+            asyncio.set_event_loop(None)
+        self.assertTrue(loop.is_closed())
+        with self.assertRaises(RuntimeError):
+            asyncio.get_event_loop()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from datetime import datetime, timedelta
@@ -24,6 +25,8 @@ TEST_ENV = {
 }
 os.environ.update(TEST_ENV)
 
+OUTBOX_IMPORT_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(OUTBOX_IMPORT_LOOP)
 import main
 import scheduled_jobs
 
@@ -67,6 +70,12 @@ class FailureConnection:
 
 
 class OutboxAlertPolicyTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def tearDownClass(cls):
+        if not OUTBOX_IMPORT_LOOP.is_closed():
+            OUTBOX_IMPORT_LOOP.close()
+        asyncio.set_event_loop(None)
+
     def test_retryable_stage_policy_first_second_one_hour_six_hours_and_independent_keys(self):
         now = datetime(2026, 8, 12, 12, 0)
         first = main.claim_outbox_retry_escalation(

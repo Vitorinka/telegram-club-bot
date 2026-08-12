@@ -290,9 +290,7 @@ def import_main_for_stripe_webhook(secret):
     with patch.dict(os.environ, stripe_webhook_test_env(secret), clear=False):
         install_aiogram_import_stubs()
         install_scheduler_import_stubs()
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
+        if MAIN_IMPORT_LOOP is None:
             MAIN_IMPORT_LOOP = asyncio.new_event_loop()
             asyncio.set_event_loop(MAIN_IMPORT_LOOP)
         if "main" in sys.modules:
@@ -317,7 +315,7 @@ class StripeWebhookSafetyTests(unittest.TestCase):
         global MAIN_IMPORT_LOOP
         if MAIN_IMPORT_LOOP and not MAIN_IMPORT_LOOP.is_closed():
             MAIN_IMPORT_LOOP.close()
-            MAIN_IMPORT_LOOP = None
+        MAIN_IMPORT_LOOP = None
         try:
             asyncio.set_event_loop(None)
         except RuntimeError:
