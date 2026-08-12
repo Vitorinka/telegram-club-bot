@@ -4998,7 +4998,7 @@ def split_telegram_text(text, limit=4096):
     return [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
 
 
-async def notify_admins(text: str, alert_key=None, severity="WARNING"):
+async def notify_admins(text: str, alert_key=None, severity="WARNING", dedupe_forever=False):
     dedupe_key = alert_key or (f"critical:{critical_alert_fingerprint(text)}" if severity == "CRITICAL" else None)
     claim_id = None
     if dedupe_key:
@@ -5007,16 +5007,27 @@ async def notify_admins(text: str, alert_key=None, severity="WARNING"):
         try:
             conn = get_db_conn()
             cur = conn.cursor()
+            dedupe_status_sql = (
+                """AND (
+                            status IN ('delivered', 'partial')
+                            OR (
+                                status IN ('claimed', 'failed')
+                                AND created_at > NOW() - INTERVAL '15 minutes'
+                            )
+                        )"""
+                if dedupe_forever
+                else """AND created_at > NOW() - INTERVAL '15 minutes'
+                        AND status IN ('claimed', 'delivered', 'partial', 'failed')"""
+            )
             cur.execute(
-                """
+                f"""
                 INSERT INTO admin_alerts (alert_key, severity, text, status, delivered_admin_ids)
                 SELECT %s, %s, %s, 'claimed', ''
                 WHERE pg_try_advisory_xact_lock(hashtext(%s))
                   AND NOT EXISTS (
                       SELECT 1 FROM admin_alerts
                       WHERE alert_key = %s
-                        AND created_at > NOW() - INTERVAL '15 minutes'
-                        AND status IN ('claimed', 'delivered', 'partial', 'failed')
+                        {dedupe_status_sql}
                   )
                 RETURNING id
                 """,
@@ -5757,6 +5768,21 @@ def is_undeliverable_user_error(error):
 OUTBOX_UNKNOWN_FAILURE_LIMIT = 10
 OUTBOX_MISSING_FREE_LESSON_VIDEO_LIMIT = 3
 OUTBOX_BAD_REQUEST_RETRY_LIMIT = 5
+OUTBOX_RETRY_WARNING_AGE = timedelta(hours=1)
+OUTBOX_RETRY_ESCALATED_AGE = timedelta(hours=6)
+OUTBOX_CRITICAL_RETRY_ATTEMPT_THRESHOLD = 3
+
+OUTBOX_CRITICAL_DELIVERY_TYPES = frozenset({
+    ACCESS_RESTORE_DELIVERY_TYPE,
+    "stripe_user_message",
+    "stripe_rejoin_invite",
+    "stripe_rejoin_check",
+    GIFT_CERTIFICATE_BUYER,
+    GIFT_CERTIFICATE_RECIPIENT,
+    "gift_redeemed_recipient",
+    "gift_refunded_buyer",
+    "gift_refunded_recipient",
+})
 
 
 class MissingFreeLessonVideoError(RuntimeError):
@@ -5849,6 +5875,148 @@ def log_outbox_delivery_failure(delivery_key, delivery_type, attempt_count, erro
         bool(decision.get("retryable")),
         bool(decision.get("permanently_failed")),
         f"{delay}m" if delay is not None else "none",
+    )
+
+
+def claim_outbox_retry_escalation(cur, delivery_key, delivery_type, attempt_count, now=None):
+    now = now or datetime.utcnow()
+    delivery_hash = safe_delivery_hash(delivery_key)
+    first_seen_key = f"outbox-retry-observed:{delivery_hash}"
+    cur.execute(
+        """
+        INSERT INTO admin_alerts (alert_key, severity, text, status, delivered_admin_ids, created_at, updated_at)
+        SELECT %s, 'INFO', %s, 'observed', '', %s, %s
+        WHERE pg_try_advisory_xact_lock(hashtext(%s))
+          AND NOT EXISTS (
+              SELECT 1 FROM admin_alerts WHERE alert_key = %s
+          )
+        """,
+        (
+            first_seen_key,
+            f"retryable outbox failure: {delivery_type}",
+            now,
+            now,
+            first_seen_key,
+            first_seen_key,
+        ),
+    )
+    cur.execute(
+        "SELECT MIN(created_at) FROM admin_alerts WHERE alert_key = %s",
+        (first_seen_key,),
+    )
+    row = cur.fetchone()
+    first_seen_at = row[0] if row and row[0] else now
+    retry_age = max(timedelta(0), now - first_seen_at)
+    critical = delivery_type in OUTBOX_CRITICAL_DELIVERY_TYPES
+    if retry_age >= OUTBOX_RETRY_ESCALATED_AGE:
+        stage = "age_6h"
+    elif retry_age >= OUTBOX_RETRY_WARNING_AGE:
+        stage = "age_1h"
+    elif critical and int(attempt_count) >= OUTBOX_CRITICAL_RETRY_ATTEMPT_THRESHOLD:
+        stage = "critical_attempt_3"
+    else:
+        stage = None
+    return {
+        "stage": stage,
+        "retry_age": retry_age,
+        "critical": critical,
+        "delivery_hash": delivery_hash,
+    }
+
+
+async def notify_retryable_outbox_failure(
+    delivery_key,
+    delivery_type,
+    attempt_count,
+    error,
+    decision,
+    escalation=None,
+):
+    conn = None
+    cur = None
+    if escalation is None:
+        try:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            escalation = claim_outbox_retry_escalation(
+                cur,
+                delivery_key,
+                delivery_type,
+                attempt_count,
+            )
+            conn.commit()
+        except Exception:
+            if conn:
+                conn.rollback()
+            logging.error(
+                "OUTBOX_RETRY_ESCALATION_STATE_FAILED: delivery_type=%s, delivery_key_hash=%s, "
+                "attempt_count=%s, error_class=%s",
+                delivery_type,
+                safe_delivery_hash(delivery_key),
+                attempt_count,
+                type(error).__name__,
+            )
+            return
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
+    stage = escalation["stage"]
+    age_minutes = int(escalation["retry_age"].total_seconds() // 60)
+    logging.warning(
+        "OUTBOX_RETRY_ALERT_POLICY: delivery_type=%s, delivery_key_hash=%s, attempt_count=%s, "
+        "retry_age_minutes=%s, error_class=%s, escalation_stage=%s",
+        delivery_type,
+        escalation["delivery_hash"],
+        attempt_count,
+        age_minutes,
+        type(error).__name__,
+        stage or "log_only",
+    )
+    if not stage:
+        return
+    await notify_admins(
+        "Есть задержка доставки сообщения.\n\n"
+        f"delivery_type: {delivery_type}\n"
+        f"delivery_hash: {escalation['delivery_hash']}\n"
+        f"attempt_count: {attempt_count}\n"
+        f"retry_age: {age_minutes}m\n"
+        f"critical_delivery: {'yes' if escalation['critical'] else 'no'}\n"
+        "automatic_retry: continues\n"
+        "details: /bot_health",
+        alert_key=f"outbox-retry:{escalation['delivery_hash']}:{stage}",
+        severity="WARNING",
+        dedupe_forever=True,
+    )
+
+
+async def notify_permanent_outbox_failure(delivery_key, delivery_type, attempt_count, error, blocked=False):
+    critical = delivery_type in OUTBOX_CRITICAL_DELIVERY_TYPES
+    if not critical:
+        logging.warning(
+            "OUTBOX_PERMANENT_ALERT_LOG_ONLY: delivery_type=%s, delivery_key_hash=%s, "
+            "attempt_count=%s, blocked=%s, error_class=%s",
+            delivery_type,
+            safe_delivery_hash(delivery_key),
+            attempt_count,
+            bool(blocked),
+            type(error).__name__,
+        )
+        return
+    delivery_hash = safe_delivery_hash(delivery_key)
+    await notify_admins(
+        "Критическая доставка завершилась permanent failure.\n\n"
+        f"delivery_type: {delivery_type}\n"
+        f"delivery_hash: {delivery_hash}\n"
+        f"attempt_count: {attempt_count}\n"
+        f"blocked: {'yes' if blocked else 'no'}\n"
+        f"error_class: {type(error).__name__}\n"
+        "details: /bot_health",
+        alert_key=f"outbox-permanent:{delivery_hash}",
+        severity="CRITICAL",
+        dedupe_forever=True,
     )
 
 
@@ -17851,6 +18019,10 @@ async def process_pending_message_deliveries(limit=25):
                         error,
                         decision,
                     ),
+                    retryable_error_callback=lambda error, decision, current_attempt_count, escalation: notify_retryable_outbox_failure(
+                        delivery_key, delivery_type, current_attempt_count, error, decision, escalation
+                    ),
+                    retryable_state_func=claim_outbox_retry_escalation,
                 )
                 if result == "sent":
                     sent += 1
@@ -17888,6 +18060,10 @@ async def process_pending_message_deliveries(limit=25):
                         error,
                         decision,
                     ),
+                    retryable_error_callback=lambda error, decision, current_attempt_count, escalation: notify_retryable_outbox_failure(
+                        delivery_key, delivery_type, current_attempt_count, error, decision, escalation
+                    ),
+                    retryable_state_func=claim_outbox_retry_escalation,
                 )
                 if result == "sent":
                     sent += 1
@@ -18297,6 +18473,7 @@ async def process_pending_message_deliveries(limit=25):
                         "reason": "admin_recipient_unreachable",
                     }
             log_outbox_delivery_failure(delivery_key, delivery_type, attempt_count, e, decision)
+            retryable_escalation = None
             fail_conn = get_db_conn()
             fail_cur = fail_conn.cursor()
             try:
@@ -18322,6 +18499,10 @@ async def process_pending_message_deliveries(limit=25):
                     permanently_failed=decision.get("permanently_failed", False),
                 )
                 if failed_result in ("failed", "permanently_failed"):
+                    if decision.get("retryable"):
+                        retryable_escalation = claim_outbox_retry_escalation(
+                            fail_cur, delivery_key, delivery_type, attempt_count
+                        )
                     fail_conn.commit()
                 else:
                     fail_conn.rollback()
@@ -18351,17 +18532,15 @@ async def process_pending_message_deliveries(limit=25):
                     alert_key=f"stripe_rejoin_group_error:{safe_delivery_hash(delivery_key)}",
                     severity="CRITICAL",
                 )
+            elif decision.get("permanently_failed"):
+                await notify_permanent_outbox_failure(
+                    delivery_key, delivery_type, attempt_count, e, blocked=decision.get("blocked", False)
+                )
+            elif decision.get("retryable"):
+                await notify_retryable_outbox_failure(
+                    delivery_key, delivery_type, attempt_count, e, decision, retryable_escalation
+                )
 
-    if retryable_failed or permanently_failed or blocked:
-        await notify_admins(
-            "Message delivery outbox processed with failures.\n\n"
-            f"sent: {sent}\n"
-            f"retryable_failed: {retryable_failed}\n"
-            f"permanently_failed: {permanently_failed}\n"
-            f"blocked: {blocked}",
-            alert_key="message_delivery_outbox_failed",
-            severity="CRITICAL" if blocked else "WARNING",
-        )
     return {
         "sent": sent,
         "retryable_failed": retryable_failed,

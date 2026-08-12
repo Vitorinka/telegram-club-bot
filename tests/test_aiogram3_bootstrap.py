@@ -2739,7 +2739,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 if status == "permanently_failed" and self.main.is_undeliverable_user_error(error):
                     expected["blocked"] += 1
                 self.assertEqual(result, expected)
-                params = connections[-1].cursor_obj.queries[-1][1]
+                params = next(
+                    params
+                    for query, params in connections[-1].cursor_obj.queries
+                    if "UPDATE message_delivery_events" in query
+                )
                 self.assertEqual(params[0], status)
                 if status == "failed":
                     self.assertEqual(params[2], delay)
@@ -2759,7 +2763,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.process_pending_message_deliveries()
 
         self.assertEqual(result, {"sent": 0, "retryable_failed": 1, "permanently_failed": 0, "blocked": 0})
-        notify_admins.assert_awaited_once()
+        notify_admins.assert_not_awaited()
 
         notify_admins.reset_mock()
         with patch.dict(os.environ, {}, clear=False), \

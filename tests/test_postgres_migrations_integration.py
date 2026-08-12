@@ -4702,6 +4702,164 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         worker_a_cur.close()
         worker_a.close()
 
+    def test_retryable_outbox_alert_stage_is_durable_and_deduped_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        delivery_key = "stripe:evt_pg_retry_alert_secret:payment_notice"
+        delivery_hash = main.safe_delivery_hash(delivery_key)
+        first_seen = datetime.utcnow() - timedelta(hours=1, minutes=5)
+
+        seed = self.get_conn()
+        seed_cur = seed.cursor()
+        first = main.claim_outbox_retry_escalation(
+            seed_cur,
+            delivery_key,
+            "first_purchase_recovery_reminder",
+            3,
+            now=first_seen,
+        )
+        seed.commit()
+        self.assertIsNone(first["stage"])
+        second = main.claim_outbox_retry_escalation(
+            seed_cur,
+            delivery_key,
+            "first_purchase_recovery_reminder",
+            3,
+            now=first_seen + timedelta(hours=1, minutes=5),
+        )
+        seed.commit()
+        seed_cur.close()
+        seed.close()
+        self.assertEqual(second["stage"], "age_1h")
+
+        send_message = mock.AsyncMock()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", send_message), \
+             mock.patch.object(main.asyncio, "sleep", mock.AsyncMock()):
+            asyncio.run(main.notify_retryable_outbox_failure(
+                delivery_key,
+                "first_purchase_recovery_reminder",
+                3,
+                RuntimeError("private database body"),
+                {"retryable": True},
+            ))
+            asyncio.run(main.notify_retryable_outbox_failure(
+                delivery_key,
+                "first_purchase_recovery_reminder",
+                4,
+                RuntimeError("private database body"),
+                {"retryable": True},
+            ))
+
+        self.assertEqual(send_message.await_count, len(main.ADMIN_IDS))
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM admin_alerts WHERE alert_key = %s",
+                (f"outbox-retry-observed:{delivery_hash}",),
+            )[0],
+            1,
+        )
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM admin_alerts WHERE alert_key = %s",
+                (f"outbox-retry:{delivery_hash}:age_1h",),
+            )[0],
+            1,
+        )
+        sent_text = "\n".join(call.args[1] for call in send_message.await_args_list)
+        self.assertNotIn(delivery_key, sent_text)
+        self.assertNotIn("private database body", sent_text)
+
+    def test_notify_admins_permanent_dedupe_retries_only_stale_unfinished_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        def seed(key, status, age_minutes):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO admin_alerts (
+                    alert_key, severity, text, status, delivered_admin_ids,
+                    created_at, updated_at
+                ) VALUES (%s, 'WARNING', 'seed', %s, '',
+                          NOW() - (%s * INTERVAL '1 minute'), NOW())
+                """,
+                (key, status, age_minutes),
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+
+        async def call(key, *, dedupe_forever=True, send_side_effect=None):
+            send_message = mock.AsyncMock(side_effect=send_side_effect)
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main.bot, "send_message", send_message), \
+                 mock.patch.object(main.asyncio, "sleep", mock.AsyncMock()):
+                result = await main.notify_admins(
+                    "safe escalation",
+                    alert_key=key,
+                    severity="WARNING",
+                    dedupe_forever=dedupe_forever,
+                )
+            return result, send_message.await_count
+
+        suppressed_cases = (
+            ("permanent-delivered", "delivered", 60),
+            ("permanent-partial", "partial", 60),
+            ("permanent-recent-claimed", "claimed", 5),
+            ("permanent-recent-failed", "failed", 5),
+        )
+        for key, status, age_minutes in suppressed_cases:
+            with self.subTest(status=status):
+                seed(key, status, age_minutes)
+                result, send_count = asyncio.run(call(key))
+                self.assertTrue(result["deduped"])
+                self.assertEqual(send_count, 0)
+
+        for status in ("claimed", "failed"):
+            key = f"permanent-old-{status}"
+            with self.subTest(stale_status=status):
+                seed(key, status, 16)
+                result, send_count = asyncio.run(call(key))
+                self.assertEqual(result["delivered"], main.ADMIN_IDS)
+                self.assertEqual(send_count, len(main.ADMIN_IDS))
+                repeated, repeated_count = asyncio.run(call(key))
+                self.assertTrue(repeated["deduped"])
+                self.assertEqual(repeated_count, 0)
+
+        permanent_key = "outbox-permanent:safehash"
+        failed, failed_count = asyncio.run(call(
+            permanent_key,
+            send_side_effect=RuntimeError("temporary admin transport failure"),
+        ))
+        self.assertEqual(failed["delivered"], [])
+        self.assertEqual(failed_count, len(main.ADMIN_IDS))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE admin_alerts SET created_at = NOW() - INTERVAL '16 minutes' WHERE alert_key = %s",
+            (permanent_key,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        retried, retried_count = asyncio.run(call(permanent_key))
+        self.assertEqual(retried["delivered"], main.ADMIN_IDS)
+        self.assertEqual(retried_count, len(main.ADMIN_IDS))
+        final, final_count = asyncio.run(call(permanent_key))
+        self.assertTrue(final["deduped"])
+        self.assertEqual(final_count, 0)
+
+        normal_key = "normal-cooldown"
+        seed(normal_key, "delivered", 16)
+        normal, normal_count = asyncio.run(call(normal_key, dedupe_forever=False))
+        self.assertEqual(normal["delivered"], main.ADMIN_IDS)
+        self.assertEqual(normal_count, len(main.ADMIN_IDS))
+        normal_repeat, normal_repeat_count = asyncio.run(call(normal_key, dedupe_forever=False))
+        self.assertTrue(normal_repeat["deduped"])
+        self.assertEqual(normal_repeat_count, 0)
+
     def test_message_delivery_generation_fences_all_finalizers_real_postgres(self):
         run_migrations(self.get_conn)
 

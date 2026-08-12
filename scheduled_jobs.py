@@ -291,6 +291,8 @@ async def process_claimed_delivery(
     classify_error_func=None,
     log_failure_func=None,
     terminal_error_callback=None,
+    retryable_error_callback=None,
+    retryable_state_func=None,
 ):
     claim_conn = get_conn()
     claim_cur = claim_conn.cursor()
@@ -331,6 +333,8 @@ async def process_claimed_delivery(
         classify_error_func=classify_error_func,
         log_failure_func=log_failure_func,
         terminal_error_callback=terminal_error_callback,
+        retryable_error_callback=retryable_error_callback,
+        retryable_state_func=retryable_state_func,
     )
 
 
@@ -348,6 +352,8 @@ async def process_already_claimed_delivery(
     classify_error_func=None,
     log_failure_func=None,
     terminal_error_callback=None,
+    retryable_error_callback=None,
+    retryable_state_func=None,
 ):
     try:
         await send_func()
@@ -372,6 +378,8 @@ async def process_already_claimed_delivery(
             decision,
             log_failure_func,
             terminal_error_callback,
+            retryable_error_callback,
+            retryable_state_func,
         )
     except Exception as exc:
         if classify_error_func:
@@ -394,6 +402,8 @@ async def process_already_claimed_delivery(
             decision,
             log_failure_func,
             terminal_error_callback,
+            retryable_error_callback,
+            retryable_state_func,
         )
 
     sent_conn = get_conn()
@@ -433,9 +443,12 @@ async def _mark_claimed_delivery_failed(
     decision,
     log_failure_func=None,
     terminal_error_callback=None,
+    retryable_error_callback=None,
+    retryable_state_func=None,
 ):
     if log_failure_func:
         log_failure_func(delivery_key, delivery_type, attempt_count, exc, decision)
+    retryable_state = None
     fail_conn = get_conn()
     fail_cur = fail_conn.cursor()
     try:
@@ -453,6 +466,10 @@ async def _mark_claimed_delivery_failed(
             permanently_failed=decision.get("permanently_failed", False),
         )
         if failed_result in ("failed", "permanently_failed"):
+            if decision.get("retryable") and retryable_state_func:
+                retryable_state = retryable_state_func(
+                    fail_cur, delivery_key, delivery_type, attempt_count
+                )
             fail_conn.commit()
         else:
             fail_conn.rollback()
@@ -464,6 +481,8 @@ async def _mark_claimed_delivery_failed(
 
     if terminal_error_callback and decision.get("permanently_failed"):
         await terminal_error_callback(exc, decision, attempt_count)
+    elif retryable_error_callback and decision.get("retryable"):
+        await retryable_error_callback(exc, decision, attempt_count, retryable_state)
 
     if decision.get("blocked"):
         return "blocked"
