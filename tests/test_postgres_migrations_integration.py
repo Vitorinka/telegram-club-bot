@@ -49,6 +49,7 @@ from stripe_invoice_rules import (
 )
 from storage_diagnostics import APPLICATION_TABLES, collect_storage_diagnostics
 from constraint_audit import collect_constraint_audit, unexpected_values
+from stripe_reconcile_audit import load_reconcile_candidates, reconcile_candidates
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -328,6 +329,84 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ORDER BY 1
         """)
         self.assertEqual(before, final_rows)
+
+    def test_stripe_reconcile_candidates_are_read_only_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users
+                    (telegram_id, paid, expiry_date, stripe_customer_id, stripe_subscription_id)
+                VALUES
+                    (7101, TRUE, NOW() + INTERVAL '30 days', 'cus_healthy', 'sub_healthy'),
+                    (7102, TRUE, NOW() + INTERVAL '30 days', 'cus_missing', 'sub_missing'),
+                    (7103, FALSE, NULL, 'cus_unpaid', 'sub_unpaid'),
+                    (7104, TRUE, NOW() + INTERVAL '30 days', 'cus_canceled', 'sub_canceled'),
+                    (7105, TRUE, NOW() + INTERVAL '60 days', NULL, NULL)
+            """)
+            cur.execute("""
+                INSERT INTO stripe_links
+                    (telegram_id, stripe_customer_id, stripe_subscription_id, status, is_active)
+                VALUES
+                    (7101, 'cus_healthy', 'sub_healthy', 'active', TRUE),
+                    (7102, 'cus_missing', 'sub_missing', 'active', TRUE),
+                    (7103, 'cus_unpaid', 'sub_unpaid', 'active', TRUE),
+                    (7104, 'cus_canceled', 'sub_canceled', 'canceled', FALSE)
+            """)
+            for user_id, customer_id, subscription_id in (
+                (7101, 'cus_healthy', 'sub_healthy'),
+                (7104, 'cus_canceled', 'sub_canceled'),
+            ):
+                cur.execute("""
+                    INSERT INTO payment_events
+                        (stripe_event_id, event_type, telegram_id, invoice_id,
+                         stripe_customer_id, stripe_subscription_id, payment_status,
+                         payment_kind, amount_paid, period_end)
+                    VALUES (%s, 'invoice.payment_succeeded', %s, %s, %s, %s,
+                            'succeeded', 'recurring', 1000, NOW() + INTERVAL '30 days')
+                """, (f'evt_{user_id}', user_id, f'in_{user_id}', customer_id, subscription_id))
+        conn.commit()
+        conn.close()
+
+        before = self.query_all("""
+            SELECT 'users', COUNT(*) FROM users
+            UNION ALL SELECT 'links', COUNT(*) FROM stripe_links
+            UNION ALL SELECT 'payments', COUNT(*) FROM payment_events
+            UNION ALL SELECT 'access', COUNT(*) FROM access_events
+            UNION ALL SELECT 'outbox', COUNT(*) FROM message_delivery_events
+            ORDER BY 1
+        """)
+        audit_conn = self.get_conn()
+        with audit_conn.cursor() as cur:
+            candidates = load_reconcile_candidates(cur)
+        audit_conn.close()
+        self.assertEqual({row['telegram_id'] for row in candidates}, {7101, 7102, 7103, 7104})
+
+        def retrieve(subscription_id):
+            if subscription_id == 'sub_missing':
+                class InvalidRequestError(Exception):
+                    http_status = 404
+                raise InvalidRequestError('synthetic missing')
+            status = 'canceled' if subscription_id == 'sub_canceled' else 'active'
+            customer = subscription_id.replace('sub_', 'cus_')
+            return {
+                'id': subscription_id, 'customer': customer, 'status': status,
+                'current_period_end': int((datetime.utcnow() + timedelta(days=30)).timestamp()),
+            }
+
+        result = asyncio.run(reconcile_candidates(candidates, retrieve))
+        issues = {row['telegram_id']: issue for row, issue, _subscription in result['results']}
+        self.assertEqual(issues[7102], 'LOCAL_ACTIVE_WITH_MISSING_STRIPE_SUBSCRIPTION')
+        self.assertEqual(issues[7103], 'STRIPE_ACTIVE_LOCAL_UNPAID')
+        self.assertEqual(issues[7104], 'STRIPE_TERMINAL_LOCAL_PAID')
+        self.assertEqual(before, self.query_all("""
+            SELECT 'users', COUNT(*) FROM users
+            UNION ALL SELECT 'links', COUNT(*) FROM stripe_links
+            UNION ALL SELECT 'payments', COUNT(*) FROM payment_events
+            UNION ALL SELECT 'access', COUNT(*) FROM access_events
+            UNION ALL SELECT 'outbox', COUNT(*) FROM message_delivery_events
+            ORDER BY 1
+        """))
 
     def test_core_safety_validation_failure_rolls_back_and_retries_real_postgres(self):
         with tempfile.TemporaryDirectory() as migration_dir:
