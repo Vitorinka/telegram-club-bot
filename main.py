@@ -90,6 +90,11 @@ from access_mismatch_observability import (
     load_access_mismatch_counts,
     load_access_mismatch_samples,
 )
+from stripe_reconcile_audit import (
+    load_reconcile_candidates,
+    reconcile_candidates,
+    render_reconcile_audit,
+)
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -154,6 +159,7 @@ class SupportReplyState(StatesGroup):
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger("stripe").setLevel(logging.WARNING)
 logging.info("Начинаю подключение к базе данных...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -11881,6 +11887,22 @@ async def constraint_audit_command(message: types.Message):
             conn.close()
 
 
+@router.message(Command('stripe_reconcile_audit'), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def stripe_reconcile_audit_command(message: types.Message):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        candidates = load_reconcile_candidates(cur, limit=100)
+    finally:
+        cur.close()
+        conn.close()
+
+    audit = await reconcile_candidates(candidates, stripe.Subscription.retrieve)
+    for page in render_reconcile_audit(audit, safe_log_id):
+        await message.answer(page)
+
+
 @router.message(Command('access_mismatches'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
 async def access_mismatches_command(message: types.Message):
@@ -11934,7 +11956,6 @@ async def access_mismatches_command(message: types.Message):
         ])
     text = "\n".join(lines)
     await message.answer(text[:4000])
-
 ADMIN_MENU_SECTIONS = {
     "stats": {
         "button": "📊 Статистика",
@@ -11977,6 +11998,7 @@ ADMIN_MENU_SECTIONS = {
             "/stripe_links <telegram_id> — показать Stripe связи пользователя",
             "/stripe_conflicts — показать unresolved Stripe identity conflicts",
             "/access_mismatches — read-only active subscription/local access mismatches",
+            "/stripe_reconcile_audit — read-only local/Stripe reconciliation",
             "/duplicate_subscriptions — показать Stripe customers с несколькими подписками",
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id> — связать Stripe с пользователем",
             "/send_invite_link <telegram_id> — отправить invite link",
