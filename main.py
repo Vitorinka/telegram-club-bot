@@ -95,6 +95,7 @@ from stripe_reconcile_audit import (
     reconcile_candidates,
     render_reconcile_audit,
 )
+from delivery_failure_admin_ux import render_critical_delivery_alert
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -5941,6 +5942,8 @@ async def notify_retryable_outbox_failure(
     error,
     decision,
     escalation=None,
+    telegram_id=None,
+    payload=None,
 ):
     conn = None
     cur = None
@@ -5988,21 +5991,26 @@ async def notify_retryable_outbox_failure(
     if not stage:
         return
     await notify_admins(
-        "Есть задержка доставки сообщения.\n\n"
-        f"delivery_type: {delivery_type}\n"
-        f"delivery_hash: {escalation['delivery_hash']}\n"
-        f"attempt_count: {attempt_count}\n"
-        f"retry_age: {age_minutes}m\n"
-        f"critical_delivery: {'yes' if escalation['critical'] else 'no'}\n"
-        "automatic_retry: continues\n"
-        "details: /bot_health",
+        render_critical_delivery_alert(
+            delivery_type=delivery_type,
+            delivery_key=delivery_key,
+            telegram_id=telegram_id,
+            reason=decision.get("reason"),
+            blocked=False,
+            retryable=True,
+            safe_user_ref=safe_log_id,
+            payload=payload,
+        ),
         alert_key=f"outbox-retry:{escalation['delivery_hash']}:{stage}",
         severity="WARNING",
         dedupe_forever=True,
     )
 
 
-async def notify_permanent_outbox_failure(delivery_key, delivery_type, attempt_count, error, blocked=False):
+async def notify_permanent_outbox_failure(
+    delivery_key, delivery_type, attempt_count, error, blocked=False,
+    telegram_id=None, payload=None, reason=None,
+):
     critical = delivery_type in OUTBOX_CRITICAL_DELIVERY_TYPES
     if not critical:
         logging.warning(
@@ -6017,13 +6025,16 @@ async def notify_permanent_outbox_failure(delivery_key, delivery_type, attempt_c
         return
     delivery_hash = safe_delivery_hash(delivery_key)
     await notify_admins(
-        "Критическая доставка завершилась permanent failure.\n\n"
-        f"delivery_type: {delivery_type}\n"
-        f"delivery_hash: {delivery_hash}\n"
-        f"attempt_count: {attempt_count}\n"
-        f"blocked: {'yes' if blocked else 'no'}\n"
-        f"error_class: {type(error).__name__}\n"
-        "details: /bot_health",
+        render_critical_delivery_alert(
+            delivery_type=delivery_type,
+            delivery_key=delivery_key,
+            telegram_id=telegram_id,
+            reason=reason,
+            blocked=blocked,
+            retryable=False,
+            safe_user_ref=safe_log_id,
+            payload=payload,
+        ),
         alert_key=f"outbox-permanent:{delivery_hash}",
         severity="CRITICAL",
         dedupe_forever=True,
@@ -18610,11 +18621,17 @@ async def process_pending_message_deliveries(limit=25):
                 )
             elif decision.get("permanently_failed"):
                 await notify_permanent_outbox_failure(
-                    delivery_key, delivery_type, attempt_count, e, blocked=decision.get("blocked", False)
+                    delivery_key, delivery_type, attempt_count, e,
+                    blocked=decision.get("blocked", False),
+                    telegram_id=telegram_id,
+                    payload=payload,
+                    reason=decision.get("reason"),
                 )
             elif decision.get("retryable"):
                 await notify_retryable_outbox_failure(
-                    delivery_key, delivery_type, attempt_count, e, decision, retryable_escalation
+                    delivery_key, delivery_type, attempt_count, e, decision, retryable_escalation,
+                    telegram_id=telegram_id,
+                    payload=payload,
                 )
 
     return {
