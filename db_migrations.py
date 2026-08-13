@@ -496,6 +496,49 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0012_validate_core_safety_check_constraints": {
+        "tables": ("message_delivery_events", "stripe_events", "payment_events"),
+        "constraints": {
+            constraint_name: {**spec, "validated": True}
+            for constraint_name, spec in {
+                "message_delivery_events_status_check": {
+                    "table": "message_delivery_events",
+                    "definition_contains": (
+                        "status", "pending", "processing", "failed", "sent",
+                        "cancelled", "permanently_failed",
+                    ),
+                },
+                "message_delivery_events_claim_generation_nonnegative_check": {
+                    "table": "message_delivery_events",
+                    "definition_contains": ("claim_generation", ">=", "0"),
+                },
+                "message_delivery_events_attempt_count_nonnegative_check": {
+                    "table": "message_delivery_events",
+                    "definition_contains": ("attempt_count", "is null", ">=", "0"),
+                },
+                "message_delivery_events_processing_lease_check": {
+                    "table": "message_delivery_events",
+                    "definition_contains": ("status", "processing", "lease_until", "is not null"),
+                },
+                "message_delivery_events_sent_timestamp_check": {
+                    "table": "message_delivery_events",
+                    "definition_contains": ("status", "sent", "sent_at", "is not null"),
+                },
+                "stripe_events_claim_generation_nonnegative_check": {
+                    "table": "stripe_events",
+                    "definition_contains": ("claim_generation", ">=", "0"),
+                },
+                "stripe_events_processed_timestamp_check": {
+                    "table": "stripe_events",
+                    "definition_contains": ("processed", "is not true", "processed_at", "is not null"),
+                },
+                "payment_events_payment_status_check": {
+                    "table": "payment_events",
+                    "definition_contains": ("payment_status", "succeeded", "failed"),
+                },
+            }.items()
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
@@ -627,7 +670,7 @@ def present_indexes(cur):
     return {row[0] for row in cur.fetchall()}
 
 
-def check_constraint_matches(cur, constraint_name, table, definition_contains=()):
+def check_constraint_matches(cur, constraint_name, table, definition_contains=(), validated=None):
     cur.execute(
         """
         SELECT pg_get_constraintdef(c.oid), c.convalidated
@@ -645,7 +688,10 @@ def check_constraint_matches(cur, constraint_name, table, definition_contains=()
     if not row:
         return False
     definition = re.sub(r"\s+", " ", str(row[0])).strip().lower()
-    return all(str(fragment).lower() in definition for fragment in definition_contains)
+    return (
+        all(str(fragment).lower() in definition for fragment in definition_contains)
+        and (validated is None or bool(row[1]) is bool(validated))
+    )
 
 
 def normalize_index_predicate(predicate):
@@ -827,6 +873,7 @@ def migration_schema_matches(cur, version):
             constraint_name,
             spec["table"],
             definition_contains=spec.get("definition_contains", ()),
+            validated=spec.get("validated"),
         ):
             return False
     if requirements.get("requires_stripe_identity_clean"):
