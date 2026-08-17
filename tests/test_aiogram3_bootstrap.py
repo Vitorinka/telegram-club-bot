@@ -6809,10 +6809,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [[button.text for button in row] for row in menu_keyboard.keyboard],
             [
-                ["🎁 Бесплатный урок"],
-                ["🎁 Подарить доступ"],
-                ["💬 Задать вопрос", "🆘 Правила клуба"],
+                ["🧘 Бесплатный урок"],
                 ["👤 Профиль и подписка"],
+                ["💬 Задать вопрос"],
+                ["🚨 Правила клуба"],
+                ["🎁 Подарить доступ в клуб"],
             ],
         )
 
@@ -6821,6 +6822,58 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.states[-1], self.main.ContactState.waiting_for_message)
         question_keyboard = message.answers[-1][1]["reply_markup"]
         self.assertEqual(question_keyboard.keyboard[0][0].text, "❌ Отмена")
+
+    async def test_main_menu_buttons_keep_their_navigation_handlers(self):
+        user = SimpleNamespace(id=123, full_name="Test User", username="test_user")
+
+        profile_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        profile_state = FakeState()
+        with patch.object(self.main, "profile", AsyncMock()) as profile:
+            await self.main.profile_button_handler(profile_message, profile_state)
+        profile.assert_awaited_once_with(profile_message)
+        self.assertEqual(profile_state.clear_calls, 1)
+
+        question_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        question_state = FakeState()
+        await self.main.ask_question_button(question_message, question_state)
+        self.assertEqual(question_state.states[-1], self.main.ContactState.waiting_for_message)
+        self.assertIn("Напишите ваш вопрос", question_message.answer.await_args.args[0])
+
+        rules_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        rules_state = FakeState()
+        await self.main.rules_button_handler(rules_message, rules_state)
+        self.assertIn("Правила и регламент", rules_message.answer.await_args.args[0])
+
+        gift_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        gift_state = FakeState()
+        configured = {
+            "configured": True,
+            "missing_prices": [],
+            "template_count": 3,
+            "required_template_count": 3,
+        }
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection()), \
+             patch.object(self.main, "gift_configuration_status", return_value=configured), \
+             patch.object(self.main, "save_telegram_user_profile"):
+            await self.main.gift_access_button_handler(gift_message, gift_state)
+        self.assertEqual(gift_state.states[-1], self.main.GiftPurchaseStates.tariff)
+        self.assertIn("На какой срок подарить доступ", gift_message.answer.await_args.args[0])
+
+        lesson_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        lesson_state = FakeState()
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+             patch.object(self.main, "process_claimed_delivery", AsyncMock(return_value="sent")) as delivery:
+            await self.main.free_lesson_button(lesson_message, lesson_state)
+        delivery.assert_awaited_once()
+        self.assertEqual(lesson_state.clear_calls, 1)
+
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn('@router.message(F.text == "🧘 Бесплатный урок", StateFilter(\'*\'))', source)
+        self.assertIn('@router.message(F.text == "🎁 Подарить доступ в клуб", StateFilter(\'*\'))', source)
+        self.assertIn('@router.message(F.text == "🚨 Правила клуба", StateFilter(\'*\'))', source)
+        self.assertNotIn('F.text == "🎁 Бесплатный урок"', source)
+        self.assertNotIn('F.text == "🎁 Подарить доступ"', source)
+        self.assertNotIn('F.text == "🆘 Правила клуба"', source)
 
     async def test_inline_keyboards_keep_expected_callback_data_and_urls(self):
         tariffs = self.main.get_tariffs_keyboard(show_trial=True)

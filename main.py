@@ -7761,10 +7761,11 @@ async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
 
 def get_main_keyboard():
     return reply_keyboard([
-        [KeyboardButton(text="🎁 Бесплатный урок")],
-        [KeyboardButton(text="🎁 Подарить доступ")],
-        [KeyboardButton(text="💬 Задать вопрос"), KeyboardButton(text="🆘 Правила клуба")],
+        [KeyboardButton(text="🧘 Бесплатный урок")],
         [KeyboardButton(text="👤 Профиль и подписка")],
+        [KeyboardButton(text="💬 Задать вопрос")],
+        [KeyboardButton(text="🚨 Правила клуба")],
+        [KeyboardButton(text="🎁 Подарить доступ в клуб")],
     ], resize_keyboard=True)
 
 
@@ -7783,7 +7784,7 @@ async def profile_button_handler(message: types.Message, state: FSMContext):
     await profile(message)
 
 
-@router.message(F.text == "🎁 Подарить доступ", StateFilter('*'))
+@router.message(F.text == "🎁 Подарить доступ в клуб", StateFilter('*'))
 async def gift_access_button_handler(message: types.Message, state: FSMContext):
     await state.clear()
     save_telegram_user_profile(message.from_user)
@@ -8144,7 +8145,7 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
     await callback.answer("Подарок активирован")
 
 
-@router.message(F.text == "🆘 Правила клуба", StateFilter('*'))
+@router.message(F.text == "🚨 Правила клуба", StateFilter('*'))
 async def rules_button_handler(message: types.Message, state: FSMContext):
     await state.clear()
 
@@ -8577,7 +8578,7 @@ async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.answer()
 
-@router.message(F.text == "🎁 Бесплатный урок", StateFilter('*'))
+@router.message(F.text == "🧘 Бесплатный урок", StateFilter('*'))
 async def free_lesson_button(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = int(message.from_user.id)
