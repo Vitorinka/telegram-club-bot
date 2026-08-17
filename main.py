@@ -36,6 +36,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 from storage_diagnostics import collect_storage_diagnostics, render_storage_diagnostics
 from constraint_audit import collect_constraint_audit, render_constraint_audit
+from schedule_config import SCHEDULES
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -2062,13 +2063,7 @@ def gift_active_checkout_conflict_keyboard(row):
     checkout_url = row.get("checkout_url")
     if checkout_url:
         buttons.append([InlineKeyboardButton(text="💳 Вернуться к оплате", url=checkout_url)])
-    buttons.append([
-        InlineKeyboardButton(
-            text="❌ Отменить прежнюю оплату",
-            callback_data=f"gift_cancel_checkout:{row['public_reference']}",
-        )
-    ])
-    return inline_keyboard(buttons)
+    return inline_keyboard(buttons) if buttons else None
 
 
 def build_gift_preview_text(data):
@@ -7759,14 +7754,176 @@ async def promo_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
-def get_main_keyboard():
-    return reply_keyboard([
+def get_main_keyboard(telegram_id=None):
+    rows = [
         [KeyboardButton(text="🧘 Бесплатный урок")],
-        [KeyboardButton(text="👤 Профиль и подписка")],
-        [KeyboardButton(text="💬 Задать вопрос")],
-        [KeyboardButton(text="🚨 Правила клуба")],
+        [KeyboardButton(text="👤 Профиль и подписка"), KeyboardButton(text="📅 Расписание")],
+        [KeyboardButton(text="💬 Задать вопрос"), KeyboardButton(text="🚨 Правила клуба")],
         [KeyboardButton(text="🎁 Подарить доступ в клуб")],
-    ], resize_keyboard=True)
+    ]
+    if telegram_id is not None and int(telegram_id) in ADMIN_IDS:
+        rows.append([KeyboardButton(text="🛠 Управление подарками")])
+    return reply_keyboard(rows, resize_keyboard=True)
+
+
+RUSSIAN_MONTH_NAMES = (
+    "январь", "февраль", "март", "апрель", "май", "июнь",
+    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+)
+
+
+def current_schedule(now=None):
+    current = now or datetime.now(MOSCOW_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MOSCOW_TZ)
+    else:
+        current = current.astimezone(MOSCOW_TZ)
+    month_key = current.strftime("%Y-%m")
+    caption = f"📅 Расписание на {RUSSIAN_MONTH_NAMES[current.month - 1]} {current.year}"
+    return month_key, SCHEDULES.get(month_key), caption
+
+
+GIFT_ADMIN_STATUS_LABELS = {
+    "checkout_pending": "Ожидает создания оплаты",
+    "checkout_open": "Ожидает оплаты",
+    "payment_pending": "Оплата обрабатывается",
+    "paid_unclaimed": "Оплачен, ожидает активации",
+    "reserved": "Требует безопасного применения",
+    "redeemed": "Активирован",
+    "cancelled": "Отменён",
+    "refunded": "Возвращён",
+    "review_required": "Требует проверки администратора",
+}
+
+
+def gift_admin_status_label(status):
+    return GIFT_ADMIN_STATUS_LABELS.get(status, "Неизвестный статус")
+
+
+def fetch_admin_gifts(cur, limit=20):
+    cur.execute("""
+        SELECT
+            gift.public_reference,
+            gift.purchaser_telegram_id,
+            purchaser.username AS purchaser_username,
+            gift.recipient_telegram_id,
+            recipient.username AS recipient_username,
+            gift.tariff_code,
+            gift.status,
+            gift.created_at,
+            gift.paid_at,
+            gift.applied_expiry
+        FROM gift_access_grants gift
+        LEFT JOIN users purchaser ON purchaser.telegram_id = gift.purchaser_telegram_id
+        LEFT JOIN users recipient ON recipient.telegram_id = gift.recipient_telegram_id
+        ORDER BY gift.created_at DESC, gift.public_reference DESC
+        LIMIT %s
+    """, (int(limit),))
+    columns = [description[0] for description in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def fetch_admin_gift(cur, public_reference):
+    cur.execute("""
+        SELECT
+            gift.public_reference,
+            gift.purchaser_telegram_id,
+            purchaser.username AS purchaser_username,
+            gift.recipient_telegram_id,
+            recipient.username AS recipient_username,
+            gift.tariff_code,
+            gift.status,
+            gift.created_at,
+            gift.paid_at,
+            gift.applied_expiry
+        FROM gift_access_grants gift
+        LEFT JOIN users purchaser ON purchaser.telegram_id = gift.purchaser_telegram_id
+        LEFT JOIN users recipient ON recipient.telegram_id = gift.recipient_telegram_id
+        WHERE gift.public_reference = %s
+    """, (public_reference,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return dict(zip((description[0] for description in cur.description), row))
+
+
+def admin_gift_center_keyboard(gifts):
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{gift['public_reference']} · {gift_admin_status_label(gift['status'])}",
+            callback_data=f"admin_gift_open:{gift['public_reference']}",
+        )]
+        for gift in gifts
+    ]
+    return inline_keyboard(rows) if rows else None
+
+
+def admin_gift_detail_keyboard(gift):
+    rows = []
+    if gift["status"] in ("checkout_pending", "checkout_open"):
+        rows.append([InlineKeyboardButton(
+            text="❌ Отменить подарок",
+            callback_data=f"admin_gift_cancel:{gift['public_reference']}",
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку подарков", callback_data="admin_gift_center")])
+    return inline_keyboard(rows)
+
+
+def admin_gift_detail_text(gift):
+    purchaser_username = f"@{gift['purchaser_username']}" if gift.get("purchaser_username") else "не указан"
+    recipient_username = f"@{gift['recipient_username']}" if gift.get("recipient_username") else "не указан"
+    recipient_id = gift.get("recipient_telegram_id") or "не указан"
+    lines = [
+        "🎁 Управление подарком",
+        "",
+        f"Референс: {gift['public_reference']}",
+        f"Покупатель telegram_id: {gift['purchaser_telegram_id']}",
+        f"Покупатель username: {purchaser_username}",
+        f"Получатель telegram_id: {recipient_id}",
+        f"Получатель username: {recipient_username}",
+        f"Тариф: {gift_tariff_label(gift['tariff_code'])}",
+        f"Статус: {gift_admin_status_label(gift['status'])}",
+        f"Создан: {gift.get('created_at') or 'не указано'}",
+        f"Оплачен: {gift.get('paid_at') or 'нет'}",
+        f"Срок доступа после активации: {gift.get('applied_expiry') or 'не активирован'}",
+    ]
+    if gift["status"] in ("paid_unclaimed", "reserved"):
+        lines.extend((
+            "",
+            "⚠️ Подарок оплачен. Локальная отмена запрещена: требуется полный refund в Stripe,",
+            "после которого статус изменит Stripe webhook.",
+        ))
+    elif gift["status"] == "redeemed":
+        lines.extend((
+            "",
+            "⚠️ Подарок уже активирован. Refund не отзывает доступ автоматически;",
+            "случай требует отдельной проверки администратора.",
+        ))
+    elif gift["status"] == "payment_pending":
+        lines.extend(("", "⚠️ Оплата обрабатывается. Дождитесь результата Stripe или проверьте платёж вручную."))
+    elif gift["status"] == "review_required":
+        lines.extend(("", "⚠️ Автоматические действия недоступны. Требуется проверка администратора."))
+    return "\n".join(lines)
+
+
+def load_admin_gifts():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        return fetch_admin_gifts(cur)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def load_admin_gift(public_reference):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        return fetch_admin_gift(cur, public_reference)
+    finally:
+        cur.close()
+        conn.close()
 
 
 @router.message(Command('menu'), StateFilter('*'))
@@ -7774,8 +7931,88 @@ async def show_menu(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Главное меню\n\nВыберите нужный раздел:",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(message.from_user.id)
     )
+
+
+@router.message(F.text == "📅 Расписание", StateFilter('*'))
+async def schedule_button_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    _, file_id, caption = current_schedule()
+    if file_id:
+        await message.answer_photo(photo=file_id, caption=caption)
+        return
+    await message.answer("📅 Расписание на этот месяц скоро появится.")
+
+
+@router.message(F.text == "🛠 Управление подарками", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_gift_center_button_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    gifts = load_admin_gifts()
+    if not gifts:
+        await message.answer("🎁 Подарков пока нет.")
+        return
+    await message.answer(
+        "🎁 Управление подарками\n\nПоследние 20 подарков всех пользователей:",
+        reply_markup=admin_gift_center_keyboard(gifts),
+    )
+
+
+@router.callback_query(F.data == "admin_gift_center", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_gift_center_callback(callback: types.CallbackQuery):
+    gifts = load_admin_gifts()
+    text = "🎁 Управление подарками\n\nПоследние 20 подарков всех пользователей:" if gifts else "🎁 Подарков пока нет."
+    await callback.message.edit_text(text, reply_markup=admin_gift_center_keyboard(gifts))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_gift_open:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_gift_open_callback(callback: types.CallbackQuery):
+    public_reference = callback.data.split(":", 1)[1]
+    gift = load_admin_gift(public_reference)
+    if not gift:
+        await callback.answer("Подарок не найден.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        admin_gift_detail_text(gift),
+        reply_markup=admin_gift_detail_keyboard(gift),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_gift_cancel:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_gift_cancel_callback(callback: types.CallbackQuery):
+    public_reference = callback.data.split(":", 1)[1]
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        gift = fetch_gift_by_public_reference(cur, public_reference)
+        if not gift:
+            await callback.answer("Подарок не найден.", show_alert=True)
+            return
+        if gift["status"] not in ("checkout_pending", "checkout_open"):
+            await callback.answer("Этот подарок нельзя отменить локально.", show_alert=True)
+            return
+        action_id = make_action_request(
+            cur,
+            callback.from_user.id,
+            "gift_cancel",
+            {"public_reference": public_reference, "admin_id": callback.from_user.id},
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    await send_admin_action_confirmation(
+        callback.message,
+        action_id,
+        gift_admin_text("Подтвердите отмену подарка", gift),
+    )
+    await callback.answer()
 
 
 @router.message(F.text == "👤 Профиль и подписка", StateFilter('*'))
@@ -7796,7 +8033,7 @@ async def gift_access_button_handler(message: types.Message, state: FSMContext):
         cur.close()
         conn.close()
     if not status["configured"]:
-        await message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard(message.from_user.id))
         await enqueue_admin_payment_problem_now(
             event_id=None,
             purpose="gift_access_configuration_missing",
@@ -7883,7 +8120,7 @@ async def gift_edit_callback(callback: types.CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "gift_cancel_flow", StateFilter('*'))
 async def gift_cancel_flow_callback(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Подарок отменён.", reply_markup=get_main_keyboard())
+    await callback.message.answer("Подарок отменён.", reply_markup=get_main_keyboard(callback.from_user.id))
     await callback.answer()
 
 
@@ -7894,7 +8131,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
     tariff_code = data.get("tariff_code")
     price_id = gift_price_id(tariff_code)
     if tariff_code not in GIFT_TARIFFS or not price_id:
-        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard(callback.from_user.id))
         await state.clear()
         return
 
@@ -7940,7 +8177,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         conn.close()
 
     if gift_unavailable:
-        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard())
+        await callback.message.answer(gift_access_unavailable_text(), reply_markup=get_main_keyboard(callback.from_user.id))
         await state.clear()
         return
 
@@ -7962,7 +8199,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer(
             "Оплата предыдущего подарка уже обрабатывается.\n\n"
             "Дождитесь результата Stripe или напишите администратору, если статус долго не меняется.",
-            reply_markup=get_main_keyboard(),
+            reply_markup=get_main_keyboard(callback.from_user.id),
         )
         await state.clear()
         return
@@ -8039,44 +8276,6 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
 
 
-@router.callback_query(F.data.startswith("gift_cancel_checkout:"), StateFilter('*'))
-async def gift_cancel_checkout_callback(callback: types.CallbackQuery, state: FSMContext):
-    public_reference = callback.data.split(":", 1)[1]
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        gift_row = fetch_gift_by_public_reference(cur, public_reference)
-    finally:
-        cur.close()
-        conn.close()
-    if not gift_row:
-        await callback.answer("Подарок не найден.", show_alert=True)
-        return
-    if int(gift_row["purchaser_telegram_id"]) != int(callback.from_user.id):
-        await callback.answer("Отменить эту оплату может только покупатель.", show_alert=True)
-        return
-    await callback.answer("⏳ Отменяем оплату...")
-    try:
-        result = await safely_cancel_gift_checkout(public_reference, callback.from_user.id, source="gift_user_cancel")
-    except Exception as e:
-        logging.error(
-            "GIFT_USER_CANCEL_FAILED: gift=%s error_ref=%s",
-            safe_log_id(public_reference),
-            safe_admin_error_reference("gift_user_cancel", e),
-            exc_info=True,
-        )
-        await callback.message.answer("Не получилось отменить оплату. Напишите администратору.")
-        return
-    if result.get("status") == "completed":
-        await state.clear()
-        await callback.message.answer(
-            "Прежняя оплата отменена. Теперь можно оформить новый подарок из меню.",
-            reply_markup=get_main_keyboard(),
-        )
-    else:
-        await callback.message.answer(result.get("admin_message") or "Не получилось отменить оплату. Напишите администратору.")
-
-
 @router.callback_query(F.data.startswith("gift_activate:"), StateFilter('*'))
 async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContext):
     public_reference = callback.data.split(":", 1)[1]
@@ -8138,7 +8337,7 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
         await callback.answer()
         return
     if action == "blocked_active_auto_renew":
-        await callback.message.answer(build_gift_reserved_recipient_text(updated), reply_markup=get_main_keyboard())
+        await callback.message.answer(build_gift_reserved_recipient_text(updated), reply_markup=get_main_keyboard(callback.from_user.id))
         await callback.answer()
         return
     await state.clear()
@@ -8192,7 +8391,7 @@ async def rules_button_handler(message: types.Message, state: FSMContext):
 
 — <b>постоянная обратная связь:</b> вы можете задавать любые вопросы в чате, я всегда на связи"""
 
-    await message.answer(rules_text, parse_mode="HTML", reply_markup=get_main_keyboard())
+    await message.answer(rules_text, parse_mode="HTML", reply_markup=get_main_keyboard(message.from_user.id))
 
 
 @router.message(F.text == "💬 Задать вопрос", StateFilter('*'))
@@ -8215,7 +8414,7 @@ async def forward_question_to_admin(message: types.Message, state: FSMContext):
         await state.clear()
         await message.answer(
             "Отправка вопроса отменена.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
         return
 
@@ -8259,14 +8458,14 @@ async def forward_question_to_admin(message: types.Message, state: FSMContext):
         await message.answer(
             "✅ Ваш вопрос отправлен администратору.\n"
             "Ответ придет здесь, в этом чате.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
 
     except Exception as e:
         logging.error(f"Ошибка отправки вопроса админу от {user.id}: {e}")
         await message.answer(
             "❌ Не удалось отправить вопрос. Попробуйте позже или напишите @re_tasha.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
 
     finally:
@@ -8573,7 +8772,7 @@ async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Хорошо, возвращайтесь, когда будет удобно.\n\n"
         "В меню ниже можно открыть тарифы, задать вопрос или посмотреть профиль.",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(callback.from_user.id)
     )
 
     await callback.answer()
@@ -8637,7 +8836,7 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
     if result != "sent":
         await message.answer(
             "❌ Не удалось отправить бесплатный урок. Попробуйте позже или напишите @re_tasha.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
 
 def get_free_lesson_feedback_keyboard():
@@ -9246,7 +9445,7 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     await bot.send_photo(callback.message.chat.id, PHOTO_URL_RULES, caption=text, reply_markup=kb, parse_mode="HTML")
     await callback.message.answer(
         "Главное меню доступно ниже ",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_main_keyboard(callback.from_user.id)
     )
     await callback.answer()
 
@@ -18312,7 +18511,7 @@ async def process_pending_message_deliveries(limit=25):
                         await bot.send_message(
                             int(telegram_id),
                             build_gift_redeemed_recipient_text({}, effective_expiry),
-                            reply_markup=get_main_keyboard(),
+                            reply_markup=get_main_keyboard(telegram_id),
                         )
                     already_conn = get_db_conn()
                     already_cur = already_conn.cursor()
