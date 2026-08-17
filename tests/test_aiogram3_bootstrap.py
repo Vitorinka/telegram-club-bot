@@ -102,11 +102,21 @@ class FakeStripeRequest:
 
 
 class FakeMessage:
-    def __init__(self):
+    def __init__(self, user_id=123):
+        self.from_user = SimpleNamespace(id=user_id)
+        self.chat = SimpleNamespace(type="private")
         self.answers = []
+        self.replies = []
+        self.edits = []
 
     async def answer(self, text, **kwargs):
         self.answers.append((text, kwargs))
+
+    async def reply(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+
+    async def edit_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
 
 
 class FakeCallback:
@@ -2428,8 +2438,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 72)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 26)
+        self.assertEqual(len(self.main.router.message.handlers), 74)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 29)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2460,8 +2470,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 72)
-        self.assertEqual(len(callback_handlers), 26)
+        self.assertEqual(len(message_handlers), 74)
+        self.assertEqual(len(callback_handlers), 29)
         self.assertEqual(
             commands,
             [
@@ -6810,10 +6820,21 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             [[button.text for button in row] for row in menu_keyboard.keyboard],
             [
                 ["🧘 Бесплатный урок"],
-                ["👤 Профиль и подписка"],
-                ["💬 Задать вопрос"],
-                ["🚨 Правила клуба"],
+                ["👤 Профиль и подписка", "📅 Расписание"],
+                ["💬 Задать вопрос", "🚨 Правила клуба"],
                 ["🎁 Подарить доступ в клуб"],
+            ],
+        )
+
+        admin_keyboard = self.main.get_main_keyboard(1)
+        self.assertEqual(
+            [[button.text for button in row] for row in admin_keyboard.keyboard],
+            [
+                ["🧘 Бесплатный урок"],
+                ["👤 Профиль и подписка", "📅 Расписание"],
+                ["💬 Задать вопрос", "🚨 Правила клуба"],
+                ["🎁 Подарить доступ в клуб"],
+                ["🛠 Управление подарками"],
             ],
         )
 
@@ -6874,6 +6895,118 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('F.text == "🎁 Бесплатный урок"', source)
         self.assertNotIn('F.text == "🎁 Подарить доступ"', source)
         self.assertNotIn('F.text == "🆘 Правила клуба"', source)
+
+    async def test_schedule_uses_current_moscow_month_and_has_no_previous_month_fallback(self):
+        august = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)
+        with patch.dict(self.main.SCHEDULES, {"2026-07": "old-file", "2026-08": "current-file"}, clear=True):
+            key, file_id, caption = self.main.current_schedule(august)
+        self.assertEqual((key, file_id), ("2026-08", "current-file"))
+        self.assertEqual(caption, "📅 Расписание на август 2026")
+
+        with patch.dict(self.main.SCHEDULES, {"2026-07": "old-file"}, clear=True):
+            key, file_id, _ = self.main.current_schedule(august)
+        self.assertEqual(key, "2026-08")
+        self.assertIsNone(file_id)
+
+    async def test_schedule_handler_sends_photo_or_missing_message_and_clears_state(self):
+        state = FakeState()
+        message = SimpleNamespace(answer=AsyncMock(), answer_photo=AsyncMock())
+        with patch.object(self.main, "current_schedule", return_value=("2026-08", "file-id", "📅 Расписание на август 2026")):
+            await self.main.schedule_button_handler(message, state)
+        message.answer_photo.assert_awaited_once_with(photo="file-id", caption="📅 Расписание на август 2026")
+        message.answer.assert_not_awaited()
+        self.assertEqual(state.clear_calls, 1)
+
+        state = FakeState()
+        message = SimpleNamespace(answer=AsyncMock(), answer_photo=AsyncMock())
+        with patch.object(self.main, "current_schedule", return_value=("2026-08", None, "unused")):
+            await self.main.schedule_button_handler(message, state)
+        message.answer.assert_awaited_once_with("📅 Расписание на этот месяц скоро появится.")
+        message.answer_photo.assert_not_awaited()
+        self.assertEqual(state.clear_calls, 1)
+
+    async def test_admin_gift_center_is_private_admin_only_and_lists_other_buyers(self):
+        gift = {
+            "public_reference": "GIFT-OTHERBUYER0001",
+            "purchaser_telegram_id": 777,
+            "status": "paid_unclaimed",
+        }
+        admin = FakeIncomingMessage(user_id=1)
+        admin_state = FakeState()
+        with patch.object(self.main, "load_admin_gifts", return_value=[gift]):
+            await self.main.admin_gift_center_button_handler(admin, admin_state)
+        self.assertEqual(admin_state.clear_calls, 1)
+        keyboard = admin.answers[0][1]["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "admin_gift_open:GIFT-OTHERBUYER0001")
+
+        non_admin = FakeIncomingMessage(user_id=777)
+        with patch.object(self.main, "load_admin_gifts") as load_gifts:
+            await self.main.admin_gift_center_button_handler(non_admin, FakeState())
+        load_gifts.assert_not_called()
+        self.assertEqual(non_admin.answers, [])
+
+    def test_admin_gift_actions_match_status_safety_policy(self):
+        base = {"public_reference": "GIFT-SAFE000000001"}
+        for status in ("checkout_pending", "checkout_open"):
+            keyboard = self.main.admin_gift_detail_keyboard({**base, "status": status})
+            callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+            self.assertIn("admin_gift_cancel:GIFT-SAFE000000001", callbacks)
+
+        for status in ("payment_pending", "paid_unclaimed", "reserved", "redeemed", "refunded", "cancelled"):
+            gift = {**base, "status": status}
+            keyboard = self.main.admin_gift_detail_keyboard(gift)
+            callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+            self.assertFalse(any(value.startswith("admin_gift_cancel:") for value in callbacks))
+
+        paid = {
+            **base, "status": "paid_unclaimed", "purchaser_telegram_id": 777,
+            "purchaser_username": "buyer", "recipient_telegram_id": None,
+            "recipient_username": None, "tariff_code": "gift_1m", "created_at": datetime(2026, 8, 1),
+            "paid_at": datetime(2026, 8, 1), "applied_expiry": None,
+        }
+        self.assertIn("полный refund в Stripe", self.main.admin_gift_detail_text(paid))
+        redeemed = {**paid, "status": "redeemed"}
+        self.assertIn("не отзывает доступ автоматически", self.main.admin_gift_detail_text(redeemed))
+
+    async def test_admin_unpaid_cancel_creates_existing_confirmed_gift_cancel_action(self):
+        callback = FakeCallback(user_id=1)
+        callback.data = "admin_gift_cancel:GIFT-CANCEL0000001"
+        gift = {
+            "public_reference": "GIFT-CANCEL0000001", "status": "checkout_open",
+            "purchaser_telegram_id": 777, "recipient_telegram_id": None, "tariff_code": "gift_1m",
+        }
+        connection = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=connection), \
+             patch.object(self.main, "fetch_gift_by_public_reference", return_value=gift), \
+             patch.object(self.main, "make_action_request", return_value="action-1") as make_request, \
+             patch.object(self.main, "send_admin_action_confirmation", AsyncMock()) as confirm:
+            await self.main.admin_gift_cancel_callback(callback)
+        make_request.assert_called_once_with(
+            connection.cursor_obj, 1, "gift_cancel",
+            {"public_reference": "GIFT-CANCEL0000001", "admin_id": 1},
+        )
+        self.assertEqual(connection.commits, 1)
+        confirm.assert_awaited_once()
+
+    async def test_paid_gift_cancel_callback_never_creates_action_request(self):
+        callback = FakeCallback(user_id=1)
+        callback.data = "admin_gift_cancel:GIFT-PAID000000001"
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection()), \
+             patch.object(self.main, "fetch_gift_by_public_reference", return_value={"status": "paid_unclaimed"}), \
+             patch.object(self.main, "make_action_request") as make_request:
+            await self.main.admin_gift_cancel_callback(callback)
+        make_request.assert_not_called()
+        self.assertIn("нельзя отменить локально", callback.answers[0][0])
+
+    async def test_user_gift_status_query_remains_scoped_to_actual_purchaser(self):
+        message = FakeIncomingMessage(user_id=777)
+        connection = FakeConnection(fetches=[[]])
+        with patch.object(self.main, "get_db_conn", return_value=connection):
+            await self.main.gift_status_command(message)
+        query, params = connection.cursor_obj.queries[0]
+        self.assertIn("WHERE purchaser_telegram_id = %s", query)
+        self.assertEqual(params, (777,))
+        self.assertEqual(message.answers[0][0], "У вас пока нет подарочных сертификатов.")
 
     async def test_inline_keyboards_keep_expected_callback_data_and_urls(self):
         tariffs = self.main.get_tariffs_keyboard(show_trial=True)
