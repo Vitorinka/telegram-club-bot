@@ -13,6 +13,9 @@ TARIFF_LABELS = {
     "sub_1": "1 месяц",
     "sub_6": "6 месяцев",
     "sub_12": "12 месяцев",
+    "gift_1m": "🎁 подарок на 1 месяц",
+    "gift_6m": "🎁 подарок на 6 месяцев",
+    "gift_12m": "🎁 подарок на 12 месяцев",
     "unknown": "Тариф не определён",
 }
 
@@ -22,6 +25,7 @@ PAYMENT_KIND_LABELS = {
     "recurring": "автопродление",
     "adjustment": "корректировка",
     "out_of_band": "ручная оплата",
+    "gift_access": "подарок",
     "unknown": "неизвестно",
 }
 
@@ -197,6 +201,14 @@ def format_buyer_name(payment):
     return f"telegram_id: {payment.get('telegram_id')}"
 
 
+def format_gift_actor(payment):
+    username = payment.get("username")
+    if username:
+        return f"@{username.lstrip('@')}"
+    telegram_id = str(payment.get("telegram_id") or "")
+    return f"id_***{telegram_id[-4:]}" if telegram_id else "неизвестно"
+
+
 def sanitize_csv_cell(value):
     if value is None:
         return ""
@@ -212,10 +224,12 @@ def build_weekly_report_text(
     metrics,
     comparison=None,
     buyers=None,
+    gifts=None,
     history_note=None,
 ):
     comparison = comparison or {}
     buyers = buyers or []
+    gifts = gifts or []
     revenue = metrics.get("revenue_by_currency", {})
     revenue_previous = comparison.get("revenue_by_currency", {})
     revenue_lines = []
@@ -252,6 +266,43 @@ def build_weekly_report_text(
     if len(buyers) > 10:
         buyer_lines.append(f"Ещё покупок: {len(buyers) - 10}. Полный список доступен в CSV.")
 
+    gift_status_labels = {
+        "paid_unclaimed": "ожидает активации",
+        "reserved": "ожидает безопасного применения",
+        "redeemed": "активирован",
+        "cancelled": "отменён",
+        "refunded": "возвращён",
+        "review_required": "требует ручной проверки",
+    }
+    gift_lines = []
+    for gift in gifts[:10]:
+        paid_at = _as_moscow(gift.get("paid_at")).strftime("%d.%m, %H:%M")
+        gift_lines.extend([
+            f"• {paid_at} — {TARIFF_LABELS.get(gift.get('tariff_code'), TARIFF_LABELS['unknown'])} — "
+            f"{format_minor_amount(gift.get('amount_total'), gift.get('currency'))}",
+            f"  Оплатил: {format_gift_actor(gift)}",
+            "  Получатель: " + (
+                format_gift_actor({
+                    "telegram_id": gift.get("recipient_telegram_id"),
+                    "username": gift.get("recipient_username"),
+                    "first_name": gift.get("recipient_first_name"),
+                    "last_name": gift.get("recipient_last_name"),
+                })
+                if gift.get("recipient_telegram_id")
+                else "ещё не активировал подарок"
+            ),
+            f"  Статус: {gift_status_labels.get(gift.get('status'), 'неизвестен')}",
+        ])
+        if gift.get("status") == "redeemed" and gift.get("applied_expiry"):
+            gift_lines.append(
+                "  Доступ получателя до: "
+                + _as_moscow(gift["applied_expiry"]).strftime("%d.%m.%Y")
+            )
+    if not gift_lines:
+        gift_lines.append("Подарков за период нет.")
+    if len(gifts) > 10:
+        gift_lines.append(f"Ещё подарков: {len(gifts) - 10}.")
+
     lines = [
         "📊 Итоги недели",
         format_period_title(period_start, period_end),
@@ -285,6 +336,9 @@ def build_weekly_report_text(
         "",
         "🛍 Кто купил",
         *buyer_lines,
+        "",
+        "🎁 Подарки",
+        *gift_lines,
         "",
         "⚠️ Подписки",
         f"Отключили автопродление: {metrics.get('auto_renew_disabled', 0)}",

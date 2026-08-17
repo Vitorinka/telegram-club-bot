@@ -214,7 +214,8 @@ class GiftAccessTests(unittest.TestCase):
         caption = self.main.gift_certificate_caption(row)
         self.assertNotIn("None", caption)
         self.assertIn("6 месяцев", caption)
-        self.assertIn("Активировать подарок можно по кнопке или ссылке ниже.", caption)
+        self.assertIn("Как получить подарок:", caption)
+        self.assertIn("Если Telegram попросит запустить бот", caption)
 
     def test_gift_certificate_delivery_caption_adds_runtime_deep_link(self):
         row = {
@@ -229,12 +230,12 @@ class GiftAccessTests(unittest.TestCase):
         caption = self.main.gift_certificate_delivery_caption(base_caption, button_url)
 
         self.assertIn("https://t.me/ClubGiftBot?start=gift_", caption)
-        self.assertIn("🎁 Подарочный сертификат в клуб Натальи Ребковец", caption)
+        self.assertIn("🎁 Вам подарили доступ в клуб Натальи Ребковец", caption)
         self.assertIn("Для: Анна", caption)
         self.assertIn("От: Виктория", caption)
         self.assertIn("Срок доступа: 1 месяц", caption)
         self.assertIn("С любовью", caption)
-        self.assertIn("Активировать подарок можно по кнопке или ссылке:", caption)
+        self.assertIn("Если кнопка не открывается, используйте эту ссылку:", caption)
 
     def test_gift_certificate_delivery_caption_stays_within_telegram_limit(self):
         row = {
@@ -295,7 +296,8 @@ class GiftAccessTests(unittest.TestCase):
             "token_hash": "secret-hash",
         }
         text = self.main.gift_admin_text("Gift", row)
-        self.assertIn("GIFT-ABCD1234ABCD1234", text)
+        self.assertIn("id_***CD1234", text)
+        self.assertNotIn("GIFT-ABCD1234ABCD1234", text)
         self.assertNotIn("secret-hash", text)
 
     def test_gift_certificate_delivery_payload_does_not_store_token_or_url(self):
