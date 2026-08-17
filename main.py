@@ -2063,13 +2063,7 @@ def gift_active_checkout_conflict_keyboard(row):
     checkout_url = row.get("checkout_url")
     if checkout_url:
         buttons.append([InlineKeyboardButton(text="💳 Вернуться к оплате", url=checkout_url)])
-    buttons.append([
-        InlineKeyboardButton(
-            text="❌ Отменить прежнюю оплату",
-            callback_data=f"gift_cancel_checkout:{row['public_reference']}",
-        )
-    ])
-    return inline_keyboard(buttons)
+    return inline_keyboard(buttons) if buttons else None
 
 
 def build_gift_preview_text(data):
@@ -8280,44 +8274,6 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
         )
         await callback.message.answer("Техническая ошибка при создании оплаты. Попробуйте позже или напишите администратору.")
         await state.clear()
-
-
-@router.callback_query(F.data.startswith("gift_cancel_checkout:"), StateFilter('*'))
-async def gift_cancel_checkout_callback(callback: types.CallbackQuery, state: FSMContext):
-    public_reference = callback.data.split(":", 1)[1]
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        gift_row = fetch_gift_by_public_reference(cur, public_reference)
-    finally:
-        cur.close()
-        conn.close()
-    if not gift_row:
-        await callback.answer("Подарок не найден.", show_alert=True)
-        return
-    if int(gift_row["purchaser_telegram_id"]) != int(callback.from_user.id):
-        await callback.answer("Отменить эту оплату может только покупатель.", show_alert=True)
-        return
-    await callback.answer("⏳ Отменяем оплату...")
-    try:
-        result = await safely_cancel_gift_checkout(public_reference, callback.from_user.id, source="gift_user_cancel")
-    except Exception as e:
-        logging.error(
-            "GIFT_USER_CANCEL_FAILED: gift=%s error_ref=%s",
-            safe_log_id(public_reference),
-            safe_admin_error_reference("gift_user_cancel", e),
-            exc_info=True,
-        )
-        await callback.message.answer("Не получилось отменить оплату. Напишите администратору.")
-        return
-    if result.get("status") == "completed":
-        await state.clear()
-        await callback.message.answer(
-            "Прежняя оплата отменена. Теперь можно оформить новый подарок из меню.",
-            reply_markup=get_main_keyboard(callback.from_user.id),
-        )
-    else:
-        await callback.message.answer(result.get("admin_message") or "Не получилось отменить оплату. Напишите администратору.")
 
 
 @router.callback_query(F.data.startswith("gift_activate:"), StateFilter('*'))

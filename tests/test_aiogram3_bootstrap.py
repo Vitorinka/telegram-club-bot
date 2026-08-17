@@ -2439,7 +2439,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 74)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 29)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 28)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2471,7 +2471,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_filters.append(text)
 
         self.assertEqual(len(message_handlers), 74)
-        self.assertEqual(len(callback_handlers), 29)
+        self.assertEqual(len(callback_handlers), 28)
         self.assertEqual(
             commands,
             [
@@ -2494,7 +2494,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catch_all_messages, [])
         self.assertTrue(any("F.data.startswith('sub_')" in item for item in callback_filters))
         self.assertTrue(any("F.data == 'retry_payment'" in item for item in callback_filters))
-        self.assertTrue(any("F.data.startswith('gift_cancel_checkout:')" in item for item in callback_filters))
+        self.assertFalse(any("gift_cancel_checkout:" in item for item in callback_filters))
 
     async def test_keyboard_callback_data_are_routable(self):
         source = Path(self.main.__file__).read_text()
@@ -6987,6 +6987,22 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(connection.commits, 1)
         confirm.assert_awaited_once()
+
+    def test_purchaser_cannot_cancel_created_gift_checkout(self):
+        checkout_keyboard = self.main.gift_active_checkout_conflict_keyboard({
+            "public_reference": "GIFT-CREATED000001",
+            "checkout_url": "https://checkout.example/gift",
+        })
+        buttons = [button for row in checkout_keyboard.inline_keyboard for button in row]
+        self.assertEqual([button.text for button in buttons], ["💳 Вернуться к оплате"])
+        self.assertTrue(all(button.callback_data is None for button in buttons))
+
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("gift_cancel_checkout:", source)
+        self.assertNotIn("gift_user_cancel", source)
+        self.assertNotIn("❌ Отменить прежнюю оплату", source)
+        self.assertIn('"gift_cancel"', source)
+        self.assertIn("send_admin_action_confirmation", source)
 
     async def test_paid_gift_cancel_callback_never_creates_action_request(self):
         callback = FakeCallback(user_id=1)
