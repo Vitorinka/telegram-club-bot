@@ -3896,6 +3896,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 RETURNING *
             """, (str(uuid.uuid4()), token_hash))
             gift_row = main.gift_row_dict(cur, cur.fetchone())
+            before_enqueue = datetime.utcnow()
             first = main.enqueue_gift_certificate_delivery(cur, gift_row, 9907, main.GIFT_CERTIFICATE_BUYER)
             second = main.enqueue_gift_certificate_delivery(cur, gift_row, 9907, main.GIFT_CERTIFICATE_BUYER)
             conn.commit()
@@ -3906,7 +3907,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         row = self.query_one("""
-            SELECT delivery_key, payload_json
+            SELECT delivery_key, payload_json, next_attempt_at
             FROM message_delivery_events
             WHERE delivery_type = %s
         """, (main.GIFT_CERTIFICATE_BUYER,))
@@ -3917,6 +3918,74 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn("https://t.me/", row[1])
         self.assertNotIn(raw_token, row[1])
         self.assertIn('"token_version": 1', row[1])
+        self.assertGreater(row[2], before_enqueue + timedelta(milliseconds=500))
+
+    def test_gift_buyer_instruction_is_delivered_before_certificate_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        reference = "GIFT-0000000000000012"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO gift_certificate_templates (tariff_code, file_id, uploaded_by)
+                VALUES ('gift_1m', 'photo_file_id', 1)
+            """)
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+                    gift_message, tariff_code, duration_days, status, token_hash, token_version
+                )
+                VALUES (%s, %s, 9932, 'Recipient', 'Sender', '', 'gift_1m', 30,
+                        'paid_unclaimed', %s, 1)
+                RETURNING *
+            """, (
+                str(uuid.uuid4()),
+                reference,
+                main.gift_token_hash_for_reference(reference, 1),
+            ))
+            gift_row = main.gift_row_dict(cur, cur.fetchone())
+            main.enqueue_gift_text_delivery(
+                cur, reference, 9932, "gift_paid_buyer", main.build_gift_buyer_paid_text(gift_row)
+            )
+            main.enqueue_gift_certificate_delivery(cur, gift_row, 9932, main.GIFT_CERTIFICATE_BUYER)
+            cur.execute("UPDATE message_delivery_events SET next_attempt_at = NOW() - INTERVAL '1 second'")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        delivered = []
+
+        async def send_message(*args, **kwargs):
+            delivered.append("instruction")
+
+        async def send_photo(*args, **kwargs):
+            delivered.append("certificate")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", side_effect=send_message), \
+             mock.patch.object(main.bot, "send_photo", side_effect=send_photo), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    UPDATE message_delivery_events
+                    SET next_attempt_at = NOW() - INTERVAL '1 second'
+                    WHERE delivery_type = %s AND status = 'failed'
+                """, (main.GIFT_CERTIFICATE_BUYER,))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(delivered, ["instruction", "certificate"])
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE status = 'sent'"
+        )[0], 2)
 
     def test_gift_checkout_draft_replaces_only_when_recipient_sender_and_message_match_real_postgres(self):
         run_migrations(self.get_conn)
@@ -4443,6 +4512,62 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)),
             (True, new_expiry),
         )
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_type = 'gift_redeemed_recipient'"
+            )[0],
+            0,
+        )
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_type = %s",
+                (main.ACCESS_RESTORE_DELIVERY_TYPE,),
+            )[0],
+            1,
+        )
+
+    def test_gift_expiry_reminder_is_source_aware_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 9930
+        expiry = datetime.utcnow() + timedelta(hours=36)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, TRUE, %s, FALSE, NULL)
+            """, (recipient_id, expiry))
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version, redeemed_at, applied_at, applied_expiry
+                )
+                VALUES (%s, 'GIFT-0000000000000011', 9931, %s, 'Recipient', 'Sender', '',
+                        'gift_1m', 30, 'redeemed', %s, 1, NOW(), NOW(), %s)
+            """, (
+                str(uuid.uuid4()),
+                recipient_id,
+                main.gift_token_hash_for_reference("GIFT-0000000000000011", 1),
+                expiry,
+            ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()) as send_message, \
+             mock.patch.object(main, "notify_subscription_check_admins_if_needed", mock.AsyncMock()):
+            asyncio.run(main.check_subscriptions_and_reminders())
+
+        send_message.assert_awaited_once()
+        self.assertIn("подарочный доступ", send_message.await_args.args[1])
+        self.assertTrue(self.query_one(
+            "SELECT reminder_sent FROM users WHERE telegram_id = %s",
+            (recipient_id,),
+        )[0])
 
     def test_gift_activation_is_atomic_under_concurrency(self):
         run_migrations(self.get_conn)

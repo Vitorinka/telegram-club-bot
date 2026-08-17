@@ -1007,7 +1007,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertLess(source.index("await asyncio.gather"), source.rindex("conn = get_db_conn()"))
 
     def test_grace_block_is_reachable_for_reminder(self):
-        source = MAIN_SOURCE[MAIN_SOURCE.index("for (telegram_id, expiry, payment_failed"):MAIN_SOURCE.index("# ----- Напоминание за 48 часов -----")]
+        source = MAIN_SOURCE[MAIN_SOURCE.index("for reminder_row in reminder_users"):MAIN_SOURCE.index("# ----- Напоминание за 48 часов -----")]
         self.assertIn("grace_total += 1", source)
         self.assertIn("if not reminder_sent:", source)
         self.assertNotIn("пропущен из-за активного grace_period_end={fmt_report_dt(grace_end)}\"\n                )\n                continue", source)

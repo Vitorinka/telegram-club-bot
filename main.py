@@ -1817,7 +1817,7 @@ def gift_certificate_caption(row):
     sender = gift_safe_user_text(row.get("sender_name") or "друга")
     message = gift_safe_user_text(row.get("gift_message"))
     lines = [
-        "🎁 Подарочный сертификат в клуб Натальи Ребковец",
+        "🎁 Вам подарили доступ в клуб Натальи Ребковец",
         "",
         f"Для: {recipient}",
         f"От: {sender}",
@@ -1825,21 +1825,22 @@ def gift_certificate_caption(row):
     ]
     if message:
         lines.extend(["", message])
-    lines.extend(["", "Активировать подарок можно по кнопке или ссылке ниже."])
+    lines.extend([
+        "",
+        "Как получить подарок:",
+        "",
+        "1. Нажмите «Активировать подарок».",
+        "2. Если Telegram попросит запустить бот — нажмите Start / Начать.",
+        "3. Бот активирует сертификат и откроет доступ в клуб.",
+        "4. После активации вы получите кнопку для входа в закрытый клуб.",
+    ])
     return "\n".join(lines)
 
 
 def gift_certificate_delivery_caption(base_caption, button_url):
-    instruction = "Активировать подарок можно по кнопке или ссылке:"
-    old_instruction = "Активировать подарок можно по кнопке ниже."
-    current_instruction = "Активировать подарок можно по кнопке или ссылке ниже."
     caption = html.unescape(base_caption or "").strip()
-    for removable in (old_instruction, current_instruction):
-        if caption.endswith(removable):
-            caption = caption[: -len(removable)].rstrip()
-            break
     url = button_url or ""
-    suffix = f"\n\n{instruction}\n\n{url}"
+    suffix = f"\n\nЕсли кнопка не открывается, используйте эту ссылку:\n{url}"
     available = GIFT_CERTIFICATE_CAPTION_LIMIT - len(suffix)
     if available < 0:
         return html.escape(suffix.strip()[:GIFT_CERTIFICATE_CAPTION_LIMIT], quote=True)
@@ -1857,15 +1858,21 @@ def gift_delivery_key(public_reference, purpose, recipient_id=None, token_versio
     return f"gift:{public_reference}:{purpose}{suffix}"
 
 
-def enqueue_gift_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload):
+def enqueue_gift_message_delivery(cur, delivery_key, telegram_id, delivery_type, payload, delay_seconds=0):
     cur.execute("""
         INSERT INTO message_delivery_events (
             delivery_key, telegram_id, delivery_type, status, attempt_count, last_error, payload_json, next_attempt_at
         )
-        VALUES (%s, %s, %s, 'pending', 0, NULL, %s, NOW())
+        VALUES (%s, %s, %s, 'pending', 0, NULL, %s, NOW() + (%s * INTERVAL '1 second'))
         ON CONFLICT (delivery_key) DO NOTHING
         RETURNING delivery_key
-    """, (delivery_key, int(telegram_id), delivery_type, json.dumps(payload, ensure_ascii=False, sort_keys=True)))
+    """, (
+        delivery_key,
+        int(telegram_id),
+        delivery_type,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        int(delay_seconds),
+    ))
     return cur.fetchone() is not None
 
 
@@ -1893,6 +1900,10 @@ def enqueue_gift_admin_delivery(cur, public_reference, purpose, text, severity="
         ):
             count += 1
     return count
+
+
+def gift_admin_recipient_allowed(telegram_id):
+    return int(telegram_id) in ADMIN_IDS
 
 
 def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
@@ -1927,6 +1938,7 @@ def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
             "parse_mode": "HTML",
             "button_text": "🎁 Активировать подарок",
         },
+        delay_seconds=1 if delivery_type == GIFT_CERTIFICATE_BUYER else 0,
     )
 
 
@@ -3127,23 +3139,34 @@ def apply_subscription_refund_reconciliation(cur, event_id, proof, source="strip
 def build_gift_buyer_paid_text(row):
     return (
         "🎁 Подарок оплачен\n\n"
-        "Сертификат уже готов. Сохраните его и отправьте получателю.\n\n"
-        f"Номер подарка: {row['public_reference']}"
+        "Всё готово. Следующим сообщением я пришлю подарочный сертификат.\n\n"
+        "Перешлите следующее сообщение целиком человеку, которому предназначен подарок.\n\n"
+        "Получателю нужно будет нажать «Активировать подарок» — после этого бот поможет ему получить доступ в клуб.\n\n"
+        "Вам больше ничего делать не нужно."
     )
 
 
 def build_gift_redeemed_recipient_text(row, expiry_date):
     return (
-        "🎁 Подарок активирован!\n\n"
-        f"Доступ в клуб открыт до {expiry_date.strftime('%d.%m.%Y')}.\n"
-        "Ссылка для входа придёт отдельным сообщением."
+        "🎉 Подарок активирован\n\n"
+        f"Ваш доступ в клуб продлён до {expiry_date.strftime('%d.%m.%Y')}.\n\n"
+        "Вы уже состоите в клубе, поэтому повторно вступать не нужно."
     )
 
 
-def build_gift_redeemed_buyer_text(row):
+def build_gift_redeemed_invite_text(expiry_date):
+    return (
+        "🎉 Подарок активирован\n\n"
+        f"Вам открыт доступ в закрытый клуб Натальи Ребковец до {expiry_date.strftime('%d.%m.%Y')}.\n\n"
+        "Нажмите кнопку ниже, чтобы присоединиться к клубу.\n"
+        "Ссылка персональная и действует 24 часа."
+    )
+
+
+def build_gift_redeemed_buyer_text(row, expiry_date):
     return (
         "🎁 Ваш подарок активирован получателем.\n\n"
-        f"Номер подарка: {row['public_reference']}"
+        f"Срок доступа: до {expiry_date.strftime('%d.%m.%Y')}."
     )
 
 
@@ -3204,13 +3227,21 @@ async def gift_recipient_subscription_state(recipient_telegram_id):
 
 
 def gift_admin_text(title, row, extra=None):
+    status_labels = {
+        "paid_unclaimed": "paid, awaiting activation",
+        "reserved": "reserved for safe application",
+        "redeemed": "redeemed",
+        "cancelled": "cancelled",
+        "refunded": "refunded",
+        "review_required": "manual review required",
+    }
     text = (
         f"{title}\n\n"
-        f"gift: {row['public_reference']}\n"
-        f"purchaser: {row['purchaser_telegram_id']}\n"
-        f"recipient: {row.get('recipient_telegram_id') or 'не указан'}\n"
-        f"tariff: {row['tariff_code']}\n"
-        f"status: {row['status']}"
+        f"Gift ref: {safe_log_id(row['public_reference'])}\n"
+        f"Purchaser: {safe_log_id(row['purchaser_telegram_id'])}\n"
+        f"Recipient: {safe_log_id(row.get('recipient_telegram_id')) if row.get('recipient_telegram_id') else 'not yet claimed'}\n"
+        f"Tariff: {gift_tariff_label(row['tariff_code'])}\n"
+        f"Status: {status_labels.get(row['status'], 'unknown')}"
     )
     if extra:
         text += f"\n{extra}"
@@ -3313,6 +3344,13 @@ def mark_gift_paid_and_enqueue(cur, event_id, event_type, session, line_item, pr
         period_end=datetime.utcnow() + timedelta(days=updated["duration_days"]),
     )
     record_gift_event(cur, updated, "gift_paid", updated["purchaser_telegram_id"], source="stripe_webhook", notes=f"event={safe_log_id(event_id)}")
+    enqueue_gift_text_delivery(
+        cur,
+        updated["public_reference"],
+        updated["purchaser_telegram_id"],
+        "gift_paid_buyer",
+        build_gift_buyer_paid_text(updated),
+    )
     try:
         enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
     except ValueError as e:
@@ -3329,13 +3367,6 @@ def mark_gift_paid_and_enqueue(cur, event_id, event_type, session, line_item, pr
             ),
             severity="CRITICAL",
         )
-    enqueue_gift_text_delivery(
-        cur,
-        updated["public_reference"],
-        updated["purchaser_telegram_id"],
-        "gift_paid_buyer",
-        build_gift_buyer_paid_text(updated),
-    )
     enqueue_gift_admin_delivery(
         cur,
         updated["public_reference"],
@@ -3425,16 +3456,9 @@ def apply_gift_access_in_transaction(cur, gift_row, recipient_telegram_id, subsc
     enqueue_gift_text_delivery(
         cur,
         redeemed["public_reference"],
-        recipient_telegram_id,
-        "gift_redeemed_recipient",
-        build_gift_redeemed_recipient_text(redeemed, new_expiry),
-    )
-    enqueue_gift_text_delivery(
-        cur,
-        redeemed["public_reference"],
         redeemed["purchaser_telegram_id"],
         "gift_redeemed_buyer",
-        build_gift_redeemed_buyer_text(redeemed),
+        build_gift_redeemed_buyer_text(redeemed, new_expiry),
     )
     enqueue_gift_admin_delivery(
         cur,
@@ -5220,6 +5244,55 @@ def _fetch_payment_buyers(cur, period_start_utc, period_end_utc):
     ]
 
 
+def _fetch_weekly_gifts(cur, period_start_utc, period_end_utc):
+    cur.execute("""
+        SELECT
+            pe.created_at,
+            pe.telegram_id,
+            purchaser.username,
+            purchaser.first_name,
+            purchaser.last_name,
+            gift.tariff_code,
+            gift.amount_total,
+            gift.currency,
+            gift.status,
+            gift.recipient_telegram_id,
+            recipient.username,
+            recipient.first_name,
+            recipient.last_name,
+            gift.applied_expiry
+        FROM payment_events pe
+        JOIN gift_access_grants gift
+          ON gift.stripe_session_id = pe.checkout_session_id
+        LEFT JOIN users purchaser ON purchaser.telegram_id = pe.telegram_id
+        LEFT JOIN users recipient ON recipient.telegram_id = gift.recipient_telegram_id
+        WHERE pe.payment_status = 'succeeded'
+          AND pe.payment_kind = %s
+          AND pe.created_at >= %s
+          AND pe.created_at < %s
+        ORDER BY pe.created_at ASC, pe.id ASC
+    """, (GIFT_PAYMENT_KIND, period_start_utc, period_end_utc))
+    return [
+        {
+            "paid_at": row[0],
+            "telegram_id": row[1],
+            "username": row[2],
+            "first_name": row[3],
+            "last_name": row[4],
+            "tariff_code": row[5],
+            "amount_total": row[6] or 0,
+            "currency": row[7],
+            "status": row[8],
+            "recipient_telegram_id": row[9],
+            "recipient_username": row[10],
+            "recipient_first_name": row[11],
+            "recipient_last_name": row[12],
+            "applied_expiry": row[13],
+        }
+        for row in cur.fetchall()
+    ]
+
+
 def _fetch_weekly_metrics(cur, period_start_utc, period_end_utc):
     metrics = {
         "new_registrations": _fetch_single_count(
@@ -5456,6 +5529,7 @@ async def build_weekly_admin_report(period_start, period_end):
         metrics = _fetch_weekly_metrics(cur, period_start_utc, period_end_utc)
         comparison = _fetch_weekly_metrics(cur, comparison_start_utc, comparison_end_utc)
         buyers = _fetch_payment_buyers(cur, period_start_utc, period_end_utc)
+        gifts = _fetch_weekly_gifts(cur, period_start_utc, period_end_utc)
         history_started_at = _fetch_payment_history_started_at(cur)
     finally:
         cur.close()
@@ -5476,6 +5550,7 @@ async def build_weekly_admin_report(period_start, period_end):
         metrics,
         comparison=comparison,
         buyers=buyers,
+        gifts=gifts,
         history_note=history_note,
     )
     return text, buyers
@@ -6947,7 +7022,19 @@ async def check_subscriptions_and_reminders():
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT telegram_id, expiry_date, payment_failed, payment_failed_at, grace_period_end, auto_renew, reminder_sent, trial_used, stripe_subscription_id, stripe_customer_id
+        SELECT users.telegram_id, users.expiry_date, users.payment_failed, users.payment_failed_at,
+               users.grace_period_end, users.auto_renew, users.reminder_sent, users.trial_used,
+               users.stripe_subscription_id, users.stripe_customer_id,
+               (
+                   users.stripe_subscription_id IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM gift_access_grants gift
+                       WHERE gift.recipient_telegram_id = users.telegram_id
+                         AND gift.status = 'redeemed'
+                         AND gift.applied_expiry = users.expiry_date
+                   )
+               ) AS current_access_is_gift
         FROM users
         WHERE paid = TRUE
           AND expiry_date IS NOT NULL
@@ -7082,7 +7169,12 @@ async def check_subscriptions_and_reminders():
 
         return "\n".join(lines)
 
-    for (telegram_id, expiry, payment_failed, payment_failed_at, grace_end, auto_renew, reminder_sent, _, stripe_subscription_id, stripe_customer_id) in reminder_users:
+    for reminder_row in reminder_users:
+        (
+            telegram_id, expiry, payment_failed, payment_failed_at, grace_end,
+            auto_renew, reminder_sent, _, stripe_subscription_id, stripe_customer_id,
+        ) = reminder_row[:10]
+        current_access_is_gift = bool(reminder_row[10]) if len(reminder_row) > 10 else False
         time_left = expiry - now
 
         # ----- Reminder после истечения, пока пользователь в льготном периоде -----
@@ -7146,7 +7238,15 @@ async def check_subscriptions_and_reminders():
                     f"Пользователь {telegram_id}: напоминание за 48 часов пропущено, потому что включено auto_renew."
                 )
             elif not reminder_sent and not auto_renew:
-                text = "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
+                text = (
+                    "🎁 Ваш подарочный доступ в клуб заканчивается через 2 дня — "
+                    f"{expiry.strftime('%d.%m.%Y')}.\n\n"
+                    "Если хотите остаться в клубе после окончания подарочного периода, "
+                    "можно оформить доступ самостоятельно.\n\n"
+                    "Выберите подходящий вариант:"
+                    if current_access_is_gift
+                    else "⏳ Ваша подписка заканчивается через 48 часов. Продлите доступ, чтобы не потерять связь с клубом."
+                )
                 try:
                     await bot.send_message(telegram_id, text, reply_markup=get_tariffs_keyboard(show_trial=False))
                     set_subscription_reminder_sent(telegram_id)
@@ -8041,8 +8141,7 @@ async def gift_activate_callback(callback: types.CallbackQuery, state: FSMContex
         await callback.answer()
         return
     await state.clear()
-    await callback.message.answer("Подарок принят. Подтверждение придёт отдельным сообщением.", reply_markup=get_main_keyboard())
-    await callback.answer()
+    await callback.answer("Подарок активирован")
 
 
 @router.message(F.text == "🆘 Правила клуба", StateFilter('*'))
@@ -9007,31 +9106,17 @@ async def show_gift_deep_link(message, state, token):
     if gift_row.get("recipient_telegram_id") and int(gift_row["recipient_telegram_id"]) != int(message.from_user.id):
         await message.answer("🎁 Этот подарок уже закреплён за другим получателем.")
         return
-    cert_conn = get_db_conn()
-    cert_cur = cert_conn.cursor()
-    try:
-        locked_gift = fetch_gift_by_public_reference_version(cert_cur, public_reference, token_version, for_update=True)
-        if locked_gift and locked_gift["status"] in ("paid_unclaimed", "reserved"):
-            enqueue_gift_certificate_delivery(cert_cur, locked_gift, message.from_user.id, GIFT_CERTIFICATE_RECIPIENT)
-        cert_conn.commit()
-    except Exception:
-        cert_conn.rollback()
-        logging.warning("GIFT_RECIPIENT_CERTIFICATE_ENQUEUE_FAILED: gift=%s", safe_log_id(public_reference), exc_info=True)
-    finally:
-        cert_cur.close()
-        cert_conn.close()
     await state.update_data(
         gift_token_hash=token_hash,
         gift_token_version=token_version,
         gift_public_reference=gift_row["public_reference"],
     )
     text = (
-        "🎁 Вам подарили доступ в клуб Натальи Ребковец\n\n"
+        "🎁 Подарок найден\n\n"
         f"Срок доступа: {gift_tariff_label(gift_row['tariff_code'])}\n"
-        f"От: {gift_safe_user_text(gift_row.get('sender_name') or 'друга')}"
+        f"От: {gift_safe_user_text(gift_row.get('sender_name') or 'друга')}\n\n"
+        "Активировать его на этот Telegram-аккаунт?"
     )
-    if gift_row.get("gift_message"):
-        text += f"\n\n{gift_safe_user_text(gift_row['gift_message'])}"
     await message.answer(text, reply_markup=gift_activation_keyboard(gift_row["public_reference"]), parse_mode="HTML")
 
 
@@ -18221,6 +18306,13 @@ async def process_pending_message_deliveries(limit=25):
                 restricted_has_access = getattr(member, "is_member", True)
                 membership_decision = restore_access_membership_decision(member_status, restricted_has_access)
                 if membership_decision == "already_member":
+                    if source == "gift_access":
+                        sending_user_message = True
+                        await bot.send_message(
+                            int(telegram_id),
+                            build_gift_redeemed_recipient_text({}, effective_expiry),
+                            reply_markup=get_main_keyboard(),
+                        )
                     already_conn = get_db_conn()
                     already_cur = already_conn.cursor()
                     try:
@@ -18286,7 +18378,11 @@ async def process_pending_message_deliveries(limit=25):
                 sending_user_message = True
                 await bot.send_message(
                     int(telegram_id),
-                    access_restore_invite_text(effective_expiry),
+                    (
+                        build_gift_redeemed_invite_text(effective_expiry)
+                        if source == "gift_access"
+                        else access_restore_invite_text(effective_expiry)
+                    ),
                     reply_markup=access_restore_invite_keyboard(link),
                 )
             elif delivery_type in ("stripe_rejoin_invite", "stripe_rejoin_check"):
@@ -18393,6 +18489,27 @@ async def process_pending_message_deliveries(limit=25):
                 cert_conn = get_db_conn()
                 cert_cur = cert_conn.cursor()
                 try:
+                    if delivery_type == GIFT_CERTIFICATE_BUYER:
+                        cert_cur.execute(
+                            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+                            (gift_delivery_key(public_reference, "gift_paid_buyer"),),
+                        )
+                        instruction_row = cert_cur.fetchone()
+                        if instruction_row and instruction_row[0] != "sent":
+                            deferred = mark_delivery_failed(
+                                cert_cur,
+                                delivery_key,
+                                claim_generation,
+                                RuntimeError("gift_certificate_waiting_for_buyer_instruction"),
+                                retry_delay_minutes=5,
+                            )
+                            if deferred == "failed":
+                                cert_conn.commit()
+                                retryable_failed += 1
+                            else:
+                                cert_conn.rollback()
+                                log_stale_delivery_claim(delivery_key, "defer_gift_certificate")
+                            continue
                     gift_row = fetch_gift_by_public_reference_version(
                         cert_cur,
                         public_reference,
@@ -18447,6 +18564,18 @@ async def process_pending_message_deliveries(limit=25):
                 text = payload.get("text")
                 if not text:
                     raise ValueError("invalid_stripe_admin_message_payload")
+                sending_user_message = True
+                await bot.send_message(
+                    int(telegram_id),
+                    text,
+                    parse_mode=payload.get("parse_mode"),
+                )
+            elif delivery_type.startswith("gift_admin_"):
+                if not gift_admin_recipient_allowed(telegram_id):
+                    raise ValueError("invalid_gift_admin_message_recipient")
+                text = payload.get("text")
+                if not text:
+                    raise ValueError("invalid_gift_admin_message_payload")
                 sending_user_message = True
                 await bot.send_message(
                     int(telegram_id),

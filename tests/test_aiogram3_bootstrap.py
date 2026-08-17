@@ -4710,7 +4710,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://t.me/ClubGiftBot?start=gift_", caption)
         self.assertIn("🎁 Подарочный сертификат в клуб Натальи Ребковец", caption)
         self.assertIn("Для: Анна", caption)
-        self.assertIn("Активировать подарок можно по кнопке или ссылке:", caption)
+        self.assertIn("Если кнопка не открывается, используйте эту ссылку:", caption)
         self.assertEqual(button_url, caption.rsplit("\n", 1)[-1])
         self.assertLessEqual(len(caption), self.main.GIFT_CERTIFICATE_CAPTION_LIMIT)
         mark_sent.assert_called_once()
