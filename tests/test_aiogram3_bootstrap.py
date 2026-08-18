@@ -2507,8 +2507,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 76)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 34)
+        self.assertEqual(len(self.main.router.message.handlers), 77)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 35)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2539,8 +2539,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 76)
-        self.assertEqual(len(callback_handlers), 34)
+        self.assertEqual(len(message_handlers), 77)
+        self.assertEqual(len(callback_handlers), 35)
         self.assertEqual(
             commands,
             [
@@ -4742,7 +4742,6 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "public_reference": public_reference,
             "token_version": token_version,
             "recipient_kind": "buyer",
-            "photo_file_id": "photo_file_id",
             "caption": (
                 "🎁 Подарочный сертификат в клуб Натальи Ребковец\n\n"
                 "Для: Анна\n"
@@ -4758,6 +4757,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "token_version": token_version,
             "token_hash": token_hash,
             "status": "paid_unclaimed",
+            "tariff_code": "gift_1m",
+            "certificate_name": "Анна",
         }
         send_photo = AsyncMock()
 
@@ -4783,7 +4784,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, {"sent": 1, "retryable_failed": 0, "permanently_failed": 0, "blocked": 0})
         send_photo.assert_awaited_once()
         _, args, kwargs = send_photo.mock_calls[0]
-        self.assertEqual(args[:2], (123, "photo_file_id"))
+        self.assertEqual(args[0], 123)
+        self.assertIsInstance(args[1], self.main.FSInputFile)
+        self.assertFalse(Path(args[1].path).exists())
         caption = kwargs["caption"]
         button_url = kwargs["reply_markup"].inline_keyboard[0][0].url
         self.assertIn("https://t.me/ClubGiftBot?start=gift_", caption)
@@ -4793,6 +4796,65 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button_url, caption.rsplit("\n", 1)[-1])
         self.assertLessEqual(len(caption), self.main.GIFT_CERTIFICATE_CAPTION_LIMIT)
         mark_sent.assert_called_once()
+
+    async def test_gift_certificate_generation_failure_keeps_delivery_retryable_and_enqueues_safe_notice(self):
+        public_reference = "GIFT-ABCD1234ABCD1234"
+        token_version = 2
+        raw_name = "Секретное Имя"
+        with patch.dict(os.environ, {
+            "BOT_USERNAME": "ClubGiftBot",
+            "GIFT_TOKEN_SECRET": "unit-test-gift-token-secret-32chars",
+        }):
+            token_hash = self.main.gift_token_hash_for_reference(public_reference, token_version)
+        payload = {
+            "public_reference": public_reference,
+            "token_version": token_version,
+            "recipient_kind": "buyer",
+            "caption": "certificate",
+            "parse_mode": "HTML",
+            "button_text": "🎁 Активировать подарок",
+        }
+        gift_row = {
+            "public_reference": public_reference,
+            "token_version": token_version,
+            "token_hash": token_hash,
+            "status": "paid_unclaimed",
+            "tariff_code": "gift_1m",
+            "certificate_name": raw_name,
+        }
+
+        with patch.dict(os.environ, {
+            "BOT_USERNAME": "ClubGiftBot",
+            "GIFT_TOKEN_SECRET": "unit-test-gift-token-secret-32chars",
+        }), patch.object(
+            self.main,
+            "get_db_conn",
+            side_effect=[FakeConnection(), FakeConnection(), FakeConnection()],
+        ), patch.object(self.main, "claim_pending_message_deliveries", return_value=[(
+                 self.main.gift_delivery_key(
+                     public_reference,
+                     self.main.GIFT_CERTIFICATE_BUYER,
+                     token_version=token_version,
+                     recipient_kind="buyer",
+                 ),
+                 123,
+                 self.main.GIFT_CERTIFICATE_BUYER,
+                 json.dumps(payload, ensure_ascii=False),
+                 1,
+                 None,
+                 1,
+             )]), \
+             patch.object(self.main, "fetch_gift_by_public_reference_version", return_value=gift_row), \
+             patch.object(self.main, "render_gift_certificate", side_effect=RuntimeError("render_failed")), \
+             patch.object(self.main, "enqueue_gift_certificate_failure_notices") as notices, \
+             patch.object(self.main, "mark_delivery_failed", return_value="failed"), \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             self.assertLogs(level="WARNING") as logs:
+            result = await self.main.process_pending_message_deliveries()
+
+        self.assertEqual(result["retryable_failed"], 1)
+        notices.assert_called_once_with(public_reference, 123, gift_row)
+        self.assertNotIn(raw_name, "\n".join(logs.output))
 
     async def test_admin_payment_helpers_enqueue_all_admins_and_sanitize_problem_text(self):
         conn = FakeConnection(fetches=[("admin-1",), ("admin-2",)])
@@ -6965,6 +7027,42 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('F.text == "🎁 Бесплатный урок"', source)
         self.assertNotIn('F.text == "🎁 Подарить доступ"', source)
         self.assertNotIn('F.text == "🆘 Правила клуба"', source)
+
+    async def test_gift_certificate_name_step_accepts_name_or_without_name(self):
+        callback = FakeCallback()
+        callback.data = "gift_tariff:gift_1m"
+        state = FakeState()
+        await self.main.gift_tariff_selected(callback, state)
+        self.assertEqual(state.states[-1], self.main.GiftPurchaseStates.certificate_name)
+        prompt, kwargs = callback.message.answers[-1]
+        self.assertIn("Как подписать сертификат?", prompt)
+        self.assertEqual(kwargs["reply_markup"].inline_keyboard[0][0].text, "Без имени")
+
+        named_state = FakeState()
+        named_message = FakeMessage()
+        named_message.text = "  Анна   Мария  "
+        await self.main.gift_certificate_name_received(named_message, named_state)
+        self.assertEqual(named_state.data["certificate_name"], "Анна Мария")
+        self.assertEqual(named_state.states[-1], self.main.GiftPurchaseStates.recipient_name)
+
+        unnamed_state = FakeState()
+        unnamed_callback = FakeCallback()
+        await self.main.gift_certificate_without_name_callback(unnamed_callback, unnamed_state)
+        self.assertIsNone(unnamed_state.data["certificate_name"])
+        self.assertEqual(unnamed_state.states[-1], self.main.GiftPurchaseStates.recipient_name)
+
+    async def test_gift_certificate_name_rejects_too_long_before_checkout(self):
+        state = FakeState()
+        message = FakeMessage()
+        message.text = "А" * 51
+        await self.main.gift_certificate_name_received(message, state)
+        self.assertEqual(state.states, [])
+        self.assertEqual(state.data, {})
+        self.assertEqual(
+            message.answers[-1][0],
+            "Подпись слишком длинная для сертификата. "
+            "Попробуйте указать имя или более короткий вариант имени и фамилии.",
+        )
 
     async def test_schedule_uses_current_moscow_month_and_has_no_previous_month_fallback(self):
         august = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)
