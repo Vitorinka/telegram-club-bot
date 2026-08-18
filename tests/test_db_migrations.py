@@ -205,6 +205,23 @@ WHERE status = 'processing';
 """,
         )
 
+    def test_club_schedules_migration_is_narrow_and_required(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0013_club_schedules"]
+        self.assertEqual(migration["tables"], ("club_schedules",))
+        self.assertEqual(
+            set(migration["columns"]["club_schedules"]),
+            {
+                "schedule_month", "telegram_file_id", "uploaded_by_telegram_id",
+                "created_at", "updated_at",
+            },
+        )
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0013_club_schedules.sql").read_text()
+        self.assertIn("CREATE TABLE IF NOT EXISTS club_schedules", sql)
+        self.assertIn("schedule_month VARCHAR(7) PRIMARY KEY", sql)
+        self.assertIn("club_schedules_month_format_check", sql)
+        self.assertNotRegex(sql.upper(), r"\b(UPDATE|DELETE|DROP|TRUNCATE)\b")
+
     def test_postgres_fsm_storage_migration_is_required(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0004_postgres_fsm_storage"]
         self.assertIn("aiogram_fsm_states", migration["tables"])

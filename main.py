@@ -36,7 +36,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from postgres_fsm_storage import PostgresFSMStorage, cleanup_postgres_fsm_storage
 from storage_diagnostics import collect_storage_diagnostics, render_storage_diagnostics
 from constraint_audit import collect_constraint_audit, render_constraint_audit
-from schedule_config import SCHEDULES
 from stripe_invoice_rules import (
     checkout_completion_action,
     claim_stripe_event,
@@ -158,6 +157,10 @@ class ReplyState(StatesGroup):
 
 class SupportReplyState(StatesGroup):
     waiting_for_message = State()
+
+
+class ScheduleAdminStates(StatesGroup):
+    waiting_for_photo = State()
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -7783,6 +7786,7 @@ def get_main_keyboard(telegram_id=None):
     ]
     if telegram_id is not None and int(telegram_id) in ADMIN_IDS:
         rows.append([KeyboardButton(text="🛠 Управление подарками")])
+        rows.append([KeyboardButton(text="📅 Управление расписанием")])
     return reply_keyboard(rows, resize_keyboard=True)
 
 
@@ -7792,7 +7796,7 @@ RUSSIAN_MONTH_NAMES = (
 )
 
 
-def current_schedule(now=None):
+def schedule_month_details(now=None):
     current = now or datetime.now(MOSCOW_TZ)
     if current.tzinfo is None:
         current = current.replace(tzinfo=MOSCOW_TZ)
@@ -7800,7 +7804,110 @@ def current_schedule(now=None):
         current = current.astimezone(MOSCOW_TZ)
     month_key = current.strftime("%Y-%m")
     caption = f"📅 Расписание на {RUSSIAN_MONTH_NAMES[current.month - 1]} {current.year}"
-    return month_key, SCHEDULES.get(month_key), caption
+    return month_key, caption
+
+
+def validated_schedule_month(month_key):
+    if not isinstance(month_key, str) or re.fullmatch(r"[0-9]{4}-(0[1-9]|1[0-2])", month_key) is None:
+        raise ValueError("invalid_schedule_month")
+    return month_key
+
+
+def schedule_month_label(month_key):
+    validated_schedule_month(month_key)
+    year, month = (int(part) for part in month_key.split("-"))
+    return f"{RUSSIAN_MONTH_NAMES[month - 1].capitalize()} {year}"
+
+
+def shifted_schedule_month(month_key, offset):
+    validated_schedule_month(month_key)
+    year, month = (int(part) for part in month_key.split("-"))
+    absolute_month = year * 12 + month - 1 + int(offset)
+    shifted_year, shifted_zero_month = divmod(absolute_month, 12)
+    return f"{shifted_year:04d}-{shifted_zero_month + 1:02d}"
+
+
+def fetch_club_schedule(cur, month_key):
+    month_key = validated_schedule_month(month_key)
+    cur.execute(
+        """
+        SELECT schedule_month, telegram_file_id, uploaded_by_telegram_id, created_at, updated_at
+        FROM club_schedules
+        WHERE schedule_month = %s
+        """,
+        (month_key,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    columns = ("schedule_month", "telegram_file_id", "uploaded_by_telegram_id", "created_at", "updated_at")
+    return dict(zip(columns, row))
+
+
+def load_club_schedule(month_key):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        return fetch_club_schedule(cur, month_key)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def upsert_club_schedule(cur, month_key, file_id, admin_id):
+    month_key = validated_schedule_month(month_key)
+    if not file_id:
+        raise ValueError("schedule_file_id_missing")
+    cur.execute(
+        """
+        INSERT INTO club_schedules (
+            schedule_month, telegram_file_id, uploaded_by_telegram_id, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, NOW(), NOW())
+        ON CONFLICT (schedule_month) DO UPDATE
+        SET telegram_file_id = EXCLUDED.telegram_file_id,
+            uploaded_by_telegram_id = EXCLUDED.uploaded_by_telegram_id,
+            updated_at = NOW()
+        RETURNING schedule_month
+        """,
+        (month_key, str(file_id), int(admin_id)),
+    )
+    return cur.fetchone()[0]
+
+
+def current_schedule(now=None):
+    month_key, caption = schedule_month_details(now)
+    schedule = load_club_schedule(month_key)
+    return month_key, schedule["telegram_file_id"] if schedule else None, caption
+
+
+def admin_schedule_keyboard(month_key, exists):
+    previous_month = shifted_schedule_month(month_key, -1)
+    next_month = shifted_schedule_month(month_key, 1)
+    rows = [
+        [InlineKeyboardButton(text="📤 Загрузить расписание", callback_data=f"admin_schedule_upload:{month_key}")],
+        [
+            InlineKeyboardButton(text=f"← {schedule_month_label(previous_month)}", callback_data=f"admin_schedule_open:{previous_month}"),
+            InlineKeyboardButton(text=f"{schedule_month_label(next_month)} →", callback_data=f"admin_schedule_open:{next_month}"),
+        ],
+    ]
+    if exists:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить расписание", callback_data=f"admin_schedule_remove:{month_key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_schedule_close")])
+    return inline_keyboard(rows)
+
+
+def admin_schedule_text(month_key, schedule):
+    return (
+        "📅 Расписание клуба\n\n"
+        f"Выбранный месяц: {schedule_month_label(month_key)}\n"
+        f"Статус: {'загружено' if schedule else 'не загружено'}"
+    )
+
+
+def load_admin_schedule_view(month_key):
+    schedule = load_club_schedule(month_key)
+    return admin_schedule_text(month_key, schedule), admin_schedule_keyboard(month_key, bool(schedule))
 
 
 GIFT_ADMIN_STATUS_LABELS = {
@@ -7958,11 +8065,154 @@ async def show_menu(message: types.Message, state: FSMContext):
 @router.message(F.text == "📅 Расписание", StateFilter('*'))
 async def schedule_button_handler(message: types.Message, state: FSMContext):
     await state.clear()
-    _, file_id, caption = current_schedule()
+    month_key, file_id, caption = current_schedule()
     if file_id:
-        await message.answer_photo(photo=file_id, caption=caption)
+        try:
+            await message.answer_photo(photo=file_id, caption=caption)
+        except Exception as e:
+            error_ref = safe_admin_error_reference("club_schedule_send", e)
+            logging.error(
+                "CLUB_SCHEDULE_SEND_FAILED: month=%s, error_type=%s, error_ref=%s",
+                month_key,
+                type(e).__name__,
+                error_ref,
+            )
+            await message.answer("📅 Не получилось загрузить расписание. Мы уже проверяем файл.")
+            await notify_admins(
+                f"⚠️ Не удалось отправить расписание за {month_key}. Запись не удалена. ref: {error_ref}",
+                alert_key=f"club-schedule-send:{month_key}:{error_ref}",
+            )
         return
     await message.answer("📅 Расписание на этот месяц скоро появится.")
+
+
+@router.message(F.text == "📅 Управление расписанием", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_button_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    month_key, _ = schedule_month_details()
+    text, keyboard = load_admin_schedule_view(month_key)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("admin_schedule_open:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_open_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    month_key = validated_schedule_month(callback.data.split(":", 1)[1])
+    text, keyboard = load_admin_schedule_view(month_key)
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_schedule_upload:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_upload_callback(callback: types.CallbackQuery, state: FSMContext):
+    month_key = validated_schedule_month(callback.data.split(":", 1)[1])
+    await state.set_state(ScheduleAdminStates.waiting_for_photo)
+    await state.update_data(schedule_month=month_key)
+    await callback.message.answer(
+        f"Отправьте изображение расписания на {schedule_month_label(month_key)}.",
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="admin_schedule_upload_cancel")
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_schedule_upload_cancel", StateFilter(ScheduleAdminStates.waiting_for_photo))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_upload_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Загрузка расписания отменена.")
+    await callback.answer()
+
+
+@router.message(F.photo, StateFilter(ScheduleAdminStates.waiting_for_photo))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_photo_received(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    month_key = validated_schedule_month(data.get("schedule_month"))
+    file_id = message.photo[-1].file_id
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        upsert_club_schedule(cur, month_key, file_id, message.from_user.id)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        error_ref = safe_admin_error_reference("club_schedule_upload", e)
+        logging.error(
+            "CLUB_SCHEDULE_UPLOAD_FAILED: month=%s, admin_id=%s, error_type=%s, error_ref=%s",
+            month_key,
+            message.from_user.id,
+            type(e).__name__,
+            error_ref,
+        )
+        await state.clear()
+        await message.answer(f"❌ Не удалось сохранить расписание. ref: {error_ref}")
+        return
+    finally:
+        cur.close()
+        conn.close()
+    await state.clear()
+    confirmation = f"✅ Расписание на {schedule_month_label(month_key).lower()} сохранено."
+    try:
+        await message.answer_photo(photo=file_id, caption=confirmation)
+    except Exception as e:
+        logging.warning(
+            "CLUB_SCHEDULE_PREVIEW_FAILED: month=%s, error_type=%s, error_ref=%s",
+            month_key,
+            type(e).__name__,
+            safe_admin_error_reference("club_schedule_preview", e),
+        )
+        await message.answer(confirmation)
+
+
+@router.callback_query(F.data.startswith("admin_schedule_remove:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_delete_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    month_key = validated_schedule_month(callback.data.split(":", 1)[1])
+    await callback.message.edit_text(
+        f"Удалить расписание на {schedule_month_label(month_key)}?",
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin_schedule_delete_confirm:{month_key}"),
+            InlineKeyboardButton(text="❌ Нет", callback_data=f"admin_schedule_open:{month_key}"),
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_schedule_delete_confirm:"), StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_delete_confirm_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    month_key = validated_schedule_month(callback.data.split(":", 1)[1])
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM club_schedules WHERE schedule_month = %s RETURNING schedule_month", (month_key,))
+        deleted = cur.fetchone()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+    text, keyboard = load_admin_schedule_view(month_key)
+    prefix = "✅ Расписание удалено.\n\n" if deleted else "ℹ️ Расписание уже отсутствует.\n\n"
+    await callback.message.edit_text(prefix + text, reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_schedule_close", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_schedule_close_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Управление расписанием закрыто.")
+    await callback.answer()
 
 
 @router.message(F.text == "🛠 Управление подарками", StateFilter('*'))
