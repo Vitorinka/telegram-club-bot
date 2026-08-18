@@ -594,6 +594,24 @@ def safe_admin_context_reference(context, *parts):
     return f"{context}:{fingerprint}"
 
 
+def non_decreasing_expiry(existing_expiry, candidate_expiry):
+    """Return the later expiry without mixing aware and naive datetime comparisons."""
+    def utc_naive(value):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    existing_utc = utc_naive(existing_expiry)
+    candidate_utc = utc_naive(candidate_expiry)
+    if existing_utc is None:
+        return candidate_utc
+    if candidate_utc is None:
+        return existing_utc
+    return max(existing_utc, candidate_utc)
+
+
 def critical_alert_fingerprint(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
 
@@ -6155,11 +6173,12 @@ async def get_open_invoice_url_for_subscription(stripe_subscription_id):
             if hosted_invoice_url:
                 return hosted_invoice_url, getattr(invoice, "id", None)
     except Exception as e:
+        error_ref = safe_admin_error_reference("open_invoice_lookup", e)
         logging.error(
-            "OPEN_INVOICE_LOOKUP_FAILED: stripe_subscription_id=%s, error=%s",
+            "OPEN_INVOICE_LOOKUP_FAILED: stripe_subscription_id=%s, error_type=%s, error_ref=%s",
             safe_log_id(stripe_subscription_id),
-            str(e),
-            exc_info=True,
+            type(e).__name__,
+            error_ref,
         )
 
     return None, None
@@ -6177,11 +6196,12 @@ async def create_billing_portal_url(stripe_customer_id):
         )
         return getattr(portal, "url", None)
     except Exception as e:
+        error_ref = safe_admin_error_reference("billing_portal_create", e)
         logging.error(
-            "BILLING_PORTAL_CREATE_FAILED: stripe_customer_id=%s, error=%s",
+            "BILLING_PORTAL_CREATE_FAILED: stripe_customer_id=%s, error_type=%s, error_ref=%s",
             safe_log_id(stripe_customer_id),
-            str(e),
-            exc_info=True,
+            type(e).__name__,
+            error_ref,
         )
         return None
 
@@ -6641,7 +6661,7 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
         if status in ('active', 'trialing') and not current_period_end:
             logging.warning(
                 f"Stripe subscription active/trialing, но period_end не найден. "
-                f"telegram_id={telegram_id}, stripe_subscription_id={stripe_subscription_id}"
+                f"telegram_id={telegram_id}, stripe_subscription_id={safe_log_id(stripe_subscription_id)}"
             )
             if cur is not None:
                 cur.execute("""
@@ -9706,8 +9726,8 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                         "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
                         "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
                         user_id,
-                        stripe_subscription_id,
-                        customer_id,
+                        safe_log_id(stripe_subscription_id),
+                        safe_log_id(customer_id),
                         status,
                         "active_subscription_no_checkout",
                     )
@@ -9746,14 +9766,15 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 conn.commit()
                 logging.warning(
                     f"Checkout заблокирован: Stripe subscription active/trialing, но period_end не найден. "
-                    f"user_id={user_id}, stripe_subscription_id={stripe_subscription_id}, customer_id={customer_id}"
+                    f"user_id={user_id}, stripe_subscription_id={safe_log_id(stripe_subscription_id)}, "
+                    f"customer_id={safe_log_id(customer_id)}"
                 )
                 logging.warning(
                     "EXISTING_STRIPE_SUBSCRIPTION_FOUND_CHECKOUT_BLOCKED: telegram_id=%s, "
                     "stripe_subscription_id=%s, stripe_customer_id=%s, status=%s, action=%s",
                     user_id,
-                    stripe_subscription_id,
-                    customer_id,
+                    safe_log_id(stripe_subscription_id),
+                    safe_log_id(customer_id),
                     status,
                     "active_subscription_period_unknown_no_checkout",
                 )
@@ -9791,7 +9812,12 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
                 await state.clear()
                 return
         except Exception as e:
-            logging.error(f"Не удалось проверить Stripe перед Checkout для пользователя {user_id}: {e}")
+            logging.error(
+                "CHECKOUT_EXISTING_SUBSCRIPTION_GUARD_FAILED: user_id=%s, error_type=%s, error_ref=%s",
+                user_id,
+                type(e).__name__,
+                safe_admin_error_reference("checkout_existing_subscription_guard", e),
+            )
             cur.close()
             conn.close()
             await enqueue_admin_payment_problem_now(
@@ -10993,7 +11019,12 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                     period_source = "invoice.lines.data[0].period.end"
                     break
         except Exception as e:
-            logging.error("Не удалось получить invoices Stripe для /sync_stripe_user %s: %s", target_user_id, e)
+            logging.error(
+                "SYNC_STRIPE_USER_INVOICE_LIST_FAILED: telegram_id=%s, error_type=%s, error_ref=%s",
+                target_user_id,
+                type(e).__name__,
+                safe_admin_error_reference("sync_stripe_invoice_list", e),
+            )
 
     if current_period_end:
         period_end_dt = datetime.utcfromtimestamp(current_period_end)
@@ -11028,6 +11059,7 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                         "чтобы проверить текущую подписку."
                     )
                 else:
+                    effective_expiry = non_decreasing_expiry(current_old_expiry, new_expiry)
                     write_cur.execute("""
                         UPDATE users
                         SET paid = TRUE,
@@ -11041,11 +11073,11 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                             auto_renew = %s,
                             blocked_bot = FALSE
                         WHERE telegram_id = %s
-                    """, (new_expiry, customer_id, auto_renew, target_user_id))
+                    """, (effective_expiry, customer_id, auto_renew, target_user_id))
                     enqueue_automatic_membership_repair(
                         write_cur,
                         target_user_id,
-                        new_expiry,
+                        effective_expiry,
                         ACCESS_RESTORE_SOURCE_AUTO_SYNC,
                         requested_by_admin_id=message.from_user.id,
                         reason="sync_stripe_user_active_period",
@@ -11056,7 +11088,7 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                         "manual_stripe_sync",
                         source="admin_command",
                         old_expiry=current_old_expiry,
-                        new_expiry=new_expiry,
+                        new_expiry=effective_expiry,
                         stripe_subscription_id=current_subscription_id,
                         notes=f"status={status}; auto_renew={auto_renew}; period_source={period_source}; admin_id={message.from_user.id}"
                     )
@@ -11066,7 +11098,7 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
                         f"telegram_id: {target_user_id}\n"
                         f"status: {status}\n"
                         "paid: TRUE\n"
-                        f"expiry_date: {new_expiry.strftime('%d.%m.%Y %H:%M')}\n"
+                        f"expiry_date: {effective_expiry.strftime('%d.%m.%Y %H:%M')}\n"
                         f"auto_renew: {auto_renew}\n"
                         f"period_source: {period_source}\n"
                         f"stripe_subscription_id: {safe_log_id(current_subscription_id) or 'нет'}\n"
@@ -11130,8 +11162,13 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
     except Exception as e:
         if write_conn:
             write_conn.rollback()
-        logging.error("Ошибка /sync_stripe_user для %s: %s", args[0], e)
         error_ref = safe_admin_error_reference("sync_stripe_user", e)
+        logging.error(
+            "SYNC_STRIPE_USER_FAILED: telegram_id=%s, error_type=%s, error_ref=%s",
+            target_user_id,
+            type(e).__name__,
+            error_ref,
+        )
         reply_text = f"❌ Ошибка синхронизации. ref: {error_ref}"
     finally:
         if write_cur:
@@ -14233,8 +14270,12 @@ async def stripe_webhook(request):
                 if not current_period_end:
                     invoice_id = stripe_value(invoice, 'id') or "нет"
                     logging.error(
-                        f"invoice.payment_succeeded: у subscription нет current_period_end. "
-                        f"subscription_id={sub_id}, customer_id={customer_id}, invoice_id={invoice_id}, event={event_id}"
+                        "invoice.payment_succeeded: у subscription нет current_period_end. "
+                        "subscription_id=%s, customer_id=%s, invoice_id=%s, event=%s",
+                        safe_log_id(sub_id),
+                        safe_log_id(customer_id),
+                        safe_log_id(invoice_id),
+                        safe_log_id(event_id),
                     )
                     enqueue_admin_payment_problem_safely(
                         cur,

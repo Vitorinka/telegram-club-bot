@@ -1492,6 +1492,75 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(read_conn.closed)
         self.assertTrue(write_conn.closed)
 
+    async def test_sync_stripe_user_never_shortens_existing_expiry(self):
+        stripe_expiry = datetime(2026, 10, 1)
+        cases = (
+            (datetime(2026, 9, 1), stripe_expiry, "stripe_later"),
+            (datetime(2026, 12, 1), datetime(2026, 12, 1), "existing_later"),
+            (None, stripe_expiry, "existing_null"),
+            (datetime(2025, 1, 1), stripe_expiry, "existing_past"),
+        )
+
+        for existing_expiry, expected_expiry, label in cases:
+            with self.subTest(label=label):
+                period_end = int(stripe_expiry.replace(tzinfo=timezone.utc).timestamp())
+                user = (False, existing_expiry, "sub_123", "cus_old", True, datetime.utcnow(), True)
+                read_conn = FakeConnection(fetches=[user])
+                write_conn = FakeConnection(fetches=[
+                    ("sub_123", "cus_old", existing_expiry),
+                    (f"access-restore:auto-sync:123:{int(expected_expiry.timestamp())}",),
+                ])
+                message = FakeIncomingMessage(user_id=1)
+                subscription = SimpleNamespace(
+                    status="active",
+                    current_period_end=period_end,
+                    customer="cus_new",
+                    cancel_at_period_end=True,
+                )
+
+                with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
+                     patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)):
+                    await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
+
+                update_params = next(
+                    params for query, params in write_conn.cursor_obj.queries
+                    if "UPDATE users" in query and "SET paid = TRUE" in query
+                )
+                self.assertEqual(update_params, (expected_expiry, "cus_new", False, 123))
+                self.assertIn(f"expiry_date: {expected_expiry.strftime('%d.%m.%Y %H:%M')}", message.replies[0][0])
+                self.assertIn("auto_renew: False", message.replies[0][0])
+                self.assertTrue(any("manual_stripe_sync" in str(params) for _, params in write_conn.cursor_obj.queries))
+
+    def test_non_decreasing_expiry_handles_timezone_aware_values(self):
+        stripe_expiry = datetime(2026, 9, 1)
+        later_aware = datetime(2026, 12, 1, tzinfo=timezone.utc)
+
+        self.assertEqual(self.main.non_decreasing_expiry(later_aware, stripe_expiry), datetime(2026, 12, 1))
+        self.assertIs(self.main.non_decreasing_expiry(None, stripe_expiry), stripe_expiry)
+
+    async def test_stripe_lookup_errors_log_safe_references_without_raw_ids(self):
+        raw_subscription = "sub_secret_logging_value"
+        raw_customer = "cus_secret_logging_value"
+        raw_url = f"https://api.stripe.com/v1/subscriptions/{raw_subscription}"
+
+        with patch.object(
+            self.main.asyncio,
+            "to_thread",
+            AsyncMock(side_effect=RuntimeError(f"request failed: {raw_url}")),
+        ), self.assertLogs(level="ERROR") as captured:
+            self.assertEqual(
+                await self.main.get_open_invoice_url_for_subscription(raw_subscription),
+                (None, None),
+            )
+            self.assertIsNone(await self.main.create_billing_portal_url(raw_customer))
+
+        output = "\n".join(captured.output)
+        self.assertNotIn(raw_subscription, output)
+        self.assertNotIn(raw_customer, output)
+        self.assertNotIn(raw_url, output)
+        self.assertIn("error_type=RuntimeError", output)
+        self.assertIn("error_ref=", output)
+
     async def test_sync_stripe_user_closes_db_during_stripe_and_reply(self):
         period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
         user = (False, None, "sub_123", "cus_old", False, None, False)
