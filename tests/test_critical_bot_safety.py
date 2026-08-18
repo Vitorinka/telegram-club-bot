@@ -528,6 +528,18 @@ class CriticalBotSafetyTests(unittest.TestCase):
         for fragment in forbidden_fragments:
             self.assertNotIn(fragment, MAIN_SOURCE)
 
+    def test_confirmed_stripe_sensitive_logs_redact_ids_and_exception_text(self):
+        forbidden_fragments = (
+            "stripe_subscription_id={stripe_subscription_id}",
+            "stripe_customer_id={stripe_customer_id}",
+            "subscription_id={sub_id}, customer_id={customer_id}, invoice_id={invoice_id}, event={event_id}",
+            '"Не удалось получить invoices Stripe для /sync_stripe_user %s: %s"',
+            '"Ошибка /sync_stripe_user для %s: %s"',
+            'f"Не удалось проверить Stripe перед Checkout для пользователя {user_id}: {e}"',
+        )
+        for fragment in forbidden_fragments:
+            self.assertNotIn(fragment, MAIN_SOURCE)
+
     def test_backup_config_decision(self):
         self.assertEqual(backup_decision({})["telegram_enabled"], False)
         self.assertFalse(backup_decision({"BACKUP_TELEGRAM_ENABLED": "true"})["allowed"])
