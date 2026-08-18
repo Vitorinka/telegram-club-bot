@@ -202,6 +202,8 @@ class GiftAccessTests(unittest.TestCase):
         self.assertIn("tariff = State()", source)
         self.assertIn("await state.set_state(GiftPurchaseStates.tariff)", source)
         self.assertIn('@router.callback_query(F.data.startswith("gift_tariff:"), StateFilter(GiftPurchaseStates.tariff))', source)
+        self.assertIn("certificate_name = State()", source)
+        self.assertIn("await state.set_state(GiftPurchaseStates.certificate_name)", source)
         self.assertNotIn('@router.callback_query(F.data.startswith("gift_tariff:"), StateFilter(GiftPurchaseStates.recipient_name))', source)
 
     def test_gift_certificate_caption_has_activation_button_and_no_none_text(self):
@@ -340,9 +342,74 @@ class GiftAccessTests(unittest.TestCase):
         self.assertNotIn("start=gift_", payload)
         self.assertNotIn("https://t.me/", payload)
         self.assertNotIn("button_url", payload)
+        self.assertNotIn("photo_file_id", payload)
         self.assertNotIn(raw_token, payload)
         self.assertIn('"public_reference": "GIFT-ABCD1234ABCD1234"', payload)
         self.assertIn('"token_version": 1', payload)
+
+    def test_gift_certificate_uses_local_assets_not_legacy_file_id_table(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        helper = source[source.index("def enqueue_gift_certificate_delivery"):source.index("def gift_row_dict")]
+        self.assertNotIn("gift_certificate_templates", helper)
+        self.assertNotIn("photo_file_id", helper)
+        self.assertIn("render_gift_certificate", source)
+        self.assertIn("FSInputFile", source)
+
+    def test_certificate_failure_fallback_payload_stores_no_token_or_name(self):
+        class Cursor:
+            def __init__(self):
+                self.queries = []
+
+            def execute(self, query, params=None):
+                self.queries.append((query, params))
+
+            def fetchone(self):
+                return ("inserted",)
+
+            def close(self):
+                pass
+
+        class Connection:
+            def __init__(self):
+                self.cursor_obj = Cursor()
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        connection = Connection()
+        gift_row = {
+            "public_reference": "GIFT-ABCD1234ABCD1234",
+            "token_version": 3,
+            "certificate_name": "Секретное Имя",
+            "purchaser_telegram_id": 123,
+            "recipient_telegram_id": None,
+            "tariff_code": "gift_1m",
+            "status": "paid_unclaimed",
+        }
+        with mock.patch.object(self.main, "get_db_conn", return_value=connection), \
+             mock.patch.object(self.main, "ADMIN_IDS", []):
+            self.main.enqueue_gift_certificate_failure_notices(
+                gift_row["public_reference"], 123, gift_row
+            )
+        payload = next(
+            params[3]
+            for query, params in connection.cursor_obj.queries
+            if "INSERT INTO message_delivery_events" in query
+        )
+        raw_token = self.main.generate_gift_token(gift_row["public_reference"], 3)
+        self.assertNotIn(raw_token, payload)
+        self.assertNotIn("Секретное Имя", payload)
+        self.assertNotIn("https://t.me/", payload)
+        self.assertIn('"token_version": 3', payload)
 
     def test_gift_subscription_state_retrieves_live_stripe_for_any_subscription_id(self):
         main = self.main

@@ -16,13 +16,14 @@ import uuid
 from psycopg2 import pool as psycopg2_pool
 from psycopg2 import errors as psycopg2_errors
 import subprocess
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -96,6 +97,15 @@ from stripe_reconcile_audit import (
     render_reconcile_audit,
 )
 from delivery_failure_admin_ux import render_critical_delivery_alert
+from gift_certificate import (
+    CERTIFICATE_NAME_TOO_LONG_TEXT,
+    CertificateNameError,
+    certificate_assets_status,
+    certificate_template_path,
+    remove_generated_certificate,
+    render_gift_certificate,
+    validate_certificate_name_fits,
+)
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -274,10 +284,12 @@ GIFT_TEXT_DELIVERY_TYPES = {
     "gift_reserved_recipient",
     "gift_refunded_buyer",
     "gift_refunded_recipient",
+    "gift_certificate_failed_buyer",
     "gift_admin_success",
     "gift_admin_redeemed",
     "gift_admin_problem",
     "gift_admin_refund",
+    "gift_admin_certificate_problem",
 }
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
@@ -320,6 +332,7 @@ class RegistrationStates(StatesGroup):
 
 class GiftPurchaseStates(StatesGroup):
     tariff = State()
+    certificate_name = State()
     recipient_name = State()
     sender_name = State()
     message = State()
@@ -1898,13 +1911,14 @@ def enqueue_gift_message_delivery(cur, delivery_key, telegram_id, delivery_type,
     return cur.fetchone() is not None
 
 
-def enqueue_gift_text_delivery(cur, public_reference, telegram_id, purpose, text, **extra):
+def enqueue_gift_text_delivery(cur, public_reference, telegram_id, purpose, text, delay_seconds=0, **extra):
     return enqueue_gift_message_delivery(
         cur,
         gift_delivery_key(public_reference, purpose, telegram_id if purpose.startswith("gift_admin_") else None),
         int(telegram_id),
         purpose,
         stripe_delivery_payload(text, **extra),
+        delay_seconds=delay_seconds,
     )
 
 
@@ -1924,6 +1938,44 @@ def enqueue_gift_admin_delivery(cur, public_reference, purpose, text, severity="
     return count
 
 
+def enqueue_gift_certificate_failure_notices(public_reference, telegram_id, gift_row):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        enqueue_gift_message_delivery(
+            cur,
+            gift_delivery_key(public_reference, "gift_certificate_failed_buyer"),
+            int(telegram_id),
+            "gift_certificate_failed_buyer",
+            {
+                "public_reference": public_reference,
+                "token_version": int(gift_row["token_version"]),
+            },
+        )
+        enqueue_gift_admin_delivery(
+            cur,
+            public_reference,
+            "gift_admin_certificate_problem",
+            gift_admin_text(
+                "⚠️ Gift certificate delivery problem",
+                gift_row,
+                extra="Платёж и ссылка активации сохранены; требуется проверить локальный рендеринг или доставку Telegram.",
+            ),
+            severity="CRITICAL",
+        )
+        conn.commit()
+    except Exception as error:
+        conn.rollback()
+        logging.error(
+            "GIFT_CERTIFICATE_FAILURE_NOTICE_ENQUEUE_FAILED: safe_ref=%s error_class=%s",
+            safe_admin_context_reference("gift_certificate", public_reference),
+            error.__class__.__name__,
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
 def gift_admin_recipient_allowed(telegram_id):
     return int(telegram_id) in ADMIN_IDS
 
@@ -1934,13 +1986,6 @@ def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
     if not hmac.compare_digest(str(row.get("token_hash") or ""), token_hash):
         raise ValueError("gift_certificate_token_hash_mismatch")
     caption = gift_certificate_caption(row)
-    cur.execute(
-        "SELECT file_id FROM gift_certificate_templates WHERE tariff_code = %s AND active IS TRUE",
-        (row["tariff_code"],),
-    )
-    template = cur.fetchone()
-    if not template:
-        raise ValueError("gift_certificate_template_missing")
     return enqueue_gift_message_delivery(
         cur,
         gift_delivery_key(
@@ -1955,12 +2000,11 @@ def enqueue_gift_certificate_delivery(cur, row, telegram_id, delivery_type):
             "public_reference": row["public_reference"],
             "token_version": token_version,
             "recipient_kind": "buyer" if delivery_type == GIFT_CERTIFICATE_BUYER else "recipient",
-            "photo_file_id": template[0],
             "caption": caption,
             "parse_mode": "HTML",
             "button_text": "🎁 Активировать подарок",
         },
-        delay_seconds=1 if delivery_type == GIFT_CERTIFICATE_BUYER else 0,
+        delay_seconds=0,
     )
 
 
@@ -2023,30 +2067,12 @@ def fetch_gift_by_public_reference_version(cur, public_reference, token_version,
 def gift_configuration_status(cur=None):
     missing_prices = [name for name in gift_required_price_envs() if not os.getenv(name)]
     missing_secrets = [] if gift_token_secret_configured() else [GIFT_TOKEN_SECRET_ENV]
-    template_count = 0
-    owns_conn = cur is None
-    conn = None
-    if owns_conn:
-        conn = get_db_conn()
-        cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM gift_certificate_templates
-            WHERE active IS TRUE
-              AND tariff_code = ANY(%s)
-        """, (list(GIFT_TARIFFS.keys()),))
-        template_count = cur.fetchone()[0]
-    finally:
-        if owns_conn:
-            cur.close()
-            conn.close()
+    assets = certificate_assets_status()
     return {
-        "configured": not missing_prices and not missing_secrets and template_count == len(GIFT_TARIFFS),
+        "configured": not missing_prices and not missing_secrets,
         "missing_prices": missing_prices,
         "missing_secrets": missing_secrets,
-        "template_count": template_count,
-        "required_template_count": len(GIFT_TARIFFS),
+        **assets,
     }
 
 
@@ -2055,6 +2081,13 @@ def gift_tariffs_keyboard():
         [InlineKeyboardButton(text="🎁 1 месяц", callback_data="gift_tariff:gift_1m")],
         [InlineKeyboardButton(text="🎁 6 месяцев", callback_data="gift_tariff:gift_6m")],
         [InlineKeyboardButton(text="🎁 12 месяцев", callback_data="gift_tariff:gift_12m")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="gift_cancel_flow")],
+    ])
+
+
+def gift_certificate_name_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="Без имени", callback_data="gift_certificate_without_name")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="gift_cancel_flow")],
     ])
 
@@ -2088,6 +2121,7 @@ def gift_active_checkout_conflict_keyboard(row):
 
 
 def build_gift_preview_text(data):
+    certificate_name = data.get("certificate_name") or "без имени"
     recipient_name = data.get("recipient_name") or "не указано"
     sender_name = data.get("sender_name") or "не указано"
     gift_message = data.get("gift_message") or "без личного сообщения"
@@ -2095,6 +2129,7 @@ def build_gift_preview_text(data):
     return (
         "🎁 Проверьте подарочный сертификат\n\n"
         f"Срок доступа: {gift_tariff_label(tariff_code)}\n"
+        f"Подпись на сертификате: {gift_safe_user_text(certificate_name)}\n"
         f"Получатель: {gift_safe_user_text(recipient_name)}\n"
         f"От кого: {gift_safe_user_text(sender_name)}\n"
         f"Сообщение: {gift_safe_user_text(gift_message)}\n\n"
@@ -2102,7 +2137,9 @@ def build_gift_preview_text(data):
     )
 
 
-def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message):
+def create_gift_checkout_draft(
+    cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message, certificate_name=None
+):
     gift_id = str(uuid.uuid4())
     public_reference = gift_public_reference()
     duration_days = gift_duration_days(tariff_code)
@@ -2111,15 +2148,16 @@ def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipien
     token_hash = gift_token_hash_for_reference(public_reference, 1)
     cur.execute("""
         INSERT INTO gift_access_grants (
-            id, public_reference, purchaser_telegram_id, recipient_name, sender_name,
+            id, public_reference, purchaser_telegram_id, certificate_name, recipient_name, sender_name,
             gift_message, tariff_code, duration_days, status, token_hash, token_version
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'checkout_pending', %s, 1)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'checkout_pending', %s, 1)
         RETURNING *
     """, (
         gift_id,
         public_reference,
         int(purchaser_telegram_id),
+        certificate_name,
         recipient_name,
         sender_name,
         gift_message,
@@ -2132,7 +2170,9 @@ def create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipien
     return row
 
 
-def find_or_create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message):
+def find_or_create_gift_checkout_draft(
+    cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message, certificate_name=None
+):
     cur.execute("""
         UPDATE gift_access_grants
         SET status = 'cancelled',
@@ -2159,7 +2199,8 @@ def find_or_create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, 
     existing = gift_row_dict(cur, cur.fetchone())
     if existing:
         same_details = (
-            (existing.get("recipient_name") or "") == (recipient_name or "")
+            (existing.get("certificate_name") or "") == (certificate_name or "")
+            and (existing.get("recipient_name") or "") == (recipient_name or "")
             and (existing.get("sender_name") or "") == (sender_name or "")
             and (existing.get("gift_message") or "") == (gift_message or "")
         )
@@ -2179,11 +2220,15 @@ def find_or_create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, 
                   AND stripe_session_id IS NULL
             """, (existing["id"],))
             record_gift_event(cur, existing, "checkout_draft_replaced", purchaser_telegram_id, source="gift_fsm")
-            return create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message), False
+            return create_gift_checkout_draft(
+                cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message, certificate_name
+            ), False
         if existing["status"] == "payment_pending":
             return existing, "payment_pending_conflict"
         return existing, "active_checkout_conflict"
-    return create_gift_checkout_draft(cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message), False
+    return create_gift_checkout_draft(
+        cur, purchaser_telegram_id, tariff_code, recipient_name, sender_name, gift_message, certificate_name
+    ), False
 
 
 def mark_gift_checkout_open(cur, gift_id, expected_status, session_id, checkout_url, checkout_expires_at=None):
@@ -3155,8 +3200,8 @@ def apply_subscription_refund_reconciliation(cur, event_id, proof, source="strip
 def build_gift_buyer_paid_text(row):
     return (
         "🎁 Подарок оплачен\n\n"
-        "Всё готово. Следующим сообщением я пришлю подарочный сертификат.\n\n"
-        "Перешлите следующее сообщение целиком человеку, которому предназначен подарок.\n\n"
+        "Всё готово. Подарочный сертификат отправлен предыдущим сообщением.\n\n"
+        "Перешлите предыдущее сообщение целиком человеку, которому предназначен подарок.\n\n"
         "Получателю нужно будет нажать «Активировать подарок» — после этого бот поможет ему получить доступ в клуб.\n\n"
         "Вам больше ничего делать не нужно."
     )
@@ -3366,23 +3411,11 @@ def mark_gift_paid_and_enqueue(cur, event_id, event_type, session, line_item, pr
         updated["purchaser_telegram_id"],
         "gift_paid_buyer",
         build_gift_buyer_paid_text(updated),
+        delay_seconds=1,
+        gift_reference=updated["public_reference"],
+        token_version=int(updated["token_version"]),
     )
-    try:
-        enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
-    except ValueError as e:
-        if e.args != ("gift_certificate_template_missing",):
-            raise
-        enqueue_gift_admin_delivery(
-            cur,
-            updated["public_reference"],
-            "gift_admin_problem",
-            gift_admin_text(
-                "⚠️ Gift certificate template missing",
-                updated,
-                extra="Подарок оплачен, но сертификат не поставлен в outbox. Загрузите шаблон и используйте /gift_reissue.",
-            ),
-            severity="CRITICAL",
-        )
+    enqueue_gift_certificate_delivery(cur, updated, updated["purchaser_telegram_id"], GIFT_CERTIFICATE_BUYER)
     enqueue_gift_admin_delivery(
         cur,
         updated["public_reference"],
@@ -8333,12 +8366,47 @@ async def gift_tariff_selected(callback: types.CallbackQuery, state: FSMContext)
         await callback.answer("Неизвестный тариф.", show_alert=True)
         return
     await state.update_data(tariff_code=tariff_code)
-    await state.set_state(GiftPurchaseStates.recipient_name)
+    await state.set_state(GiftPurchaseStates.certificate_name)
     await callback.message.answer(
-        "Напишите имя получателя для сертификата.\n\n"
-        "Можно отправить «-», если не хотите указывать имя."
+        "Как подписать сертификат?\n\n"
+        "Можно указать имя или имя и фамилию получателя.\n\n"
+        "Например:\nАнастасия\nАнастасия Иванова\n\n"
+        "Или выберите «Без имени».",
+        reply_markup=gift_certificate_name_keyboard(),
     )
     await callback.answer()
+
+
+async def continue_gift_after_certificate_name(message, state, certificate_name):
+    await state.update_data(certificate_name=certificate_name)
+    await state.set_state(GiftPurchaseStates.recipient_name)
+    await message.answer(
+        "Напишите имя получателя для сообщения об активации.\n\n"
+        "Можно отправить «-», если не хотите указывать имя."
+    )
+
+
+@router.callback_query(
+    F.data == "gift_certificate_without_name",
+    StateFilter(GiftPurchaseStates.certificate_name),
+)
+async def gift_certificate_without_name_callback(callback: types.CallbackQuery, state: FSMContext):
+    await continue_gift_after_certificate_name(callback.message, state, None)
+    await callback.answer()
+
+
+@router.message(StateFilter(GiftPurchaseStates.certificate_name))
+async def gift_certificate_name_received(message: types.Message, state: FSMContext):
+    try:
+        certificate_name = validate_certificate_name_fits(message.text)
+    except CertificateNameError as error:
+        if error.args and error.args[0] in ("certificate_name_too_long", "certificate_name_does_not_fit"):
+            text = CERTIFICATE_NAME_TOO_LONG_TEXT
+        else:
+            text = "Укажите имя или имя и фамилию буквами; можно использовать пробел и дефис."
+        await message.answer(text, reply_markup=gift_certificate_name_keyboard())
+        return
+    await continue_gift_after_certificate_name(message, state, certificate_name)
 
 
 @router.message(StateFilter(GiftPurchaseStates.recipient_name))
@@ -8425,6 +8493,7 @@ async def gift_pay_callback(callback: types.CallbackQuery, state: FSMContext):
                 data.get("recipient_name") or "",
                 data.get("sender_name") or gift_sender_default_name(callback.from_user),
                 data.get("gift_message") or "",
+                data.get("certificate_name"),
             )
             conn.commit()
             if draft_result in ("active_checkout_conflict", "payment_pending_conflict"):
@@ -18970,37 +19039,57 @@ async def process_pending_message_deliveries(limit=25):
                         reply_markup=stripe_delivery_reply_markup(payload),
                         parse_mode=payload.get("parse_mode"),
                     )
+            elif delivery_type == "gift_paid_buyer":
+                public_reference = payload.get("gift_reference")
+                token_version = payload.get("token_version")
+                if public_reference and token_version:
+                    order_conn = get_db_conn()
+                    order_cur = order_conn.cursor()
+                    try:
+                        order_cur.execute(
+                            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+                            (gift_delivery_key(
+                                public_reference,
+                                GIFT_CERTIFICATE_BUYER,
+                                token_version=token_version,
+                                recipient_kind="buyer",
+                            ),),
+                        )
+                        certificate_delivery = order_cur.fetchone()
+                        if certificate_delivery and certificate_delivery[0] not in (
+                            "sent", "cancelled", "permanently_failed"
+                        ):
+                            deferred = mark_delivery_failed(
+                                order_cur,
+                                delivery_key,
+                                claim_generation,
+                                RuntimeError("gift_buyer_instruction_waiting_for_certificate"),
+                                retry_delay_minutes=5,
+                            )
+                            if deferred == "failed":
+                                order_conn.commit()
+                                retryable_failed += 1
+                            else:
+                                order_conn.rollback()
+                                log_stale_delivery_claim(delivery_key, "defer_gift_buyer_instruction")
+                            continue
+                    finally:
+                        order_cur.close()
+                        order_conn.close()
+                text = payload.get("text")
+                if not text:
+                    raise ValueError("invalid_gift_paid_buyer_payload")
+                sending_user_message = True
+                await bot.send_message(int(telegram_id), text)
             elif delivery_type in (GIFT_CERTIFICATE_BUYER, GIFT_CERTIFICATE_RECIPIENT):
-                photo_file_id = payload.get("photo_file_id")
                 caption = payload.get("caption")
                 public_reference = payload.get("public_reference")
                 token_version = payload.get("token_version")
-                if not photo_file_id or not caption or not public_reference or not token_version:
+                if not caption or not public_reference or not token_version:
                     raise ValueError("invalid_gift_certificate_payload")
                 cert_conn = get_db_conn()
                 cert_cur = cert_conn.cursor()
                 try:
-                    if delivery_type == GIFT_CERTIFICATE_BUYER:
-                        cert_cur.execute(
-                            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
-                            (gift_delivery_key(public_reference, "gift_paid_buyer"),),
-                        )
-                        instruction_row = cert_cur.fetchone()
-                        if instruction_row and instruction_row[0] != "sent":
-                            deferred = mark_delivery_failed(
-                                cert_cur,
-                                delivery_key,
-                                claim_generation,
-                                RuntimeError("gift_certificate_waiting_for_buyer_instruction"),
-                                retry_delay_minutes=5,
-                            )
-                            if deferred == "failed":
-                                cert_conn.commit()
-                                retryable_failed += 1
-                            else:
-                                cert_conn.rollback()
-                                log_stale_delivery_claim(delivery_key, "defer_gift_certificate")
-                            continue
                     gift_row = fetch_gift_by_public_reference_version(
                         cert_cur,
                         public_reference,
@@ -19040,14 +19129,67 @@ async def process_pending_message_deliveries(limit=25):
                     cert_conn.close()
                 button_url = gift_deep_link(generate_gift_token(public_reference, token_version))
                 sending_user_message = True
-                await bot.send_photo(
+                generated_path = None
+                try:
+                    template_path = certificate_template_path(gift_row["tariff_code"])
+                    certificate_name = gift_row.get("certificate_name")
+                    if certificate_name:
+                        with tempfile.NamedTemporaryFile(prefix="gift-certificate-", suffix=".png", delete=False) as output:
+                            generated_path = output.name
+                        render_gift_certificate(gift_row["tariff_code"], certificate_name, generated_path)
+                        photo = FSInputFile(generated_path)
+                    else:
+                        photo = FSInputFile(str(template_path))
+                    await bot.send_photo(
+                        int(telegram_id),
+                        photo,
+                        caption=gift_certificate_delivery_caption(caption, button_url),
+                        reply_markup=inline_keyboard([[
+                            InlineKeyboardButton(
+                                text=payload.get("button_text") or "🎁 Активировать подарок",
+                                url=button_url,
+                            )
+                        ]]),
+                        parse_mode=payload.get("parse_mode"),
+                    )
+                except Exception:
+                    enqueue_gift_certificate_failure_notices(public_reference, telegram_id, gift_row)
+                    raise
+                finally:
+                    if generated_path:
+                        remove_generated_certificate(generated_path)
+            elif delivery_type == "gift_certificate_failed_buyer":
+                public_reference = payload.get("public_reference")
+                token_version = payload.get("token_version")
+                if not public_reference or not token_version:
+                    raise ValueError("invalid_gift_certificate_fallback_payload")
+                fallback_conn = get_db_conn()
+                fallback_cur = fallback_conn.cursor()
+                try:
+                    gift_row = fetch_gift_by_public_reference_version(
+                        fallback_cur,
+                        public_reference,
+                        int(token_version),
+                        for_update=False,
+                    )
+                finally:
+                    fallback_cur.close()
+                    fallback_conn.close()
+                if not gift_row or gift_row["status"] not in ("paid_unclaimed", "reserved"):
+                    raise ValueError("gift_certificate_fallback_stale")
+                expected_hash = gift_token_hash_for_reference(public_reference, token_version)
+                if not hmac.compare_digest(str(gift_row.get("token_hash") or ""), expected_hash):
+                    raise ValueError("gift_certificate_fallback_token_version_mismatch")
+                activation_url = gift_deep_link(generate_gift_token(public_reference, token_version))
+                sending_user_message = True
+                await bot.send_message(
                     int(telegram_id),
-                    photo_file_id,
-                    caption=gift_certificate_delivery_caption(caption, button_url),
-                    reply_markup=inline_keyboard([[
-                        InlineKeyboardButton(text=payload.get("button_text") or "🎁 Активировать подарок", url=button_url)
-                    ]]),
-                    parse_mode=payload.get("parse_mode"),
+                    (
+                        "🎁 Подарок успешно оформлен, но изображение сертификата пока не удалось отправить.\n\n"
+                        "Подарок можно активировать по ссылке:\n"
+                        f"{activation_url}\n\n"
+                        "Мы уже сообщили администратору об ошибке сертификата."
+                    ),
                 )
             elif delivery_type == "stripe_admin_message":
                 if int(telegram_id) not in ADMIN_IDS:

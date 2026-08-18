@@ -558,6 +558,10 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0014_gift_certificate_name": {
+        "tables": ("gift_access_grants",),
+        "columns": {"gift_access_grants": ("certificate_name",)},
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

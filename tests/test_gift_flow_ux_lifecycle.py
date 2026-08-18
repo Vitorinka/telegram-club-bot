@@ -61,8 +61,8 @@ class GiftFlowUxLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     def test_purchaser_instruction_prepares_forward_and_hides_internal_reference(self):
         text = main.build_gift_buyer_paid_text({"public_reference": "GIFT-SECRET12345678"})
-        self.assertIn("Следующим сообщением", text)
-        self.assertIn("Перешлите следующее сообщение целиком", text)
+        self.assertIn("предыдущим сообщением", text)
+        self.assertIn("Перешлите предыдущее сообщение целиком", text)
         self.assertIn("Вам больше ничего делать не нужно", text)
         self.assertNotIn("GIFT-", text)
 

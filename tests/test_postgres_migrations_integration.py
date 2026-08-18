@@ -1526,7 +1526,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 13)
+        self.assertEqual(len(migrations), 14)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -3957,9 +3957,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertNotIn("https://t.me/", row[1])
         self.assertNotIn(raw_token, row[1])
         self.assertIn('"token_version": 1', row[1])
-        self.assertGreater(row[2], before_enqueue + timedelta(milliseconds=500))
+        self.assertGreaterEqual(row[2], before_enqueue - timedelta(seconds=1))
 
-    def test_gift_buyer_instruction_is_delivered_before_certificate_real_postgres(self):
+    def test_gift_certificate_is_delivered_before_buyer_instruction_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
         reference = "GIFT-0000000000000012"
@@ -3985,7 +3985,13 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             ))
             gift_row = main.gift_row_dict(cur, cur.fetchone())
             main.enqueue_gift_text_delivery(
-                cur, reference, 9932, "gift_paid_buyer", main.build_gift_buyer_paid_text(gift_row)
+                cur,
+                reference,
+                9932,
+                "gift_paid_buyer",
+                main.build_gift_buyer_paid_text(gift_row),
+                gift_reference=reference,
+                token_version=1,
             )
             main.enqueue_gift_certificate_delivery(cur, gift_row, 9932, main.GIFT_CERTIFICATE_BUYER)
             cur.execute("UPDATE message_delivery_events SET next_attempt_at = NOW() - INTERVAL '1 second'")
@@ -4014,14 +4020,14 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     UPDATE message_delivery_events
                     SET next_attempt_at = NOW() - INTERVAL '1 second'
                     WHERE delivery_type = %s AND status = 'failed'
-                """, (main.GIFT_CERTIFICATE_BUYER,))
+                """, ("gift_paid_buyer",))
                 conn.commit()
             finally:
                 cur.close()
                 conn.close()
             asyncio.run(main.process_pending_message_deliveries(limit=10))
 
-        self.assertEqual(delivered, ["instruction", "certificate"])
+        self.assertEqual(delivered, ["certificate", "instruction"])
         self.assertEqual(self.query_one(
             "SELECT COUNT(*) FROM message_delivery_events WHERE status = 'sent'"
         )[0], 2)
@@ -4040,6 +4046,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "Анна",
                 "Олег",
                 "С днём рождения",
+                "Анастасия Иванова",
             )
             same, same_result = main.find_or_create_gift_checkout_draft(
                 cur,
@@ -4048,6 +4055,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "Анна",
                 "Олег",
                 "С днём рождения",
+                "Анастасия Иванова",
             )
             changed_recipient, recipient_result = main.find_or_create_gift_checkout_draft(
                 cur,
@@ -4056,6 +4064,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "Мария",
                 "Олег",
                 "С днём рождения",
+                "Анастасия Иванова",
             )
             changed_sender, sender_result = main.find_or_create_gift_checkout_draft(
                 cur,
@@ -4064,6 +4073,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "Мария",
                 "Ирина",
                 "С днём рождения",
+                "Анастасия Иванова",
             )
             changed_message, message_result = main.find_or_create_gift_checkout_draft(
                 cur,
@@ -4072,6 +4082,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 "Мария",
                 "Ирина",
                 "Для тебя",
+                "Анастасия Иванова",
             )
             conn.commit()
         finally:
@@ -4088,11 +4099,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertFalse(message_result)
         self.assertEqual(
             self.query_one("""
-                SELECT recipient_name, sender_name, gift_message, status
+                SELECT certificate_name, recipient_name, sender_name, gift_message, status
                 FROM gift_access_grants
                 WHERE id = %s
             """, (changed_message["id"],)),
-            ("Мария", "Ирина", "Для тебя", "checkout_pending"),
+            ("Анастасия Иванова", "Мария", "Ирина", "Для тебя", "checkout_pending"),
         )
         self.assertEqual(
             self.query_one("""

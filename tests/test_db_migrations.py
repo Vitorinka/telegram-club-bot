@@ -222,6 +222,15 @@ WHERE status = 'processing';
         self.assertIn("club_schedules_month_format_check", sql)
         self.assertNotRegex(sql.upper(), r"\b(UPDATE|DELETE|DROP|TRUNCATE)\b")
 
+    def test_gift_certificate_name_migration_is_narrow_and_required(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0014_gift_certificate_name"]
+        self.assertEqual(migration["tables"], ("gift_access_grants",))
+        self.assertEqual(migration["columns"]["gift_access_grants"], ("certificate_name",))
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0014_gift_certificate_name.sql").read_text()
+        self.assertIn("ADD COLUMN IF NOT EXISTS certificate_name TEXT", sql)
+        self.assertNotRegex(sql.upper(), r"\b(UPDATE|DELETE|DROP|TRUNCATE)\b")
+
     def test_postgres_fsm_storage_migration_is_required(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0004_postgres_fsm_storage"]
         self.assertIn("aiogram_fsm_states", migration["tables"])
