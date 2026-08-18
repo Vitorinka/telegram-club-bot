@@ -2507,8 +2507,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 74)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 28)
+        self.assertEqual(len(self.main.router.message.handlers), 76)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 34)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2539,8 +2539,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 74)
-        self.assertEqual(len(callback_handlers), 28)
+        self.assertEqual(len(message_handlers), 76)
+        self.assertEqual(len(callback_handlers), 34)
         self.assertEqual(
             commands,
             [
@@ -6904,6 +6904,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ["💬 Задать вопрос", "🚨 Правила клуба"],
                 ["🎁 Подарить доступ в клуб"],
                 ["🛠 Управление подарками"],
+                ["📅 Управление расписанием"],
             ],
         )
 
@@ -6967,15 +6968,24 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_schedule_uses_current_moscow_month_and_has_no_previous_month_fallback(self):
         august = datetime(2026, 8, 17, 12, tzinfo=timezone.utc)
-        with patch.dict(self.main.SCHEDULES, {"2026-07": "old-file", "2026-08": "current-file"}, clear=True):
+        with patch.object(self.main, "load_club_schedule", return_value={"telegram_file_id": "current-file"}) as load:
             key, file_id, caption = self.main.current_schedule(august)
         self.assertEqual((key, file_id), ("2026-08", "current-file"))
         self.assertEqual(caption, "📅 Расписание на август 2026")
+        load.assert_called_once_with("2026-08")
 
-        with patch.dict(self.main.SCHEDULES, {"2026-07": "old-file"}, clear=True):
+        with patch.object(self.main, "load_club_schedule", return_value=None) as load:
             key, file_id, _ = self.main.current_schedule(august)
         self.assertEqual(key, "2026-08")
         self.assertIsNone(file_id)
+        load.assert_called_once_with("2026-08")
+
+        moscow_september = datetime(2026, 8, 31, 21, 30, tzinfo=timezone.utc)
+        with patch.object(self.main, "load_club_schedule", return_value=None) as load:
+            key, _, caption = self.main.current_schedule(moscow_september)
+        self.assertEqual(key, "2026-09")
+        self.assertEqual(caption, "📅 Расписание на сентябрь 2026")
+        load.assert_called_once_with("2026-09")
 
     async def test_schedule_handler_sends_photo_or_missing_message_and_clears_state(self):
         state = FakeState()
@@ -6993,6 +7003,113 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         message.answer.assert_awaited_once_with("📅 Расписание на этот месяц скоро появится.")
         message.answer_photo.assert_not_awaited()
         self.assertEqual(state.clear_calls, 1)
+
+    async def test_invalid_schedule_file_has_safe_user_and_admin_fallback(self):
+        state = FakeState()
+        raw_file_id = "AgAC_secret_schedule_file"
+        raw_error = f"wrong file identifier {raw_file_id}"
+        message = SimpleNamespace(
+            answer=AsyncMock(),
+            answer_photo=AsyncMock(side_effect=RuntimeError(raw_error)),
+        )
+        with patch.object(
+            self.main,
+            "current_schedule",
+            return_value=("2026-08", raw_file_id, "📅 Расписание на август 2026"),
+        ), patch.object(self.main, "notify_admins", AsyncMock()) as notify, self.assertLogs(level="ERROR") as logs:
+            await self.main.schedule_button_handler(message, state)
+
+        message.answer.assert_awaited_once_with("📅 Не получилось загрузить расписание. Мы уже проверяем файл.")
+        notify.assert_awaited_once()
+        notified_text = notify.await_args.args[0]
+        self.assertIn("2026-08", notified_text)
+        self.assertIn("ref:", notified_text)
+        self.assertNotIn(raw_file_id, notified_text)
+        self.assertNotIn(raw_file_id, "\n".join(logs.output))
+
+    async def test_admin_schedule_controls_are_private_admin_only(self):
+        admin = FakeIncomingMessage(user_id=1)
+        with patch.object(
+            self.main,
+            "load_admin_schedule_view",
+            return_value=("schedule panel", self.main.inline_keyboard([])),
+        ):
+            await self.main.admin_schedule_button_handler(admin, FakeState())
+        self.assertEqual(admin.answers[0][0], "schedule panel")
+
+        non_admin = FakeIncomingMessage(user_id=777)
+        with patch.object(self.main, "load_admin_schedule_view") as load:
+            await self.main.admin_schedule_button_handler(non_admin, FakeState())
+        load.assert_not_called()
+        self.assertEqual(non_admin.answers, [])
+
+        forged = FakeCallback(user_id=777)
+        forged.data = "admin_schedule_upload:2026-09"
+        with patch.object(self.main, "get_db_conn") as get_conn:
+            await self.main.admin_schedule_upload_callback(forged, FakeState())
+        get_conn.assert_not_called()
+        self.assertEqual(forged.answers, [])
+
+        group_admin = FakeCallback(user_id=1)
+        group_admin.data = "admin_schedule_upload:2026-09"
+        group_admin.message.chat.type = "group"
+        await self.main.admin_schedule_upload_callback(group_admin, FakeState())
+        self.assertIn("личном чате", group_admin.answers[0][0])
+
+    async def test_admin_schedule_upload_saves_photo_owner_and_clears_fsm(self):
+        callback = FakeCallback(user_id=1)
+        callback.data = "admin_schedule_upload:2026-09"
+        state = FakeState()
+        await self.main.admin_schedule_upload_callback(callback, state)
+        self.assertEqual(state.states[-1], self.main.ScheduleAdminStates.waiting_for_photo)
+        self.assertEqual(state.data["schedule_month"], "2026-09")
+
+        conn = FakeConnection(fetches=[("2026-09",)])
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            chat=SimpleNamespace(type="private"),
+            photo=[SimpleNamespace(file_id="small"), SimpleNamespace(file_id="large-file-id")],
+            answer=AsyncMock(),
+            answer_photo=AsyncMock(),
+        )
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.admin_schedule_photo_received(message, state)
+
+        insert = next((query, params) for query, params in conn.cursor_obj.queries if "INSERT INTO club_schedules" in query)
+        self.assertIn("ON CONFLICT (schedule_month) DO UPDATE", insert[0])
+        self.assertEqual(insert[1], ("2026-09", "large-file-id", 1))
+        self.assertEqual(conn.commits, 1)
+        self.assertEqual(state.clear_calls, 1)
+        message.answer_photo.assert_awaited_once_with(
+            photo="large-file-id",
+            caption="✅ Расписание на сентябрь 2026 сохранено.",
+        )
+
+    async def test_admin_schedule_cancel_and_delete_are_safe(self):
+        cancel = FakeCallback(user_id=1)
+        cancel.data = "admin_schedule_upload_cancel"
+        cancel_state = FakeState()
+        await self.main.admin_schedule_upload_cancel_callback(cancel, cancel_state)
+        self.assertEqual(cancel_state.clear_calls, 1)
+
+        request = FakeCallback(user_id=1)
+        request.data = "admin_schedule_remove:2026-09"
+        with patch.object(self.main, "get_db_conn") as get_conn:
+            await self.main.admin_schedule_delete_callback(request, FakeState())
+        get_conn.assert_not_called()
+        keyboard = request.message.edits[0][1]["reply_markup"]
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "admin_schedule_delete_confirm:2026-09")
+
+        delete_conn = FakeConnection(fetches=[("2026-09",)])
+        confirm = FakeCallback(user_id=1)
+        confirm.data = "admin_schedule_delete_confirm:2026-09"
+        with patch.object(self.main, "get_db_conn", return_value=delete_conn), \
+             patch.object(self.main, "load_admin_schedule_view", return_value=("empty", self.main.inline_keyboard([]))):
+            await self.main.admin_schedule_delete_confirm_callback(confirm, FakeState())
+        delete_query = next((query, params) for query, params in delete_conn.cursor_obj.queries if "DELETE FROM club_schedules" in query)
+        self.assertEqual(delete_query[1], ("2026-09",))
+        self.assertEqual(delete_conn.commits, 1)
+        self.assertIn("Расписание удалено", confirm.message.edits[0][0])
 
     async def test_admin_gift_center_is_private_admin_only_and_lists_other_buyers(self):
         gift = {

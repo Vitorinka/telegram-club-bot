@@ -539,6 +539,25 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             }.items()
         },
     },
+    "0013_club_schedules": {
+        "tables": ("club_schedules",),
+        "columns": {
+            "club_schedules": (
+                "schedule_month",
+                "telegram_file_id",
+                "uploaded_by_telegram_id",
+                "created_at",
+                "updated_at",
+            ),
+        },
+        "constraints": {
+            "club_schedules_month_format_check": {
+                "table": "club_schedules",
+                "definition_contains": ("schedule_month", "0[1-9]", "1[0-2]"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

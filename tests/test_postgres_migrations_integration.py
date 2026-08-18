@@ -1526,7 +1526,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 12)
+        self.assertEqual(len(migrations), 13)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -3579,6 +3579,45 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "SELECT 1 FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = %s",
             (user_id, main.ACCESS_RESTORE_DELIVERY_TYPE),
         ))
+
+    def test_club_schedule_unique_upsert_delete_and_month_constraint_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertEqual(main.upsert_club_schedule(cur, "2026-08", "file-old", 1), "2026-08")
+            conn.commit()
+            self.assertEqual(main.upsert_club_schedule(cur, "2026-08", "file-new", 2), "2026-08")
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*), MIN(telegram_file_id), MIN(uploaded_by_telegram_id) FROM club_schedules WHERE schedule_month = '2026-08'"
+            ),
+            (1, "file-new", 2),
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            with self.assertRaises(Exception):
+                cur.execute(
+                    "INSERT INTO club_schedules (schedule_month, telegram_file_id, uploaded_by_telegram_id) VALUES ('2026-13', 'bad', 1)"
+                )
+            conn.rollback()
+            cur.execute("DELETE FROM club_schedules WHERE schedule_month = '2026-08' RETURNING schedule_month")
+            self.assertEqual(cur.fetchone(), ("2026-08",))
+            conn.commit()
+            cur.execute("DELETE FROM club_schedules WHERE schedule_month = '2026-08' RETURNING schedule_month")
+            self.assertIsNone(cur.fetchone())
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
 
     def test_restore_access_stripe_identity_changed_fails_closed_real_postgres(self):
         run_migrations(self.get_conn)
