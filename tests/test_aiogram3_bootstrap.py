@@ -1753,7 +1753,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "active_in_db")
-        mark_short.assert_called_with(123, "pending", "active_access_in_db")
+        mark_short.assert_called_with(123, "superseded", "active_access_in_db")
         ban.assert_not_awaited()
 
     def test_manual_revoke_removal_is_not_due_after_new_access(self):
@@ -2030,7 +2030,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "stripe_cancel_failed")
-        mark_short.assert_called_with(123, "telegram_failed", "stripe_cancellation_cancel_failed")
+        mark_short.assert_called_with(123, "pending", "stripe_cancellation_cancel_failed")
         get_member.assert_not_awaited()
         ban.assert_not_awaited()
         finalize_db.assert_not_called()
@@ -2101,9 +2101,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         user_row = (
             True, expired, "sub_retry", True, expired, expired + timedelta(days=2), True, "cus_retry",
         )
+        canceled_at = datetime.utcnow() - timedelta(minutes=1)
+        banned_at = datetime.utcnow()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
              patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=user_row), \
+             patch.object(self.main, "fetch_subscription_removal_context", side_effect=[
+                 ("sub_retry", expired, canceled_at, None, None, "processing"),
+                 ("sub_retry", expired, canceled_at, banned_at, None, "telegram_failed"),
+             ]), \
              patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
              patch.object(
                  self.main,
@@ -2126,8 +2132,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first, "unban_failed")
         self.assertEqual(second, "removed")
-        self.assertEqual(cancel_subscription.await_count, 2)
-        self.assertEqual(ban.await_count, 2)
+        cancel_subscription.assert_not_awaited()
+        self.assertEqual(ban.await_count, 1)
         self.assertEqual(unban.await_count, 2)
         finalize_db.assert_called_once_with(
             123,
@@ -2146,6 +2152,30 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "already_finalized")
         cancel_subscription.assert_not_awaited()
         ban.assert_not_awaited()
+
+    async def test_recovered_access_after_failed_unban_is_unbanned_and_not_finalized(self):
+        claim_conn = FakeConnection()
+        future_expiry = datetime.utcnow() + timedelta(days=30)
+        banned_at = datetime.utcnow() - timedelta(minutes=5)
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 True, future_expiry, "sub_new", False, None, None, True, "cus_new",
+             )), \
+             patch.object(self.main, "fetch_subscription_removal_context", return_value=(
+                 "sub_old", future_expiry - timedelta(days=31), banned_at, banned_at, None, "telegram_failed",
+             )), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "active_in_db")
+        unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
+        ban.assert_not_awaited()
+        finalize_db.assert_not_called()
+        mark_short.assert_called_with(123, "superseded", "active_access_in_db")
 
     def test_real_aiogram_bot_api_has_no_kick_and_production_uses_ban_unban(self):
         from aiogram import Bot
@@ -6972,6 +7002,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         mark_processed.assert_awaited_once_with(event_id, 1)
         sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertIn("UPDATE subscription_removal_events", sql)
+        self.assertIn("stripe_canceled_at = COALESCE", sql)
         self.assertIn("stripe_subscription_id = NULL", sql)
         self.assertNotIn("stripe_customer_id = COALESCE", sql)
         self.assertIn("UPDATE stripe_links", sql)

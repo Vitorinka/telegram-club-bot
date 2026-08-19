@@ -34,7 +34,7 @@ EXPECTED_VALUES = {
         "restore_access", "revoke_access", "gift_cancel", "gift_reissue",
     )),
     "scheduled_job_runs.status": frozenset(("running", "completed", "failed")),
-    "subscription_removal_events.status": frozenset(("pending", "processing", "telegram_failed", "telegram_removed", "db_finalized", "cancelled", "not_due", "superseded")),
+    "subscription_removal_events.status": frozenset(("pending", "processing", "stripe_canceled", "telegram_failed", "telegram_removed", "db_finalized", "cancelled", "not_due", "superseded")),
     "bot_invite_links.status": frozenset((None, "active", "revoked")),
     "admin_alerts.status": frozenset((None, "claimed", "delivered", "partial", "failed", "observed")),
     "subscription_refund_reconciliations.reconciliation_result": frozenset(("review_required", "access_revoked", "already_reconciled", "already_inactive")),

@@ -1526,7 +1526,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 14)
+        self.assertEqual(len(migrations), 15)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -4009,6 +4009,168 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "а доступ в клуб завершён.\n\n"
             "Вы всегда сможете вернуться и оформить новую подписку снова.",
         ))
+
+    def test_deleted_webhook_state_after_ban_failure_is_retried_from_removal_event_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9942
+        expired = datetime.utcnow() - timedelta(days=3)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expired,
+            payment_failed=True,
+            payment_failed_at=expired,
+            grace_period_end=expired + timedelta(days=2),
+            auto_renew=True,
+            stripe_subscription_id="sub_deleted_retry_ban",
+            stripe_customer_id="cus_deleted_retry_ban",
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock(return_value=False)), \
+             mock.patch.object(
+                 main,
+                 "cancel_failed_renewal_subscription_after_grace",
+                 mock.AsyncMock(return_value="canceled"),
+             ), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock(side_effect=RuntimeError("temporary ban failure"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            first = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(first, "kick_failed")
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_subscription_id, stripe_canceled_at, telegram_banned_at "
+            "FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        )[:2], ("telegram_failed", "sub_deleted_retry_ban"))
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL "
+            "WHERE telegram_id = %s",
+            (user_id,),
+        )
+        cur.execute(
+            "UPDATE subscription_removal_events SET status = 'stripe_canceled', "
+            "stripe_canceled_at = COALESCE(stripe_canceled_at, NOW()) WHERE telegram_id = %s",
+            (user_id,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock()) as refresh, \
+             mock.patch.object(main, "cancel_failed_renewal_subscription_after_grace", mock.AsyncMock()) as cancel, \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            asyncio.run(main.check_subscriptions_and_reminders())
+
+        refresh.assert_not_awaited()
+        cancel.assert_not_awaited()
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("db_finalized",))
+        self.assertEqual(self.query_one(
+            "SELECT paid, auto_renew, payment_failed, payment_failed_at, grace_period_end, stripe_subscription_id "
+            "FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (False, False, False, None, None, None))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events "
+            "WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        ), (1,))
+
+    def test_deleted_webhook_state_after_unban_failure_retries_unban_only_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9943
+        expired = datetime.utcnow() - timedelta(days=3)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expired,
+            payment_failed=True,
+            payment_failed_at=expired,
+            grace_period_end=expired + timedelta(days=2),
+            auto_renew=True,
+            stripe_subscription_id="sub_deleted_retry_unban",
+            stripe_customer_id="cus_deleted_retry_unban",
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock(return_value=False)), \
+             mock.patch.object(
+                 main,
+                 "cancel_failed_renewal_subscription_after_grace",
+                 mock.AsyncMock(return_value="canceled"),
+             ), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as first_ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock(side_effect=RuntimeError("temporary unban failure"))), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            first = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(first, "unban_failed")
+        first_ban.assert_awaited_once()
+        self.assertIsNotNone(self.query_one(
+            "SELECT telegram_banned_at FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0])
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET paid = FALSE, auto_renew = FALSE, stripe_subscription_id = NULL "
+            "WHERE telegram_id = %s",
+            (user_id,),
+        )
+        cur.execute(
+            "UPDATE subscription_removal_events SET status = 'stripe_canceled', "
+            "stripe_canceled_at = COALESCE(stripe_canceled_at, NOW()) WHERE telegram_id = %s",
+            (user_id,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock()) as refresh, \
+             mock.patch.object(main, "cancel_failed_renewal_subscription_after_grace", mock.AsyncMock()) as cancel, \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock()) as get_member, \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as second_ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as second_unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            asyncio.run(main.check_subscriptions_and_reminders())
+
+        refresh.assert_not_awaited()
+        cancel.assert_not_awaited()
+        get_member.assert_not_awaited()
+        second_ban.assert_not_awaited()
+        second_unban.assert_awaited_once_with(
+            chat_id=int(main.GROUP_ID),
+            user_id=user_id,
+            only_if_banned=True,
+        )
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("db_finalized",))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events "
+            "WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        ), (1,))
 
     def test_gift_certificate_delivery_is_deduped_and_stores_no_raw_token_real_postgres(self):
         run_migrations(self.get_conn)

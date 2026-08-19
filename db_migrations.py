@@ -562,6 +562,18 @@ MIGRATION_BASELINE_REQUIREMENTS = {
         "tables": ("gift_access_grants",),
         "columns": {"gift_access_grants": ("certificate_name",)},
     },
+    "0015_subscription_removal_retry_state": {
+        "tables": ("subscription_removal_events",),
+        "columns": {
+            "subscription_removal_events": (
+                "stripe_subscription_id",
+                "access_expiry",
+                "stripe_canceled_at",
+                "telegram_banned_at",
+            ),
+        },
+        "indexes": ("subscription_removal_events_retry_idx",),
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

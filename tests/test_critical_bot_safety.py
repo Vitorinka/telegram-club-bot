@@ -835,7 +835,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         source = MAIN_SOURCE[MAIN_SOURCE.index("def claim_subscription_removal"):MAIN_SOURCE.index("def mark_subscription_removal_status")]
         self.assertIn("FOR UPDATE", source)
         self.assertIn("current_lease_until < now", source)
-        self.assertIn('current_status in ("pending", "telegram_failed")', source)
+        self.assertIn('current_status in ("pending", "stripe_canceled", "telegram_failed")', source)
         self.assertIn('"telegram_removed"', source)
         self.assertIn("claimed_after_telegram_removed", source)
         self.assertIn("last_payment_succeeded_at > %s", source)
@@ -862,8 +862,10 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("bot.kick_chat_member", removal)
         self.assertIn("bot.ban_chat_member", removal)
         self.assertIn("only_if_banned=True", removal)
-        self.assertIn('elif ban_status == "removed":', scheduler)
+        self.assertIn('elif ban_status in ("removed", "db_finalized"):', scheduler)
+        self.assertIn('elif ban_status == "stripe_cancel_failed":', scheduler)
         self.assertIn('elif ban_status in ("kick_failed", "unban_failed"):', scheduler)
+        self.assertIn("stripe_cancellation_errors += 1", scheduler)
         self.assertNotIn('ban_status in ("removed", "kick_failed")', scheduler)
 
     def test_failed_renewal_cancellation_precedes_telegram_and_local_finalization(self):
