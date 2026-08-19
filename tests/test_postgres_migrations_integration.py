@@ -3912,7 +3912,245 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(self.query_one(
             "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
             (user_id,),
-        ), ("pending", "active_access_in_db"))
+        ), ("superseded", "active_access_in_db"))
+
+    def test_superseded_removal_rearms_only_for_new_due_access_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+
+        cases = (
+            (9951, now - timedelta(days=2), now - timedelta(days=2), "superseded"),
+            (9952, now - timedelta(days=2), now + timedelta(days=2), "superseded"),
+            (9953, now - timedelta(days=2), now - timedelta(days=1), "claimed"),
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            for telegram_id, historical_expiry, current_expiry, _expected in cases:
+                self.insert_recovery_user(
+                    telegram_id,
+                    paid=True,
+                    expiry_date=current_expiry,
+                    auto_renew=False,
+                    stripe_subscription_id=None,
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, attempt_count, access_expiry,
+                        created_at, updated_at
+                    )
+                    VALUES (%s, 'superseded', 'subscription_expired', 2, %s, NOW(), NOW())
+                    """,
+                    (telegram_id, historical_expiry),
+                )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        for telegram_id, _historical_expiry, current_expiry, expected in cases:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                result = main.claim_subscription_removal(
+                    cur,
+                    telegram_id,
+                    "subscription_expired",
+                    owner_id=f"worker-{telegram_id}",
+                    now=now,
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            self.assertEqual(result, expected)
+            row = self.query_one(
+                """
+                SELECT status, access_expiry, attempt_count
+                FROM subscription_removal_events
+                WHERE telegram_id = %s
+                """,
+                (telegram_id,),
+            )
+            if expected == "claimed":
+                self.assertEqual(row, ("processing", current_expiry, 1))
+                self.assertEqual(
+                    self.query_one(
+                        """
+                        SELECT event_type, old_expiry, new_expiry
+                        FROM access_events
+                        WHERE telegram_id = %s
+                          AND event_type = 'subscription_removal_cycle_superseded'
+                        """,
+                        (telegram_id,),
+                    ),
+                    (
+                        "subscription_removal_cycle_superseded",
+                        now - timedelta(days=2),
+                        current_expiry,
+                    ),
+                )
+                duplicate_conn = self.get_conn()
+                duplicate_cur = duplicate_conn.cursor()
+                try:
+                    duplicate = main.claim_subscription_removal(
+                        duplicate_cur,
+                        telegram_id,
+                        "subscription_expired",
+                        owner_id="duplicate-worker",
+                        now=now,
+                    )
+                    duplicate_conn.commit()
+                finally:
+                    duplicate_cur.close()
+                    duplicate_conn.close()
+                self.assertEqual(duplicate, "already_processing")
+                self.assertEqual(self.query_one(
+                    """
+                    SELECT COUNT(*) FROM access_events
+                    WHERE telegram_id = %s
+                      AND event_type = 'subscription_removal_cycle_superseded'
+                    """,
+                    (telegram_id,),
+                )[0], 1)
+            else:
+                self.assertEqual(row[0], "superseded")
+                self.assertEqual(self.query_one(
+                    """
+                    SELECT COUNT(*) FROM access_events
+                    WHERE telegram_id = %s
+                      AND event_type = 'subscription_removal_cycle_superseded'
+                    """,
+                    (telegram_id,),
+                )[0], 0)
+
+    def test_superseded_cycle_rearms_after_new_access_expires_and_finalizes_once_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9954
+        old_expiry = datetime.utcnow() - timedelta(days=10)
+        active_expiry = datetime.utcnow() + timedelta(days=5)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=old_expiry,
+            auto_renew=False,
+            stripe_subscription_id=None,
+        )
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            self.assertEqual(
+                main.claim_subscription_removal(
+                    cur,
+                    user_id,
+                    "subscription_expired",
+                    owner_id="cycle-1-worker",
+                ),
+                "claimed",
+            )
+            cur.execute(
+                """
+                UPDATE subscription_removal_events
+                SET status = 'pending', owner_id = NULL, claimed_at = NULL, lease_until = NULL
+                WHERE telegram_id = %s
+                """,
+                (user_id,),
+            )
+            cur.execute(
+                "UPDATE users SET expiry_date = %s WHERE telegram_id = %s",
+                (active_expiry, user_id),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as first_ban:
+            self.assertEqual(asyncio.run(main.ban_user_logic(user_id)), "active_in_db")
+        first_ban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            """
+            SELECT status, last_error, access_expiry, db_finalized_at
+            FROM subscription_removal_events WHERE telegram_id = %s
+            """,
+            (user_id,),
+        ), ("superseded", "active_access_in_db", old_expiry, None))
+
+        cycle_2_expiry = datetime.utcnow() - timedelta(days=1)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE users SET expiry_date = %s WHERE telegram_id = %s",
+                (cycle_2_expiry, user_id),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.bot,
+                 "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            asyncio.run(main.check_subscriptions_and_reminders())
+            asyncio.run(main.check_subscriptions_and_reminders())
+
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        self.assertEqual(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s",
+            (user_id,),
+        )[0], False)
+        self.assertEqual(self.query_one(
+            """
+            SELECT status, access_expiry, attempt_count,
+                   stripe_canceled_at, telegram_banned_at, telegram_removed_at,
+                   db_finalized_at
+            FROM subscription_removal_events WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )[:3], ("db_finalized", cycle_2_expiry, 1))
+        archived = self.query_one(
+            """
+            SELECT old_expiry, new_expiry, notes
+            FROM access_events
+            WHERE telegram_id = %s
+              AND event_type = 'subscription_removal_cycle_superseded'
+            """,
+            (user_id,),
+        )
+        self.assertEqual(archived[:2], (old_expiry, cycle_2_expiry))
+        self.assertIn("status=superseded", archived[2])
+        cycle_1_key = main.subscription_expired_delivery_key(user_id, old_expiry)
+        cycle_2_key = main.subscription_expired_delivery_key(user_id, cycle_2_expiry)
+        self.assertNotEqual(cycle_1_key, cycle_2_key)
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM message_delivery_events
+            WHERE telegram_id = %s
+              AND delivery_type = 'subscription_expired_user'
+            """,
+            (user_id,),
+        )[0], 1)
+        self.assertEqual(self.query_one(
+            """
+            SELECT delivery_key FROM message_delivery_events
+            WHERE telegram_id = %s
+              AND delivery_type = 'subscription_expired_user'
+            """,
+            (user_id,),
+        )[0], cycle_2_key)
 
     def test_live_past_due_grace_is_fixed_and_failed_notice_is_deduped_real_postgres(self):
         run_migrations(self.get_conn)

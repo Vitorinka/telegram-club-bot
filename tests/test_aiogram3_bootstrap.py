@@ -1796,7 +1796,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params, (123, "manual_access_revoked", now))
 
     def test_superseded_removal_without_new_revoke_is_not_claimed(self):
-        conn = FakeConnection(fetches=[("superseded", None, None, "manual_access_revoked")])
+        conn = FakeConnection(fetches=[(
+            "superseded", None, None, "manual_access_revoked",
+            None, None, 1, datetime.utcnow(), datetime.utcnow(),
+        )])
 
         result = self.main.claim_subscription_removal(conn.cursor_obj, 123, "subscription_expired")
 

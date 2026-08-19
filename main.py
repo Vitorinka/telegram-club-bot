@@ -6426,7 +6426,8 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
-        SELECT status, lease_until, db_finalized_at, reason
+        SELECT status, lease_until, db_finalized_at, reason, access_expiry,
+               stripe_subscription_id, attempt_count, created_at, updated_at
         FROM subscription_removal_events
         WHERE telegram_id = %s
         FOR UPDATE
@@ -6435,8 +6436,19 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     )
     row = cur.fetchone()
     if row:
-        current_status, current_lease_until, db_finalized_at, current_reason = row
+        (
+            current_status,
+            current_lease_until,
+            db_finalized_at,
+            current_reason,
+            current_access_expiry,
+            current_subscription_id,
+            current_attempt_count,
+            current_created_at,
+            current_updated_at,
+        ) = row
         can_start_new_cycle = False
+        can_rearm_superseded_cycle = False
         if current_status == "db_finalized" and db_finalized_at:
             cur.execute(
                 """
@@ -6452,6 +6464,39 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                 (int(telegram_id), db_finalized_at, db_finalized_at),
             )
             can_start_new_cycle = cur.fetchone() is not None
+        if current_status == "superseded" and current_access_expiry:
+            cur.execute(
+                """
+                SELECT expiry_date
+                FROM users
+                WHERE telegram_id = %s
+                  AND paid = TRUE
+                  AND expiry_date IS NOT NULL
+                  AND expiry_date < %s
+                  AND expiry_date > %s
+                FOR UPDATE
+                """,
+                (int(telegram_id), now, current_access_expiry),
+            )
+            rearm_user = cur.fetchone()
+            if rearm_user:
+                current_user_expiry = rearm_user[0]
+                record_access_event_cur(
+                    cur,
+                    telegram_id,
+                    "subscription_removal_cycle_superseded",
+                    source="subscription_removal_rearm",
+                    old_expiry=current_access_expiry,
+                    new_expiry=current_user_expiry,
+                    stripe_subscription_id=current_subscription_id,
+                    notes=(
+                        f"status=superseded; reason={current_reason or 'none'}; "
+                        f"attempt_count={int(current_attempt_count or 0)}; "
+                        f"created_at={current_created_at}; updated_at={current_updated_at}"
+                    ),
+                )
+                can_rearm_superseded_cycle = True
+                can_start_new_cycle = True
         if current_status in ("pending", "stripe_canceled", "telegram_failed") or (
             current_status == "processing"
             and current_lease_until
@@ -6462,6 +6507,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                 UPDATE subscription_removal_events
                 SET status = 'processing',
                     reason = CASE
+                        WHEN %s THEN %s
                         WHEN subscription_removal_events.reason IN ('subscription_refund_reconciled', 'manual_access_revoked')
                             THEN subscription_removal_events.reason
                         ELSE %s
@@ -6469,7 +6515,6 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     owner_id = %s,
                     claimed_at = %s,
                     lease_until = %s,
-                    attempt_count = attempt_count + 1,
                     last_error = NULL,
                     stripe_subscription_id = CASE WHEN %s
                         THEN (SELECT stripe_subscription_id FROM users WHERE telegram_id = %s)
@@ -6489,10 +6534,16 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     telegram_banned_at = CASE WHEN %s THEN NULL ELSE telegram_banned_at END,
                     telegram_removed_at = CASE WHEN %s THEN NULL ELSE telegram_removed_at END,
                     db_finalized_at = CASE WHEN %s THEN NULL ELSE db_finalized_at END,
+                    admin_notified_at = CASE WHEN %s THEN NULL ELSE admin_notified_at END,
+                    revoke_started_at = CASE WHEN %s THEN NULL ELSE revoke_started_at END,
+                    attempt_count = CASE WHEN %s THEN 1 ELSE attempt_count + 1 END,
+                    created_at = CASE WHEN %s THEN %s ELSE created_at END,
                     updated_at = %s
                 WHERE telegram_id = %s
                 """,
                 (
+                    can_rearm_superseded_cycle,
+                    reason,
                     reason,
                     owner_id,
                     now,
@@ -6507,6 +6558,11 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     can_start_new_cycle,
                     can_start_new_cycle,
                     can_start_new_cycle,
+                    can_start_new_cycle,
+                    can_rearm_superseded_cycle,
+                    can_rearm_superseded_cycle,
+                    can_rearm_superseded_cycle,
+                    now,
                     now,
                     int(telegram_id),
                 ),
