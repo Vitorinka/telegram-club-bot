@@ -1753,7 +1753,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "active_in_db")
-        mark_short.assert_called_with(123, "superseded", "active_access_in_db")
+        mark_short.assert_called_once()
+        self.assertEqual(mark_short.call_args.args, (123, "superseded", "active_access_in_db"))
+        self.assertIsNotNone(mark_short.call_args.kwargs["owner_id"])
+        self.assertEqual(mark_short.call_args.kwargs["claim_generation"], 123)
         ban.assert_not_awaited()
 
     def test_manual_revoke_removal_is_not_due_after_new_access(self):

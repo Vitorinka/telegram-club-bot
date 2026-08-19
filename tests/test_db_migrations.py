@@ -248,6 +248,31 @@ WHERE status = 'processing';
         sql = (root / "migrations" / "0015_subscription_removal_retry_state.sql").read_text()
         self.assertNotRegex(sql.upper(), r"\b(UPDATE|DELETE|DROP|TRUNCATE)\b")
 
+    def test_subscription_removal_fencing_migration_is_forward_only_and_staged(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0016_subscription_removal_fencing"]
+        self.assertEqual(
+            set(migration["tables"]),
+            {"subscription_removal_events", "scheduled_job_runs"},
+        )
+        self.assertEqual(
+            migration["columns"]["subscription_removal_events"],
+            ("claim_generation",),
+        )
+        self.assertEqual(
+            migration["columns"]["scheduled_job_runs"],
+            ("claim_generation",),
+        )
+        self.assertTrue(all(
+            requirement["validated"] is False
+            for requirement in migration["constraints"].values()
+        ))
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0016_subscription_removal_fencing.sql").read_text()
+        self.assertEqual(sql.upper().count("NOT VALID"), 3)
+        self.assertIn("subscription_removal_events_status_check", sql)
+        self.assertIn("claim_generation BIGINT NOT NULL DEFAULT 0", sql)
+        self.assertNotRegex(sql.upper(), r"\b(UPDATE|DELETE|DROP|TRUNCATE)\b")
+
     def test_postgres_fsm_storage_migration_is_required(self):
         migration = MIGRATION_BASELINE_REQUIREMENTS["0004_postgres_fsm_storage"]
         self.assertIn("aiogram_fsm_states", migration["tables"])

@@ -185,6 +185,52 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
 
+    def test_subscription_removal_fencing_migration_is_idempotent_and_rejects_new_invalid_rows(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0016_subscription_removal_fencing", first["applied"])
+        self.assertIn("0016_subscription_removal_fencing", second["applied"])
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE (table_name, column_name) IN (
+                ('subscription_removal_events', 'claim_generation'),
+                ('scheduled_job_runs', 'claim_generation')
+            )
+            """
+        )[0], 2)
+        constraints = self.query_all(
+            """
+            SELECT conname, convalidated
+            FROM pg_constraint
+            WHERE conname IN (
+                'subscription_removal_events_status_check',
+                'subscription_removal_events_claim_generation_nonnegative_check',
+                'scheduled_job_runs_claim_generation_nonnegative_check'
+            )
+            ORDER BY conname
+            """
+        )
+        self.assertEqual(len(constraints), 3)
+        self.assertTrue(all(validated is False for _name, validated in constraints))
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.errors.CheckViolation):
+                    cur.execute(
+                        "INSERT INTO subscription_removal_events (telegram_id, status) VALUES (987654, 'unknown')"
+                    )
+                conn.rollback()
+                with self.assertRaises(psycopg2.errors.CheckViolation):
+                    cur.execute(
+                        "INSERT INTO scheduled_job_runs (job_key, job_name, schedule_slot, status, claim_generation) "
+                        "VALUES ('bad-generation', 'test', 'slot', 'running', -1)"
+                    )
+                conn.rollback()
+        finally:
+            conn.close()
+
     def test_core_safety_checks_upgrade_and_reject_invalid_rows_real_postgres(self):
         with tempfile.TemporaryDirectory() as migration_dir:
             for migration in load_migrations():
@@ -1526,7 +1572,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 15)
+        self.assertEqual(len(migrations), 16)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -3913,6 +3959,261 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
             (user_id,),
         ), ("superseded", "active_access_in_db"))
+
+    def test_subscription_removal_and_scheduled_job_claims_are_generation_fenced_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9960
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(user_id, paid=True, expiry_date=expiry)
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            worker_a = main.claim_subscription_removal(
+                cur, user_id, "subscription_expired", owner_id="worker-a",
+                now=datetime.utcnow() - timedelta(hours=2), lease_minutes=1,
+                return_token=True,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            worker_b = main.claim_subscription_removal(
+                cur, user_id, "subscription_expired", owner_id="worker-b",
+                return_token=True,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        self.assertEqual(worker_a["claim_generation"], 1)
+        self.assertEqual(worker_b["claim_generation"], 2)
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertFalse(main.mark_subscription_stripe_canceled(
+                user_id, worker_a["owner_id"], worker_a["claim_generation"]
+            ))
+            self.assertFalse(main.mark_subscription_removal_short(
+                user_id, "telegram_removed", owner_id=worker_a["owner_id"],
+                claim_generation=worker_a["claim_generation"],
+            ))
+            self.assertEqual(
+                main.finalize_subscription_removal_in_db(
+                    user_id, expiry, owner_id=worker_a["owner_id"],
+                    claim_generation=worker_a["claim_generation"],
+                ),
+                "ownership_lost",
+            )
+        self.assertTrue(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s", (user_id,)
+        )[0])
+        self.assertEqual(self.query_one(
+            "SELECT owner_id, claim_generation, status FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("worker-b", 2, "processing"))
+
+        job_key = "fencing-test:2026-08-20"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            job_a = main.claim_scheduled_job(
+                cur, job_key, "fencing-test", "2026-08-20", owner_id="job-a",
+                now=datetime.utcnow() - timedelta(hours=2), lease_minutes=1,
+                return_token=True,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            job_b = main.claim_scheduled_job(
+                cur, job_key, "fencing-test", "2026-08-20", owner_id="job-b",
+                return_token=True,
+            )
+            self.assertEqual(
+                main.complete_scheduled_job(
+                    cur, job_key, job_a["owner_id"], job_a["claim_generation"]
+                ),
+                "not_owner",
+            )
+            self.assertEqual(
+                main.fail_scheduled_job(
+                    cur, job_key, "stale", job_a["owner_id"], job_a["claim_generation"]
+                ),
+                "not_owner",
+            )
+            self.assertEqual(
+                main.complete_scheduled_job(
+                    cur, job_key, job_b["owner_id"], job_b["claim_generation"]
+                ),
+                "completed",
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+    def test_new_access_before_telegram_removal_supersedes_old_cycle_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9961
+        old_expiry = datetime.utcnow() - timedelta(days=2)
+        new_expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=old_expiry, auto_renew=False
+        )
+
+        async def grant_new_access(*_args, **_kwargs):
+            conn = self.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET paid = TRUE, expiry_date = %s WHERE telegram_id = %s",
+                    (new_expiry, user_id),
+                )
+            conn.commit()
+            conn.close()
+            return False
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", side_effect=grant_new_access), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            result = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(result, "active_in_db")
+        ban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (user_id,)
+        ), (True, new_expiry))
+        self.assertEqual(self.query_one(
+            "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("superseded", "newer_access_before_telegram_removal"))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        )[0], 0)
+
+    def test_new_access_after_telegram_removal_is_preserved_and_repair_is_queued_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9962
+        old_expiry = datetime.utcnow() - timedelta(days=2)
+        new_expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=old_expiry, auto_renew=False
+        )
+
+        async def unban_then_grant(*_args, **_kwargs):
+            conn = self.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET paid = TRUE, expiry_date = %s WHERE telegram_id = %s",
+                    (new_expiry, user_id),
+                )
+            conn.commit()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock(return_value=False)), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock(side_effect=unban_then_grant)) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(result, "active_in_db")
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (user_id,)
+        ), (True, new_expiry))
+        self.assertEqual(self.query_one(
+            "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("superseded", "newer_access_before_db_finalization"))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        )[0], 0)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'access_restore_invite'",
+            (user_id,),
+        )[0], 1)
+
+    def test_deleted_subscription_webhook_preserves_retry_and_is_idempotent_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9963
+        sub_id = "sub_deleted_real_path"
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry, auto_renew=True,
+            stripe_subscription_id=sub_id, stripe_customer_id="cus_deleted_real_path",
+        )
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscription_removal_events (
+                    telegram_id, status, reason, stripe_subscription_id, access_expiry
+                ) VALUES (%s, 'pending', 'subscription_expired', %s, %s)
+                """,
+                (user_id, sub_id, expiry),
+            )
+        conn.commit()
+        conn.close()
+
+        event = SimpleNamespace(
+            id="evt_deleted_real_path",
+            type="customer.subscription.deleted",
+            created=int(datetime.utcnow().timestamp()),
+            data=SimpleNamespace(object=SimpleNamespace(
+                id=sub_id, customer="cus_deleted_real_path", status="canceled"
+            )),
+        )
+        request = SimpleNamespace(
+            headers={"Stripe-Signature": "sig", "Content-Type": "application/json"},
+            path="/stripe-payment", host="club.example",
+            read=mock.AsyncMock(return_value=b"{}"),
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "construct_verified_stripe_event", return_value=event):
+            first = asyncio.run(main.stripe_webhook(request))
+            second = asyncio.run(main.stripe_webhook(request))
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(second.status, 200)
+        self.assertEqual(self.query_one(
+            "SELECT processed, claim_generation FROM stripe_events WHERE event_id = %s",
+            (event.id,),
+        ), (True, 1))
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_canceled_at IS NOT NULL FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("stripe_canceled", True))
+        self.assertEqual(self.query_one(
+            "SELECT paid, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (False, False, None))
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            retry = main.claim_subscription_removal(
+                cur, user_id, "subscription_expired", owner_id="retry-worker",
+                return_token=True,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(retry["status"], "claimed")
 
     def test_superseded_removal_rearms_only_for_new_due_access_real_postgres(self):
         run_migrations(self.get_conn)

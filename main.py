@@ -6420,14 +6420,28 @@ async def send_existing_subscription_action(callback, user_id, stripe_subscripti
     return True
 
 
-def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None, lease_minutes=30):
+def removal_claim_result(status, owner_id=None, claim_generation=None, return_token=False):
+    if return_token:
+        return {
+            "status": status,
+            "owner_id": owner_id,
+            "claim_generation": claim_generation,
+        }
+    return status
+
+
+def claim_subscription_removal(
+    cur, telegram_id, reason, owner_id=None, now=None, lease_minutes=30,
+    return_token=False,
+):
     owner_id = owner_id or OWNER_ID
     now = now or datetime.utcnow()
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
         SELECT status, lease_until, db_finalized_at, reason, access_expiry,
-               stripe_subscription_id, attempt_count, created_at, updated_at
+               stripe_subscription_id, attempt_count, created_at, updated_at,
+               claim_generation
         FROM subscription_removal_events
         WHERE telegram_id = %s
         FOR UPDATE
@@ -6436,6 +6450,8 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
     )
     row = cur.fetchone()
     if row:
+        if len(row) == 9:  # Compatibility for legacy rows/test doubles before migration 0016.
+            row = tuple(row) + (0,)
         (
             current_status,
             current_lease_until,
@@ -6446,6 +6462,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
             current_attempt_count,
             current_created_at,
             current_updated_at,
+            current_claim_generation,
         ) = row
         can_start_new_cycle = False
         can_rearm_superseded_cycle = False
@@ -6492,6 +6509,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     notes=(
                         f"status=superseded; reason={current_reason or 'none'}; "
                         f"attempt_count={int(current_attempt_count or 0)}; "
+                        f"claim_generation={int(current_claim_generation or 0)}; "
                         f"created_at={current_created_at}; updated_at={current_updated_at}"
                     ),
                 )
@@ -6515,6 +6533,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     owner_id = %s,
                     claimed_at = %s,
                     lease_until = %s,
+                    claim_generation = claim_generation + 1,
                     last_error = NULL,
                     stripe_subscription_id = CASE WHEN %s
                         THEN (SELECT stripe_subscription_id FROM users WHERE telegram_id = %s)
@@ -6540,6 +6559,7 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     created_at = CASE WHEN %s THEN %s ELSE created_at END,
                     updated_at = %s
                 WHERE telegram_id = %s
+                RETURNING claim_generation
                 """,
                 (
                     can_rearm_superseded_cycle,
@@ -6567,36 +6587,49 @@ def claim_subscription_removal(cur, telegram_id, reason, owner_id=None, now=None
                     int(telegram_id),
                 ),
             )
+            claimed_generation = cur.fetchone()[0]
             if current_status == "telegram_removed" and not can_start_new_cycle:
-                return "claimed_after_telegram_removed"
-            return "claimed"
+                return removal_claim_result(
+                    "claimed_after_telegram_removed", owner_id, claimed_generation, return_token
+                )
+            return removal_claim_result("claimed", owner_id, claimed_generation, return_token)
         if current_status == "db_finalized":
-            return "already_finalized"
+            return removal_claim_result("already_finalized", return_token=return_token)
         if current_status == "processing":
-            return "already_processing"
-        return current_status
+            return removal_claim_result("already_processing", return_token=return_token)
+        return removal_claim_result(current_status, return_token=return_token)
 
     cur.execute(
         """
         INSERT INTO subscription_removal_events (
             telegram_id, status, reason, owner_id, claimed_at, lease_until,
-            attempt_count, stripe_subscription_id, access_expiry, created_at, updated_at
+            attempt_count, stripe_subscription_id, access_expiry, created_at, updated_at,
+            claim_generation
         )
         SELECT %s, 'processing', %s, %s, %s, %s, 1,
-               users.stripe_subscription_id, users.expiry_date, %s, %s
+               users.stripe_subscription_id, users.expiry_date, %s, %s, 1
         FROM users
         WHERE users.telegram_id = %s
         ON CONFLICT (telegram_id) DO NOTHING
-        RETURNING telegram_id
+        RETURNING claim_generation
         """,
         (int(telegram_id), reason, owner_id, now, lease_until, now, now, int(telegram_id)),
     )
-    if cur.fetchone():
-        return "claimed"
-    return "not_claimed"
+    claimed_row = cur.fetchone()
+    if claimed_row:
+        return removal_claim_result("claimed", owner_id, claimed_row[0], return_token)
+    return removal_claim_result("not_claimed", return_token=return_token)
 
 
-def mark_subscription_removal_status(cur, telegram_id, status, error_text=None):
+def mark_subscription_removal_status(
+    cur,
+    telegram_id,
+    status,
+    error_text=None,
+    owner_id=None,
+    claim_generation=None,
+    expected_statuses=None,
+):
     fields = {
         "telegram_removed": "telegram_removed_at = COALESCE(telegram_removed_at, NOW()),",
         "db_finalized": "db_finalized_at = COALESCE(db_finalized_at, NOW()),",
@@ -6615,9 +6648,24 @@ def mark_subscription_removal_status(cur, telegram_id, status, error_text=None):
             last_error = LEFT(%s, 1000),
             updated_at = NOW()
         WHERE telegram_id = %s
+          AND (%s IS NULL OR owner_id = %s)
+          AND (%s IS NULL OR claim_generation = %s)
+          AND (%s IS NULL OR status = ANY(%s))
+        RETURNING telegram_id
         """,
-        (status, str(error_text) if error_text else None, int(telegram_id)),
+        (
+            status,
+            str(error_text) if error_text else None,
+            int(telegram_id),
+            owner_id,
+            owner_id,
+            claim_generation,
+            claim_generation,
+            list(expected_statuses) if expected_statuses else None,
+            list(expected_statuses) if expected_statuses else None,
+        ),
     )
+    return cur.fetchone() is not None
 
 
 def fetch_subscription_removal_user(telegram_id):
@@ -6662,7 +6710,7 @@ def fetch_subscription_removal_context(telegram_id):
         conn.close()
 
 
-def mark_subscription_stripe_canceled(telegram_id):
+def mark_subscription_stripe_canceled(telegram_id, owner_id=None, claim_generation=None):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -6677,10 +6725,19 @@ def mark_subscription_stripe_canceled(telegram_id):
                 last_error = NULL,
                 updated_at = NOW()
             WHERE telegram_id = %s
+              AND (%s IS NULL OR owner_id = %s)
+              AND (%s IS NULL OR claim_generation = %s)
+              AND status IN ('processing', 'stripe_canceled')
+            RETURNING telegram_id
             """,
-            (int(telegram_id),),
+            (
+                int(telegram_id), owner_id, owner_id,
+                claim_generation, claim_generation,
+            ),
         )
+        changed = cur.fetchone() is not None
         conn.commit()
+        return changed
     except Exception:
         conn.rollback()
         raise
@@ -6689,7 +6746,7 @@ def mark_subscription_stripe_canceled(telegram_id):
         conn.close()
 
 
-def mark_subscription_telegram_banned(telegram_id):
+def mark_subscription_telegram_banned(telegram_id, owner_id=None, claim_generation=None):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -6699,10 +6756,19 @@ def mark_subscription_telegram_banned(telegram_id):
             SET telegram_banned_at = COALESCE(telegram_banned_at, NOW()),
                 updated_at = NOW()
             WHERE telegram_id = %s
+              AND (%s IS NULL OR owner_id = %s)
+              AND (%s IS NULL OR claim_generation = %s)
+              AND status IN ('processing', 'stripe_canceled', 'telegram_failed')
+            RETURNING telegram_id
             """,
-            (int(telegram_id),),
+            (
+                int(telegram_id), owner_id, owner_id,
+                claim_generation, claim_generation,
+            ),
         )
+        changed = cur.fetchone() is not None
         conn.commit()
+        return changed
     except Exception:
         conn.rollback()
         raise
@@ -6783,14 +6849,131 @@ def update_user_blocked_bot(telegram_id):
         conn.close()
 
 
+def check_subscription_removal_cycle_cur(cur, telegram_id, owner_id, claim_generation):
+    cur.execute(
+        """
+        SELECT removal.access_expiry, removal.stripe_subscription_id,
+               removal.telegram_banned_at, removal.created_at, removal.status,
+               users.paid, users.expiry_date, users.stripe_subscription_id,
+               users.last_payment_succeeded_at
+        FROM subscription_removal_events removal
+        JOIN users ON users.telegram_id = removal.telegram_id
+        WHERE removal.telegram_id = %s
+          AND removal.owner_id = %s
+          AND removal.claim_generation = %s
+        FOR UPDATE OF removal, users
+        """,
+        (int(telegram_id), owner_id, int(claim_generation)),
+    )
+    row = cur.fetchone()
+    if not row:
+        return {"status": "ownership_lost"}
+    (
+        removal_expiry,
+        removal_subscription_id,
+        telegram_banned_at,
+        cycle_created_at,
+        removal_status,
+        paid,
+        current_expiry,
+        current_subscription_id,
+        last_payment_succeeded_at,
+    ) = row
+    newer_expiry = bool(
+        paid
+        and current_expiry
+        and removal_expiry
+        and current_expiry > removal_expiry
+    )
+    newer_subscription = bool(
+        paid
+        and has_valid_stripe_subscription_id(current_subscription_id)
+        and current_subscription_id != removal_subscription_id
+    )
+    newer_payment = bool(
+        paid
+        and last_payment_succeeded_at
+        and cycle_created_at
+        and last_payment_succeeded_at > cycle_created_at
+        and current_expiry
+        and (not removal_expiry or current_expiry >= removal_expiry)
+    )
+    return {
+        "status": "superseded" if (newer_expiry or newer_subscription or newer_payment) else "current",
+        "removal_status": removal_status,
+        "removal_expiry": removal_expiry,
+        "current_expiry": current_expiry,
+        "telegram_banned_at": telegram_banned_at,
+    }
+
+
+def supersede_subscription_removal_for_new_access_cur(
+    cur, telegram_id, owner_id, claim_generation, cycle_state, reason,
+):
+    current_expiry = cycle_state.get("current_expiry")
+    if cycle_state.get("telegram_banned_at") and current_expiry:
+        enqueue_automatic_membership_repair(
+            cur,
+            telegram_id,
+            current_expiry,
+            ACCESS_RESTORE_SOURCE_AUTO_SYNC,
+            reason="subscription_removal_superseded_by_new_access",
+        )
+    return mark_subscription_removal_status(
+        cur,
+        telegram_id,
+        "superseded",
+        reason,
+        owner_id=owner_id,
+        claim_generation=claim_generation,
+    )
+
+
+def check_subscription_removal_cycle(telegram_id, owner_id, claim_generation):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        state = check_subscription_removal_cycle_cur(
+            cur, telegram_id, owner_id, claim_generation
+        )
+        conn.commit()
+        return state
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def finalize_subscription_removal_in_db(
     telegram_id,
     expiry_date=None,
     subscription_cancelled_after_grace=False,
+    owner_id=None,
+    claim_generation=None,
 ):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
+        if owner_id is not None and claim_generation is not None:
+            cycle_state = check_subscription_removal_cycle_cur(
+                cur, telegram_id, owner_id, claim_generation
+            )
+            if cycle_state["status"] == "ownership_lost":
+                conn.rollback()
+                return "ownership_lost"
+            if cycle_state["status"] == "superseded":
+                supersede_subscription_removal_for_new_access_cur(
+                    cur,
+                    telegram_id,
+                    owner_id,
+                    claim_generation,
+                    cycle_state,
+                    "newer_access_before_db_finalization",
+                )
+                conn.commit()
+                return "superseded"
         cur.execute("""
             UPDATE users
             SET paid = FALSE,
@@ -6809,8 +6992,19 @@ def finalize_subscription_removal_in_db(
                 "Вы всегда сможете вернуться и оформить новую подписку снова."
             )
         enqueue_subscription_expired_user_message(cur, telegram_id, expiry_date, text=final_text)
-        mark_subscription_removal_status(cur, telegram_id, "db_finalized")
+        finalized = mark_subscription_removal_status(
+            cur,
+            telegram_id,
+            "db_finalized",
+            owner_id=owner_id,
+            claim_generation=claim_generation,
+            expected_statuses=("telegram_removed", "processing"),
+        )
+        if not finalized:
+            conn.rollback()
+            return "ownership_lost"
         conn.commit()
+        return "db_finalized"
     except Exception:
         conn.rollback()
         raise
@@ -6819,12 +7013,24 @@ def finalize_subscription_removal_in_db(
         conn.close()
 
 
-def mark_subscription_removal_short(telegram_id, status, error_text=None):
+def mark_subscription_removal_short(
+    telegram_id, status, error_text=None, owner_id=None, claim_generation=None,
+    expected_statuses=None,
+):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        mark_subscription_removal_status(cur, telegram_id, status, error_text)
+        changed = mark_subscription_removal_status(
+            cur,
+            telegram_id,
+            status,
+            error_text,
+            owner_id=owner_id,
+            claim_generation=claim_generation,
+            expected_statuses=expected_statuses,
+        )
         conn.commit()
+        return changed
     except Exception:
         conn.rollback()
         raise
@@ -7259,7 +7465,12 @@ async def ban_user_logic(telegram_id, cur=None):
     claim_conn = get_db_conn()
     claim_cur = claim_conn.cursor()
     try:
-        claim = claim_subscription_removal(claim_cur, telegram_id, "subscription_expired")
+        claim_info = claim_subscription_removal(
+            claim_cur,
+            telegram_id,
+            "subscription_expired",
+            return_token=True,
+        )
         claim_conn.commit()
     except Exception:
         claim_conn.rollback()
@@ -7268,6 +7479,15 @@ async def ban_user_logic(telegram_id, cur=None):
         claim_cur.close()
         claim_conn.close()
 
+    legacy_claim_result = not isinstance(claim_info, dict)
+    if legacy_claim_result:
+        claim = claim_info
+        removal_owner_id = None
+        removal_claim_generation = None
+    else:
+        claim = claim_info["status"]
+        removal_owner_id = claim_info["owner_id"]
+        removal_claim_generation = claim_info["claim_generation"]
     if claim not in ("claimed", "claimed_after_telegram_removed"):
         logging.info(
             "USER_REMOVE_CLAIM_SKIPPED: telegram_id=%s, claim=%s",
@@ -7275,6 +7495,27 @@ async def ban_user_logic(telegram_id, cur=None):
             claim,
         )
         return claim
+
+    def mark_owned(status, error_text=None, expected_statuses=None):
+        if legacy_claim_result:
+            mark_subscription_removal_short(telegram_id, status, error_text)
+            return True
+        return mark_subscription_removal_short(
+            telegram_id,
+            status,
+            error_text,
+            owner_id=removal_owner_id,
+            claim_generation=removal_claim_generation,
+            expected_statuses=expected_statuses,
+        )
+
+    def mark_banned_owned():
+        if legacy_claim_result:
+            mark_subscription_telegram_banned(telegram_id)
+            return True
+        return mark_subscription_telegram_banned(
+            telegram_id, removal_owner_id, removal_claim_generation
+        )
 
     user = fetch_subscription_removal_user(telegram_id)
     removal_context = fetch_subscription_removal_context(telegram_id)
@@ -7285,7 +7526,7 @@ async def ban_user_logic(telegram_id, cur=None):
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "user_not_found", None, None, None, None, None
         )
-        mark_subscription_removal_short(telegram_id, "db_finalized", "user_not_found")
+        mark_owned("db_finalized", "user_not_found")
         return "not_found"
 
     (
@@ -7330,14 +7571,14 @@ async def ban_user_logic(telegram_id, cur=None):
                     only_if_banned=True,
                 )
             except Exception as error:
-                mark_subscription_removal_short(telegram_id, "telegram_failed", error)
+                mark_owned("telegram_failed", error)
                 return "unban_failed"
         logging.warning(
             "USER_REMOVE_SKIPPED_SAFETY_CHECK: telegram_id=%s, reason=%s, paid=%s, "
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "active_access_in_db", paid, expiry_date, grace, auto_renew, stripe_subscription_id
         )
-        mark_subscription_removal_short(telegram_id, "superseded", "active_access_in_db")
+        mark_owned("superseded", "active_access_in_db")
         return "active_in_db"
 
     if payment_failed and payment_failed_at:
@@ -7348,7 +7589,7 @@ async def ban_user_logic(telegram_id, cur=None):
                 "payment_failed_at=%s, grace_until=%s, expiry_date=%s, stripe_subscription_id=%s",
                 telegram_id, None, payment_failed_at, retry_until, expiry_date, stripe_subscription_id
             )
-            mark_subscription_removal_short(telegram_id, "pending", "recent_payment_failure")
+            mark_owned("pending", "recent_payment_failure")
             return "recent_payment_failure"
 
     if grace_period_end and now < grace_period_end:
@@ -7357,7 +7598,7 @@ async def ban_user_logic(telegram_id, cur=None):
             "expiry_date=%s, grace=%s, auto_renew=%s, stripe_subscription_id=%s",
             telegram_id, "grace_period_active", paid, expiry_date, grace_period_end, auto_renew, stripe_subscription_id
         )
-        mark_subscription_removal_short(telegram_id, "pending", "grace_period_active")
+        mark_owned("pending", "grace_period_active")
         return "grace_active"
 
     if auto_renew and not has_valid_stripe_subscription_id(stripe_subscription_id):
@@ -7384,7 +7625,7 @@ async def ban_user_logic(telegram_id, cur=None):
             "Нужно вручную проверить Stripe и связать пользователя командой "
             "/link_stripe_user <telegram_id> <customer_id> <subscription_id>."
         )
-        mark_subscription_removal_short(telegram_id, "pending", "auto_renew_without_valid_subscription_id")
+        mark_owned("pending", "auto_renew_without_valid_subscription_id")
         return "STRIPE_UNLINKED_REVIEW"
 
     if auto_renew and has_valid_stripe_subscription_id(stripe_subscription_id):
@@ -7401,7 +7642,7 @@ async def ban_user_logic(telegram_id, cur=None):
             effective_subscription_id,
         )
         if stripe_guard_status:
-            mark_subscription_removal_short(telegram_id, "pending", stripe_guard_status)
+            mark_owned("pending", stripe_guard_status)
             return stripe_guard_status
 
     if failed_renewal_grace_expired and not stripe_canceled_at:
@@ -7410,21 +7651,51 @@ async def ban_user_logic(telegram_id, cur=None):
             effective_subscription_id,
         )
         if cancellation_status == "recovered":
-            mark_subscription_removal_short(telegram_id, "pending", "STRIPE_ACTIVE")
+            mark_owned("pending", "STRIPE_ACTIVE")
             return "STRIPE_ACTIVE"
         if cancellation_status not in ("canceled", "already_canceled"):
-            mark_subscription_removal_short(
-                telegram_id,
+            mark_owned(
                 "pending",
                 f"stripe_cancellation_{cancellation_status}",
             )
             return "stripe_cancel_failed"
-        mark_subscription_stripe_canceled(telegram_id)
+        if legacy_claim_result:
+            mark_subscription_stripe_canceled(telegram_id)
+            stripe_marked = True
+        else:
+            stripe_marked = mark_subscription_stripe_canceled(
+                telegram_id, removal_owner_id, removal_claim_generation
+            )
+        if stripe_marked is False:
+            return "ownership_lost"
         stripe_canceled_at = datetime.utcnow()
 
     if not subscription_refund_group_removal_still_due(telegram_id):
-        mark_subscription_removal_short(telegram_id, "superseded", "access_revoke_no_longer_current")
+        mark_owned("superseded", "access_revoke_no_longer_current")
         return "access_revoke_no_longer_current"
+
+    pre_telegram_cycle = (
+        {"status": "current"}
+        if legacy_claim_result
+        else check_subscription_removal_cycle(
+            telegram_id, removal_owner_id, removal_claim_generation
+        )
+    )
+    if pre_telegram_cycle["status"] == "ownership_lost":
+        return "ownership_lost"
+    if pre_telegram_cycle["status"] == "superseded":
+        if pre_telegram_cycle.get("telegram_banned_at"):
+            try:
+                await bot.unban_chat_member(
+                    chat_id=int(GROUP_ID),
+                    user_id=int(telegram_id),
+                    only_if_banned=True,
+                )
+            except Exception as error:
+                mark_owned("telegram_failed", error)
+                return "unban_failed"
+        mark_owned("superseded", "newer_access_before_telegram_removal")
+        return "active_in_db"
 
     if not telegram_banned_at:
         try:
@@ -7437,10 +7708,11 @@ async def ban_user_logic(telegram_id, cur=None):
                     GROUP_ID,
                     telegram_status,
                 )
-                mark_subscription_removal_short(telegram_id, "pending", "telegram_admin")
+                mark_owned("pending", "telegram_admin")
                 return "telegram_admin"
             if telegram_status in ("kicked", "banned"):
-                mark_subscription_telegram_banned(telegram_id)
+                if mark_banned_owned() is False:
+                    return "ownership_lost"
                 telegram_banned_at = datetime.utcnow()
         except Exception as e:
             logging.critical(
@@ -7457,16 +7729,22 @@ async def ban_user_logic(telegram_id, cur=None):
                 f"Ошибка: проверка не выполнена. ref: {error_ref}\n\n"
                 "Пользователь НЕ удалён автоматически."
             )
-            mark_subscription_removal_short(telegram_id, "pending", f"telegram_status_error: {e}")
+            mark_owned("pending", f"telegram_status_error: {e}")
             return "telegram_status_error"
 
     if claim == "claimed_after_telegram_removed":
-        finalize_subscription_removal_in_db(
-            telegram_id,
-            effective_expiry,
-            subscription_cancelled_after_grace=failed_renewal_grace_expired,
+        finalize_kwargs = {
+            "subscription_cancelled_after_grace": failed_renewal_grace_expired,
+        }
+        if not legacy_claim_result:
+            finalize_kwargs.update(
+                owner_id=removal_owner_id,
+                claim_generation=removal_claim_generation,
+            )
+        finalized = finalize_subscription_removal_in_db(
+            telegram_id, effective_expiry, **finalize_kwargs
         )
-        return "db_finalized"
+        return finalized
 
     # 1. Пытаемся удалить пользователя из группы
     status = "removed"
@@ -7486,7 +7764,15 @@ async def ban_user_logic(telegram_id, cur=None):
     try:
         if not telegram_banned_at:
             await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
-            mark_subscription_telegram_banned(telegram_id)
+            if mark_banned_owned() is False:
+                try:
+                    await bot.unban_chat_member(
+                        chat_id=int(GROUP_ID),
+                        user_id=int(telegram_id),
+                        only_if_banned=True,
+                    )
+                finally:
+                    return "ownership_lost"
         try:
             await bot.unban_chat_member(
                 chat_id=int(GROUP_ID),
@@ -7504,13 +7790,14 @@ async def ban_user_logic(telegram_id, cur=None):
                 f"Пользователь {telegram_id} удален из группы, но не удалось снять бан.\n"
                 f"Ошибка: действие не выполнено. ref: {error_ref}"
             )
-            mark_subscription_removal_short(telegram_id, "telegram_failed", e)
+            mark_owned("telegram_failed", e)
             return "unban_failed"
         logging.info(
             "USER_REMOVED_FROM_GROUP: telegram_id=%s, username=%s, chat_id=%s, reason=%s, result=%s",
             telegram_id, None, GROUP_ID, reason, unban_result
         )
-        mark_subscription_removal_short(telegram_id, "telegram_removed")
+        if mark_owned("telegram_removed") is False:
+            return "ownership_lost"
         logging.info(
             "ADMIN_NOTIFICATION_SUPPRESSED: category=expected_access_removal, "
             "result=removed, telegram_id=%s, reason=%s, subscription_ref=%s",
@@ -7529,19 +7816,29 @@ async def ban_user_logic(telegram_id, cur=None):
             f"Ошибка: действие не выполнено. ref: {error_ref}\n\n"
             "Пользователь мог остаться в группе. Проверьте вручную."
         )
-        mark_subscription_removal_short(telegram_id, "telegram_failed", e)
+        mark_owned("telegram_failed", e)
         status = "kick_failed"
 
     if status == "kick_failed":
         return status
 
     # 2. Закрываем доступ в базе только после успешного Telegram side effect.
-    finalize_subscription_removal_in_db(
-        telegram_id,
-        effective_expiry,
-        subscription_cancelled_after_grace=failed_renewal_grace_expired,
+    finalize_kwargs = {
+        "subscription_cancelled_after_grace": failed_renewal_grace_expired,
+    }
+    if not legacy_claim_result:
+        finalize_kwargs.update(
+            owner_id=removal_owner_id,
+            claim_generation=removal_claim_generation,
+        )
+    finalized = finalize_subscription_removal_in_db(
+        telegram_id, effective_expiry, **finalize_kwargs
     )
-    return status
+    if legacy_claim_result:
+        return status
+    if finalized == "superseded":
+        return "active_in_db"
+    return status if finalized == "db_finalized" else finalized
 
 def subscription_check_requires_admin_notification(removed_total, reminder_errors, telegram_errors):
     return reminder_errors > 0 or telegram_errors > 0
@@ -19146,30 +19443,48 @@ async def run_scheduled_with_lock(job_name, schedule_slot, func, lease_minutes=3
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        claim = claim_scheduled_job(cur, job_key, job_name, schedule_slot, lease_minutes=lease_minutes)
+        claim = claim_scheduled_job(
+            cur,
+            job_key,
+            job_name,
+            schedule_slot,
+            lease_minutes=lease_minutes,
+            return_token=True,
+        )
         conn.commit()
     finally:
         cur.close()
         conn.close()
-    if claim != "claimed":
-        logging.info("SCHEDULED_JOB_SKIPPED: job_key=%s, claim=%s, owner_id=%s", job_key, claim, OWNER_ID)
-        return {"status": claim, "job_key": job_key}
+    if claim["status"] != "claimed":
+        logging.info("SCHEDULED_JOB_SKIPPED: job_key=%s, claim=%s, owner_id=%s", job_key, claim["status"], OWNER_ID)
+        return {"status": claim["status"], "job_key": job_key}
     try:
         result = await func()
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            complete_scheduled_job(cur, job_key)
+            completion = complete_scheduled_job(
+                cur,
+                job_key,
+                owner_id=claim["owner_id"],
+                claim_generation=claim["claim_generation"],
+            )
             conn.commit()
         finally:
             cur.close()
             conn.close()
-        return {"status": "completed", "job_key": job_key, "result": result}
+        return {"status": completion, "job_key": job_key, "result": result}
     except Exception as e:
         conn = get_db_conn()
         cur = conn.cursor()
         try:
-            fail_scheduled_job(cur, job_key, e)
+            fail_scheduled_job(
+                cur,
+                job_key,
+                e,
+                owner_id=claim["owner_id"],
+                claim_generation=claim["claim_generation"],
+            )
             conn.commit()
         finally:
             cur.close()

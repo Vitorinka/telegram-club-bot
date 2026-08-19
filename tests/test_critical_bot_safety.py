@@ -846,11 +846,11 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertLess(source.index("claim_conn.close()"), source.index("fetch_subscription_removal_user"))
         self.assertLess(source.index("fetch_subscription_removal_user"), source.index("refresh_active_stripe_subscription"))
         self.assertLess(source.index("fetch_subscription_removal_user"), source.index("bot.get_chat_member"))
-        self.assertLess(source.index("mark_subscription_removal_short(telegram_id, \"telegram_removed\")"), source.rindex("finalize_subscription_removal_in_db"))
+        self.assertLess(source.index('mark_owned("telegram_removed")'), source.rindex("finalize_subscription_removal_in_db"))
 
     def test_subscription_removal_kick_failure_does_not_close_access(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
-        failure_pos = source.index("mark_subscription_removal_short(telegram_id, \"telegram_failed\", e)")
+        failure_pos = source.index('mark_owned("telegram_failed", e)')
         return_pos = source.index("if status == \"kick_failed\":")
         finalize_pos = source.rindex("finalize_subscription_removal_in_db")
         self.assertLess(failure_pos, return_pos)
