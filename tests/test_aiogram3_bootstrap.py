@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
+from aiogram.exceptions import TelegramNetworkError
 import stripe
 
 
@@ -1820,12 +1821,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=False), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main.bot, "kick_chat_member", AsyncMock(), create=True) as kick:
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban:
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "access_revoke_no_longer_current")
         mark_short.assert_called_with(123, "superseded", "access_revoke_no_longer_current")
-        kick.assert_not_awaited()
+        ban.assert_not_awaited()
 
     async def test_second_revoke_after_superseded_can_reach_telegram_removal(self):
         claim_conn = FakeConnection()
@@ -1848,15 +1849,102 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()), \
-             patch.object(self.main.bot, "kick_chat_member", AsyncMock(), create=True) as kick, \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban:
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "removed")
-        kick.assert_awaited_once()
-        unban.assert_awaited_once()
-        finalize_db.assert_called_once_with(123)
+        ban.assert_awaited_once_with(chat_id=-100123, user_id=123)
+        unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
+        finalize_db.assert_called_once()
+        self.assertEqual(finalize_db.call_args.args[0], 123)
         self.assertTrue(any(call.args[:2] == (123, "telegram_removed") for call in mark_short.call_args_list))
+
+    async def test_live_past_due_recheck_creates_bounded_grace_without_removal(self):
+        subscription = SimpleNamespace(status="past_due", current_period_end=None)
+        first_failure = datetime.utcnow()
+        grace_until = first_failure + timedelta(hours=48)
+        with patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
+             patch.object(
+                 self.main,
+                 "ensure_failed_renewal_grace_from_recheck",
+                 return_value=(first_failure, grace_until),
+             ) as ensure_grace:
+            result = await self.main.refresh_active_stripe_subscription(123, "sub_retry")
+
+        self.assertEqual(result, "STRIPE_GRACE_ACTIVE")
+        ensure_grace.assert_called_once_with(123, "sub_retry")
+
+    async def test_subscription_removal_ban_failure_is_retryable_and_not_finalized(self):
+        claim_conn = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 True, datetime.utcnow() - timedelta(days=1), "sub_retry", False, None, None, True, "cus_retry",
+             )), \
+             patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
+             patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "kick_failed")
+        finalize_db.assert_not_called()
+        unban.assert_not_awaited()
+        self.assertTrue(any(call.args[:2] == (123, "telegram_failed") for call in mark_short.call_args_list))
+
+    async def test_subscription_removal_unban_failure_keeps_db_open_for_retry(self):
+        claim_conn = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 True, datetime.utcnow() - timedelta(days=1), "sub_retry", False, None, None, True, "cus_retry",
+             )), \
+             patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
+             patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "notify_admins", AsyncMock()), \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
+             patch.object(self.main.bot, "unban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))) as unban:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "unban_failed")
+        ban.assert_awaited_once()
+        unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
+        finalize_db.assert_not_called()
+        self.assertTrue(any(call.args[:2] == (123, "telegram_failed") for call in mark_short.call_args_list))
+
+    async def test_failed_renewal_billing_portal_action_uses_canonical_customer(self):
+        conn = FakeConnection(fetches=[("cus_canonical",)])
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main, "create_billing_portal_url", AsyncMock(return_value="https://billing.example/session")) as create_portal:
+            keyboard = await self.main.stripe_delivery_reply_markup_for_user(
+                {"keyboard_kind": "billing_portal"},
+                123,
+            )
+
+        create_portal.assert_awaited_once_with("cus_canonical")
+        button = keyboard.inline_keyboard[0][0]
+        self.assertEqual(button.text, "Обновить способ оплаты")
+        self.assertEqual(button.url, "https://billing.example/session")
+
+    def test_real_aiogram_bot_api_has_no_kick_and_production_uses_ban_unban(self):
+        from aiogram import Bot
+
+        self.assertFalse(hasattr(Bot, "kick_chat_member"))
+        self.assertTrue(hasattr(Bot, "ban_chat_member"))
+        self.assertTrue(hasattr(Bot, "unban_chat_member"))
+        source = Path(self.main.__file__).read_text()
+        self.assertNotIn("bot.kick_chat_member", source)
+        removal = source[source.index("async def ban_user_logic"):source.index("async def check_subscriptions_and_reminders")]
+        self.assertIn("bot.ban_chat_member", removal)
+        self.assertIn("only_if_banned=True", removal)
 
     async def test_postgres_fsm_storage_module_imports_independently(self):
         import postgres_fsm_storage
