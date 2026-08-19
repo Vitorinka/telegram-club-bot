@@ -3914,6 +3914,84 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (user_id,),
         ), ("pending", "active_access_in_db"))
 
+    def test_live_past_due_grace_is_fixed_and_failed_notice_is_deduped_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9940
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=datetime.utcnow() - timedelta(minutes=10),
+            auto_renew=True,
+            stripe_subscription_id="sub_live_past_due",
+            stripe_customer_id="cus_live_past_due",
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            first = main.ensure_failed_renewal_grace_from_recheck(user_id, "sub_live_past_due")
+            second = main.ensure_failed_renewal_grace_from_recheck(user_id, "sub_live_past_due")
+
+        self.assertEqual(first, second)
+        payment_failed_at, grace_until = first
+        self.assertEqual(grace_until, payment_failed_at + timedelta(hours=48))
+        self.assertEqual(self.query_one(
+            "SELECT paid, payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, True, payment_failed_at, grace_until))
+        delivery = self.query_one(
+            """
+            SELECT COUNT(*), MIN(status),
+                   MIN((payload_json::jsonb)->>'text'),
+                   MIN((payload_json::jsonb)->>'keyboard_kind')
+            FROM message_delivery_events
+            WHERE telegram_id = %s AND delivery_type = 'stripe_user_message'
+            """,
+            (user_id,),
+        )
+        self.assertEqual(delivery[0], 1)
+        self.assertEqual(delivery[1], "pending")
+        self.assertEqual(delivery[2], main.failed_renewal_message_text())
+        self.assertEqual(delivery[3], "billing_portal")
+
+    def test_expired_past_due_grace_allows_ban_unban_and_durable_final_notice_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9941
+        expired = datetime.utcnow() - timedelta(days=3)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expired,
+            payment_failed=True,
+            payment_failed_at=datetime.utcnow() - timedelta(days=3),
+            grace_period_end=datetime.utcnow() - timedelta(days=1),
+            auto_renew=True,
+            stripe_subscription_id="sub_expired_past_due",
+            stripe_customer_id="cus_expired_past_due",
+        )
+        subscription = SimpleNamespace(status="past_due", current_period_end=None)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.asyncio, "to_thread", mock.AsyncMock(return_value=subscription)), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(result, "removed")
+        ban.assert_awaited_once()
+        unban.assert_awaited_once_with(
+            chat_id=int(main.GROUP_ID),
+            user_id=user_id,
+            only_if_banned=True,
+        )
+        self.assertFalse(self.query_one("SELECT paid FROM users WHERE telegram_id = %s", (user_id,))[0])
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        ), ("pending",))
+
     def test_gift_certificate_delivery_is_deduped_and_stores_no_raw_token_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()

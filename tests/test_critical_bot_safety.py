@@ -411,6 +411,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
                 index for index in (
                     block.find("enqueue_stripe_user_message"),
                     block.find("enqueue_user_payment_success_message"),
+                    block.find("enqueue_failed_renewal_user_message"),
                 )
                 if index >= 0
             )
@@ -854,6 +855,16 @@ class CriticalBotSafetyTests(unittest.TestCase):
         finalize_pos = source.rindex("finalize_subscription_removal_in_db")
         self.assertLess(failure_pos, return_pos)
         self.assertLess(return_pos, finalize_pos)
+
+    def test_subscription_removal_uses_real_aiogram_api_and_failed_removal_is_not_counted(self):
+        removal = MAIN_SOURCE[MAIN_SOURCE.index("async def ban_user_logic"):MAIN_SOURCE.index("async def check_subscriptions_and_reminders")]
+        scheduler = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
+        self.assertNotIn("bot.kick_chat_member", removal)
+        self.assertIn("bot.ban_chat_member", removal)
+        self.assertIn("only_if_banned=True", removal)
+        self.assertIn('elif ban_status == "removed":', scheduler)
+        self.assertIn('elif ban_status in ("kick_failed", "unban_failed"):', scheduler)
+        self.assertNotIn('ban_status in ("removed", "kick_failed")', scheduler)
 
     def test_subscription_check_releases_batch_cursor_before_side_effects(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
