@@ -3979,6 +3979,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             cur.close()
             conn.close()
+
         conn = self.get_conn()
         cur = conn.cursor()
         try:
@@ -4058,6 +4059,226 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             cur.close()
             conn.close()
+
+    def test_stale_late_ban_compensation_survives_terminal_new_owner_real_postgres(self):
+        from aiogram.exceptions import TelegramNetworkError
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9964
+        expiry = datetime.utcnow() - timedelta(days=2)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry, auto_renew=False
+        )
+        telegram_state = {"banned": False, "ban_calls": 0, "unban_calls": 0}
+
+        async def get_member(**_kwargs):
+            return SimpleNamespace(
+                status="kicked" if telegram_state["banned"] else "member"
+            )
+
+        async def unban_member(**_kwargs):
+            telegram_state["unban_calls"] += 1
+            if telegram_state["unban_calls"] == 2:
+                raise TelegramNetworkError(method=None, message="temporary unban failure")
+            telegram_state["banned"] = False
+
+        async def scenario():
+            a_waiting_at_ban = asyncio.Event()
+            resume_a = asyncio.Event()
+
+            async def ban_member_for_scenario(**_kwargs):
+                telegram_state["ban_calls"] += 1
+                if telegram_state["ban_calls"] == 1:
+                    a_waiting_at_ban.set()
+                    await resume_a.wait()
+                telegram_state["banned"] = True
+
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main, "refresh_active_stripe_subscription", mock.AsyncMock(return_value=False)), \
+                 mock.patch.object(main, "notify_admins", mock.AsyncMock()), \
+                 mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(side_effect=get_member)), \
+                 mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock(side_effect=ban_member_for_scenario)) as ban, \
+                 mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock(side_effect=unban_member)) as unban:
+                worker_a = asyncio.create_task(main.ban_user_logic(user_id))
+                await a_waiting_at_ban.wait()
+                conn = self.get_conn()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE subscription_removal_events SET lease_until = NOW() - INTERVAL '1 minute' WHERE telegram_id = %s",
+                        (user_id,),
+                    )
+                conn.commit()
+                conn.close()
+
+                worker_b_result = await main.ban_user_logic(user_id)
+                self.assertEqual(worker_b_result, "removed")
+                self.assertFalse(telegram_state["banned"])
+                resume_a.set()
+                worker_a_result = await worker_a
+                self.assertEqual(worker_a_result, "ownership_lost")
+                self.assertTrue(telegram_state["banned"])
+
+                conn = self.get_conn()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE message_delivery_events
+                        SET next_attempt_at = CASE
+                            WHEN delivery_type = %s THEN NOW()
+                            ELSE NOW() + INTERVAL '1 day'
+                        END
+                        WHERE status IN ('pending', 'failed')
+                        """,
+                        (main.TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE,),
+                    )
+                conn.commit()
+                conn.close()
+                retry = await main.process_pending_message_deliveries(limit=10)
+                self.assertEqual(retry["sent"], 1)
+                self.assertFalse(telegram_state["banned"])
+                self.assertEqual(ban.await_count, 2)
+                self.assertEqual(unban.await_count, 3)
+
+        asyncio.run(scenario())
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0], "db_finalized")
+        self.assertEqual(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s", (user_id,)
+        )[0], False)
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM message_delivery_events
+            WHERE telegram_id = %s
+              AND delivery_type = %s
+              AND status = 'sent'
+            """,
+            (user_id, main.TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE),
+        )[0], 2)
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM message_delivery_events
+            WHERE telegram_id = %s
+              AND delivery_type = 'subscription_expired_user'
+            """,
+            (user_id,),
+        )[0], 1)
+
+    def test_unban_compensation_is_deduped_and_preserves_active_access_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9965
+        expiry = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry, auto_renew=False
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            compensation = main.prepare_telegram_unban_compensation(
+                user_id, expiry, removal_generation=7
+            )
+            self.assertEqual(compensation["status"], "claimed")
+            self.assertEqual(
+                main.fail_telegram_unban_compensation(
+                    compensation, RuntimeError("retry")
+                ),
+                "failed",
+            )
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE message_delivery_events SET next_attempt_at = NOW() WHERE delivery_key = %s",
+                (compensation["delivery_key"],),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            first = asyncio.run(main.process_pending_message_deliveries(limit=10))
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE message_delivery_events
+                SET next_attempt_at = NOW() + INTERVAL '1 day'
+                WHERE telegram_id = %s
+                  AND delivery_type = 'access_restore_invite'
+                """,
+                (user_id,),
+            )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as retry_unban, \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as retry_ban:
+            second = asyncio.run(main.process_pending_message_deliveries(limit=10))
+            duplicate = main.prepare_telegram_unban_compensation(
+                user_id, expiry, removal_generation=7
+            )
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        self.assertEqual(duplicate["status"], "already_sent")
+        ban.assert_not_awaited()
+        unban.assert_not_awaited()
+        retry_ban.assert_not_awaited()
+        retry_unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (user_id,)
+        ), (True, expiry))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key = %s",
+            (compensation["delivery_key"],),
+        )[0], 1)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'access_restore_invite'",
+            (user_id,),
+        )[0], 1)
+
+    def test_unban_compensation_recovers_processing_lease_after_crash_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9966
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(
+            user_id, paid=False, expiry_date=expiry, auto_renew=False
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            compensation = main.prepare_telegram_unban_compensation(
+                user_id, expiry, removal_generation=8
+            )
+        self.assertEqual(compensation["status"], "claimed")
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE message_delivery_events SET lease_until = NOW() - INTERVAL '1 minute' WHERE delivery_key = %s",
+                (compensation["delivery_key"],),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="kicked"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            first = asyncio.run(main.process_pending_message_deliveries(limit=10))
+            second = asyncio.run(main.process_pending_message_deliveries(limit=10))
+
+        self.assertEqual(first["sent"], 1)
+        self.assertEqual(second["sent"], 0)
+        ban.assert_not_awaited()
+        unban.assert_awaited_once_with(
+            chat_id=int(main.GROUP_ID), user_id=user_id, only_if_banned=True
+        )
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+            (compensation["delivery_key"],),
+        )[0], "sent")
 
     def test_new_access_before_telegram_removal_supersedes_old_cycle_real_postgres(self):
         run_migrations(self.get_conn)
