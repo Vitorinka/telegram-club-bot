@@ -866,6 +866,24 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn('elif ban_status in ("kick_failed", "unban_failed"):', scheduler)
         self.assertNotIn('ban_status in ("removed", "kick_failed")', scheduler)
 
+    def test_failed_renewal_cancellation_precedes_telegram_and_local_finalization(self):
+        removal = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def ban_user_logic"):
+            MAIN_SOURCE.index("async def check_subscriptions_and_reminders")
+        ]
+        cancel_pos = removal.index("cancel_failed_renewal_subscription_after_grace")
+        ban_pos = removal.index("bot.ban_chat_member")
+        finalize_pos = removal.rindex("finalize_subscription_removal_in_db")
+        self.assertLess(cancel_pos, ban_pos)
+        self.assertLess(ban_pos, finalize_pos)
+        cancel_failure = removal[
+            removal.index('if cancellation_status not in ("canceled", "already_canceled")'):
+            removal.index("if not subscription_refund_group_removal_still_due")
+        ]
+        self.assertIn('return "stripe_cancel_failed"', cancel_failure)
+        self.assertNotIn("bot.ban_chat_member", cancel_failure)
+        self.assertNotIn("finalize_subscription_removal_in_db", cancel_failure)
+
     def test_subscription_check_releases_batch_cursor_before_side_effects(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
         self.assertLess(source.index("conn.close()"), source.index("for (telegram_id, expiry"))

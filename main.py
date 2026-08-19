@@ -3951,15 +3951,17 @@ def subscription_expired_delivery_key(telegram_id, expiry_date):
     return f"subscription-expired:{safe_delivery_hash(f'{int(telegram_id)}:{expiry_point}')}"
 
 
-def enqueue_subscription_expired_user_message(cur, telegram_id, expiry_date):
+def enqueue_subscription_expired_user_message(cur, telegram_id, expiry_date, text=None):
     return enqueue_message_delivery(
         cur,
         subscription_expired_delivery_key(telegram_id, expiry_date),
         int(telegram_id),
         "subscription_expired_user",
         stripe_delivery_payload(
-            "⚠️ Ваша подписка истекла. Доступ закрыт.\n"
-            "Вы можете оформить новую подписку в любое время.",
+            text or (
+                "⚠️ Ваша подписка истекла. Доступ закрыт.\n"
+                "Вы можете оформить новую подписку в любое время."
+            ),
             keyboard_kind="tariffs",
             show_trial=False,
         ),
@@ -6629,20 +6631,32 @@ def update_user_blocked_bot(telegram_id):
         conn.close()
 
 
-def finalize_subscription_removal_in_db(telegram_id, expiry_date=None):
+def finalize_subscription_removal_in_db(
+    telegram_id,
+    expiry_date=None,
+    subscription_cancelled_after_grace=False,
+):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
         cur.execute("""
             UPDATE users
             SET paid = FALSE,
+                auto_renew = CASE WHEN %s THEN FALSE ELSE auto_renew END,
                 payment_failed = FALSE,
                 payment_failed_at = NULL,
                 grace_period_end = NULL,
                 reminder_sent = FALSE
             WHERE telegram_id = %s
-        """, (int(telegram_id),))
-        enqueue_subscription_expired_user_message(cur, telegram_id, expiry_date)
+        """, (bool(subscription_cancelled_after_grace), int(telegram_id)))
+        final_text = None
+        if subscription_cancelled_after_grace:
+            final_text = (
+                "Подписку не удалось продлить в течение 48 часов, поэтому она была отменена, "
+                "а доступ в клуб завершён.\n\n"
+                "Вы всегда сможете вернуться и оформить новую подписку снова."
+            )
+        enqueue_subscription_expired_user_message(cur, telegram_id, expiry_date, text=final_text)
         mark_subscription_removal_status(cur, telegram_id, "db_finalized")
         conn.commit()
     except Exception:
@@ -6979,6 +6993,113 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
 
     return False
 
+
+async def cancel_failed_renewal_subscription_after_grace(telegram_id, stripe_subscription_id):
+    safe_subscription_id = safe_log_id(stripe_subscription_id) or "none"
+    logging.warning(
+        "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_ATTEMPTED: telegram_id=%s, subscription_id=%s",
+        telegram_id,
+        safe_subscription_id,
+    )
+    try:
+        subscription = await asyncio.to_thread(
+            stripe.Subscription.retrieve,
+            stripe_subscription_id,
+        )
+        status = getattr(subscription, "status", None)
+        if status in ("active", "trialing"):
+            recovery_status = await refresh_active_stripe_subscription(
+                telegram_id,
+                stripe_subscription_id,
+            )
+            if recovery_status != "STRIPE_ACTIVE":
+                logging.warning(
+                    "FAILED_RENEWAL_SUBSCRIPTION_RECOVERY_SYNC_DEFERRED: telegram_id=%s, "
+                    "subscription_id=%s, recovery_status=%s",
+                    telegram_id,
+                    safe_subscription_id,
+                    recovery_status or "unknown",
+                )
+                return "recovery_sync_deferred"
+            logging.info(
+                "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_SKIPPED_RECOVERED: telegram_id=%s, "
+                "subscription_id=%s, status=%s",
+                telegram_id,
+                safe_subscription_id,
+                status,
+            )
+            return "recovered"
+        if status == "canceled":
+            logging.info(
+                "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_ALREADY_COMPLETED: telegram_id=%s, "
+                "subscription_id=%s",
+                telegram_id,
+                safe_subscription_id,
+            )
+            return "already_canceled"
+        if status not in ("past_due", "unpaid"):
+            logging.warning(
+                "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_SKIPPED_STATUS: telegram_id=%s, "
+                "subscription_id=%s, status=%s",
+                telegram_id,
+                safe_subscription_id,
+                status or "unknown",
+            )
+            return "status_not_cancellable"
+
+        latest_invoice = getattr(subscription, "latest_invoice", None)
+        if latest_invoice:
+            if isinstance(latest_invoice, str):
+                latest_invoice = await asyncio.to_thread(
+                    stripe.Invoice.retrieve,
+                    latest_invoice,
+                )
+            invoice_status = getattr(latest_invoice, "status", None)
+            invoice_paid = bool(getattr(latest_invoice, "paid", False))
+            if invoice_status == "paid" or invoice_paid:
+                recovery_status = await refresh_active_stripe_subscription(
+                    telegram_id,
+                    stripe_subscription_id,
+                )
+                logging.warning(
+                    "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_SKIPPED_PAID_INVOICE: telegram_id=%s, "
+                    "subscription_id=%s, recovery_status=%s",
+                    telegram_id,
+                    safe_subscription_id,
+                    recovery_status or "unknown",
+                )
+                return (
+                    "recovered"
+                    if recovery_status == "STRIPE_ACTIVE"
+                    else "recovery_sync_deferred"
+                )
+
+        await asyncio.to_thread(stripe.Subscription.delete, stripe_subscription_id)
+        logging.info(
+            "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_SUCCEEDED: telegram_id=%s, subscription_id=%s",
+            telegram_id,
+            safe_subscription_id,
+        )
+        return "canceled"
+    except Exception as error:
+        error_ref = safe_admin_error_reference("failed_renewal_subscription_cancel", error)
+        logging.error(
+            "FAILED_RENEWAL_SUBSCRIPTION_CANCEL_FAILED: telegram_id=%s, subscription_id=%s, "
+            "error_class=%s, error_ref=%s",
+            telegram_id,
+            safe_subscription_id,
+            type(error).__name__,
+            error_ref,
+        )
+        await notify_admins(
+            "Не удалось отменить Stripe subscription после истечения grace period.\n\n"
+            f"telegram_id: {telegram_id}\n"
+            f"subscription_id: {safe_subscription_id}\n"
+            f"Ошибка: временный сбой отмены. ref: {error_ref}\n\n"
+            "Доступ и участие в группе пока не изменены; scheduler повторит попытку."
+        )
+        return "cancel_failed"
+
 async def ban_user_logic(telegram_id, cur=None):
     claim_conn = get_db_conn()
     claim_cur = claim_conn.cursor()
@@ -7024,6 +7145,12 @@ async def ban_user_logic(telegram_id, cur=None):
     now = datetime.utcnow()
     reason = "subscription_expired"
     grace = grace_period_end
+    failed_renewal_grace_expired = bool(
+        payment_failed
+        and grace_period_end
+        and grace_period_end <= now
+        and has_valid_stripe_subscription_id(stripe_subscription_id)
+    )
 
     if paid and expiry_date and expiry_date > now:
         logging.warning(
@@ -7094,6 +7221,22 @@ async def ban_user_logic(telegram_id, cur=None):
         mark_subscription_removal_short(telegram_id, "pending", stripe_guard_status)
         return stripe_guard_status
 
+    if failed_renewal_grace_expired:
+        cancellation_status = await cancel_failed_renewal_subscription_after_grace(
+            telegram_id,
+            stripe_subscription_id,
+        )
+        if cancellation_status == "recovered":
+            mark_subscription_removal_short(telegram_id, "pending", "STRIPE_ACTIVE")
+            return "STRIPE_ACTIVE"
+        if cancellation_status not in ("canceled", "already_canceled"):
+            mark_subscription_removal_short(
+                telegram_id,
+                "telegram_failed",
+                f"stripe_cancellation_{cancellation_status}",
+            )
+            return "stripe_cancel_failed"
+
     if not subscription_refund_group_removal_still_due(telegram_id):
         mark_subscription_removal_short(telegram_id, "superseded", "access_revoke_no_longer_current")
         return "access_revoke_no_longer_current"
@@ -7129,7 +7272,11 @@ async def ban_user_logic(telegram_id, cur=None):
         return "telegram_status_error"
 
     if claim == "claimed_after_telegram_removed":
-        finalize_subscription_removal_in_db(telegram_id, expiry_date)
+        finalize_subscription_removal_in_db(
+            telegram_id,
+            expiry_date,
+            subscription_cancelled_after_grace=failed_renewal_grace_expired,
+        )
         return "db_finalized"
 
     # 1. Пытаемся удалить пользователя из группы
@@ -7198,7 +7345,11 @@ async def ban_user_logic(telegram_id, cur=None):
         return status
 
     # 2. Закрываем доступ в базе только после успешного Telegram side effect.
-    finalize_subscription_removal_in_db(telegram_id, expiry_date)
+    finalize_subscription_removal_in_db(
+        telegram_id,
+        expiry_date,
+        subscription_cancelled_after_grace=failed_renewal_grace_expired,
+    )
     return status
 
 def subscription_check_requires_admin_notification(removed_total, reminder_errors, telegram_errors):

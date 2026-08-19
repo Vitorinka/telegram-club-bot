@@ -3973,6 +3973,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
              mock.patch.object(main.asyncio, "to_thread", mock.AsyncMock(return_value=subscription)), \
+             mock.patch.object(
+                 main,
+                 "cancel_failed_renewal_subscription_after_grace",
+                 mock.AsyncMock(return_value="canceled"),
+             ) as cancel_subscription, \
              mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
              mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
              mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
@@ -3980,17 +3985,30 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             result = asyncio.run(main.ban_user_logic(user_id))
 
         self.assertEqual(result, "removed")
+        cancel_subscription.assert_awaited_once_with(user_id, "sub_expired_past_due")
         ban.assert_awaited_once()
         unban.assert_awaited_once_with(
             chat_id=int(main.GROUP_ID),
             user_id=user_id,
             only_if_banned=True,
         )
-        self.assertFalse(self.query_one("SELECT paid FROM users WHERE telegram_id = %s", (user_id,))[0])
         self.assertEqual(self.query_one(
-            "SELECT status FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            "SELECT paid, auto_renew, payment_failed, payment_failed_at, grace_period_end "
+            "FROM users WHERE telegram_id = %s",
             (user_id,),
-        ), ("pending",))
+        ), (False, False, False, None, None))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*), MIN(status), MIN((payload_json::jsonb)->>'text') "
+            "FROM message_delivery_events "
+            "WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (user_id,),
+        ), (
+            1,
+            "pending",
+            "Подписку не удалось продлить в течение 48 часов, поэтому она была отменена, "
+            "а доступ в клуб завершён.\n\n"
+            "Вы всегда сможете вернуться и оформить новую подписку снова.",
+        ))
 
     def test_gift_certificate_delivery_is_deduped_and_stores_no_raw_token_real_postgres(self):
         run_migrations(self.get_conn)
