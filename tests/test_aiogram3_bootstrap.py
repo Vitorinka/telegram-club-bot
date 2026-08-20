@@ -2866,8 +2866,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(closed_during_reply, [True])
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
-        self.assertEqual(len(self.main.router.message.handlers), 77)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 35)
+        self.assertEqual(len(self.main.router.message.handlers), 78)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 37)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2898,8 +2898,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_handlers.append(node.name)
                     callback_filters.append(text)
 
-        self.assertEqual(len(message_handlers), 77)
-        self.assertEqual(len(callback_handlers), 35)
+        self.assertEqual(len(message_handlers), 78)
+        self.assertEqual(len(callback_handlers), 37)
         self.assertEqual(
             commands,
             [
@@ -2922,6 +2922,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catch_all_messages, [])
         self.assertTrue(any("F.data.startswith('sub_')" in item for item in callback_filters))
         self.assertTrue(any("F.data == 'retry_payment'" in item for item in callback_filters))
+        self.assertTrue(any("admin_billing_portal:start" in item for item in callback_filters))
+        self.assertTrue(any("admin_billing_portal:cancel" in item for item in callback_filters))
         self.assertFalse(any("gift_cancel_checkout:" in item for item in callback_filters))
 
     async def test_keyboard_callback_data_are_routable(self):
@@ -7589,6 +7591,260 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             await self.main.admin_gift_center_button_handler(non_admin, FakeState())
         load_gifts.assert_not_called()
         self.assertEqual(non_admin.answers, [])
+
+    async def test_admin_billing_portal_resend_entry_is_private_admin_only(self):
+        menu = self.main.get_admin_menu_keyboard()
+        callbacks = [button.callback_data for row in menu.inline_keyboard for button in row]
+        self.assertIn("admin_billing_portal:start", callbacks)
+
+        non_admin = FakeCallback(user_id=777)
+        with patch.object(self.main, "get_db_conn") as get_conn:
+            await self.main.admin_billing_portal_start_callback(non_admin, FakeState())
+        get_conn.assert_not_called()
+        self.assertEqual(non_admin.message.answers, [])
+
+        group_admin = FakeCallback(user_id=1)
+        group_admin.message.chat.type = "group"
+        state = FakeState()
+        await self.main.admin_billing_portal_start_callback(group_admin, state)
+        self.assertEqual(state.states, [])
+        self.assertIn("личном чате", group_admin.answers[0][0])
+
+    async def test_admin_billing_portal_resend_builds_safe_confirmation(self):
+        user = (
+            777, True, True, True, datetime.utcnow() + timedelta(hours=24),
+            "cus_secret_123", "sub_secret_456",
+        )
+        conn = FakeConnection(fetches=[user, ("action-1",)])
+        message = FakeIncomingMessage(user_id=1)
+        message.text = "777"
+        state = FakeState()
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            await self.main.admin_billing_portal_user_received(message, state)
+
+        text = message.answers[0][0]
+        keyboard = message.answers[0][1]["reply_markup"]
+        self.assertIn("Отправить пользователю ссылку", text)
+        self.assertNotIn("cus_secret_123", text)
+        self.assertNotIn("sub_secret_456", text)
+        self.assertEqual([button.text for button in keyboard.inline_keyboard[0]], ["Отправить", "Отмена"])
+        self.assertEqual(state.clear_calls, 1)
+        insert = next((query, params) for query, params in conn.cursor_obj.queries if "INSERT INTO admin_action_requests" in query)
+        self.assertEqual(insert[1][2], "billing_portal_resend")
+        persisted_payload = str(adapted_json_value(insert[1][3]))
+        self.assertNotIn("cus_secret_123", persisted_payload)
+        self.assertNotIn("sub_secret_456", persisted_payload)
+        self.assertNotIn("portal", persisted_payload.lower())
+
+    async def test_admin_billing_portal_resend_sends_exact_message_without_user_state_update(self):
+        user = (
+            777, True, True, True, datetime.utcnow() + timedelta(hours=24),
+            "cus_canonical", "sub_current",
+        )
+        conn = FakeConnection(fetches=[user])
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(self.main, "create_billing_portal_url", AsyncMock(return_value="https://portal.example/fresh")) as portal, \
+             patch.object(self.main.bot, "send_message", AsyncMock()) as send:
+            result = await self.main.execute_confirmed_billing_portal_resend({
+                "telegram_id": 777,
+                "admin_id": 1,
+                "action_id": "action-1",
+            })
+
+        self.assertEqual(result["status"], "completed")
+        portal.assert_awaited_once_with("cus_canonical")
+        send.assert_awaited_once()
+        self.assertEqual(send.await_args.args[:2], (777, self.main.failed_renewal_message_text()))
+        button = send.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, "Обновить способ оплаты")
+        self.assertEqual(button.url, "https://portal.example/fresh")
+        sql = "\n".join(query for query, _ in conn.cursor_obj.queries)
+        self.assertNotRegex(sql, r"\b(UPDATE|INSERT|DELETE)\s+users\b")
+
+    async def test_admin_billing_portal_resend_uses_neutral_text_without_active_grace(self):
+        cases = (
+            (False, datetime.utcnow() + timedelta(hours=24)),
+            (True, None),
+            (True, datetime.utcnow() - timedelta(seconds=1)),
+        )
+        neutral_text = (
+            "Управление оплатой подписки\n\n"
+            "По кнопке ниже можно обновить способ оплаты или управлять "
+            "платёжными данными для подписки."
+        )
+        for payment_failed, grace_period_end in cases:
+            with self.subTest(
+                payment_failed=payment_failed, grace_period_end=grace_period_end
+            ):
+                user = (
+                    777, True, True, payment_failed, grace_period_end,
+                    "cus_canonical", "sub_current",
+                )
+                conn = FakeConnection(fetches=[user])
+                with patch.object(self.main, "get_db_conn", return_value=conn), \
+                     patch.object(
+                         self.main,
+                         "create_billing_portal_url",
+                         AsyncMock(return_value="https://portal.example/fresh"),
+                     ), patch.object(
+                         self.main.bot, "send_message", AsyncMock()
+                     ) as send:
+                    result = await self.main.execute_confirmed_billing_portal_resend({
+                        "telegram_id": 777,
+                        "admin_id": 1,
+                        "action_id": "action-neutral",
+                    })
+
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(send.await_args.args[:2], (777, neutral_text))
+                button = send.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+                self.assertEqual(button.text, "Управление оплатой")
+
+    async def test_admin_billing_portal_confirmation_rechecks_state_after_preview(self):
+        active_preview = (
+            777, True, True, True, datetime.utcnow() + timedelta(hours=24),
+            "cus_canonical", "sub_current",
+        )
+        self.assertNotIn(
+            "нет активного 48-часового grace",
+            self.main.billing_portal_resend_confirmation_text(active_preview),
+        )
+        expired_at_confirmation = (
+            777, True, True, True, datetime.utcnow() - timedelta(seconds=1),
+            "cus_canonical", "sub_current",
+        )
+        conn = FakeConnection(fetches=[expired_at_confirmation])
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(
+                 self.main,
+                 "create_billing_portal_url",
+                 AsyncMock(return_value="https://portal.example/fresh"),
+             ), patch.object(self.main.bot, "send_message", AsyncMock()) as send:
+            await self.main.execute_confirmed_billing_portal_resend({
+                "telegram_id": 777, "admin_id": 1, "action_id": "action-race",
+            })
+        self.assertEqual(send.await_args.args[1], (
+            "Управление оплатой подписки\n\n"
+            "По кнопке ниже можно обновить способ оплаты или управлять "
+            "платёжными данными для подписки."
+        ))
+
+        inactive_preview = (
+            777, True, True, False, None, "cus_canonical", "sub_current",
+        )
+        self.assertIn(
+            "нет активного 48-часового grace",
+            self.main.billing_portal_resend_confirmation_text(inactive_preview),
+        )
+        active_at_confirmation = (
+            777, True, True, True, datetime.utcnow() + timedelta(hours=24),
+            "cus_canonical", "sub_current",
+        )
+        conn = FakeConnection(fetches=[active_at_confirmation])
+        with patch.object(self.main, "get_db_conn", return_value=conn), \
+             patch.object(
+                 self.main,
+                 "create_billing_portal_url",
+                 AsyncMock(return_value="https://portal.example/fresh"),
+             ), patch.object(self.main.bot, "send_message", AsyncMock()) as send:
+            await self.main.execute_confirmed_billing_portal_resend({
+                "telegram_id": 777, "admin_id": 1, "action_id": "action-race-2",
+            })
+        self.assertEqual(send.await_args.args[1], self.main.failed_renewal_message_text())
+
+    async def test_admin_billing_portal_resend_missing_customer_and_portal_failure_are_safe(self):
+        missing_conn = FakeConnection(fetches=[(777, True, True, False, None, None, "sub_current")])
+        with patch.object(self.main, "get_db_conn", return_value=missing_conn), \
+             patch.object(self.main, "create_billing_portal_url", AsyncMock()) as portal:
+            missing = await self.main.execute_confirmed_billing_portal_resend({
+                "telegram_id": 777, "admin_id": 1, "action_id": "action-missing",
+            })
+        self.assertEqual(missing["status"], "failed")
+        portal.assert_not_awaited()
+
+        raw_customer = "cus_secret_logging_value"
+        raw_portal = "https://billing.stripe.test/session/raw-secret"
+        failed_conn = FakeConnection(fetches=[(777, True, True, False, None, raw_customer, "sub_secret")])
+        with patch.object(self.main, "get_db_conn", return_value=failed_conn), \
+             patch.object(
+                 self.main.stripe.billing_portal.Session,
+                 "create",
+                 side_effect=RuntimeError(f"failed for {raw_customer} at {raw_portal}"),
+             ), self.assertLogs(level="ERROR") as captured:
+            failed = await self.main.execute_confirmed_billing_portal_resend({
+                "telegram_id": 777, "admin_id": 1, "action_id": "action-failed",
+            })
+        output = "\n".join(captured.output)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("ref:", failed["admin_message"])
+        self.assertNotIn(raw_customer, output)
+        self.assertNotIn(raw_portal, output)
+        self.assertNotIn(raw_customer, failed["admin_message"])
+        self.assertNotIn(raw_portal, failed["admin_message"])
+
+    async def test_admin_billing_portal_duplicate_confirmation_sends_once(self):
+        payload = json.dumps({"telegram_id": 777, "admin_id": 1})
+        first_claim = FakeConnection(fetches=[("billing_portal_resend", payload)])
+        user_conn = FakeConnection(fetches=[(
+            777, True, True, True, datetime.utcnow() + timedelta(hours=24),
+            "cus_canonical", "sub_current",
+        )])
+        complete_conn = FakeConnection()
+        second_claim = FakeConnection(fetches=[None, ("completed",)])
+        first = FakeCallback(user_id=1)
+        first.data = "admin_action:confirm:action-1"
+        second = FakeCallback(user_id=1)
+        second.data = first.data
+
+        with patch.object(
+            self.main,
+            "get_db_conn",
+            side_effect=[first_claim, user_conn, complete_conn, second_claim],
+        ), patch.object(
+            self.main,
+            "create_billing_portal_url",
+            AsyncMock(return_value="https://portal.example/fresh"),
+        ) as portal, patch.object(self.main.bot, "send_message", AsyncMock()) as send:
+            await self.main.admin_action_confirm_callback(first)
+            await self.main.admin_action_confirm_callback(second)
+
+        portal.assert_awaited_once()
+        send.assert_awaited_once()
+        self.assertIn("уже обработан", second.answers[0][0])
+
+    async def test_admin_billing_portal_confirm_is_owned_by_creating_admin(self):
+        other_admin_claim = FakeConnection(fetches=[None, ("pending",)])
+        callback = FakeCallback(user_id=2)
+        callback.data = "admin_action:confirm:action-owned-by-admin-1"
+        with patch.object(self.main, "get_db_conn", return_value=other_admin_claim), \
+             patch.object(
+                 self.main, "execute_confirmed_admin_action", AsyncMock()
+             ) as execute:
+            await self.main.admin_action_confirm_callback(callback)
+
+        execute.assert_not_awaited()
+        self.assertIn("уже обработан", callback.answers[0][0])
+        claim_update = next(
+            (query, params) for query, params in other_admin_claim.cursor_obj.queries
+            if "UPDATE admin_action_requests" in query
+        )
+        self.assertEqual(claim_update[1][1], 2)
+
+    async def test_admin_billing_portal_processing_action_is_not_reclaimed_after_send(self):
+        processing_claim = FakeConnection(fetches=[None, ("processing",)])
+        callback = FakeCallback(user_id=1)
+        callback.data = "admin_action:confirm:action-crashed-after-send"
+        with patch.object(self.main, "get_db_conn", return_value=processing_claim), \
+             patch.object(
+                 self.main, "execute_confirmed_admin_action", AsyncMock()
+             ) as execute, patch.object(
+                 self.main.bot, "send_message", AsyncMock()
+             ) as send:
+            await self.main.admin_action_confirm_callback(callback)
+
+        execute.assert_not_awaited()
+        send.assert_not_awaited()
+        self.assertIn("уже обработан", callback.answers[0][0])
 
     def test_admin_gift_actions_match_status_safety_policy(self):
         base = {"public_reference": "GIFT-SAFE000000001"}

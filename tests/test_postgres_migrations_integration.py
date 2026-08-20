@@ -3558,13 +3558,174 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         self.assertEqual(self.query_one(
-            "SELECT status FROM admin_action_requests WHERE action_id = %s",
+            "SELECT status, completed_at IS NOT NULL FROM admin_action_requests WHERE action_id = %s",
             (failed_action_id,),
-        )[0], "failed")
+        ), ("failed", True))
         self.assertEqual(self.query_one(
             "SELECT status FROM admin_action_requests WHERE action_id = %s",
             (completed_action_id,),
         )[0], "completed")
+
+    def test_admin_billing_portal_resend_audit_and_user_state_real_postgres(self):
+        from admin_security import claim_admin_action, complete_admin_action, make_action_request
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 99071
+        expiry = datetime.utcnow() + timedelta(days=2)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            payment_failed=True,
+            payment_failed_at=datetime.utcnow(),
+            grace_period_end=expiry,
+            auto_renew=True,
+            stripe_subscription_id="sub_manual_portal",
+            stripe_customer_id="cus_manual_portal",
+        )
+        before = self.query_one(
+            "SELECT paid, expiry_date, auto_renew, payment_failed, payment_failed_at, "
+            "grace_period_end, stripe_customer_id, stripe_subscription_id "
+            "FROM users WHERE telegram_id = %s",
+            (user_id,),
+        )
+        removal_before = self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0]
+        deliveries_before = self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0]
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        action_id = make_action_request(
+            cur,
+            1,
+            "billing_portal_resend",
+            {"telegram_id": user_id, "admin_id": 1},
+        )
+        wrong_admin_claim = claim_admin_action(cur, action_id, 2)
+        self.assertEqual(wrong_admin_claim["status"], "missing")
+        cur.execute(
+            "SELECT status FROM admin_action_requests WHERE action_id = %s",
+            (action_id,),
+        )
+        self.assertEqual(cur.fetchone()[0], "pending")
+        claim = claim_admin_action(cur, action_id, 1)
+        conn.commit()
+        cur.close()
+        conn.close()
+        claim["payload"]["action_id"] = action_id
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "create_billing_portal_url", mock.AsyncMock(return_value="https://portal.example/fresh")), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()) as send:
+            result = asyncio.run(main.execute_confirmed_billing_portal_resend(claim["payload"]))
+        self.assertEqual(result["status"], "completed")
+        send.assert_awaited_once()
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        complete_admin_action(cur, action_id)
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        after = self.query_one(
+            "SELECT paid, expiry_date, auto_renew, payment_failed, payment_failed_at, "
+            "grace_period_end, stripe_customer_id, stripe_subscription_id "
+            "FROM users WHERE telegram_id = %s",
+            (user_id,),
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0], removal_before)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s",
+            (user_id,),
+        )[0], deliveries_before)
+        self.assertEqual(self.query_one(
+            "SELECT admin_id, action_type, status, completed_at IS NOT NULL "
+            "FROM admin_action_requests WHERE action_id = %s",
+            (action_id,),
+        ), (1, "billing_portal_resend", "completed", True))
+        persisted_payload = self.query_one(
+            "SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
+            (action_id,),
+        )[0]
+        self.assertEqual(
+            json.loads(persisted_payload),
+            {"admin_id": 1, "telegram_id": user_id},
+        )
+        persisted_text = str(persisted_payload)
+        self.assertNotIn("https://", persisted_text)
+        self.assertNotIn("cus_manual_portal", persisted_text)
+        self.assertNotIn("sub_manual_portal", persisted_text)
+
+    def test_admin_billing_portal_crash_after_send_is_not_reclaimed_real_postgres(self):
+        from admin_security import claim_admin_action, make_action_request
+
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 99072
+        expiry = datetime.utcnow() + timedelta(days=2)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            payment_failed=True,
+            payment_failed_at=datetime.utcnow(),
+            grace_period_end=expiry,
+            auto_renew=True,
+            stripe_subscription_id="sub_manual_portal_crash",
+            stripe_customer_id="cus_manual_portal_crash",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        action_id = make_action_request(
+            cur,
+            1,
+            "billing_portal_resend",
+            {"telegram_id": user_id, "admin_id": 1},
+        )
+        first_claim = claim_admin_action(cur, action_id, 1)
+        conn.commit()
+        cur.close()
+        conn.close()
+        first_claim["payload"]["action_id"] = action_id
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main,
+                 "create_billing_portal_url",
+                 mock.AsyncMock(return_value="https://portal.example/fresh"),
+             ), mock.patch.object(
+                 main.bot, "send_message", mock.AsyncMock()
+             ) as send:
+            result = asyncio.run(
+                main.execute_confirmed_billing_portal_resend(first_claim["payload"])
+            )
+        self.assertEqual(result["status"], "completed")
+        send.assert_awaited_once()
+
+        # Simulate process loss before complete_admin_action(). The durable action
+        # remains processing and cannot be claimed/sent again by the callback.
+        conn = self.get_conn()
+        cur = conn.cursor()
+        duplicate_claim = claim_admin_action(cur, action_id, 1)
+        conn.commit()
+        cur.close()
+        conn.close()
+        self.assertEqual(duplicate_claim["status"], "processing")
+        self.assertEqual(self.query_one(
+            "SELECT status, completed_at FROM admin_action_requests WHERE action_id = %s",
+            (action_id,),
+        ), ("processing", None))
 
     def test_sync_stripe_user_identity_changed_rolls_back_real_postgres(self):
         run_migrations(self.get_conn)
