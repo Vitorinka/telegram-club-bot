@@ -1860,7 +1860,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "removed")
-        ban.assert_awaited_once_with(chat_id=-100123, user_id=123)
+        ban.assert_awaited_once()
+        self.assertEqual(ban.await_args.kwargs["chat_id"], -100123)
+        self.assertEqual(ban.await_args.kwargs["user_id"], 123)
+        self.assertIsInstance(ban.await_args.kwargs["until_date"], datetime)
         unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
         finalize_db.assert_called_once()
         self.assertEqual(finalize_db.call_args.args[0], 123)

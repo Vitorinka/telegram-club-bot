@@ -244,6 +244,8 @@ FIRST_PURCHASE_RECOVERY_REMINDER_DELAY_HOURS = 24
 FIRST_PURCHASE_RECOVERY_ATTEMPT_STATUSES = ("creating", "creation_unknown", "open", "expired", "failed", "completed")
 ACCESS_RESTORE_DELIVERY_TYPE = "access_restore_invite"
 TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE = "telegram_unban_compensation"
+TELEGRAM_REMOVAL_BAN_WINDOW_SECONDS = 300
+TELEGRAM_UNBAN_COMPENSATION_LEASE_MINUTES = 1
 ACCESS_RESTORE_SOURCE_ADMIN = "admin_restore_access"
 ACCESS_RESTORE_SOURCE_AUTO_SYNC = "automatic_membership_repair"
 SUBSCRIPTION_REFUND_REVOKE_EVENT = "stripe_refund_access_revoked"
@@ -4492,7 +4494,8 @@ def telegram_unban_compensation_key(telegram_id, access_expiry, removal_generati
 
 
 def prepare_telegram_unban_compensation(
-    telegram_id, access_expiry, removal_generation, lease_minutes=30,
+    telegram_id, access_expiry, removal_generation,
+    expected_ban_until, lease_minutes=TELEGRAM_UNBAN_COMPENSATION_LEASE_MINUTES,
 ):
     delivery_key = telegram_unban_compensation_key(
         telegram_id, access_expiry, removal_generation
@@ -4506,9 +4509,14 @@ def prepare_telegram_unban_compensation(
             int(telegram_id),
             TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE,
             {
+                "version": 2,
                 "removal_generation": int(removal_generation),
                 "access_expiry": access_expiry.isoformat() if access_expiry else None,
                 "group_hash": safe_delivery_hash(str(GROUP_ID))[:12],
+                "group_id": int(GROUP_ID),
+                "expected_ban_until": expected_ban_until.isoformat(),
+                "retry_deadline": expected_ban_until.isoformat(),
+                "ban_confirmed": False,
             },
         )
         now = datetime.utcnow()
@@ -4556,10 +4564,64 @@ def prepare_telegram_unban_compensation(
             "status": claim,
             "delivery_key": delivery_key,
             "claim_generation": claim_generation,
+            "expected_ban_until": expected_ban_until,
         }
     except Exception:
         conn.rollback()
         raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def confirm_telegram_unban_compensation(compensation):
+    if not compensation or compensation.get("status") != "claimed":
+        return False
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE message_delivery_events
+            SET payload_json = jsonb_set(
+                    COALESCE(payload_json::jsonb, '{}'::jsonb),
+                    '{ban_confirmed}', 'true'::jsonb, TRUE
+                )::text
+            WHERE delivery_key = %s
+              AND status = 'processing'
+              AND claim_generation = %s
+            RETURNING delivery_key
+            """,
+            (compensation["delivery_key"], compensation["claim_generation"]),
+        )
+        confirmed = cur.fetchone() is not None
+        conn.commit()
+        return confirmed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def subscription_removal_claim_is_current(telegram_id, owner_id, claim_generation):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT 1
+            FROM subscription_removal_events
+            WHERE telegram_id = %s
+              AND owner_id = %s
+              AND claim_generation = %s
+              AND status IN ('processing', 'stripe_canceled', 'telegram_failed')
+              AND lease_until > NOW()
+            """,
+            (int(telegram_id), owner_id, int(claim_generation)),
+        )
+        return cur.fetchone() is not None
     finally:
         cur.close()
         conn.close()
@@ -4585,6 +4647,28 @@ def fail_telegram_unban_compensation(compensation, error):
                 safe_delivery_hash(compensation["delivery_key"]),
                 type(error).__name__,
             )
+        else:
+            conn.rollback()
+        return result
+    finally:
+        cur.close()
+        conn.close()
+
+
+def cancel_telegram_unban_compensation(compensation, reason):
+    if not compensation or compensation.get("status") != "claimed":
+        return "not_claimed"
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        result = mark_delivery_cancelled(
+            cur,
+            compensation["delivery_key"],
+            compensation["claim_generation"],
+            reason,
+        )
+        if result == "cancelled":
+            conn.commit()
         else:
             conn.rollback()
         return result
@@ -4641,6 +4725,47 @@ def complete_telegram_unban_compensation(
     finally:
         cur.close()
         conn.close()
+
+
+async def stop_telegram_unban_compensation(
+    delivery_key, claim_generation, telegram_id, reason,
+):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        result = mark_delivery_cancelled(
+            cur, delivery_key, claim_generation, reason
+        )
+        if result == "cancelled":
+            conn.commit()
+        else:
+            conn.rollback()
+            return result
+    finally:
+        cur.close()
+        conn.close()
+    await notify_admins(
+        "HIGH: автоматическая компенсация Telegram ban остановлена.\n\n"
+        f"telegram_id: {int(telegram_id)}\n"
+        f"action_ref: {safe_delivery_hash(delivery_key)}\n"
+        f"Причина: {reason}.\n\n"
+        "Текущий статус участия нужно проверить вручную; бот не будет снимать "
+        "возможный административный ban без подтверждённого происхождения.",
+        alert_key=f"telegram-unban-manual:{safe_delivery_hash(delivery_key)}",
+        severity="CRITICAL",
+        dedupe_forever=True,
+    )
+    return result
+
+
+def telegram_ban_until_matches(actual_until, expected_until):
+    if not actual_until or not expected_until:
+        return False
+    if actual_until.tzinfo is not None:
+        actual_until = actual_until.astimezone(timezone.utc).replace(tzinfo=None)
+    if expected_until.tzinfo is not None:
+        expected_until = expected_until.astimezone(timezone.utc).replace(tzinfo=None)
+    return abs((actual_until - expected_until).total_seconds()) <= 1
 
 
 def access_restore_invite_text(expiry_date):
@@ -7927,13 +8052,18 @@ async def ban_user_logic(telegram_id, cur=None):
         stripe_subscription_id,
     )
     unban_compensation = None
+    ban_performed = False
     try:
         if not telegram_banned_at:
             if not legacy_claim_result:
+                expected_ban_until = datetime.utcnow() + timedelta(
+                    seconds=TELEGRAM_REMOVAL_BAN_WINDOW_SECONDS
+                )
                 unban_compensation = prepare_telegram_unban_compensation(
                     telegram_id,
                     effective_expiry,
                     removal_claim_generation,
+                    expected_ban_until,
                 )
                 if unban_compensation["status"] != "claimed":
                     logging.warning(
@@ -7944,25 +8074,36 @@ async def ban_user_logic(telegram_id, cur=None):
                         unban_compensation["status"],
                     )
                     return "unban_compensation_not_claimed"
-            await bot.ban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
-            if mark_banned_owned() is False:
-                logging.warning(
-                    "STALE_LATE_BAN_DETECTED: telegram_id=%s, removal_generation=%s",
-                    telegram_id,
-                    removal_claim_generation,
+                # This is deliberately the final operation before the Telegram API
+                # call. There must be no await between this ownership check and ban.
+                if not subscription_removal_claim_is_current(
+                    telegram_id, removal_owner_id, removal_claim_generation
+                ):
+                    cancel_telegram_unban_compensation(
+                        unban_compensation, "ownership_lost_before_ban"
+                    )
+                    return "ownership_lost"
+            else:
+                expected_ban_until = datetime.utcnow() + timedelta(
+                    seconds=TELEGRAM_REMOVAL_BAN_WINDOW_SECONDS
                 )
+            await bot.ban_chat_member(
+                chat_id=int(GROUP_ID),
+                user_id=int(telegram_id),
+                until_date=expected_ban_until,
+            )
+            ban_performed = True
+            if unban_compensation:
                 try:
-                    await bot.unban_chat_member(
-                        chat_id=int(GROUP_ID),
-                        user_id=int(telegram_id),
-                        only_if_banned=True,
-                    )
-                    complete_telegram_unban_compensation(
-                        unban_compensation, telegram_id, member_status="left"
-                    )
+                    confirm_telegram_unban_compensation(unban_compensation)
                 except Exception as error:
-                    fail_telegram_unban_compensation(unban_compensation, error)
-                return "ownership_lost"
+                    logging.warning(
+                        "STALE_BAN_COMPENSATION_CONFIRM_FAILED: telegram_id=%s, "
+                        "delivery_hash=%s, error_type=%s",
+                        telegram_id,
+                        safe_delivery_hash(unban_compensation["delivery_key"]),
+                        type(error).__name__,
+                    )
         try:
             await bot.unban_chat_member(
                 chat_id=int(GROUP_ID),
@@ -7985,8 +8126,23 @@ async def ban_user_logic(telegram_id, cur=None):
                 f"Ошибка: действие не выполнено. ref: {error_ref}"
             )
             fail_telegram_unban_compensation(unban_compensation, e)
+            if ban_performed:
+                if mark_banned_owned() is False:
+                    logging.warning(
+                        "STALE_LATE_BAN_DETECTED: telegram_id=%s, removal_generation=%s",
+                        telegram_id,
+                        removal_claim_generation,
+                    )
+                    return "ownership_lost"
             mark_owned("telegram_failed", e)
             return "unban_failed"
+        if ban_performed and mark_banned_owned() is False:
+            logging.warning(
+                "STALE_LATE_BAN_DETECTED: telegram_id=%s, removal_generation=%s",
+                telegram_id,
+                removal_claim_generation,
+            )
+            return "ownership_lost"
         logging.info(
             "USER_REMOVED_FROM_GROUP: telegram_id=%s, username=%s, chat_id=%s, reason=%s, result=%s",
             telegram_id, None, GROUP_ID, reason, unban_result
@@ -19932,12 +20088,50 @@ async def process_pending_message_deliveries(limit=25):
                     retryable_failed += 1
                 continue
             elif delivery_type == TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE:
+                compensation_version = payload.get("version")
+                expected_until_raw = payload.get("expected_ban_until")
+                expected_group_id = payload.get("group_id")
+                if (
+                    compensation_version != 2
+                    or not expected_until_raw
+                    or expected_group_id != int(GROUP_ID)
+                ):
+                    await stop_telegram_unban_compensation(
+                        delivery_key,
+                        claim_generation,
+                        telegram_id,
+                        "legacy_or_unverifiable_compensation",
+                    )
+                    continue
+                expected_until = datetime.fromisoformat(expected_until_raw)
+                if expected_until.tzinfo is not None:
+                    expected_until = expected_until.astimezone(timezone.utc).replace(
+                        tzinfo=None
+                    )
+                if datetime.utcnow() >= expected_until:
+                    await stop_telegram_unban_compensation(
+                        delivery_key,
+                        claim_generation,
+                        telegram_id,
+                        "bounded_retry_window_expired",
+                    )
+                    continue
                 member = await bot.get_chat_member(
                     chat_id=int(GROUP_ID), user_id=int(telegram_id)
                 )
                 member_status = getattr(member, "status", None)
                 restricted_has_access = getattr(member, "is_member", True)
                 if member_status in ("kicked", "banned"):
+                    if not telegram_ban_until_matches(
+                        getattr(member, "until_date", None), expected_until
+                    ):
+                        await stop_telegram_unban_compensation(
+                            delivery_key,
+                            claim_generation,
+                            telegram_id,
+                            "telegram_ban_origin_mismatch",
+                        )
+                        continue
                     await bot.unban_chat_member(
                         chat_id=int(GROUP_ID),
                         user_id=int(telegram_id),
@@ -19949,6 +20143,11 @@ async def process_pending_message_deliveries(limit=25):
                     "member", "left", "administrator", "creator", "restricted"
                 ):
                     raise RuntimeError("telegram_unban_compensation_unknown_member_state")
+                elif not payload.get("ban_confirmed"):
+                    # The durable record is armed before the Telegram call. An
+                    # unbanned member does not prove that ban happened, so keep
+                    # retrying inside the short origin-verification window.
+                    raise RuntimeError("telegram_unban_compensation_not_yet_observed")
                 completed = complete_telegram_unban_compensation(
                     {
                         "status": "claimed",
