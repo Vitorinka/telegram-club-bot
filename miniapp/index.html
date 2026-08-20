@@ -18,6 +18,32 @@
         <div><dt>Telegram ID</dt><dd id="telegram-id"></dd></div>
         <div id="username-row" hidden><dt>Username</dt><dd id="username"></dd></div>
       </dl>
+      <button id="refresh" type="button" hidden>Обновить данные</button>
+    </section>
+    <section id="dashboard" class="dashboard" hidden>
+      <article class="card"><h2>Обзор</h2><dl>
+        <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
+        <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
+        <div><dt>Trial</dt><dd data-metric="users.trial"></dd></div>
+        <div><dt>Просроченные доступы</dt><dd data-metric="users.expired_paid"></dd></div>
+      </dl></article>
+      <article class="card"><h2>Оплата</h2><dl>
+        <div><dt>Неудачные оплаты</dt><dd data-metric="billing.failed_payments"></dd></div>
+        <div><dt>Активный grace</dt><dd data-metric="billing.active_grace"></dd></div>
+        <div><dt>Истёкший grace</dt><dd data-metric="billing.expired_grace"></dd></div>
+        <div><dt>Автопродление</dt><dd data-metric="billing.auto_renew"></dd></div>
+      </dl></article>
+      <article class="card"><h2>Доставка</h2><dl>
+        <div><dt>Pending</dt><dd data-metric="deliveries.pending"></dd></div>
+        <div><dt>Failed</dt><dd data-metric="deliveries.failed"></dd></div>
+        <div><dt>Permanently failed</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
+      </dl></article>
+      <article class="card"><h2>Система</h2><dl>
+        <div><dt>DB pool used</dt><dd data-metric="system.db_pool.pool_used"></dd></div>
+        <div><dt>Migrations</dt><dd data-metric="system.migrations.count"></dd></div>
+        <div><dt>Latest</dt><dd data-metric="system.migrations.latest"></dd></div>
+        <div><dt>Scheduler jobs</dt><dd data-metric="system.scheduler.known_jobs"></dd></div>
+      </dl></article>
     </section>
   </main>
 </body>

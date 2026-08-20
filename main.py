@@ -112,6 +112,7 @@ from miniapp_sessions import (
     parse_bearer_authorization,
     revoke_miniapp_admin_session,
 )
+from admin_dashboard import collect_admin_dashboard
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21493,6 +21494,31 @@ def authenticate_miniapp_session(request):
     return session
 
 
+@web.middleware
+async def miniapp_admin_auth_middleware(request, handler):
+    is_admin_api = request.path.startswith("/api/admin/")
+    if is_admin_api and not (
+        request.path == "/api/admin/session" and request.method == "POST"
+    ):
+        try:
+            request["miniapp_admin"] = authenticate_miniapp_session(request)
+        except MiniAppSessionError as error:
+            return miniapp_auth_error_response(error.status)
+    try:
+        response = await handler(request)
+    except Exception:
+        if not is_admin_api:
+            raise
+        category = "admin_api_internal_error"
+        logging.error(
+            "MINIAPP_ADMIN_API_FAILED: category=%s error_ref=%s",
+            category,
+            miniapp_auth_error_reference(category),
+        )
+        response = web.json_response({"error": "internal_error"}, status=500)
+    return apply_miniapp_security_headers(response) if is_admin_api else response
+
+
 async def miniapp_admin_session_create(request):
     try:
         raw_init_data = parse_miniapp_authorization(
@@ -21513,10 +21539,7 @@ async def miniapp_admin_session_create(request):
 
 
 async def miniapp_admin_me(request):
-    try:
-        session = authenticate_miniapp_session(request)
-    except MiniAppSessionError as error:
-        return miniapp_auth_error_response(error.status)
+    session = request["miniapp_admin"]
     payload = {
         "telegram_id": session.telegram_id,
         "is_admin": True,
@@ -21525,12 +21548,18 @@ async def miniapp_admin_me(request):
 
 
 async def miniapp_admin_session_revoke(request):
-    try:
-        session = authenticate_miniapp_session(request)
-    except MiniAppSessionError as error:
-        return miniapp_auth_error_response(error.status)
+    session = request["miniapp_admin"]
     revoke_miniapp_admin_session(get_db_conn, session.session_id)
     return apply_miniapp_security_headers(web.Response(status=204))
+
+
+async def miniapp_admin_dashboard(request):
+    dashboard = collect_admin_dashboard(
+        get_db_conn,
+        db_pool_health,
+        len(scheduler.get_jobs()),
+    )
+    return apply_miniapp_security_headers(web.json_response(dashboard))
 
 
 def _route_exists(app, method, path):
@@ -21544,7 +21573,7 @@ def _route_exists(app, method, path):
 
 
 def create_app():
-    app = web.Application()
+    app = web.Application(middlewares=[miniapp_admin_auth_middleware])
     telegram_path = get_telegram_webhook_path()
     if not _route_exists(app, "POST", telegram_path):
         SimpleRequestHandler(
@@ -21568,6 +21597,8 @@ def create_app():
         app.router.add_post('/api/admin/session', miniapp_admin_session_create)
     if not _route_exists(app, "POST", "/api/admin/session/revoke"):
         app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
+    if not _route_exists(app, "GET", "/api/admin/dashboard"):
+        app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
         app.on_startup.append(on_startup)
