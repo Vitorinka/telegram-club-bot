@@ -99,7 +99,19 @@ from stripe_reconcile_audit import (
     render_reconcile_audit,
 )
 from delivery_failure_admin_ux import render_critical_delivery_alert
-from miniapp_auth import require_admin_miniapp
+from miniapp_auth import (
+    MiniAppAuthError,
+    miniapp_auth_error_reference,
+    parse_miniapp_authorization,
+    validate_telegram_init_data,
+)
+from miniapp_sessions import (
+    MiniAppSessionError,
+    create_miniapp_admin_session,
+    load_miniapp_admin_session,
+    parse_bearer_authorization,
+    revoke_miniapp_admin_session,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21467,21 +21479,58 @@ async def miniapp_stylesheet(request):
     )
 
 
-@require_admin_miniapp(
-    BOT_TOKEN,
-    ADMIN_IDS,
-    on_error=log_miniapp_auth_failure,
-    error_response=miniapp_auth_error_response,
-)
+def authenticate_miniapp_session(request):
+    try:
+        raw_token = parse_bearer_authorization(request.headers.get("Authorization"))
+        session = load_miniapp_admin_session(get_db_conn, raw_token)
+    except MiniAppSessionError as error:
+        log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
+        raise
+    if session.telegram_id not in ADMIN_IDS:
+        category = "session_admin_forbidden"
+        log_miniapp_auth_failure(category, miniapp_auth_error_reference(category))
+        raise MiniAppSessionError(category, status=403)
+    return session
+
+
+async def miniapp_admin_session_create(request):
+    try:
+        raw_init_data = parse_miniapp_authorization(
+            request.headers.get("Authorization")
+        )
+        identity = validate_telegram_init_data(raw_init_data, BOT_TOKEN, ADMIN_IDS)
+    except MiniAppAuthError as error:
+        log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
+        return miniapp_auth_error_response(error.status)
+    raw_token, session = create_miniapp_admin_session(
+        get_db_conn, identity.telegram_id
+    )
+    return apply_miniapp_security_headers(web.json_response({
+        "token": raw_token,
+        "expires_at": session.expires_at.isoformat(),
+        "telegram_id": session.telegram_id,
+    }, status=201))
+
+
 async def miniapp_admin_me(request):
-    identity = request["miniapp_identity"]
+    try:
+        session = authenticate_miniapp_session(request)
+    except MiniAppSessionError as error:
+        return miniapp_auth_error_response(error.status)
     payload = {
-        "telegram_id": identity.telegram_id,
+        "telegram_id": session.telegram_id,
         "is_admin": True,
     }
-    if identity.username:
-        payload["username"] = identity.username
     return apply_miniapp_security_headers(web.json_response(payload))
+
+
+async def miniapp_admin_session_revoke(request):
+    try:
+        session = authenticate_miniapp_session(request)
+    except MiniAppSessionError as error:
+        return miniapp_auth_error_response(error.status)
+    revoke_miniapp_admin_session(get_db_conn, session.session_id)
+    return apply_miniapp_security_headers(web.Response(status=204))
 
 
 def _route_exists(app, method, path):
@@ -21515,6 +21564,10 @@ def create_app():
         app.router.add_get('/miniapp/styles.css', miniapp_stylesheet)
     if not _route_exists(app, "GET", "/api/admin/me"):
         app.router.add_get('/api/admin/me', miniapp_admin_me)
+    if not _route_exists(app, "POST", "/api/admin/session"):
+        app.router.add_post('/api/admin/session', miniapp_admin_session_create)
+    if not _route_exists(app, "POST", "/api/admin/session/revoke"):
+        app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
         app.on_startup.append(on_startup)

@@ -8812,48 +8812,76 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conn.commits, 1)
         self.assertEqual(state.clear_calls, 1)
 
-    async def test_miniapp_admin_me_requires_tma_authorization_and_returns_no_store(self):
+    async def test_miniapp_session_create_uses_tma_and_returns_no_store(self):
         app = self.main.create_app()
-        handler = self.route_handler(app, "GET", "/api/admin/me")
+        handler = self.route_handler(app, "POST", "/api/admin/session")
 
         missing = await handler(FakeMiniAppRequest(app))
-        wrong = await handler(FakeMiniAppRequest(app, "Bearer invalid"))
         valid_raw = signed_miniapp_init_data(1, token=self.main.BOT_TOKEN, username="owner")
-        accepted = await handler(FakeMiniAppRequest(app, f"tma {valid_raw}"))
+        session = SimpleNamespace(
+            telegram_id=1,
+            session_id="safe-session-ref",
+            expires_at=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+        with patch.object(
+            self.main,
+            "create_miniapp_admin_session",
+            return_value=("opaque-token", session),
+        ) as create_session:
+            accepted = await handler(FakeMiniAppRequest(app, f"tma {valid_raw}"))
 
         self.assertEqual(missing.status, 401)
-        self.assertEqual(wrong.status, 401)
-        self.assertEqual(accepted.status, 200)
+        self.assertEqual(accepted.status, 201)
         self.assertEqual(json.loads(accepted.text), {
+            "token": "opaque-token",
+            "expires_at": "2026-08-21T00:00:00+00:00",
             "telegram_id": 1,
-            "is_admin": True,
-            "username": "owner",
         })
-        for response in (missing, wrong, accepted):
+        create_session.assert_called_once_with(self.main.get_db_conn, 1)
+        for response in (missing, accepted):
             self.assertEqual(response.headers["Cache-Control"], "no-store")
             self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
             self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
             self.assertIn("Content-Security-Policy", response.headers)
 
-    async def test_miniapp_admin_me_does_not_access_database_or_stripe(self):
+    async def test_miniapp_admin_me_requires_valid_bearer_session(self):
         app = self.main.create_app()
         handler = self.route_handler(app, "GET", "/api/admin/me")
-        raw = signed_miniapp_init_data(1, token=self.main.BOT_TOKEN)
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
 
-        with patch.object(
-            self.main, "get_db_conn", side_effect=AssertionError("DB must not be used")
-        ), patch.object(
+        missing = await handler(FakeMiniAppRequest(app))
+        malformed = await handler(FakeMiniAppRequest(app, "tma stale"))
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), patch.object(
             self.main.stripe.Subscription,
             "retrieve",
             side_effect=AssertionError("Stripe must not be used"),
         ):
-            response = await handler(FakeMiniAppRequest(app, f"tma {raw}"))
+            response = await handler(FakeMiniAppRequest(app, "Bearer opaque-token"))
 
+        self.assertEqual(missing.status, 401)
+        self.assertEqual(malformed.status, 401)
         self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.text), {"telegram_id": 1, "is_admin": True})
 
-    async def test_miniapp_non_admin_is_forbidden_without_logging_init_data(self):
+    async def test_miniapp_removed_admin_is_forbidden_without_logging_token(self):
         app = self.main.create_app()
         handler = self.route_handler(app, "GET", "/api/admin/me")
+        raw_token = "opaque-private-session-token"
+        session = SimpleNamespace(telegram_id=999, session_id="safe-session-ref")
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             self.assertLogs(level="WARNING") as captured:
+            response = await handler(FakeMiniAppRequest(app, f"Bearer {raw_token}"))
+
+        output = "\n".join(captured.output)
+        self.assertEqual(response.status, 403)
+        self.assertNotIn(raw_token, output)
+        self.assertNotIn(self.main.BOT_TOKEN, output)
+        self.assertIn("category=session_admin_forbidden", output)
+
+    async def test_miniapp_rejected_init_data_is_not_logged(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "POST", "/api/admin/session")
         raw = signed_miniapp_init_data(
             999, token=self.main.BOT_TOKEN, username="private-name"
         )
@@ -8866,7 +8894,21 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(raw, output)
         self.assertNotIn("private-name", output)
         self.assertNotIn(self.main.BOT_TOKEN, output)
-        self.assertIn("category=admin_forbidden", output)
+
+    async def test_miniapp_session_revoke_revokes_only_current_session(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "POST", "/api/admin/session/revoke")
+        session = SimpleNamespace(telegram_id=1, session_id="current-session")
+
+        with patch.object(
+            self.main, "load_miniapp_admin_session", return_value=session
+        ), patch.object(self.main, "revoke_miniapp_admin_session") as revoke:
+            response = await handler(
+                FakeMiniAppRequest(app, "Bearer opaque-current-token")
+            )
+
+        self.assertEqual(response.status, 204)
+        revoke.assert_called_once_with(self.main.get_db_conn, "current-session")
 
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
@@ -8885,8 +8927,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         javascript = (self.main.MINIAPP_ASSET_DIR / "app.js").read_text(encoding="utf-8")
         self.assertIn("telegram-web-app.js", index)
         self.assertIn("/api/admin/me", javascript)
+        self.assertIn("/api/admin/session", javascript)
+        self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
+        for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
+            self.assertNotIn(forbidden_storage, javascript)
 
     def test_admin_menu_webapp_button_requires_valid_https_configuration(self):
         self.assertIsNone(self.main.normalize_miniapp_base_url(None))

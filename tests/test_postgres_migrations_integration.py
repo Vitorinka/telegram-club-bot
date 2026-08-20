@@ -50,6 +50,12 @@ from stripe_invoice_rules import (
 from storage_diagnostics import APPLICATION_TABLES, collect_storage_diagnostics
 from constraint_audit import collect_constraint_audit, unexpected_values
 from stripe_reconcile_audit import load_reconcile_candidates, reconcile_candidates
+from miniapp_sessions import (
+    MiniAppSessionError,
+    create_miniapp_admin_session,
+    load_miniapp_admin_session,
+    revoke_miniapp_admin_session,
+)
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -184,6 +190,103 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
+
+    def test_miniapp_admin_sessions_migration_is_idempotent_and_constrained(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0017_miniapp_admin_sessions", first["applied"])
+        self.assertIn("0017_miniapp_admin_sessions", second["applied"])
+        self.assertEqual(
+            self.query_one("SELECT to_regclass('public.miniapp_admin_sessions')")[0],
+            "miniapp_admin_sessions",
+        )
+        indexes = {
+            row[0] for row in self.query_all(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE tablename = 'miniapp_admin_sessions'
+                """
+            )
+        }
+        self.assertIn("miniapp_admin_sessions_token_hash_key", indexes)
+        self.assertIn("miniapp_admin_sessions_expires_at_idx", indexes)
+        self.assertIn("miniapp_admin_sessions_telegram_id_idx", indexes)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur, self.assertRaises(psycopg2.errors.CheckViolation):
+                cur.execute(
+                    """
+                    INSERT INTO miniapp_admin_sessions (
+                        session_id, token_hash, telegram_id, created_at, expires_at
+                    ) VALUES (%s, 'invalid-expiry', 1, NOW(), NOW())
+                    """,
+                    (str(uuid.uuid4()),),
+                )
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def test_miniapp_sessions_are_hashed_durable_revocable_and_limited(self):
+        run_migrations(self.get_conn)
+        issued = [create_miniapp_admin_session(self.get_conn, 42) for _ in range(6)]
+        raw_tokens = [item[0] for item in issued]
+        self.assertTrue(all(len(token) >= 43 for token in raw_tokens))
+        stored = self.query_all(
+            """
+            SELECT token_hash, revoked_at IS NOT NULL
+            FROM miniapp_admin_sessions
+            WHERE telegram_id = 42
+            ORDER BY created_at, session_id
+            """
+        )
+        self.assertEqual(len(stored), 6)
+        self.assertEqual(sum(1 for _token_hash, revoked in stored if revoked), 1)
+        self.assertFalse(set(raw_tokens) & {token_hash for token_hash, _ in stored})
+        for raw_token in raw_tokens:
+            self.assertNotIn(raw_token, str(stored))
+
+        newest_token, newest_session = issued[-1]
+        loaded_after_new_connection = load_miniapp_admin_session(
+            self.get_conn, newest_token
+        )
+        self.assertEqual(loaded_after_new_connection.session_id, newest_session.session_id)
+        revoke_miniapp_admin_session(self.get_conn, newest_session.session_id)
+        with self.assertRaises(MiniAppSessionError):
+            load_miniapp_admin_session(self.get_conn, newest_token)
+
+    def test_miniapp_session_expiry_cleanup_and_independent_sessions(self):
+        run_migrations(self.get_conn)
+        first_token, first = create_miniapp_admin_session(self.get_conn, 77)
+        second_token, second = create_miniapp_admin_session(self.get_conn, 77)
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertEqual(load_miniapp_admin_session(self.get_conn, first_token).telegram_id, 77)
+        self.assertEqual(load_miniapp_admin_session(self.get_conn, second_token).telegram_id, 77)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE miniapp_admin_sessions
+                    SET created_at = NOW() - INTERVAL '10 hours',
+                        expires_at = NOW() - INTERVAL '1 hour'
+                    WHERE session_id = %s
+                    """,
+                    (first.session_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(MiniAppSessionError):
+            load_miniapp_admin_session(self.get_conn, first_token)
+        create_miniapp_admin_session(self.get_conn, 77)
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM miniapp_admin_sessions WHERE session_id = %s",
+                (first.session_id,),
+            )[0],
+            0,
+        )
 
     def test_subscription_removal_fencing_migration_is_idempotent_and_rejects_new_invalid_rows(self):
         first = run_migrations(self.get_conn)
@@ -1572,7 +1675,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 16)
+        self.assertEqual(len(migrations), 17)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""

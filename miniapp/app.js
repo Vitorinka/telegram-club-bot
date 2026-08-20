@@ -21,12 +21,27 @@
   webApp.ready();
   webApp.expand();
 
-  fetch("/api/admin/me", {
-    method: "GET",
+  let sessionToken = null;
+
+  fetch("/api/admin/session", {
+    method: "POST",
     headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store",
     credentials: "omit",
   })
+    .then((response) => {
+      if (!response.ok) throw new Error("telegram_session_expired");
+      return response.json();
+    })
+    .then((session) => {
+      sessionToken = session.token;
+      return fetch("/api/admin/me", {
+        method: "GET",
+        headers: {Authorization: `Bearer ${sessionToken}`},
+        cache: "no-store",
+        credentials: "omit",
+      });
+    })
     .then((response) => {
       if (!response.ok) throw new Error("access_denied");
       return response.json();
@@ -40,5 +55,12 @@
         usernameRow.hidden = false;
       }
     })
-    .catch(deny);
+    .catch((error) => {
+      if (error.message === "telegram_session_expired") {
+        status.textContent = "Сессия Telegram устарела. Закройте и откройте мини-приложение снова.";
+        identity.hidden = true;
+        return;
+      }
+      deny();
+    });
 })();
