@@ -1813,7 +1813,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_access_revoke_removal_is_superseded_without_telegram_kick(self):
         claim_conn = FakeConnection(fetches=[])
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  False,
                  datetime.utcnow() - timedelta(days=1),
@@ -1831,13 +1832,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "access_revoke_no_longer_current")
-        mark_short.assert_called_with(123, "superseded", "access_revoke_no_longer_current")
+        self.assertTrue(any(call.args[:3] == (123, "superseded", "access_revoke_no_longer_current") for call in mark_short.call_args_list))
         ban.assert_not_awaited()
 
     async def test_second_revoke_after_superseded_can_reach_telegram_removal(self):
         claim_conn = FakeConnection()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  False,
                  datetime.utcnow() - timedelta(days=1),
@@ -1851,7 +1853,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "send_message", AsyncMock()), \
@@ -1887,14 +1889,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_subscription_removal_ban_failure_is_retryable_and_not_finalized(self):
         claim_conn = FakeConnection()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, datetime.utcnow() - timedelta(days=1), "sub_retry", False, None, None, True, "cus_retry",
              )), \
              patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))), \
@@ -1906,17 +1909,32 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         unban.assert_not_awaited()
         self.assertTrue(any(call.args[:2] == (123, "telegram_failed") for call in mark_short.call_args_list))
 
-    async def test_subscription_removal_unban_failure_keeps_db_open_for_retry(self):
+    async def test_legacy_subscription_removal_claim_fails_closed_before_ban(self):
         claim_conn = FakeConnection()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
              patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "enqueue_telegram_unban_manual_alert") as alert, \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
+             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "legacy_claim_rejected")
+        alert.assert_called_once()
+        ban.assert_not_awaited()
+        finalize_db.assert_not_called()
+
+    async def test_subscription_removal_unban_failure_keeps_db_open_for_retry(self):
+        claim_conn = FakeConnection()
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, datetime.utcnow() - timedelta(days=1), "sub_retry", False, None, None, True, "cus_retry",
              )), \
              patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=False)), \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
@@ -2022,7 +2040,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         claim_conn = FakeConnection()
         expired = datetime.utcnow() - timedelta(days=3)
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, expired, "sub_retry", True, expired, expired + timedelta(days=2), True, "cus_retry",
              )), \
@@ -2033,13 +2052,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                  AsyncMock(return_value="cancel_failed"),
              ), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main.bot, "get_chat_member", AsyncMock()) as get_member, \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban:
             result = await self.main.ban_user_logic(123)
 
         self.assertEqual(result, "stripe_cancel_failed")
-        mark_short.assert_called_with(123, "pending", "stripe_cancellation_cancel_failed")
+        self.assertTrue(any(call.args[:3] == (123, "pending", "stripe_cancellation_cancel_failed") for call in mark_short.call_args_list))
         get_member.assert_not_awaited()
         ban.assert_not_awaited()
         finalize_db.assert_not_called()
@@ -2048,7 +2067,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         claim_conn = FakeConnection()
         expired = datetime.utcnow() - timedelta(days=3)
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, expired, "sub_retry", True, expired, expired + timedelta(days=2), True, "cus_retry",
              )), \
@@ -2060,7 +2080,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              ) as cancel_subscription, \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short"), \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
@@ -2071,17 +2091,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         cancel_subscription.assert_awaited_once_with(123, "sub_retry")
         ban.assert_awaited_once()
         unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
-        finalize_db.assert_called_once_with(
-            123,
-            expired,
-            subscription_cancelled_after_grace=True,
-        )
+        finalize_db.assert_called_once()
+        self.assertEqual(finalize_db.call_args.args[:2], (123, expired))
+        self.assertTrue(finalize_db.call_args.kwargs["subscription_cancelled_after_grace"])
 
     async def test_canceled_subscription_then_telegram_failure_remains_retryable(self):
         claim_conn = FakeConnection()
         expired = datetime.utcnow() - timedelta(days=3)
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, expired, "sub_retry", True, expired, expired + timedelta(days=2), True, "cus_retry",
              )), \
@@ -2093,7 +2112,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              ) as cancel_subscription, \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock(side_effect=TelegramNetworkError(method=None, message="network"))):
@@ -2113,7 +2132,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         canceled_at = datetime.utcnow() - timedelta(minutes=1)
         banned_at = datetime.utcnow()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=user_row), \
              patch.object(self.main, "fetch_subscription_removal_context", side_effect=[
                  ("sub_retry", expired, canceled_at, None, None, "processing"),
@@ -2127,7 +2147,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              ) as cancel_subscription, \
              patch.object(self.main, "subscription_refund_group_removal_still_due", return_value=True), \
              patch.object(self.main, "mark_subscription_removal_short"), \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main, "notify_admins", AsyncMock()), \
              patch.object(self.main.bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="member"))), \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
@@ -2144,11 +2164,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         cancel_subscription.assert_not_awaited()
         self.assertEqual(ban.await_count, 1)
         self.assertEqual(unban.await_count, 2)
-        finalize_db.assert_called_once_with(
-            123,
-            expired,
-            subscription_cancelled_after_grace=True,
-        )
+        finalize_db.assert_called_once()
+        self.assertEqual(finalize_db.call_args.args[:2], (123, expired))
+        self.assertTrue(finalize_db.call_args.kwargs["subscription_cancelled_after_grace"])
 
     async def test_completed_failed_renewal_removal_duplicate_is_idempotent(self):
         claim_conn = FakeConnection()
@@ -2167,7 +2185,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         future_expiry = datetime.utcnow() + timedelta(days=30)
         banned_at = datetime.utcnow() - timedelta(minutes=5)
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
-             patch.object(self.main, "claim_subscription_removal", return_value="claimed"), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.multiple(self.main, subscription_removal_claim_is_current=Mock(return_value=True), check_subscription_removal_cycle=Mock(return_value={"status": "current"}), mark_subscription_telegram_banned=Mock(return_value=True), mark_subscription_stripe_canceled=Mock(return_value=True), prepare_telegram_unban_compensation=Mock(return_value={"status": "claimed", "delivery_key": "test-comp", "claim_generation": 1}), confirm_telegram_unban_compensation=Mock(return_value=True), complete_telegram_unban_compensation=Mock(return_value="sent"), fail_telegram_unban_compensation=Mock(return_value="failed")), \
              patch.object(self.main, "fetch_subscription_removal_user", return_value=(
                  True, future_expiry, "sub_new", False, None, None, True, "cus_new",
              )), \
@@ -2175,7 +2194,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                  "sub_old", future_expiry - timedelta(days=31), banned_at, banned_at, None, "telegram_failed",
              )), \
              patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
-             patch.object(self.main, "finalize_subscription_removal_in_db") as finalize_db, \
+             patch.object(self.main, "finalize_subscription_removal_in_db", return_value="removed") as finalize_db, \
              patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban, \
              patch.object(self.main.bot, "unban_chat_member", AsyncMock()) as unban:
             result = await self.main.ban_user_logic(123)
@@ -2184,7 +2203,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         unban.assert_awaited_once_with(chat_id=-100123, user_id=123, only_if_banned=True)
         ban.assert_not_awaited()
         finalize_db.assert_not_called()
-        mark_short.assert_called_with(123, "superseded", "active_access_in_db")
+        self.assertTrue(any(call.args[:3] == (123, "superseded", "active_access_in_db") for call in mark_short.call_args_list))
 
     def test_real_aiogram_bot_api_has_no_kick_and_production_uses_ban_unban(self):
         from aiogram import Bot

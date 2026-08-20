@@ -4727,12 +4727,40 @@ def complete_telegram_unban_compensation(
         conn.close()
 
 
+def enqueue_telegram_unban_manual_alert(cur, delivery_key, telegram_id, reason):
+    action_ref = safe_delivery_hash(delivery_key)
+    text = (
+        "HIGH: автоматическая компенсация Telegram ban остановлена.\n\n"
+        f"telegram_id: {int(telegram_id)}\n"
+        f"action_ref: {action_ref}\n"
+        f"Причина: {reason}.\n\n"
+        "Текущий статус участия нужно проверить вручную; бот не будет снимать "
+        "возможный административный ban без подтверждённого происхождения."
+    )
+    for admin_id in ADMIN_IDS:
+        enqueue_message_delivery(
+            cur,
+            f"telegram-unban-manual:{action_ref}:{int(admin_id)}",
+            int(admin_id),
+            "stripe_admin_message",
+            stripe_delivery_payload(
+                text,
+                severity="CRITICAL",
+                category="telegram_unban_manual_intervention",
+                safe_ref=action_ref,
+            ),
+        )
+
+
 async def stop_telegram_unban_compensation(
     delivery_key, claim_generation, telegram_id, reason,
 ):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
+        enqueue_telegram_unban_manual_alert(
+            cur, delivery_key, telegram_id, reason
+        )
         result = mark_delivery_cancelled(
             cur, delivery_key, claim_generation, reason
         )
@@ -4744,17 +4772,6 @@ async def stop_telegram_unban_compensation(
     finally:
         cur.close()
         conn.close()
-    await notify_admins(
-        "HIGH: автоматическая компенсация Telegram ban остановлена.\n\n"
-        f"telegram_id: {int(telegram_id)}\n"
-        f"action_ref: {safe_delivery_hash(delivery_key)}\n"
-        f"Причина: {reason}.\n\n"
-        "Текущий статус участия нужно проверить вручную; бот не будет снимать "
-        "возможный административный ban без подтверждённого происхождения.",
-        alert_key=f"telegram-unban-manual:{safe_delivery_hash(delivery_key)}",
-        severity="CRITICAL",
-        dedupe_forever=True,
-    )
     return result
 
 
@@ -7785,6 +7802,27 @@ async def ban_user_logic(telegram_id, cur=None):
             claim,
         )
         return claim
+    if legacy_claim_result:
+        alert_conn = get_db_conn()
+        alert_cur = alert_conn.cursor()
+        try:
+            enqueue_telegram_unban_manual_alert(
+                alert_cur,
+                f"legacy-subscription-removal:{int(telegram_id)}",
+                telegram_id,
+                "legacy_non_tokenized_removal_claim",
+            )
+            alert_conn.commit()
+        except Exception:
+            alert_conn.rollback()
+            raise
+        finally:
+            alert_cur.close()
+            alert_conn.close()
+        logging.critical(
+            "USER_REMOVE_LEGACY_CLAIM_REJECTED: telegram_id=%s", telegram_id
+        )
+        return "legacy_claim_rejected"
 
     def mark_owned(status, error_text=None, expected_statuses=None):
         if legacy_claim_result:
@@ -20091,16 +20129,35 @@ async def process_pending_message_deliveries(limit=25):
                 compensation_version = payload.get("version")
                 expected_until_raw = payload.get("expected_ban_until")
                 expected_group_id = payload.get("group_id")
+                payload_generation = payload.get("removal_generation")
+                payload_access_expiry = payload.get("access_expiry")
                 if (
                     compensation_version != 2
                     or not expected_until_raw
                     or expected_group_id != int(GROUP_ID)
+                    or not isinstance(payload_generation, int)
+                    or not payload_access_expiry
                 ):
                     await stop_telegram_unban_compensation(
                         delivery_key,
                         claim_generation,
                         telegram_id,
                         "legacy_or_unverifiable_compensation",
+                    )
+                    continue
+                try:
+                    payload_expiry = datetime.fromisoformat(payload_access_expiry)
+                    expected_delivery_key = telegram_unban_compensation_key(
+                        telegram_id, payload_expiry, payload_generation
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    expected_delivery_key = None
+                if expected_delivery_key != delivery_key:
+                    await stop_telegram_unban_compensation(
+                        delivery_key,
+                        claim_generation,
+                        telegram_id,
+                        "telegram_ban_cycle_identity_mismatch",
                     )
                     continue
                 expected_until = datetime.fromisoformat(expected_until_raw)

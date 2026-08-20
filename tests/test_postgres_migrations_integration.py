@@ -4358,16 +4358,34 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
             conn.close()
             with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
-                 mock.patch.object(main, "notify_admins", mock.AsyncMock()) as alert, \
                  mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="kicked", until_date=actual_until))), \
                  mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
                 await main.process_pending_message_deliveries(limit=10)
             unban.assert_not_awaited()
-            alert.assert_awaited_once()
             self.assertEqual(self.query_one(
                 "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
                 (compensation["delivery_key"],),
             )[0], "cancelled")
+            self.assertEqual(self.query_one(
+                """
+                SELECT COUNT(*) FROM message_delivery_events
+                WHERE delivery_key LIKE %s
+                  AND delivery_type = 'stripe_admin_message'
+                """,
+                (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+            )[0], len(main.ADMIN_IDS))
+            conn = self.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE message_delivery_events
+                    SET next_attempt_at = NOW() + INTERVAL '1 day'
+                    WHERE delivery_key LIKE %s
+                    """,
+                    (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+                )
+            conn.commit()
+            conn.close()
 
         asyncio.run(run_case(
             9,
@@ -4377,8 +4395,75 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         asyncio.run(run_case(
             10,
             datetime.utcnow() + timedelta(minutes=5),
-            None,
+            datetime.utcnow() + timedelta(minutes=7),
         ))
+
+    def test_unconfirmed_preban_and_legacy_compensations_are_safe_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9969
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(user_id, paid=False, expiry_date=expiry, auto_renew=False)
+        expected_until = datetime.utcnow() + timedelta(minutes=5)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            armed = main.prepare_telegram_unban_compensation(
+                user_id, expiry, 11, expected_until
+            )
+            main.fail_telegram_unban_compensation(armed, RuntimeError("reclaim"))
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE message_delivery_events SET next_attempt_at = NOW() WHERE delivery_key = %s",
+                (armed["delivery_key"],),
+            )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="left"))), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+        unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+            (armed["delivery_key"],),
+        )[0], "failed")
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE message_delivery_events
+                SET payload_json = jsonb_set(payload_json::jsonb, '{version}', '1')::text,
+                    next_attempt_at = NOW()
+                WHERE delivery_key = %s
+                """,
+                (armed["delivery_key"],),
+            )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as legacy_unban:
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+        legacy_unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+            (armed["delivery_key"],),
+        )[0], "cancelled")
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s",
+            (f"telegram-unban-manual:{main.safe_delivery_hash(armed['delivery_key'])}:%",),
+        )[0], len(main.ADMIN_IDS))
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "send_message", mock.AsyncMock()) as admin_send, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as no_unban:
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+        self.assertEqual(admin_send.await_count, len(main.ADMIN_IDS))
+        no_unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s AND status = 'sent'",
+            (f"telegram-unban-manual:{main.safe_delivery_hash(armed['delivery_key'])}:%",),
+        )[0], len(main.ADMIN_IDS))
 
     def test_new_access_before_telegram_removal_supersedes_old_cycle_real_postgres(self):
         run_migrations(self.get_conn)
