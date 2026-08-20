@@ -19,20 +19,25 @@ def log_stale_delivery_claim(delivery_key, action):
     )
 
 
-def claim_scheduled_job(cur, job_key, job_name, schedule_slot, owner_id=None, now=None, lease_minutes=30, manual_retry=False):
+def claim_scheduled_job(
+    cur, job_key, job_name, schedule_slot, owner_id=None, now=None,
+    lease_minutes=30, manual_retry=False, return_token=False,
+):
     owner_id = owner_id or OWNER_ID
     now = now or datetime.utcnow()
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
         INSERT INTO scheduled_job_runs (
-            job_key, job_name, schedule_slot, status, owner_id, lease_until, started_at, updated_at
+            job_key, job_name, schedule_slot, status, owner_id, lease_until, started_at, updated_at,
+            claim_generation
         )
-        VALUES (%s, %s, %s, 'running', %s, %s, %s, %s)
+        VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, 1)
         ON CONFLICT (job_key) DO UPDATE SET
             status = 'running',
             owner_id = EXCLUDED.owner_id,
             lease_until = EXCLUDED.lease_until,
+            claim_generation = scheduled_job_runs.claim_generation + 1,
             updated_at = EXCLUDED.updated_at,
             error_text = NULL
         WHERE scheduled_job_runs.status = 'failed'
@@ -41,41 +46,55 @@ def claim_scheduled_job(cur, job_key, job_name, schedule_slot, owner_id=None, no
                 scheduled_job_runs.status = 'running'
                 AND scheduled_job_runs.lease_until < %s
            )
-        RETURNING job_key
+        RETURNING claim_generation
         """,
         (job_key, job_name, schedule_slot, owner_id, lease_until, now, now, manual_retry, now),
     )
-    if cur.fetchone():
+    claimed_row = cur.fetchone()
+    if claimed_row:
+        if return_token:
+            return {"status": "claimed", "owner_id": owner_id, "claim_generation": claimed_row[0]}
         return "claimed"
     cur.execute("SELECT status FROM scheduled_job_runs WHERE job_key = %s", (job_key,))
     row = cur.fetchone()
-    if row and row[0] == "completed":
-        return "duplicate_completed"
-    if row and row[0] == "running":
-        return "already_running"
-    return row[0] if row else "not_claimed"
+    status = (
+        "duplicate_completed" if row and row[0] == "completed"
+        else "already_running" if row and row[0] == "running"
+        else row[0] if row else "not_claimed"
+    )
+    return {"status": status, "owner_id": None, "claim_generation": None} if return_token else status
 
 
-def complete_scheduled_job(cur, job_key):
+def complete_scheduled_job(cur, job_key, owner_id=None, claim_generation=None):
     cur.execute(
         """
         UPDATE scheduled_job_runs
         SET status = 'completed', completed_at = NOW(), updated_at = NOW()
         WHERE job_key = %s
+          AND (%s IS NULL OR owner_id = %s)
+          AND (%s IS NULL OR claim_generation = %s)
+          AND status = 'running'
+        RETURNING job_key
         """,
-        (job_key,),
+        (job_key, owner_id, owner_id, claim_generation, claim_generation),
     )
+    return "completed" if cur.fetchone() else "not_owner"
 
 
-def fail_scheduled_job(cur, job_key, error_text):
+def fail_scheduled_job(cur, job_key, error_text, owner_id=None, claim_generation=None):
     cur.execute(
         """
         UPDATE scheduled_job_runs
         SET status = 'failed', error_text = LEFT(%s, 1000), updated_at = NOW()
         WHERE job_key = %s
+          AND (%s IS NULL OR owner_id = %s)
+          AND (%s IS NULL OR claim_generation = %s)
+          AND status = 'running'
+        RETURNING job_key
         """,
-        (str(error_text), job_key),
+        (str(error_text), job_key, owner_id, owner_id, claim_generation, claim_generation),
     )
+    return "failed" if cur.fetchone() else "not_owner"
 
 
 def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=None, lease_minutes=10):

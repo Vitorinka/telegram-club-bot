@@ -562,6 +562,42 @@ MIGRATION_BASELINE_REQUIREMENTS = {
         "tables": ("gift_access_grants",),
         "columns": {"gift_access_grants": ("certificate_name",)},
     },
+    "0015_subscription_removal_retry_state": {
+        "tables": ("subscription_removal_events",),
+        "columns": {
+            "subscription_removal_events": (
+                "stripe_subscription_id",
+                "access_expiry",
+                "stripe_canceled_at",
+                "telegram_banned_at",
+            ),
+        },
+        "indexes": ("subscription_removal_events_retry_idx",),
+    },
+    "0016_subscription_removal_fencing": {
+        "tables": ("subscription_removal_events", "scheduled_job_runs"),
+        "columns": {
+            "subscription_removal_events": ("claim_generation",),
+            "scheduled_job_runs": ("claim_generation",),
+        },
+        "constraints": {
+            "subscription_removal_events_status_check": {
+                "table": "subscription_removal_events",
+                "definition_contains": ("status", "superseded", "stripe_canceled"),
+                "validated": False,
+            },
+            "subscription_removal_events_claim_generation_nonnegative_check": {
+                "table": "subscription_removal_events",
+                "definition_contains": ("claim_generation", ">= 0"),
+                "validated": False,
+            },
+            "scheduled_job_runs_claim_generation_nonnegative_check": {
+                "table": "scheduled_job_runs",
+                "definition_contains": ("claim_generation", ">= 0"),
+                "validated": False,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
