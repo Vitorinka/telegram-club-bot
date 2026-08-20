@@ -18,7 +18,9 @@ from psycopg2 import errors as psycopg2_errors
 import subprocess
 import tempfile
 import threading
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
@@ -97,6 +99,19 @@ from stripe_reconcile_audit import (
     render_reconcile_audit,
 )
 from delivery_failure_admin_ux import render_critical_delivery_alert
+from miniapp_auth import (
+    MiniAppAuthError,
+    miniapp_auth_error_reference,
+    parse_miniapp_authorization,
+    validate_telegram_init_data,
+)
+from miniapp_sessions import (
+    MiniAppSessionError,
+    create_miniapp_admin_session,
+    load_miniapp_admin_session,
+    parse_bearer_authorization,
+    revoke_miniapp_admin_session,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -213,6 +228,49 @@ if (
     raise ValueError(
         "WEBHOOK_SECRET is incompatible with Telegram webhook secret_token requirements"
     )
+
+
+def normalize_miniapp_base_url(value):
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or any(char.isspace() or ord(char) < 32 for char in candidate):
+        return None
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/miniapp"):
+        path = f"{path}/miniapp" if path else "/miniapp"
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/", "", ""))
+
+
+MINIAPP_PUBLIC_URL = normalize_miniapp_base_url(os.getenv("MINIAPP_BASE_URL"))
+MINIAPP_ASSET_DIR = Path(__file__).resolve().parent / "miniapp"
+MINIAPP_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'self' https://telegram.org; "
+        "style-src 'self'; "
+        "connect-src 'self'; "
+        "img-src 'self' data:; "
+        "base-uri 'none'; form-action 'none'; "
+        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+    ),
+}
 
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
@@ -14127,6 +14185,11 @@ def get_admin_menu_keyboard():
         text="💳 Отправить ссылку на оплату",
         callback_data="admin_billing_portal:start",
     )])
+    if MINIAPP_PUBLIC_URL:
+        rows.append([InlineKeyboardButton(
+            text="🖥 Админ-платформа",
+            web_app=types.WebAppInfo(url=MINIAPP_PUBLIC_URL),
+        )])
     return inline_keyboard(rows)
 
 
@@ -21377,6 +21440,99 @@ async def health(request):
     })
 
 
+def apply_miniapp_security_headers(response):
+    for name, value in MINIAPP_SECURITY_HEADERS.items():
+        response.headers[name] = value
+    return response
+
+
+def log_miniapp_auth_failure(category, error_ref):
+    logging.warning(
+        "MINIAPP_AUTH_REJECTED: category=%s error_ref=%s",
+        category,
+        error_ref,
+    )
+
+
+def miniapp_auth_error_response(status):
+    label = "forbidden" if int(status) == 403 else "unauthorized"
+    return apply_miniapp_security_headers(
+        web.json_response({"error": label}, status=int(status))
+    )
+
+
+async def miniapp_index(request):
+    return apply_miniapp_security_headers(
+        web.FileResponse(MINIAPP_ASSET_DIR / "index.html")
+    )
+
+
+async def miniapp_javascript(request):
+    return apply_miniapp_security_headers(
+        web.FileResponse(MINIAPP_ASSET_DIR / "app.js")
+    )
+
+
+async def miniapp_stylesheet(request):
+    return apply_miniapp_security_headers(
+        web.FileResponse(MINIAPP_ASSET_DIR / "styles.css")
+    )
+
+
+def authenticate_miniapp_session(request):
+    try:
+        raw_token = parse_bearer_authorization(request.headers.get("Authorization"))
+        session = load_miniapp_admin_session(get_db_conn, raw_token)
+    except MiniAppSessionError as error:
+        log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
+        raise
+    if session.telegram_id not in ADMIN_IDS:
+        category = "session_admin_forbidden"
+        log_miniapp_auth_failure(category, miniapp_auth_error_reference(category))
+        raise MiniAppSessionError(category, status=403)
+    return session
+
+
+async def miniapp_admin_session_create(request):
+    try:
+        raw_init_data = parse_miniapp_authorization(
+            request.headers.get("Authorization")
+        )
+        identity = validate_telegram_init_data(raw_init_data, BOT_TOKEN, ADMIN_IDS)
+    except MiniAppAuthError as error:
+        log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
+        return miniapp_auth_error_response(error.status)
+    raw_token, session = create_miniapp_admin_session(
+        get_db_conn, identity.telegram_id
+    )
+    return apply_miniapp_security_headers(web.json_response({
+        "token": raw_token,
+        "expires_at": session.expires_at.isoformat(),
+        "telegram_id": session.telegram_id,
+    }, status=201))
+
+
+async def miniapp_admin_me(request):
+    try:
+        session = authenticate_miniapp_session(request)
+    except MiniAppSessionError as error:
+        return miniapp_auth_error_response(error.status)
+    payload = {
+        "telegram_id": session.telegram_id,
+        "is_admin": True,
+    }
+    return apply_miniapp_security_headers(web.json_response(payload))
+
+
+async def miniapp_admin_session_revoke(request):
+    try:
+        session = authenticate_miniapp_session(request)
+    except MiniAppSessionError as error:
+        return miniapp_auth_error_response(error.status)
+    revoke_miniapp_admin_session(get_db_conn, session.session_id)
+    return apply_miniapp_security_headers(web.Response(status=204))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21400,6 +21556,18 @@ def create_app():
         app.router.add_post('/stripe-payment', stripe_webhook)
     if not _route_exists(app, "GET", "/health"):
         app.router.add_get('/health', health)
+    if not _route_exists(app, "GET", "/miniapp/"):
+        app.router.add_get('/miniapp/', miniapp_index)
+    if not _route_exists(app, "GET", "/miniapp/app.js"):
+        app.router.add_get('/miniapp/app.js', miniapp_javascript)
+    if not _route_exists(app, "GET", "/miniapp/styles.css"):
+        app.router.add_get('/miniapp/styles.css', miniapp_stylesheet)
+    if not _route_exists(app, "GET", "/api/admin/me"):
+        app.router.add_get('/api/admin/me', miniapp_admin_me)
+    if not _route_exists(app, "POST", "/api/admin/session"):
+        app.router.add_post('/api/admin/session', miniapp_admin_session_create)
+    if not _route_exists(app, "POST", "/api/admin/session/revoke"):
+        app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
         app.on_startup.append(on_startup)
