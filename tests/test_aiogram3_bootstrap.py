@@ -91,9 +91,11 @@ def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=Non
 
 
 class FakeMiniAppRequest(dict):
-    def __init__(self, app, authorization=None):
+    def __init__(self, app, authorization=None, path="/api/admin/me", method="GET"):
         super().__init__()
         self.app = app
+        self.path = path
+        self.method = method
         self.headers = {}
         if authorization is not None:
             self.headers["Authorization"] = authorization
@@ -8849,14 +8851,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         handler = self.route_handler(app, "GET", "/api/admin/me")
         session = SimpleNamespace(telegram_id=1, session_id="session-ref")
 
-        missing = await handler(FakeMiniAppRequest(app))
-        malformed = await handler(FakeMiniAppRequest(app, "tma stale"))
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app), handler
+        )
+        malformed = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, "tma stale"), handler
+        )
         with patch.object(self.main, "load_miniapp_admin_session", return_value=session), patch.object(
             self.main.stripe.Subscription,
             "retrieve",
             side_effect=AssertionError("Stripe must not be used"),
         ):
-            response = await handler(FakeMiniAppRequest(app, "Bearer opaque-token"))
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer opaque-token"), handler
+            )
 
         self.assertEqual(missing.status, 401)
         self.assertEqual(malformed.status, 401)
@@ -8871,7 +8879,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
              self.assertLogs(level="WARNING") as captured:
-            response = await handler(FakeMiniAppRequest(app, f"Bearer {raw_token}"))
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, f"Bearer {raw_token}"), handler
+            )
 
         output = "\n".join(captured.output)
         self.assertEqual(response.status, 403)
@@ -8903,12 +8913,112 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             self.main, "load_miniapp_admin_session", return_value=session
         ), patch.object(self.main, "revoke_miniapp_admin_session") as revoke:
-            response = await handler(
-                FakeMiniAppRequest(app, "Bearer opaque-current-token")
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app,
+                    "Bearer opaque-current-token",
+                    path="/api/admin/session/revoke",
+                    method="POST",
+                ),
+                handler,
             )
 
         self.assertEqual(response.status, 204)
         revoke.assert_called_once_with(self.main.get_db_conn, "current-session")
+
+    async def test_miniapp_admin_api_is_protected_centrally_by_default(self):
+        app = self.main.create_app()
+        protected_handler = AsyncMock(return_value=web.json_response({"ok": True}))
+        request = FakeMiniAppRequest(app, path="/api/admin/protected-test")
+
+        response = await self.main.miniapp_admin_auth_middleware(
+            request, protected_handler
+        )
+
+        self.assertEqual(response.status, 401)
+        protected_handler.assert_not_awaited()
+
+    async def test_miniapp_admin_api_failure_is_generic_and_secure(self):
+        app = self.main.create_app()
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        handler = AsyncMock(side_effect=RuntimeError("private database detail"))
+        request = FakeMiniAppRequest(
+            app, "Bearer opaque-token", path="/api/admin/protected-test"
+        )
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             self.assertLogs(level="ERROR") as logs:
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(json.loads(response.text), {"error": "internal_error"})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertNotIn("private database detail", "\n".join(logs.output))
+
+    async def test_miniapp_session_login_is_the_only_tma_middleware_exception(self):
+        app = self.main.create_app()
+        login_handler = AsyncMock(return_value=web.Response(status=201))
+        request = FakeMiniAppRequest(
+            app,
+            "tma signed-data",
+            path="/api/admin/session",
+            method="POST",
+        )
+
+        response = await self.main.miniapp_admin_auth_middleware(
+            request, login_handler
+        )
+
+        self.assertEqual(response.status, 201)
+        login_handler.assert_awaited_once_with(request)
+
+    async def test_miniapp_dashboard_returns_only_aggregate_data_without_stripe(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/dashboard")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        aggregate = {
+            "generated_at": "2026-08-20T00:00:00+00:00",
+            "users": {"total": 2, "active_access": 1},
+            "billing": {"failed_payments": 1},
+            "access": {"pending_removals": 0},
+            "deliveries": {"pending": 1},
+            "system": {"migrations": {"count": 17, "latest": "0017_miniapp_admin_sessions"}},
+        }
+        request = FakeMiniAppRequest(
+            app, "Bearer dashboard-token", path="/api/admin/dashboard"
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "collect_admin_dashboard", return_value=aggregate), \
+             patch.object(
+                 self.main.stripe.Subscription,
+                 "retrieve",
+                 side_effect=AssertionError("Stripe must not be called"),
+             ):
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+
+        self.assertEqual(response.status, 200)
+        payload = response.text
+        self.assertEqual(json.loads(payload), aggregate)
+        for forbidden in ("username", "email", "telegram_id", "cus_", "sub_", "payload_json"):
+            self.assertNotIn(forbidden, payload)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    async def test_miniapp_dashboard_rejects_expired_and_revoked_sessions(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/dashboard")
+        for category in ("session_inactive", "session_unknown"):
+            request = FakeMiniAppRequest(
+                app, "Bearer inactive-token", path="/api/admin/dashboard"
+            )
+            with self.subTest(category=category), patch.object(
+                self.main,
+                "load_miniapp_admin_session",
+                side_effect=self.main.MiniAppSessionError(category),
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(
+                    request, handler
+                )
+            self.assertEqual(response.status, 401)
 
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
@@ -8928,7 +9038,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("telegram-web-app.js", index)
         self.assertIn("/api/admin/me", javascript)
         self.assertIn("/api/admin/session", javascript)
+        self.assertIn("/api/admin/dashboard", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
+        self.assertIn("loadDashboard", javascript)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):

@@ -56,6 +56,7 @@ from miniapp_sessions import (
     load_miniapp_admin_session,
     revoke_miniapp_admin_session,
 )
+from admin_dashboard import collect_admin_dashboard
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -287,6 +288,109 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             )[0],
             0,
         )
+
+    def test_miniapp_dashboard_aggregates_synthetic_records_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        telegram_id, paid, expiry_date, payment_failed,
+                        grace_period_end, trial_used, first_payment_done,
+                        auto_renew, stripe_customer_id
+                    ) VALUES
+                        (8801, TRUE, NOW() + INTERVAL '10 days', FALSE, NULL, FALSE, TRUE, TRUE, 'cus_private'),
+                        (8802, TRUE, NOW() + INTERVAL '2 days', FALSE, NULL, TRUE, FALSE, FALSE, NULL),
+                        (8803, TRUE, NOW() - INTERVAL '1 hour', TRUE, NOW() + INTERVAL '1 day', FALSE, TRUE, TRUE, NULL),
+                        (8804, TRUE, NOW() - INTERVAL '3 days', TRUE, NOW() - INTERVAL '1 day', FALSE, TRUE, TRUE, NULL)
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, lease_until, db_finalized_at
+                    ) VALUES
+                        (8801, 'pending', NULL, NULL),
+                        (8802, 'processing', NOW() + INTERVAL '10 minutes', NULL),
+                        (8803, 'telegram_failed', NULL, NULL),
+                        (8804, 'db_finalized', NULL, NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO message_delivery_events (
+                        delivery_key, telegram_id, delivery_type, status,
+                        lease_until, sent_at
+                    ) VALUES
+                        ('dash-pending', 8801, 'test', 'pending', NULL, NULL),
+                        ('dash-processing', 8802, 'test', 'processing', NOW() + INTERVAL '10 minutes', NULL),
+                        ('dash-failed', 8803, 'test', 'failed', NULL, NULL),
+                        ('dash-permanent', 8804, 'test', 'permanently_failed', NULL, NULL),
+                        ('dash-sent', 8804, 'test', 'sent', NULL, NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO scheduled_job_runs (
+                        job_key, job_name, schedule_slot, status, lease_until, updated_at
+                    ) VALUES
+                        ('dash-failed', 'dash', 'one', 'failed', NULL, NOW()),
+                        ('dash-running', 'dash', 'two', 'running', NOW() + INTERVAL '10 minutes', NOW()),
+                        ('dash-stale', 'dash', 'three', 'running', NOW() - INTERVAL '10 minutes', NOW())
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        dashboard = collect_admin_dashboard(
+            self.get_conn,
+            lambda: {"pool_used": 0},
+            9,
+        )
+        self.assertEqual(dashboard["users"], {
+            "total": 4,
+            "active_access": 3,
+            "expired_paid": 1,
+            "payment_failed": 2,
+            "active_grace": 1,
+            "trial": 1,
+            "stripe_linked": 1,
+        })
+        self.assertEqual(dashboard["billing"], {
+            "failed_payments": 2,
+            "active_grace": 1,
+            "expired_grace": 1,
+            "auto_renew": 3,
+            "non_renewing": 1,
+        })
+        self.assertEqual(dashboard["access"], {
+            "pending_removals": 1,
+            "retryable_removals": 2,
+            "finalized_removals_recent": 1,
+        })
+        self.assertEqual(dashboard["deliveries"], {
+            "pending": 1,
+            "processing": 1,
+            "failed": 1,
+            "permanently_failed": 1,
+            "sent_last_24h": 1,
+        })
+        self.assertEqual(dashboard["system"]["migrations"], {
+            "count": 17,
+            "latest": "0017_miniapp_admin_sessions",
+        })
+        self.assertEqual(dashboard["system"]["scheduler"], {
+            "known_jobs": 9,
+            "failed_last_24h": 1,
+            "running": 2,
+            "stale": 1,
+        })
+        serialized = json.dumps(dashboard)
+        for forbidden in ("cus_private", "telegram_id", "stripe_customer_id", "payload_json"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_subscription_removal_fencing_migration_is_idempotent_and_rejects_new_invalid_rows(self):
         first = run_migrations(self.get_conn)
