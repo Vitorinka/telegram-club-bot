@@ -4465,6 +4465,154 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (f"telegram-unban-manual:{main.safe_delivery_hash(armed['delivery_key'])}:%",),
         )[0], len(main.ADMIN_IDS))
 
+    def test_malformed_unban_compensations_cancel_atomically_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9970
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(
+            user_id, paid=False, expiry_date=expiry, auto_renew=False
+        )
+
+        malformed_payloads = []
+        for generation in range(20, 24):
+            expected_until = datetime.utcnow() + timedelta(minutes=5)
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+                compensation = main.prepare_telegram_unban_compensation(
+                    user_id, expiry, generation, expected_until
+                )
+                main.fail_telegram_unban_compensation(
+                    compensation, RuntimeError("make due")
+                )
+            payload = json.loads(self.query_one(
+                "SELECT payload_json FROM message_delivery_events WHERE delivery_key = %s",
+                (compensation["delivery_key"],),
+            )[0])
+            if generation == 20:
+                malformed = "{not-json"
+            elif generation == 21:
+                payload["expected_ban_until"] = "not-a-date"
+                malformed = json.dumps(payload)
+            elif generation == 22:
+                payload["access_expiry"] = "not-a-date"
+                malformed = json.dumps(payload)
+            else:
+                payload.pop("removal_generation")
+                malformed = json.dumps(payload)
+            malformed_payloads.append((compensation, malformed))
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            for compensation, malformed in malformed_payloads:
+                cur.execute(
+                    """
+                    UPDATE message_delivery_events
+                    SET payload_json = %s, next_attempt_at = NOW()
+                    WHERE delivery_key = %s
+                    """,
+                    (malformed, compensation["delivery_key"]),
+                )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock()) as get_member, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            asyncio.run(main.process_pending_message_deliveries(limit=10))
+        get_member.assert_not_awaited()
+        unban.assert_not_awaited()
+
+        for compensation, _ in malformed_payloads:
+            self.assertEqual(self.query_one(
+                "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+                (compensation["delivery_key"],),
+            )[0], "cancelled")
+            self.assertEqual(self.query_one(
+                "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s",
+                (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+            )[0], len(main.ADMIN_IDS))
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE message_delivery_events
+                SET next_attempt_at = NOW() + INTERVAL '1 day'
+                WHERE delivery_type = 'stripe_admin_message'
+                  AND delivery_key LIKE 'telegram-unban-manual:%'
+                """
+            )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock()) as second_get_member, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as second_unban:
+            second = asyncio.run(main.process_pending_message_deliveries(limit=10))
+        self.assertEqual(second["sent"], 0)
+        second_get_member.assert_not_awaited()
+        second_unban.assert_not_awaited()
+        for compensation, _ in malformed_payloads:
+            self.assertEqual(self.query_one(
+                "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s",
+                (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+            )[0], len(main.ADMIN_IDS))
+
+    def test_unban_compensation_alert_and_cancel_rollback_together_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9971
+        expiry = datetime.utcnow() - timedelta(days=1)
+        self.insert_recovery_user(
+            user_id, paid=False, expiry_date=expiry, auto_renew=False
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            compensation = main.prepare_telegram_unban_compensation(
+                user_id,
+                expiry,
+                removal_generation=30,
+                expected_ban_until=datetime.utcnow() + timedelta(minutes=5),
+            )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main,
+                 "mark_delivery_cancelled",
+                 side_effect=RuntimeError("injected before cancellation"),
+             ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(main.stop_telegram_unban_compensation(
+                    compensation["delivery_key"],
+                    compensation["claim_generation"],
+                    user_id,
+                    "malformed_telegram_unban_compensation",
+                ))
+
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+            (compensation["delivery_key"],),
+        )[0], "processing")
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s",
+            (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+        )[0], 0)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            result = asyncio.run(main.stop_telegram_unban_compensation(
+                compensation["delivery_key"],
+                compensation["claim_generation"],
+                user_id,
+                "malformed_telegram_unban_compensation",
+            ))
+        self.assertEqual(result, "cancelled")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM message_delivery_events WHERE delivery_key = %s",
+            (compensation["delivery_key"],),
+        )[0], "cancelled")
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s",
+            (f"telegram-unban-manual:{main.safe_delivery_hash(compensation['delivery_key'])}:%",),
+        )[0], len(main.ADMIN_IDS))
+
     def test_new_access_before_telegram_removal_supersedes_old_cycle_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()

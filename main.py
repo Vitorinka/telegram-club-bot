@@ -4785,6 +4785,72 @@ def telegram_ban_until_matches(actual_until, expected_until):
     return abs((actual_until - expected_until).total_seconds()) <= 1
 
 
+def parse_telegram_unban_compensation_payload(
+    payload_json, delivery_key, telegram_id,
+):
+    """Return a verified v2 payload, or a generic safe rejection reason."""
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, None, "malformed_telegram_unban_compensation"
+
+    if not isinstance(payload, dict):
+        return None, None, "malformed_telegram_unban_compensation"
+
+    version = payload.get("version")
+    removal_generation = payload.get("removal_generation")
+    access_expiry_raw = payload.get("access_expiry")
+    group_id = payload.get("group_id")
+    group_hash = payload.get("group_hash")
+    expected_until_raw = payload.get("expected_ban_until")
+    retry_deadline_raw = payload.get("retry_deadline")
+    ban_confirmed = payload.get("ban_confirmed")
+    expected_group_hash = safe_delivery_hash(str(GROUP_ID))[:12]
+
+    if (
+        type(version) is not int
+        or version != 2
+        or type(removal_generation) is not int
+        or removal_generation < 0
+        or not isinstance(access_expiry_raw, str)
+        or not access_expiry_raw
+        or type(group_id) is not int
+        or group_id != int(GROUP_ID)
+        or not isinstance(group_hash, str)
+        or group_hash != expected_group_hash
+        or not isinstance(expected_until_raw, str)
+        or not expected_until_raw
+        or not isinstance(retry_deadline_raw, str)
+        or not retry_deadline_raw
+        or type(ban_confirmed) is not bool
+    ):
+        return None, None, "legacy_or_unverifiable_compensation"
+
+    try:
+        access_expiry = datetime.fromisoformat(access_expiry_raw)
+        expected_until = datetime.fromisoformat(expected_until_raw)
+        retry_deadline = datetime.fromisoformat(retry_deadline_raw)
+        expected_delivery_key = telegram_unban_compensation_key(
+            telegram_id, access_expiry, removal_generation
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None, None, "malformed_telegram_unban_compensation"
+
+    if expected_delivery_key != delivery_key:
+        return None, None, "telegram_ban_cycle_identity_mismatch"
+
+    def normalize_utc(value):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    expected_until = normalize_utc(expected_until)
+    retry_deadline = normalize_utc(retry_deadline)
+    if retry_deadline != expected_until:
+        return None, None, "telegram_ban_cycle_identity_mismatch"
+    return payload, expected_until, None
+
+
 def access_restore_invite_text(expiry_date):
     expiry_text = expiry_date.strftime("%d.%m.%Y") if expiry_date else "активна"
     return (
@@ -19987,7 +20053,22 @@ async def process_pending_message_deliveries(limit=25):
         sending_user_message = False
         payload = {}
         try:
-            payload = json.loads(payload_json or "{}")
+            if delivery_type == TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE:
+                payload, expected_until, unsafe_reason = (
+                    parse_telegram_unban_compensation_payload(
+                        payload_json, delivery_key, telegram_id
+                    )
+                )
+                if unsafe_reason:
+                    await stop_telegram_unban_compensation(
+                        delivery_key,
+                        claim_generation,
+                        telegram_id,
+                        unsafe_reason,
+                    )
+                    continue
+            else:
+                payload = json.loads(payload_json or "{}")
             if payload.get("keyboard_kind") == "billing_portal":
                 check_conn = get_db_conn()
                 check_cur = check_conn.cursor()
@@ -20126,45 +20207,6 @@ async def process_pending_message_deliveries(limit=25):
                     retryable_failed += 1
                 continue
             elif delivery_type == TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE:
-                compensation_version = payload.get("version")
-                expected_until_raw = payload.get("expected_ban_until")
-                expected_group_id = payload.get("group_id")
-                payload_generation = payload.get("removal_generation")
-                payload_access_expiry = payload.get("access_expiry")
-                if (
-                    compensation_version != 2
-                    or not expected_until_raw
-                    or expected_group_id != int(GROUP_ID)
-                    or not isinstance(payload_generation, int)
-                    or not payload_access_expiry
-                ):
-                    await stop_telegram_unban_compensation(
-                        delivery_key,
-                        claim_generation,
-                        telegram_id,
-                        "legacy_or_unverifiable_compensation",
-                    )
-                    continue
-                try:
-                    payload_expiry = datetime.fromisoformat(payload_access_expiry)
-                    expected_delivery_key = telegram_unban_compensation_key(
-                        telegram_id, payload_expiry, payload_generation
-                    )
-                except (TypeError, ValueError, OverflowError):
-                    expected_delivery_key = None
-                if expected_delivery_key != delivery_key:
-                    await stop_telegram_unban_compensation(
-                        delivery_key,
-                        claim_generation,
-                        telegram_id,
-                        "telegram_ban_cycle_identity_mismatch",
-                    )
-                    continue
-                expected_until = datetime.fromisoformat(expected_until_raw)
-                if expected_until.tzinfo is not None:
-                    expected_until = expected_until.astimezone(timezone.utc).replace(
-                        tzinfo=None
-                    )
                 if datetime.utcnow() >= expected_until:
                     await stop_telegram_unban_compensation(
                         delivery_key,
