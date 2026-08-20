@@ -8810,6 +8810,111 @@ async def check_subscriptions_and_reminders():
         telegram_errors + stripe_cancellation_errors,
     )
 
+
+def fetch_expired_access_candidates():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT telegram_id, payment_failed, grace_period_end
+            FROM users
+            WHERE paid = TRUE
+              AND expiry_date IS NOT NULL
+              AND expiry_date <= NOW()
+            ORDER BY expiry_date ASC, telegram_id ASC
+            """
+        )
+        return [
+            (int(row[0]), bool(row[1]), row[2])
+            for row in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def process_expired_access():
+    candidates = fetch_expired_access_candidates()
+    metrics = {
+        "candidates": len(candidates),
+        "active_grace_skipped": 0,
+        "recovered_protected": 0,
+        "ordinary_expired_processed": 0,
+        "post_grace_processed": 0,
+        "finalized": 0,
+        "retryable_failures": 0,
+        "telegram_errors": 0,
+    }
+    protected_statuses = {
+        "STRIPE_ACTIVE",
+        "STRIPE_GRACE_ACTIVE",
+        "active_in_db",
+        "access_revoke_no_longer_current",
+        "superseded",
+        "not_due",
+        "recent_payment_failure",
+        "grace_active",
+    }
+    completed_statuses = {"removed", "db_finalized"}
+    retryable_statuses = {
+        "STRIPE_CHECK_FAILED",
+        "STRIPE_UNLINKED_REVIEW",
+        "stripe_cancel_failed",
+        "kick_failed",
+        "unban_failed",
+        "telegram_status_error",
+        "ownership_lost",
+        "unban_compensation_not_claimed",
+        "legacy_claim_rejected",
+    }
+
+    now = datetime.utcnow()
+    for telegram_id, payment_failed, grace_period_end in candidates:
+        if payment_failed and grace_period_end and grace_period_end > now:
+            metrics["active_grace_skipped"] += 1
+            continue
+        if payment_failed and grace_period_end and grace_period_end <= now:
+            metrics["post_grace_processed"] += 1
+        else:
+            metrics["ordinary_expired_processed"] += 1
+        try:
+            status = await ban_user_logic(telegram_id)
+        except Exception as error:
+            metrics["retryable_failures"] += 1
+            logging.error(
+                "EXPIRED_ACCESS_HOURLY_PROCESSING_FAILED: telegram_id=%s, "
+                "error_class=%s, error_ref=%s",
+                telegram_id,
+                type(error).__name__,
+                safe_admin_error_reference("expired_access_hourly", error),
+            )
+            continue
+
+        if status in protected_statuses:
+            metrics["recovered_protected"] += 1
+        elif status in completed_statuses:
+            metrics["finalized"] += 1
+        elif status in retryable_statuses:
+            metrics["retryable_failures"] += 1
+            if status in {"kick_failed", "unban_failed", "telegram_status_error"}:
+                metrics["telegram_errors"] += 1
+
+    logging.info(
+        "EXPIRED_ACCESS_HOURLY_COMPLETED: candidates=%s, active_grace_skipped=%s, "
+        "recovered_protected=%s, ordinary_expired_processed=%s, post_grace_processed=%s, "
+        "finalized=%s, retryable_failures=%s, telegram_errors=%s",
+        metrics["candidates"],
+        metrics["active_grace_skipped"],
+        metrics["recovered_protected"],
+        metrics["ordinary_expired_processed"],
+        metrics["post_grace_processed"],
+        metrics["finalized"],
+        metrics["retryable_failures"],
+        metrics["telegram_errors"],
+    )
+    return metrics
+
 async def check_free_lesson_followups():
     logging.info("--- Проверка follow-up после бесплатного урока ---")
 
@@ -20178,6 +20283,15 @@ async def scheduled_check_subscriptions_and_reminders():
     )
 
 
+async def scheduled_process_expired_access():
+    return await run_scheduled_with_lock(
+        "process_expired_access",
+        hourly_schedule_slot(),
+        process_expired_access,
+        lease_minutes=50,
+    )
+
+
 def five_minute_schedule_slot(now=None):
     now = now or datetime.utcnow()
     minute = now.minute - (now.minute % 5)
@@ -21117,6 +21231,15 @@ def register_scheduler_jobs_once():
         'cron',
         hour=10,
         minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_process_expired_access,
+        'cron',
+        minute=5,
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1
