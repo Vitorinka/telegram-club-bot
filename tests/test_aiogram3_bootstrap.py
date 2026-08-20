@@ -7259,7 +7259,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for call in set_webhook.await_args_list:
             self.assertEqual(call.kwargs["secret_token"], TEST_ENV["WEBHOOK_SECRET"])
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 8)
+        self.assertEqual(len(fake_scheduler.jobs), 9)
         self.assertFalse(hasattr(self.main, "scheduled_apply_reserved_gifts"))
         self.assertEqual(fake_scheduler.start_calls, 1)
 
@@ -8783,6 +8783,113 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         forward_message.assert_awaited_once_with(chat_id=1, from_chat_id=777, message_id=55)
         self.assertEqual(conn.commits, 1)
         self.assertEqual(state.clear_calls, 1)
+
+
+class ExpiredAccessHourlyTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.main = import_main()
+
+    def test_candidate_query_is_limited_to_paid_due_access(self):
+        grace = datetime.utcnow() - timedelta(hours=1)
+        conn = FakeConnection(fetches=[[(101, False, None), (202, True, grace)]])
+
+        with patch.object(self.main, "get_db_conn", return_value=conn):
+            candidates = self.main.fetch_expired_access_candidates()
+
+        self.assertEqual(candidates, [(101, False, None), (202, True, grace)])
+        query, params = conn.cursor_obj.queries[0]
+        self.assertIsNone(params)
+        normalized = " ".join(query.split())
+        self.assertIn("paid = TRUE", normalized)
+        self.assertIn("expiry_date IS NOT NULL", normalized)
+        self.assertIn("expiry_date <= NOW()", normalized)
+
+    async def test_future_access_is_not_selected(self):
+        with patch.object(
+            self.main, "fetch_expired_access_candidates", return_value=[]
+        ), patch.object(self.main, "ban_user_logic", new=AsyncMock()) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_not_awaited()
+        self.assertEqual(metrics["candidates"], 0)
+
+    async def test_active_failed_grace_is_skipped(self):
+        future_grace = datetime.utcnow() + timedelta(hours=1)
+        with patch.object(
+            self.main, "fetch_expired_access_candidates",
+            return_value=[(102, True, future_grace)],
+        ), patch.object(self.main, "ban_user_logic", new=AsyncMock()) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_not_awaited()
+        self.assertEqual(metrics["active_grace_skipped"], 1)
+        self.assertEqual(metrics["post_grace_processed"], 0)
+
+    async def test_ordinary_expired_access_without_stripe_uses_lifecycle(self):
+        with patch.object(
+            self.main, "fetch_expired_access_candidates", return_value=[(103, False, None)]
+        ), patch.object(
+            self.main, "ban_user_logic", new=AsyncMock(return_value="db_finalized")
+        ) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_awaited_once_with(103)
+        self.assertEqual(metrics["ordinary_expired_processed"], 1)
+        self.assertEqual(metrics["post_grace_processed"], 0)
+        self.assertEqual(metrics["finalized"], 1)
+
+    async def test_expired_grace_reuses_lifecycle_and_counts_recovery(self):
+        with patch.object(
+            self.main, "fetch_expired_access_candidates",
+            return_value=[(101, True, datetime.utcnow() - timedelta(minutes=1))]
+        ), patch.object(
+            self.main, "ban_user_logic", new=AsyncMock(return_value="STRIPE_ACTIVE")
+        ) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_awaited_once_with(101)
+        self.assertEqual(metrics["recovered_protected"], 1)
+        self.assertEqual(metrics["finalized"], 0)
+
+    async def test_expired_past_due_is_delegated_to_existing_lifecycle(self):
+        with patch.object(
+            self.main, "fetch_expired_access_candidates",
+            return_value=[(303, True, datetime.utcnow() - timedelta(minutes=1))]
+        ), patch.object(
+            self.main, "ban_user_logic", new=AsyncMock(return_value="db_finalized")
+        ) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_awaited_once_with(303)
+        self.assertEqual(metrics["post_grace_processed"], 1)
+        self.assertEqual(metrics["finalized"], 1)
+
+    async def test_payment_recovery_after_selection_is_protected_by_fresh_lifecycle_result(self):
+        with patch.object(
+            self.main, "fetch_expired_access_candidates",
+            return_value=[(404, True, datetime.utcnow() - timedelta(minutes=1))]
+        ), patch.object(
+            self.main, "ban_user_logic", new=AsyncMock(return_value="active_in_db")
+        ) as lifecycle:
+            metrics = await self.main.process_expired_access()
+
+        lifecycle.assert_awaited_once_with(404)
+        self.assertEqual(metrics["recovered_protected"], 1)
+        self.assertEqual(metrics["retryable_failures"], 0)
+
+    async def test_duplicate_runs_keep_using_fenced_lifecycle_entrypoint(self):
+        lifecycle = AsyncMock(side_effect=["db_finalized", "already_finalized"])
+        with patch.object(
+            self.main, "fetch_expired_access_candidates", return_value=[(505, False, None)]
+        ), patch.object(self.main, "ban_user_logic", new=lifecycle):
+            first = await self.main.process_expired_access()
+            second = await self.main.process_expired_access()
+
+        self.assertEqual(lifecycle.await_args_list[0].args, (505,))
+        self.assertEqual(lifecycle.await_args_list[1].args, (505,))
+        self.assertEqual(first["finalized"], 1)
+        self.assertEqual(second["finalized"], 0)
 
 
 if __name__ == "__main__":

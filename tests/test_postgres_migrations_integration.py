@@ -5207,6 +5207,86 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(delivery[2], main.failed_renewal_message_text())
         self.assertEqual(delivery[3], "billing_portal")
 
+    def test_hourly_expired_access_selector_excludes_future_and_processes_ordinary_trial_once_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        expired_user = 9937
+        future_user = 9938
+        active_grace_user = 9939
+        self.insert_recovery_user(
+            expired_user,
+            paid=True,
+            expiry_date=now - timedelta(minutes=10),
+            payment_failed=False,
+            auto_renew=False,
+            trial_used=True,
+            stripe_subscription_id=None,
+        )
+        self.insert_recovery_user(
+            future_user,
+            paid=True,
+            expiry_date=now + timedelta(hours=1),
+            payment_failed=False,
+            auto_renew=False,
+            trial_used=True,
+            stripe_subscription_id=None,
+        )
+        self.insert_recovery_user(
+            active_grace_user,
+            paid=True,
+            expiry_date=now - timedelta(minutes=10),
+            payment_failed=True,
+            payment_failed_at=now - timedelta(hours=1),
+            grace_period_end=now + timedelta(hours=47),
+            auto_renew=True,
+            stripe_subscription_id="sub_active_hourly_grace",
+        )
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            candidates = main.fetch_expired_access_candidates()
+
+        candidate_ids = {row[0] for row in candidates}
+        self.assertEqual(candidate_ids, {expired_user, active_grace_user})
+        self.assertNotIn(future_user, candidate_ids)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "cancel_failed_renewal_subscription_after_grace", mock.AsyncMock()
+             ) as cancel_subscription, \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            first = asyncio.run(main.process_expired_access())
+            second = asyncio.run(main.process_expired_access())
+
+        cancel_subscription.assert_not_awaited()
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        self.assertEqual(first["candidates"], 2)
+        self.assertEqual(first["active_grace_skipped"], 1)
+        self.assertEqual(first["ordinary_expired_processed"], 1)
+        self.assertEqual(first["finalized"], 1)
+        self.assertEqual(second["candidates"], 1)
+        self.assertEqual(second["active_grace_skipped"], 1)
+        self.assertEqual(second["finalized"], 0)
+        self.assertEqual(self.query_one(
+            "SELECT paid, payment_failed, grace_period_end FROM users WHERE telegram_id = %s",
+            (expired_user,),
+        ), (False, False, None))
+        self.assertEqual(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s", (active_grace_user,)
+        ), (True,))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events "
+            "WHERE telegram_id = %s AND delivery_type = 'subscription_expired_user'",
+            (expired_user,),
+        ), (1,))
+
     def test_expired_past_due_grace_allows_ban_unban_and_durable_final_notice_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
