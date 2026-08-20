@@ -32,6 +32,7 @@ EXPECTED_VALUES = {
         "broadcast", "give_access", "set_expiry", "link_stripe_user",
         "resolve_checkout", "revoke_invite_links", "retry_delivery",
         "restore_access", "revoke_access", "gift_cancel", "gift_reissue",
+        "billing_portal_resend",
     )),
     "scheduled_job_runs.status": frozenset(("running", "completed", "failed")),
     "subscription_removal_events.status": frozenset(("pending", "processing", "stripe_canceled", "telegram_failed", "telegram_removed", "db_finalized", "cancelled", "not_due", "superseded")),

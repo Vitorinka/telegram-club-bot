@@ -92,7 +92,8 @@ def complete_admin_action(cur, action_id):
 
 def fail_admin_action(cur, action_id):
     cur.execute(
-        "UPDATE admin_action_requests SET status = 'failed' WHERE action_id = %s AND status = 'processing'",
+        "UPDATE admin_action_requests SET status = 'failed', completed_at = NOW() "
+        "WHERE action_id = %s AND status = 'processing'",
         (action_id,),
     )
 

@@ -172,6 +172,10 @@ class SupportReplyState(StatesGroup):
 class ScheduleAdminStates(StatesGroup):
     waiting_for_photo = State()
 
+
+class BillingPortalResendStates(StatesGroup):
+    waiting_for_telegram_id = State()
+
 # --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("stripe").setLevel(logging.WARNING)
@@ -14010,10 +14014,15 @@ ADMIN_MENU_SECTIONS = {
 
 
 def get_admin_menu_keyboard():
-    return inline_keyboard([
+    rows = [
         [InlineKeyboardButton(text=section["button"], callback_data=f"admin_menu:{section_key}")]
         for section_key, section in ADMIN_MENU_SECTIONS.items()
-    ])
+    ]
+    rows.append([InlineKeyboardButton(
+        text="💳 Отправить ссылку на оплату",
+        callback_data="admin_billing_portal:start",
+    )])
+    return inline_keyboard(rows)
 
 
 def get_admin_back_keyboard():
@@ -14100,6 +14109,129 @@ async def admin_menu_callback(callback: types.CallbackQuery):
 
     await callback.message.edit_text(get_admin_section_text(section_key), reply_markup=get_admin_back_keyboard())
     await callback.answer()
+
+
+def fetch_billing_portal_resend_user(cur, telegram_id):
+    cur.execute(
+        """
+        SELECT telegram_id, paid, auto_renew, payment_failed, grace_period_end,
+               stripe_customer_id, stripe_subscription_id
+        FROM users
+        WHERE telegram_id = %s
+        """,
+        (int(telegram_id),),
+    )
+    return cur.fetchone()
+
+
+def billing_portal_failed_grace_active(user, now=None):
+    now = now or datetime.utcnow()
+    payment_failed = bool(user[3])
+    grace_period_end = user[4]
+    return bool(
+        payment_failed
+        and grace_period_end is not None
+        and grace_period_end > now
+    )
+
+
+def billing_portal_resend_confirmation_text(user, now=None):
+    (
+        telegram_id,
+        paid,
+        auto_renew,
+        payment_failed,
+        grace_period_end,
+        stripe_customer_id,
+        stripe_subscription_id,
+    ) = user
+    warning = ""
+    if not billing_portal_failed_grace_active(user, now=now):
+        warning = (
+            "\n\n⚠️ У пользователя сейчас нет активного 48-часового grace. "
+            "Будет отправлена нейтральная ссылка на управление оплатой."
+        )
+    return (
+        "Отправить пользователю ссылку на обновление способа оплаты?\n\n"
+        f"telegram_id: {telegram_id}\n"
+        f"paid: {bool(paid)}\n"
+        f"auto_renew: {bool(auto_renew)}\n"
+        f"payment_failed: {bool(payment_failed)}\n"
+        f"grace_period_end: {grace_period_end or 'нет'}\n"
+        f"stripe_customer_id: {safe_log_id(stripe_customer_id) or 'нет'}\n"
+        f"stripe_subscription_id: {safe_log_id(stripe_subscription_id) or 'нет'}"
+        f"{warning}"
+    )
+
+
+@router.callback_query(F.data == "admin_billing_portal:start", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_billing_portal_start_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(BillingPortalResendStates.waiting_for_telegram_id)
+    await callback.message.answer(
+        "Введите Telegram ID пользователя",
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="Отмена", callback_data="admin_billing_portal:cancel")
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_billing_portal:cancel", StateFilter('*'))
+@admin_private_only(ADMIN_IDS)
+async def admin_billing_portal_cancel_callback(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("Отправка ссылки отменена.")
+    await callback.answer()
+
+
+@router.message(StateFilter(BillingPortalResendStates.waiting_for_telegram_id))
+@admin_private_only(ADMIN_IDS)
+async def admin_billing_portal_user_received(message: types.Message, state: FSMContext):
+    try:
+        telegram_id = int((message.text or "").strip())
+    except (TypeError, ValueError):
+        await message.answer("⚠️ Telegram ID должен быть целым числом.")
+        return
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        user = fetch_billing_portal_resend_user(cur, telegram_id)
+        if not user:
+            await message.answer("❌ Пользователь с таким Telegram ID не найден.")
+            return
+        if not user[5]:
+            await message.answer(
+                "❌ У пользователя нет Stripe customer. Ссылка на управление оплатой не отправлена."
+            )
+            return
+        action_id = make_action_request(
+            cur,
+            message.from_user.id,
+            "billing_portal_resend",
+            {
+                "telegram_id": telegram_id,
+                "admin_id": message.from_user.id,
+            },
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+    await state.clear()
+    callbacks = admin_action_confirmation_keyboard(action_id)
+    await message.answer(
+        billing_portal_resend_confirmation_text(user),
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="Отправить", callback_data=callbacks["confirm"]),
+            InlineKeyboardButton(text="Отмена", callback_data=callbacks["cancel"]),
+        ]]),
+    )
 
 
 @router.message(Command('admin_help'), StateFilter('*'))
@@ -18824,7 +18956,96 @@ async def execute_confirmed_admin_action(action_type, payload):
         return await execute_confirmed_gift_cancel(payload)
     if action_type == "gift_reissue":
         return await execute_confirmed_gift_reissue(payload)
+    if action_type == "billing_portal_resend":
+        return await execute_confirmed_billing_portal_resend(payload)
     raise ValueError(f"Unsupported admin action: {action_type}")
+
+
+async def execute_confirmed_billing_portal_resend(payload):
+    telegram_id = int(payload["telegram_id"])
+    action_id = str(payload["action_id"])
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        user = fetch_billing_portal_resend_user(cur, telegram_id)
+    finally:
+        cur.close()
+        conn.close()
+
+    if not user:
+        return {
+            "status": "failed",
+            "admin_message": "❌ Пользователь не найден. Ссылка не отправлена.",
+        }
+    stripe_customer_id = user[5]
+    if not stripe_customer_id:
+        return {
+            "status": "failed",
+            "admin_message": (
+                "❌ У пользователя нет Stripe customer. "
+                "Ссылка на управление оплатой не отправлена."
+            ),
+        }
+
+    portal_url = await create_billing_portal_url(stripe_customer_id)
+    if not portal_url:
+        safe_ref = f"billing_portal_resend:{safe_delivery_hash(action_id)}"
+        return {
+            "status": "failed",
+            "admin_message": (
+                "❌ Не удалось создать ссылку Stripe Billing Portal. "
+                f"Действие не выполнено. ref: {safe_ref}"
+            ),
+        }
+
+    failed_grace_active = billing_portal_failed_grace_active(user)
+    if failed_grace_active:
+        user_text = failed_renewal_message_text()
+        button_text = "Обновить способ оплаты"
+    else:
+        user_text = (
+            "Управление оплатой подписки\n\n"
+            "По кнопке ниже можно обновить способ оплаты или управлять "
+            "платёжными данными для подписки."
+        )
+        button_text = "Управление оплатой"
+
+    try:
+        await bot.send_message(
+            telegram_id,
+            user_text,
+            reply_markup=inline_keyboard([[
+                InlineKeyboardButton(text=button_text, url=portal_url)
+            ]]),
+        )
+    except Exception as error:
+        safe_ref = safe_admin_error_reference("billing_portal_resend_delivery", error)
+        logging.error(
+            "ADMIN_BILLING_PORTAL_RESEND_FAILED: action_id=%s, telegram_id=%s, "
+            "error_class=%s, error_ref=%s",
+            action_id,
+            telegram_id,
+            type(error).__name__,
+            safe_ref,
+        )
+        return {
+            "status": "failed",
+            "admin_message": (
+                "❌ Ссылка создана, но сообщение пользователю не доставлено. "
+                f"Действие не выполнено. ref: {safe_ref}"
+            ),
+        }
+
+    logging.info(
+        "ADMIN_BILLING_PORTAL_RESEND_COMPLETED: action_id=%s, admin_id=%s, telegram_id=%s",
+        action_id,
+        payload.get("admin_id"),
+        telegram_id,
+    )
+    return {
+        "status": "completed",
+        "admin_message": f"✅ Ссылка на обновление способа оплаты отправлена пользователю {telegram_id}.",
+    }
 
 
 async def execute_confirmed_broadcast(payload):
