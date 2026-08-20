@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Админ-платформа</title>
+  <link rel="stylesheet" href="/miniapp/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="/miniapp/app.js" defer></script>
+</head>
+<body>
+  <main class="shell" aria-live="polite">
+    <section class="card">
+      <p class="eyebrow">Telegram Club Bot</p>
+      <h1 id="title">Админ-платформа</h1>
+      <p id="status">Проверяем доступ…</p>
+      <dl id="identity" hidden>
+        <div><dt>Telegram ID</dt><dd id="telegram-id"></dd></div>
+        <div id="username-row" hidden><dt>Username</dt><dd id="username"></dd></div>
+      </dl>
+    </section>
+  </main>
+</body>
+</html>

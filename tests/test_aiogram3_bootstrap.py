@@ -16,6 +16,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import urlencode
 
 from aiohttp import web
 from aiogram.exceptions import TelegramNetworkError
@@ -69,6 +70,33 @@ def signed_header(payload, secret, timestamp=None):
     signed_payload = f"{timestamp}.".encode("utf-8") + payload
     signature = hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
     return f"t={timestamp},v1={signature}"
+
+
+def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=None, username=None):
+    auth_date = int(time.time()) if auth_date is None else int(auth_date)
+    user = {"id": int(user_id)}
+    if username:
+        user["username"] = username
+    fields = {
+        "auth_date": str(auth_date),
+        "query_id": "bootstrap-query",
+        "user": json.dumps(user, separators=(",", ":")),
+    }
+    data_check_string = "\n".join(
+        f"{key}={value}" for key, value in sorted(fields.items())
+    )
+    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    fields["hash"] = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+class FakeMiniAppRequest(dict):
+    def __init__(self, app, authorization=None):
+        super().__init__()
+        self.app = app
+        self.headers = {}
+        if authorization is not None:
+            self.headers["Authorization"] = authorization
 
 
 def import_main():
@@ -8783,6 +8811,117 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         forward_message.assert_awaited_once_with(chat_id=1, from_chat_id=777, message_id=55)
         self.assertEqual(conn.commits, 1)
         self.assertEqual(state.clear_calls, 1)
+
+    async def test_miniapp_admin_me_requires_tma_authorization_and_returns_no_store(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/me")
+
+        missing = await handler(FakeMiniAppRequest(app))
+        wrong = await handler(FakeMiniAppRequest(app, "Bearer invalid"))
+        valid_raw = signed_miniapp_init_data(1, token=self.main.BOT_TOKEN, username="owner")
+        accepted = await handler(FakeMiniAppRequest(app, f"tma {valid_raw}"))
+
+        self.assertEqual(missing.status, 401)
+        self.assertEqual(wrong.status, 401)
+        self.assertEqual(accepted.status, 200)
+        self.assertEqual(json.loads(accepted.text), {
+            "telegram_id": 1,
+            "is_admin": True,
+            "username": "owner",
+        })
+        for response in (missing, wrong, accepted):
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+            self.assertIn("Content-Security-Policy", response.headers)
+
+    async def test_miniapp_admin_me_does_not_access_database_or_stripe(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/me")
+        raw = signed_miniapp_init_data(1, token=self.main.BOT_TOKEN)
+
+        with patch.object(
+            self.main, "get_db_conn", side_effect=AssertionError("DB must not be used")
+        ), patch.object(
+            self.main.stripe.Subscription,
+            "retrieve",
+            side_effect=AssertionError("Stripe must not be used"),
+        ):
+            response = await handler(FakeMiniAppRequest(app, f"tma {raw}"))
+
+        self.assertEqual(response.status, 200)
+
+    async def test_miniapp_non_admin_is_forbidden_without_logging_init_data(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/me")
+        raw = signed_miniapp_init_data(
+            999, token=self.main.BOT_TOKEN, username="private-name"
+        )
+
+        with self.assertLogs(level="WARNING") as captured:
+            response = await handler(FakeMiniAppRequest(app, f"tma {raw}"))
+
+        output = "\n".join(captured.output)
+        self.assertEqual(response.status, 403)
+        self.assertNotIn(raw, output)
+        self.assertNotIn("private-name", output)
+        self.assertNotIn(self.main.BOT_TOKEN, output)
+        self.assertIn("category=admin_forbidden", output)
+
+    async def test_miniapp_static_routes_are_registered_with_secure_content(self):
+        app = self.main.create_app()
+        expected = {
+            "/miniapp/": "index.html",
+            "/miniapp/app.js": "app.js",
+            "/miniapp/styles.css": "styles.css",
+        }
+        for route, filename in expected.items():
+            handler = self.route_handler(app, "GET", route)
+            response = await handler(SimpleNamespace())
+            self.assertEqual(Path(response._path).name, filename)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        index = (self.main.MINIAPP_ASSET_DIR / "index.html").read_text(encoding="utf-8")
+        javascript = (self.main.MINIAPP_ASSET_DIR / "app.js").read_text(encoding="utf-8")
+        self.assertIn("telegram-web-app.js", index)
+        self.assertIn("/api/admin/me", javascript)
+        self.assertIn("textContent", javascript)
+        self.assertNotIn("innerHTML", javascript)
+
+    def test_admin_menu_webapp_button_requires_valid_https_configuration(self):
+        self.assertIsNone(self.main.normalize_miniapp_base_url(None))
+        for invalid in (
+            "http://club.example",
+            "javascript:alert(1)",
+            "data:text/html,test",
+            "https://user:pass@club.example",
+            "https://club.example/?token=secret",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(self.main.normalize_miniapp_base_url(invalid))
+
+        with patch.object(self.main, "MINIAPP_PUBLIC_URL", None):
+            unavailable = self.main.get_admin_menu_keyboard()
+        self.assertNotIn(
+            "🖥 Админ-платформа",
+            [button.text for row in unavailable.inline_keyboard for button in row],
+        )
+
+        expected_url = "https://club.example/miniapp/"
+        with patch.object(self.main, "MINIAPP_PUBLIC_URL", expected_url):
+            available = self.main.get_admin_menu_keyboard()
+        platform = next(
+            button for row in available.inline_keyboard for button in row
+            if button.text == "🖥 Админ-платформа"
+        )
+        self.assertEqual(platform.web_app.url, expected_url)
+        self.assertIsNone(platform.callback_data)
+
+    def test_ordinary_main_keyboard_never_contains_miniapp_button(self):
+        for telegram_id in (None, 999, 1):
+            keyboard = self.main.get_main_keyboard(telegram_id)
+            labels = [button.text for row in keyboard.keyboard for button in row]
+            self.assertNotIn("🖥 Админ-платформа", labels)
 
 
 class ExpiredAccessHourlyTests(unittest.IsolatedAsyncioTestCase):
