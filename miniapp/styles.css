@@ -38,7 +38,7 @@ body {
   box-shadow: none;
 }
 
-.shell > .card:first-child { padding: 13px 15px; }
+.hero-card { padding: 10px 13px; }
 .eyebrow {
   margin: 0 0 3px;
   color: var(--tg-theme-hint-color, #618080);
@@ -48,11 +48,12 @@ body {
   text-transform: uppercase;
 }
 
-h1 { margin: 0; font-size: clamp(24px, 6vw, 27px); line-height: 1.15; }
+h1 { margin: 0; font-size: clamp(22px, 5.6vw, 25px); line-height: 1.12; }
 h2 { margin: 0; font-size: 18px; line-height: 1.25; }
 p { margin: 7px 0 0; line-height: 1.4; }
-.admin-status-line { margin-top: 5px; color: var(--tg-theme-hint-color, #618080); font-size: 13px; }
+.admin-status-line { margin-top: 3px; color: var(--tg-theme-hint-color, #618080); font-size: 12px; }
 .admin-status-line strong { color: var(--tg-theme-text-color, #163c3c); font-weight: 700; }
+.hero-card #refresh { min-height: 44px; margin-top: 7px; padding-block: 7px; }
 
 dl { margin: 10px 0 0; }
 dl div {
@@ -107,7 +108,7 @@ input, select {
   font: inherit;
 }
 
-.user-list { display: grid; gap: 8px; }
+.user-list { display: grid; gap: 7px; }
 .user-card { padding: 13px 14px; }
 .user-card button {
   min-height: 44px;
@@ -152,6 +153,22 @@ input, select {
 .summary-grid span { color: var(--tg-theme-hint-color, #618080); font-size: 11px; line-height: 1.25; }
 .summary-grid strong { font-size: clamp(22px, 7vw, 28px); line-height: 1.1; overflow-wrap: anywhere; }
 
+.subscriptions-toolbar .summary-grid { gap: 5px; margin-top: 9px; }
+.subscriptions-toolbar .summary-grid div { padding: 7px 8px; }
+.subscriptions-toolbar .search-label { margin-top: 9px; }
+
+.schedule-toolbar { padding: 12px 13px; }
+.schedule-toolbar > .hint { margin-top: 4px; line-height: 1.3; }
+.schedule-toolbar #schedule-upload-open { min-height: 44px; margin-top: 8px; padding-block: 7px; }
+.schedule-toolbar .summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 8px;
+}
+.schedule-toolbar .summary-grid div { padding: 7px 6px; }
+.schedule-toolbar .summary-grid span { font-size: 10px; }
+.schedule-toolbar .summary-grid strong { font-size: clamp(19px, 5.5vw, 23px); }
+
 .compact-list { display: grid; gap: 0; margin-top: 10px; }
 .compact-item { min-width: 0; display: grid; gap: 2px; padding: 8px 0; border-bottom: 1px solid var(--ui-border); }
 .compact-item:last-child { border-bottom: 0; }
@@ -161,22 +178,39 @@ input, select {
 
 .filter-row {
   display: flex;
-  gap: 6px;
-  margin-top: 12px;
-  padding-bottom: 2px;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 0 0 2px;
   overflow-x: auto;
   scrollbar-width: none;
+  scroll-padding-inline: 6px;
 }
 .filter-row::-webkit-scrollbar { display: none; }
+.filter-row::after { content: ""; flex: 0 0 6px; }
 .filter-row button {
   flex: 0 0 auto;
   width: auto;
-  min-height: 40px;
+  min-height: 44px;
   margin: 0;
-  padding: 7px 11px;
+  padding: 6px 8px;
   border: 1px solid var(--ui-border);
-  font-size: 12px;
+  font-size: 11px;
   white-space: nowrap;
+}
+
+.system-compact-card { padding: 12px 13px; }
+.system-compact-card dl { margin-top: 7px; }
+.system-compact-card dl div { padding-block: 5px; }
+#system-screen > .card:first-child .summary-grid { gap: 5px; margin-top: 9px; }
+#system-screen > .card:first-child .summary-grid div { padding: 7px 8px; }
+#deliveries-list { gap: 6px; }
+#deliveries-list .user-card { padding: 11px 13px; }
+#system-migrations dd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .schedule-preview {
@@ -220,7 +254,7 @@ input, select {
   border-radius: 8px;
   background: transparent;
   color: var(--tg-theme-text-color, #163c3c);
-  font-size: clamp(9px, 2.7vw, 11px);
+  font-size: clamp(9px, 2.45vw, 10.5px);
   line-height: 1.1;
   white-space: nowrap;
   overflow: hidden;
@@ -241,4 +275,8 @@ input, select {
   .card { padding: 12px; }
   .action-row { grid-template-columns: 1fr; }
   .bottom-nav button { font-size: 9px; }
+}
+
+@media (min-width: 341px) and (max-width: 430px) {
+  .bottom-nav button { font-size: 9.4px; letter-spacing: -.015em; }
 }

@@ -10,7 +10,7 @@
 </head>
 <body>
   <main class="shell" aria-live="polite">
-    <section class="card">
+    <section class="card hero-card">
       <p class="eyebrow">Telegram Club Bot</p>
       <h1 id="title">Админ-платформа</h1>
       <p class="admin-status-line">
@@ -68,7 +68,7 @@
       <div id="user-details-content" class="dashboard"></div>
     </section>
     <section id="subscriptions-screen" class="screen page" data-screen="subscriptions" hidden>
-      <article class="card">
+      <article class="card subscriptions-toolbar">
         <h2>Подписки</h2>
         <div id="subscriptions-summary" class="summary-grid" aria-label="Сводка подписок">
           <div><span>Активные</span><strong data-subscription-metric="active">—</strong></div>
@@ -96,7 +96,7 @@
       <div id="subscription-details-content" class="dashboard"></div>
     </section>
     <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
-      <article class="card">
+      <article class="card schedule-toolbar">
         <h2 id="schedule-heading">Расписание</h2>
         <p class="hint">В проекте расписание хранится как одна опубликованная картинка на месяц.</p>
         <button id="schedule-upload-open" type="button">Загрузить расписание</button>
@@ -189,8 +189,8 @@
           <div><span>Retryable removals</span><strong data-system-metric="removals.retryable">—</strong></div>
         </div>
       </article>
-      <article class="card"><h2>Требуют внимания</h2><dl id="system-attention"></dl></article>
-      <article class="card"><h2>Доставка</h2><dl id="system-delivery-metrics"></dl></article>
+      <article class="card system-compact-card"><h2>Требуют внимания</h2><dl id="system-attention"></dl></article>
+      <article class="card system-compact-card"><h2>Доставка</h2><dl id="system-delivery-metrics"></dl></article>
       <article class="card">
         <h2>События доставки</h2>
         <select id="deliveries-status" aria-label="Статус доставки">
