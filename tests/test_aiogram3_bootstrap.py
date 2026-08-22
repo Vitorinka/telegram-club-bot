@@ -91,11 +91,16 @@ def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=Non
 
 
 class FakeMiniAppRequest(dict):
-    def __init__(self, app, authorization=None, path="/api/admin/me", method="GET"):
+    def __init__(
+        self, app, authorization=None, path="/api/admin/me", method="GET",
+        query=None, match_info=None,
+    ):
         super().__init__()
         self.app = app
         self.path = path
         self.method = method
+        self.query = query or {}
+        self.match_info = match_info or {}
         self.headers = {}
         if authorization is not None:
             self.headers["Authorization"] = authorization
@@ -9020,6 +9025,56 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(response.status, 401)
 
+    async def test_miniapp_users_route_is_bearer_protected_and_bounded(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/users")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        result = {"items": [], "next_cursor": None, "has_more": False}
+        request = FakeMiniAppRequest(
+            app,
+            "Bearer users-token",
+            path="/api/admin/users",
+            query={"limit": "50", "status": "active", "q": "admin"},
+        )
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/users"), handler
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_users", return_value=result) as list_users, \
+             patch.object(
+                 self.main.stripe.Subscription,
+                 "retrieve",
+                 side_effect=AssertionError("Stripe must not be called"),
+             ):
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+
+        self.assertEqual(missing.status, 401)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.text), result)
+        list_users.assert_called_once_with(
+            self.main.get_db_conn,
+            limit=50,
+            cursor=None,
+            query="admin",
+            status="active",
+        )
+
+    async def test_miniapp_users_rejects_invalid_limit_and_status(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/users")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        for query in ({"limit": "51"}, {"status": "dangerous"}):
+            request = FakeMiniAppRequest(
+                app, "Bearer token", path="/api/admin/users", query=query
+            )
+            with self.subTest(query=query), patch.object(
+                self.main, "load_miniapp_admin_session", return_value=session
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(
+                    request, handler
+                )
+            self.assertEqual(response.status, 400)
+
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
         expected = {
@@ -9039,8 +9094,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/me", javascript)
         self.assertIn("/api/admin/session", javascript)
         self.assertIn("/api/admin/dashboard", javascript)
+        self.assertIn("/api/admin/users", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
+        self.assertIn("data-nav=", index)
+        self.assertIn("Пользователи", index)
+        self.assertIn("Раздел в разработке", index)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):

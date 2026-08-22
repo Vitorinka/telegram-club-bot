@@ -20,7 +20,7 @@
       </dl>
       <button id="refresh" type="button" hidden>Обновить данные</button>
     </section>
-    <section id="dashboard" class="dashboard" hidden>
+    <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
       <article class="card"><h2>Обзор</h2><dl>
         <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
         <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
@@ -45,6 +45,37 @@
         <div><dt>Scheduler jobs</dt><dd data-metric="system.scheduler.known_jobs"></dd></div>
       </dl></article>
     </section>
+    <section id="users-screen" class="screen page" data-screen="users" hidden>
+      <article class="card">
+        <h2>Пользователи</h2>
+        <label class="search-label" for="users-search">Telegram ID или username</label>
+        <input id="users-search" type="search" maxlength="64" autocomplete="off">
+        <select id="users-status" aria-label="Статус пользователей">
+          <option value="all">Все</option><option value="active">Активные</option>
+          <option value="trial">Trial</option><option value="failed_payment">Ошибка оплаты</option>
+          <option value="active_grace">Grace</option><option value="expired">Просроченные</option>
+          <option value="auto_renew">Автопродление</option><option value="non_renewing">Без автопродления</option>
+        </select>
+      </article>
+      <div id="users-list" class="user-list"></div>
+      <button id="users-more" type="button" hidden>Показать ещё</button>
+    </section>
+    <section id="user-details" class="screen page" data-screen="user-details" hidden>
+      <button id="users-back" class="secondary" type="button">← К пользователям</button>
+      <div id="user-details-content" class="dashboard"></div>
+    </section>
+    <section class="screen page" data-screen="subscriptions" hidden>
+      <article class="card"><h2>Подписки</h2><p>Раздел в разработке</p></article>
+    </section>
+    <section class="screen page" data-screen="system" hidden>
+      <article class="card"><h2>Система</h2><p>Системные показатели доступны в разделе «Обзор».</p></article>
+    </section>
   </main>
+  <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
+    <button type="button" data-nav="overview">Обзор</button>
+    <button type="button" data-nav="users">Пользователи</button>
+    <button type="button" data-nav="subscriptions">Подписки</button>
+    <button type="button" data-nav="system">Система</button>
+  </nav>
 </body>
 </html>
