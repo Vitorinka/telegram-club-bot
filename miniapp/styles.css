@@ -74,6 +74,9 @@ input, select {
 .summary-grid strong { font-size: 20px; }
 .user-card.attention { border: 2px solid var(--tg-theme-destructive-text-color, #b34747); }
 .attention-label { font-weight: 800; }
+.compact-list { display: grid; gap: 10px; margin-top: 16px; }
+.compact-item { display: grid; gap: 4px; padding: 10px 0; border-bottom: 1px solid rgb(0 60 60 / 12%); }
+.compact-item span { color: var(--tg-theme-hint-color, #618080); font-size: 13px; overflow-wrap: anywhere; }
 .secondary { background: transparent; color: var(--tg-theme-link-color, #168787); border: 1px solid currentColor; }
 .bottom-nav {
   position: fixed; z-index: 10; left: 0; right: 0; bottom: 0;

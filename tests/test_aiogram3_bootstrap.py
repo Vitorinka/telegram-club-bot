@@ -9113,6 +9113,54 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.main.miniapp_admin_auth_middleware(request, handler)
             self.assertEqual(response.status, 400)
 
+    async def test_miniapp_system_and_deliveries_are_centrally_protected_and_read_only(self):
+        app = self.main.create_app()
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        system_handler = self.route_handler(app, "GET", "/api/admin/system")
+        deliveries_handler = self.route_handler(app, "GET", "/api/admin/deliveries")
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/system"), system_handler
+        )
+        self.assertEqual(missing.status, 401)
+        system_result = {"database": {}, "scheduler": {}, "deliveries": {}, "removals": {}}
+        deliveries_result = {"items": [], "next_cursor": None, "has_more": False}
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "collect_admin_system", return_value=system_result), \
+             patch.object(self.main, "list_admin_deliveries", return_value=deliveries_result) as list_deliveries, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            system_response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer token", path="/api/admin/system"),
+                system_handler,
+            )
+            deliveries_response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/deliveries",
+                    query={"status": "failed", "limit": "50", "type": "access_restore_invite"},
+                ),
+                deliveries_handler,
+            )
+        self.assertEqual(system_response.status, 200)
+        self.assertEqual(deliveries_response.status, 200)
+        list_deliveries.assert_called_once_with(
+            self.main.get_db_conn, status="failed", limit=50, cursor=None,
+            delivery_type="access_restore_invite",
+        )
+
+    async def test_miniapp_deliveries_reject_invalid_status_limit_and_type(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/deliveries")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        for query in ({"status": "unknown"}, {"limit": "51"}, {"type": "invented"}):
+            request = FakeMiniAppRequest(
+                app, "Bearer token", path="/api/admin/deliveries", query=query
+            )
+            with self.subTest(query=query), patch.object(
+                self.main, "load_miniapp_admin_session", return_value=session
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(request, handler)
+            self.assertEqual(response.status, 400)
+
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
         expected = {
@@ -9134,12 +9182,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/dashboard", javascript)
         self.assertIn("/api/admin/users", javascript)
         self.assertIn("/api/admin/subscriptions", javascript)
+        self.assertIn("/api/admin/system", javascript)
+        self.assertIn("/api/admin/deliveries", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
         self.assertIn("data-nav=", index)
         self.assertIn("Пользователи", index)
         self.assertIn("Требуют внимания", index)
         self.assertIn("subscriptions-search", index)
+        self.assertIn("Система / Ошибки", index)
+        self.assertIn("loadSystem", javascript)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
