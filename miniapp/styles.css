@@ -80,6 +80,11 @@ input, select {
 .hint { color: var(--tg-theme-hint-color, #618080); font-size: 14px; }
 .filter-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 16px; }
 .filter-row button { margin: 0; padding: 9px 6px; font-size: 12px; }
+.schedule-preview { display: grid; place-items: center; min-height: 150px; margin-top: 12px; border-radius: 12px; overflow: hidden; background: rgb(0 60 60 / 6%); }
+.schedule-preview-large { min-height: 240px; }
+.schedule-image { display: block; width: 100%; max-height: 360px; object-fit: contain; }
+.schedule-preview-large .schedule-image { max-height: 70vh; }
+.schedule-image-loading, .schedule-image-error { padding: 20px; color: var(--tg-theme-hint-color, #618080); text-align: center; }
 .secondary { background: transparent; color: var(--tg-theme-link-color, #168787); border: 1px solid currentColor; }
 .bottom-nav {
   position: fixed; z-index: 10; left: 0; right: 0; bottom: 0;
