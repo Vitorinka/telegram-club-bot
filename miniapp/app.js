@@ -31,6 +31,14 @@
   const scheduleMore = document.getElementById("schedule-more");
   const scheduleDetailsContent = document.getElementById("schedule-details-content");
   const scheduleMetricNodes = document.querySelectorAll("[data-schedule-metric]");
+  const giftsSearch = document.getElementById("gifts-search");
+  const giftsStatus = document.getElementById("gifts-status");
+  const giftsDuration = document.getElementById("gifts-duration");
+  const giftsList = document.getElementById("gifts-list");
+  const giftsEmpty = document.getElementById("gifts-empty");
+  const giftsMore = document.getElementById("gifts-more");
+  const giftDetailsContent = document.getElementById("gift-details-content");
+  const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -44,6 +52,8 @@
   let scheduleRange = "future";
   let scheduleImageGeneration = 0;
   const scheduleImageUrls = new Map();
+  let giftsCursor = null;
+  let giftsSearchTimer = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -425,6 +435,75 @@
     }).catch(showApiError);
   }
 
+  const giftProfileLabel = (profile) => {
+    if (!profile) return "Не указан";
+    const name = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
+    const username = profile.username ? `@${profile.username}` : null;
+    return [username, name, `ID ${profile.telegram_id}`].filter(Boolean).join(" · ");
+  };
+  const giftCard = (gift) => {
+    const article = document.createElement("article");
+    article.className = `card user-card${gift.requires_attention ? " attention" : ""}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", gift.public_reference, "eyebrow"));
+    button.append(text("h2", `Подарок на ${gift.duration_label}`));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", gift.status_label, "badge"));
+    if (gift.requires_attention) badges.append(text("span", "⚠️ Требует внимания", "badge attention-label"));
+    button.append(badges);
+    button.append(
+      text("p", `Получатель: ${giftProfileLabel(gift.recipient)}`),
+      text("p", `Покупатель: ${giftProfileLabel(gift.purchaser)}`),
+      text("p", `Имя на сертификате: ${gift.certificate_name || "Без имени"}`),
+      text("p", `Создан: ${formatDate(gift.created_at)}`)
+    );
+    if (gift.redeemed_at) button.append(text("p", `Активирован: ${formatDate(gift.redeemed_at)}`));
+    button.addEventListener("click", () => loadGiftDetails(gift.gift_id));
+    article.append(button);
+    return article;
+  };
+  const loadGifts = (append = false) => {
+    status.textContent = "Загружаем подарки…";
+    const params = new URLSearchParams({
+      limit: "25", status: giftsStatus.value, duration: giftsDuration.value,
+    });
+    if (giftsSearch.value.trim()) params.set("q", giftsSearch.value.trim());
+    if (append && giftsCursor) params.set("cursor", giftsCursor);
+    return api(`/api/admin/gifts?${params.toString()}`).then((data) => {
+      if (!append) giftsList.replaceChildren();
+      data.items.forEach((gift) => giftsList.append(giftCard(gift)));
+      giftsCursor = data.next_cursor;
+      giftsMore.hidden = !data.has_more;
+      giftsEmpty.hidden = giftsList.children.length !== 0;
+      giftMetricNodes.forEach((node) => {
+        node.textContent = String(data.summary[node.dataset.giftMetric] ?? "—");
+      });
+      showScreen("gifts");
+      status.textContent = data.items.length ? `Подарков показано: ${giftsList.children.length}` : "Подарков пока нет.";
+    });
+  };
+  function loadGiftDetails(giftId) {
+    status.textContent = "Загружаем подарок…";
+    return api(`/api/admin/gifts/${encodeURIComponent(giftId)}`).then((gift) => {
+      giftDetailsContent.replaceChildren();
+      const lifecycle = gift.lifecycle_events.length
+        ? gift.lifecycle_events.map((event) => [event.event_type, `${event.source || "—"} · ${formatDate(event.created_at)}`])
+        : [["События", "Нет"]];
+      giftDetailsContent.append(
+        detailCard("Подарок", [["Reference", gift.public_reference], ["Статус", gift.status_label], ["Тариф", gift.duration_label], ["Создан", formatDate(gift.created_at)], ["Оплачен", formatDate(gift.paid_at)]]),
+        detailCard("Покупатель", [["Профиль", giftProfileLabel(gift.purchaser)]]),
+        detailCard("Получатель", [["Профиль", giftProfileLabel(gift.recipient)], ["Указанное имя", gift.recipient_name], ["Имя на сертификате", gift.certificate_name || "Без имени"]]),
+        detailCard("Активация", [["Reserved", formatDate(gift.reserved_at)], ["Активирован", formatDate(gift.redeemed_at)], ["Применён", formatDate(gift.applied_at)], ["Доступ до", formatDate(gift.applied_expiry)]]),
+        detailCard("Завершение", [["Возвращён", formatDate(gift.refunded_at)], ["Отменён", formatDate(gift.cancelled_at)]]),
+        detailCard("Lifecycle", lifecycle)
+      );
+      showScreen("gift-details");
+      status.textContent = gift.public_reference;
+    }).catch(showApiError);
+  }
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -443,6 +522,7 @@
     });
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
+  document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {
@@ -468,6 +548,15 @@
     });
   });
   document.getElementById("schedule-back").addEventListener("click", () => showScreen("schedule"));
+  giftsMore.addEventListener("click", () => loadGifts(true).catch(showApiError));
+  giftsStatus.addEventListener("change", () => loadGifts(false).catch(showApiError));
+  giftsDuration.addEventListener("change", () => loadGifts(false).catch(showApiError));
+  giftsSearch.addEventListener("input", () => {
+    window.clearTimeout(giftsSearchTimer);
+    giftsSearchTimer = window.setTimeout(() => loadGifts(false).catch(showApiError), 300);
+  });
+  document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
+  document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",

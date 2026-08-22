@@ -139,6 +139,12 @@ from admin_schedule import (
     list_admin_schedule,
     parse_schedule_limit,
 )
+from admin_gifts import (
+    AdminGiftsQueryError,
+    get_admin_gift_details,
+    list_admin_gifts,
+    parse_gifts_limit,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21821,6 +21827,41 @@ async def miniapp_admin_schedule_image(request):
     return response
 
 
+async def miniapp_admin_gifts(request):
+    try:
+        result = list_admin_gifts(
+            get_db_conn,
+            limit=parse_gifts_limit(request.query.get("limit")),
+            cursor=request.query.get("cursor"),
+            query=request.query.get("q", ""),
+            status=request.query.get("status", "all"),
+            duration=request.query.get("duration", "all"),
+        )
+    except AdminGiftsQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_gift_details(request):
+    try:
+        details = get_admin_gift_details(
+            get_db_conn, request.match_info.get("gift_id")
+        )
+    except AdminGiftsQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_gift_id"},
+            status=400,
+        ))
+    if details is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "gift_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(details))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21893,6 +21934,10 @@ def create_app():
         app.router.add_get(
             '/api/admin/schedule/{schedule_id}', miniapp_admin_schedule_details
         )
+    if not _route_exists(app, "GET", "/api/admin/gifts"):
+        app.router.add_get('/api/admin/gifts', miniapp_admin_gifts)
+    if not _route_exists(app, "GET", "/api/admin/gifts/{gift_id}"):
+        app.router.add_get('/api/admin/gifts/{gift_id}', miniapp_admin_gift_details)
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
         app.on_startup.append(on_startup)

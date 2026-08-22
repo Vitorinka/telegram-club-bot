@@ -44,6 +44,10 @@
         <div><dt>Latest</dt><dd data-metric="system.migrations.latest"></dd></div>
         <div><dt>Scheduler jobs</dt><dd data-metric="system.scheduler.known_jobs"></dd></div>
       </dl></article>
+      <article class="card secondary-navigation">
+        <h2>Дополнительные разделы</h2>
+        <button id="open-gifts" type="button">🎁 Подарки</button>
+      </article>
     </section>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
@@ -115,6 +119,46 @@
     <section id="schedule-details" class="screen page" data-screen="schedule-details" hidden>
       <button id="schedule-back" class="secondary" type="button">← К расписанию</button>
       <div id="schedule-details-content" class="dashboard"></div>
+    </section>
+    <section id="gifts-screen" class="screen page" data-screen="gifts" hidden>
+      <article class="card">
+        <h2>Подарки</h2>
+        <div class="summary-grid" aria-label="Сводка подарков">
+          <div><span>Всего</span><strong data-gift-metric="total">—</strong></div>
+          <div><span>Ожидают активации</span><strong data-gift-metric="awaiting_activation">—</strong></div>
+          <div><span>Активированы</span><strong data-gift-metric="redeemed">—</strong></div>
+          <div><span>Отменены / возвращены</span><strong data-gift-metric="cancelled_or_refunded">—</strong></div>
+          <div><span>Требуют внимания</span><strong data-gift-metric="requires_attention">—</strong></div>
+        </div>
+        <label class="search-label" for="gifts-search">Telegram ID, reference, username или имя сертификата</label>
+        <input id="gifts-search" type="search" maxlength="64" autocomplete="off">
+        <select id="gifts-status" aria-label="Статус подарка">
+          <option value="all">Все статусы</option>
+          <option value="checkout_pending">Ожидает создания оплаты</option>
+          <option value="checkout_open">Ожидает оплаты</option>
+          <option value="payment_pending">Оплата обрабатывается</option>
+          <option value="paid_unclaimed">Оплачен, ожидает активации</option>
+          <option value="reserved">Требует безопасного применения</option>
+          <option value="redeemed">Активирован</option>
+          <option value="cancelled">Отменён</option>
+          <option value="refunded">Возвращён</option>
+          <option value="review_required">Требует проверки</option>
+        </select>
+        <select id="gifts-duration" aria-label="Срок подарка">
+          <option value="all">Все сроки</option>
+          <option value="gift_1m">1 месяц</option>
+          <option value="gift_6m">6 месяцев</option>
+          <option value="gift_12m">12 месяцев</option>
+        </select>
+      </article>
+      <div id="gifts-list" class="user-list"></div>
+      <p id="gifts-empty" class="card" hidden>Подарков пока нет.</p>
+      <button id="gifts-more" type="button" hidden>Показать ещё</button>
+      <button id="gifts-dashboard-back" class="secondary" type="button">← К обзору</button>
+    </section>
+    <section id="gift-details" class="screen page" data-screen="gift-details" hidden>
+      <button id="gifts-back" class="secondary" type="button">← К подаркам</button>
+      <div id="gift-details-content" class="dashboard"></div>
     </section>
     <section id="system-screen" class="screen page" data-screen="system" hidden>
       <article class="card">
