@@ -92,6 +92,30 @@
       <button id="subscriptions-back" class="secondary" type="button">← К подпискам</button>
       <div id="subscription-details-content" class="dashboard"></div>
     </section>
+    <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
+      <article class="card">
+        <h2>Расписание</h2>
+        <p class="hint">В проекте расписание хранится как одна опубликованная картинка на месяц.</p>
+        <div class="summary-grid">
+          <div><span>Текущий месяц</span><strong data-schedule-metric="current_month">—</strong></div>
+          <div><span>Ближайшие 3 месяца</span><strong data-schedule-metric="next_three_months">—</strong></div>
+          <div><span>Всего будущих</span><strong data-schedule-metric="total_future">—</strong></div>
+        </div>
+        <div class="filter-row" aria-label="Период расписания">
+          <button type="button" data-schedule-range="today">Сегодня</button>
+          <button type="button" data-schedule-range="7">7 дней</button>
+          <button type="button" data-schedule-range="30">30 дней</button>
+          <button type="button" data-schedule-range="future">Все будущие</button>
+        </div>
+      </article>
+      <div id="schedule-list" class="user-list"></div>
+      <p id="schedule-empty" class="card" hidden>На выбранный период расписаний нет.</p>
+      <button id="schedule-more" type="button" hidden>Показать ещё</button>
+    </section>
+    <section id="schedule-details" class="screen page" data-screen="schedule-details" hidden>
+      <button id="schedule-back" class="secondary" type="button">← К расписанию</button>
+      <div id="schedule-details-content" class="dashboard"></div>
+    </section>
     <section id="system-screen" class="screen page" data-screen="system" hidden>
       <article class="card">
         <h2>Система / Ошибки</h2>
@@ -127,6 +151,7 @@
     <button type="button" data-nav="overview">Обзор</button>
     <button type="button" data-nav="users">Пользователи</button>
     <button type="button" data-nav="subscriptions">Подписки</button>
+    <button type="button" data-nav="schedule">Расписание</button>
     <button type="button" data-nav="system">Система</button>
   </nav>
 </body>

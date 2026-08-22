@@ -9161,6 +9161,48 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.main.miniapp_admin_auth_middleware(request, handler)
             self.assertEqual(response.status, 400)
 
+    async def test_miniapp_schedule_routes_are_centrally_protected_and_read_only(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/schedule")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        result = {"items": [], "next_cursor": None, "has_more": False, "summary": {}}
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/schedule"), handler
+        )
+        request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/schedule",
+            query={"from": "2026-08-01", "to": "2026-10-01", "status": "upcoming", "limit": "50"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_schedule", return_value=result) as list_schedule, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(missing.status, 401)
+        self.assertEqual(response.status, 200)
+        list_schedule.assert_called_once_with(
+            self.main.get_db_conn, from_value="2026-08-01", to_value="2026-10-01",
+            status="upcoming", limit=50, cursor=None,
+        )
+
+    async def test_miniapp_schedule_rejects_invalid_query(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/schedule")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        for query in (
+            {"from": "bad"}, {"to": "bad"},
+            {"from": "2026-10-01", "to": "2026-08-01"},
+            {"limit": "51"}, {"status": "active"},
+        ):
+            request = FakeMiniAppRequest(
+                app, "Bearer token", path="/api/admin/schedule", query=query
+            )
+            with self.subTest(query=query), patch.object(
+                self.main, "load_miniapp_admin_session", return_value=session
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(request, handler)
+            self.assertEqual(response.status, 400)
+
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
         expected = {
@@ -9184,6 +9226,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/subscriptions", javascript)
         self.assertIn("/api/admin/system", javascript)
         self.assertIn("/api/admin/deliveries", javascript)
+        self.assertIn("/api/admin/schedule", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
         self.assertIn("data-nav=", index)
@@ -9192,6 +9235,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("subscriptions-search", index)
         self.assertIn("Система / Ошибки", index)
         self.assertIn("loadSystem", javascript)
+        self.assertIn("data-nav=\"schedule\"", index)
+        self.assertIn("loadSchedule", javascript)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
