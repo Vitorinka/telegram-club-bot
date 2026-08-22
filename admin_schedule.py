@@ -10,6 +10,7 @@ SCHEDULE_STATEMENT_TIMEOUT_MS = 5000
 DEFAULT_SCHEDULE_LIMIT = 25
 MAX_SCHEDULE_LIMIT = 50
 SCHEDULE_STATUSES = frozenset({"all", "upcoming", "past"})
+SCHEDULE_PERIODS = frozenset({"range", "archive"})
 MONTH_NAMES = (
     "январь", "февраль", "март", "апрель", "май", "июнь",
     "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
@@ -68,6 +69,13 @@ def validate_schedule_status(value):
     if status not in SCHEDULE_STATUSES:
         raise AdminScheduleQueryError("invalid_status")
     return status
+
+
+def validate_schedule_period(value):
+    period = str(value or "range")
+    if period not in SCHEDULE_PERIODS:
+        raise AdminScheduleQueryError("invalid_period")
+    return period
 
 
 def schedule_window(from_value=None, to_value=None, now=None):
@@ -136,26 +144,38 @@ def _schedule_projection(row, current_month):
 
 def list_admin_schedule(
     get_connection, *, from_value=None, to_value=None, status="all",
-    limit=25, cursor=None, now=None,
+    limit=25, cursor=None, now=None, period="range",
 ):
     limit = parse_schedule_limit(limit)
     status = validate_schedule_status(status)
-    start, end = schedule_window(from_value, to_value, now=now)
+    period = validate_schedule_period(period)
     current_month = current_moscow_month(now)
     cursor_month = decode_schedule_cursor(cursor)
-    start_month = start.strftime("%Y-%m")
-    end_month = end.strftime("%Y-%m")
-    clauses = ["schedule_month >= %s", "schedule_month <= %s"]
-    params = [start_month, end_month]
-    if status == "upcoming":
-        clauses.append("schedule_month >= %s")
-        params.append(current_month)
-    elif status == "past":
-        clauses.append("schedule_month < %s")
-        params.append(current_month)
-    if cursor_month:
-        clauses.append("schedule_month > %s")
-        params.append(cursor_month)
+    if period == "archive":
+        start = date.fromisoformat(f"{_shift_month(current_month, -12)}-01")
+        end = date.fromisoformat(f"{_shift_month(current_month, -1)}-01")
+        clauses = ["schedule_month >= %s", "schedule_month < %s"]
+        params = [_shift_month(current_month, -12), current_month]
+        order = "DESC"
+        if cursor_month:
+            clauses.append("schedule_month < %s")
+            params.append(cursor_month)
+    else:
+        start, end = schedule_window(from_value, to_value, now=now)
+        start_month = start.strftime("%Y-%m")
+        end_month = end.strftime("%Y-%m")
+        clauses = ["schedule_month >= %s", "schedule_month <= %s"]
+        params = [start_month, end_month]
+        if status == "upcoming":
+            clauses.append("schedule_month >= %s")
+            params.append(current_month)
+        elif status == "past":
+            clauses.append("schedule_month < %s")
+            params.append(current_month)
+        order = "ASC"
+        if cursor_month:
+            clauses.append("schedule_month > %s")
+            params.append(cursor_month)
     params.append(limit + 1)
     conn = get_connection()
     cur = conn.cursor()
@@ -166,7 +186,7 @@ def list_admin_schedule(
             SELECT schedule_month, created_at, updated_at
             FROM club_schedules
             WHERE {' AND '.join(clauses)}
-            ORDER BY schedule_month ASC
+            ORDER BY schedule_month {order}
             LIMIT %s
             """,
             tuple(params),
@@ -202,6 +222,7 @@ def list_admin_schedule(
         "next_cursor": encode_schedule_cursor(page[-1][0]) if has_more else None,
         "has_more": has_more,
         "window": {"from": start.isoformat(), "to": end.isoformat()},
+        "period": period,
         "timezone": "Europe/Moscow",
         "summary": {
             "current_month": int(summary[0] or 0),

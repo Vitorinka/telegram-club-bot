@@ -10,6 +10,7 @@ from admin_schedule import (
     parse_schedule_limit,
     schedule_month_label,
     schedule_window,
+    validate_schedule_period,
     validate_schedule_status,
 )
 
@@ -22,8 +23,11 @@ class AdminScheduleTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(AdminScheduleQueryError):
                 parse_schedule_limit(invalid)
         self.assertEqual(validate_schedule_status("upcoming"), "upcoming")
+        self.assertEqual(validate_schedule_period("archive"), "archive")
         with self.assertRaises(AdminScheduleQueryError):
             validate_schedule_status("active")
+        with self.assertRaises(AdminScheduleQueryError):
+            validate_schedule_period("history")
         cursor = encode_schedule_cursor("2026-08")
         self.assertEqual(decode_schedule_cursor(cursor), "2026-08")
         with self.assertRaises(AdminScheduleQueryError):

@@ -8235,6 +8235,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                         schedule_month, telegram_file_id,
                         uploaded_by_telegram_id, created_at, updated_at
                     ) VALUES
+                        ('2025-07', 'telegram_secret_file_outside_archive', 8999, NOW() - INTERVAL '14 months', NOW()),
+                        ('2026-06', 'telegram_secret_file_june', 9000, NOW() - INTERVAL '5 months', NOW()),
                         ('2026-07', 'telegram_secret_file_july', 9001, NOW() - INTERVAL '4 months', NOW()),
                         ('2026-08', 'telegram_secret_file_august', 9002, NOW() - INTERVAL '3 months', NOW()),
                         ('2026-09', 'telegram_secret_file_september', 9003, NOW() - INTERVAL '2 months', NOW()),
@@ -8261,7 +8263,32 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.get_conn, from_value="2026-01-01", to_value="2026-08-31",
             status="past", now=now,
         )
-        self.assertEqual([item["schedule_id"] for item in past["items"]], ["2026-07"])
+        self.assertEqual(
+            [item["schedule_id"] for item in past["items"]],
+            ["2026-06", "2026-07"],
+        )
+        archive_first = list_admin_schedule(
+            self.get_conn, period="archive", limit=1, now=now,
+        )
+        archive_second = list_admin_schedule(
+            self.get_conn, period="archive", limit=1,
+            cursor=archive_first["next_cursor"], now=now,
+        )
+        self.assertEqual(
+            [item["schedule_id"] for item in archive_first["items"]],
+            ["2026-07"],
+        )
+        self.assertEqual(
+            [item["schedule_id"] for item in archive_second["items"]],
+            ["2026-06"],
+        )
+        self.assertFalse(archive_second["has_more"])
+        self.assertFalse(
+            {item["schedule_id"] for item in archive_first["items"]}
+            & {item["schedule_id"] for item in archive_second["items"]}
+        )
+        self.assertEqual(archive_first["period"], "archive")
+        self.assertEqual(archive_first["summary"], default["summary"])
         upcoming = list_admin_schedule(
             self.get_conn, from_value="2026-08-01", to_value="2026-12-31",
             status="upcoming", now=now,
@@ -8321,7 +8348,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         try:
             with verify_conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM club_schedules")
-                self.assertEqual(cur.fetchone()[0], 4)
+                self.assertEqual(cur.fetchone()[0], 6)
         finally:
             verify_conn.close()
 
