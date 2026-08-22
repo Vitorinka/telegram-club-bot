@@ -13,11 +13,10 @@
     <section class="card">
       <p class="eyebrow">Telegram Club Bot</p>
       <h1 id="title">Админ-платформа</h1>
-      <p id="status">Проверяем доступ…</p>
-      <dl id="identity" hidden>
-        <div><dt>Telegram ID</dt><dd id="telegram-id"></dd></div>
-        <div id="username-row" hidden><dt>Username</dt><dd id="username"></dd></div>
-      </dl>
+      <p class="admin-status-line">
+        <span id="status">Проверяем доступ…</span>
+        <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
+      </p>
       <button id="refresh" type="button" hidden>Обновить данные</button>
     </section>
     <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
