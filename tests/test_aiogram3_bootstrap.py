@@ -9185,6 +9185,71 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             status="upcoming", limit=50, cursor=None,
         )
 
+    async def test_miniapp_schedule_write_routes_are_centrally_bearer_protected(self):
+        app = self.main.create_app()
+        routes = (
+            ("POST", "/api/admin/schedule/upload-preview"),
+            ("GET", "/api/admin/schedule/uploads/{upload_id}/image"),
+            ("POST", "/api/admin/schedule/uploads/{upload_id}/confirm"),
+            ("POST", "/api/admin/schedule/uploads/{upload_id}/cancel"),
+            ("GET", "/api/admin/schedule/actions/{action_id}"),
+        )
+        for method, path in routes:
+            handler = self.route_handler(app, method, path)
+            request = FakeMiniAppRequest(app, path=path)
+            with self.subTest(method=method, path=path):
+                response = await self.main.miniapp_admin_auth_middleware(request, handler)
+                self.assertEqual(response.status, 401)
+
+    async def test_miniapp_schedule_confirm_uploads_once_and_returns_safe_result(self):
+        action = {"action_id": "11111111-1111-4111-8111-111111111111", "status": "pending"}
+        with patch.object(self.main, "ensure_schedule_upload_action", return_value=action), \
+             patch.object(self.main, "execute_miniapp_schedule_upload", new=AsyncMock(return_value={"status": "completed", "schedule_month": "2026-08"})) as execute:
+            request = FakeMiniAppRequest(
+                self.main.create_app(), path="/api/admin/schedule/uploads/u/confirm",
+                match_info={"upload_id": "11111111-1111-4111-8111-111111111112"},
+            )
+            request["miniapp_admin"] = SimpleNamespace(telegram_id=1)
+            response = await self.main.miniapp_admin_schedule_upload_confirm(request)
+        self.assertEqual(response.status, 200)
+        body = json.loads(response.text)
+        self.assertEqual(body["status"], "completed")
+        self.assertNotIn("telegram_file_id", body)
+        execute.assert_awaited_once_with(
+            "11111111-1111-4111-8111-111111111112", action["action_id"], 1,
+        )
+
+    async def test_miniapp_schedule_executor_uploads_to_owning_admin_then_applies(self):
+        upload_id = "11111111-1111-4111-8111-111111111112"
+        action_id = "11111111-1111-4111-8111-111111111111"
+        telegram_message = SimpleNamespace(
+            photo=[SimpleNamespace(file_id="private-telegram-file-id")]
+        )
+        with patch.object(self.main, "prepare_schedule_upload_execution", side_effect=[{
+            "mode": "upload", "image_bytes": b"\x89PNG\r\n\x1a\nimage",
+            "content_type": "image/png", "schedule_month": "2026-08",
+        }]), patch.object(
+            self.main.bot, "send_photo", new=AsyncMock(return_value=telegram_message)
+        ) as send_photo, patch.object(
+            self.main, "record_schedule_telegram_upload"
+        ) as record, patch.object(
+            self.main, "apply_schedule_upload",
+            return_value={"status": "completed", "schedule_month": "2026-08"},
+        ) as apply:
+            result = await self.main.execute_miniapp_schedule_upload(
+                upload_id, action_id, 1
+            )
+        self.assertEqual(result["status"], "completed")
+        send_photo.assert_awaited_once()
+        self.assertEqual(send_photo.await_args.args[0], 1)
+        record.assert_called_once_with(
+            self.main.get_db_conn, upload_id, action_id, 1,
+            "private-telegram-file-id",
+        )
+        apply.assert_called_once_with(
+            self.main.get_db_conn, upload_id, action_id, 1,
+        )
+
     async def test_miniapp_schedule_rejects_invalid_query(self):
         app = self.main.create_app()
         handler = self.route_handler(app, "GET", "/api/admin/schedule")
@@ -9413,6 +9478,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/system", javascript)
         self.assertIn("/api/admin/deliveries", javascript)
         self.assertIn("/api/admin/schedule", javascript)
+        self.assertIn("/api/admin/schedule/upload-preview", javascript)
+        self.assertIn("schedule-upload-confirm", index)
+        self.assertIn("accept=\"image/jpeg,image/png,image/webp\"", index)
+        self.assertIn("new FormData()", javascript)
+        self.assertIn("scheduleUploadId", javascript)
+        self.assertIn("URL.revokeObjectURL", javascript)
         self.assertIn("/api/admin/gifts", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)

@@ -50,6 +50,16 @@ from admin_schedule import (
     list_admin_schedule,
 )
 from admin_gifts import get_admin_gift_details, list_admin_gifts
+from schedule_uploads import (
+    apply_schedule_upload,
+    cancel_schedule_upload,
+    create_schedule_upload,
+    ensure_schedule_upload_action,
+    get_schedule_upload,
+    get_schedule_upload_action,
+    prepare_schedule_upload_execution,
+    record_schedule_telegram_upload,
+)
 from scheduled_jobs import (
     claim_pending_message_deliveries,
     enqueue_message_delivery,
@@ -396,8 +406,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 17,
-            "latest": "0017_miniapp_admin_sessions",
+            "count": 18,
+            "latest": "0018_miniapp_schedule_uploads",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1881,7 +1891,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 17)
+        self.assertEqual(len(migrations), 18)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -4134,6 +4144,91 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             cur.close()
             conn.close()
+
+    def test_miniapp_schedule_upload_staging_fencing_and_idempotency_real_postgres(self):
+        run_migrations(self.get_conn)
+        image = b"\x89PNG\r\n\x1a\nsynthetic-schedule"
+        draft = create_schedule_upload(
+            self.get_conn, 1, "2026-08", image,
+        )
+        self.assertFalse(draft["existing_schedule"])
+        self.assertIsNone(self.query_one(
+            "SELECT telegram_file_id FROM club_schedules WHERE schedule_month = '2026-08'"
+        ))
+        self.assertIsNone(get_schedule_upload(self.get_conn, draft["upload_id"], 2))
+        self.assertEqual(get_schedule_upload(
+            self.get_conn, draft["upload_id"], 1, include_bytes=True,
+        )["image_bytes"], image)
+
+        action = ensure_schedule_upload_action(self.get_conn, draft["upload_id"], 1)
+        self.assertEqual(
+            json.loads(self.query_one(
+                "SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
+                (action["action_id"],),
+            )[0]),
+            {"admin_id": 1, "schedule_month": "2026-08", "upload_id": draft["upload_id"]},
+        )
+        state = prepare_schedule_upload_execution(
+            self.get_conn, draft["upload_id"], action["action_id"], 1,
+        )
+        self.assertEqual(state["mode"], "upload")
+        record_schedule_telegram_upload(
+            self.get_conn, draft["upload_id"], action["action_id"], 1, "telegram-file-new",
+        )
+        self.assertEqual(
+            apply_schedule_upload(self.get_conn, draft["upload_id"], action["action_id"], 1),
+            {"status": "completed", "schedule_month": "2026-08"},
+        )
+        self.assertEqual(
+            self.query_one("SELECT telegram_file_id FROM club_schedules WHERE schedule_month = '2026-08'"),
+            ("telegram-file-new",),
+        )
+        self.assertEqual(
+            prepare_schedule_upload_execution(
+                self.get_conn, draft["upload_id"], action["action_id"], 1,
+            )["mode"],
+            "completed",
+        )
+        audit = get_schedule_upload_action(self.get_conn, action["action_id"], 1)
+        self.assertEqual(audit["status"], "completed")
+        self.assertNotIn("telegram_file_id", audit)
+        self.assertNotIn("image_bytes", audit)
+
+        stale = create_schedule_upload(
+            self.get_conn, 1, "2026-08", image,
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE club_schedules SET telegram_file_id = 'other-admin', updated_at = NOW() + INTERVAL '1 second' WHERE schedule_month = '2026-08'"
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        stale_action = ensure_schedule_upload_action(self.get_conn, stale["upload_id"], 1)
+        prepare_schedule_upload_execution(self.get_conn, stale["upload_id"], stale_action["action_id"], 1)
+        record_schedule_telegram_upload(
+            self.get_conn, stale["upload_id"], stale_action["action_id"], 1, "stale-file",
+        )
+        self.assertEqual(
+            apply_schedule_upload(self.get_conn, stale["upload_id"], stale_action["action_id"], 1),
+            {"status": "failed", "failure_category": "stale_schedule_preview"},
+        )
+        self.assertEqual(
+            self.query_one("SELECT telegram_file_id FROM club_schedules WHERE schedule_month = '2026-08'"),
+            ("other-admin",),
+        )
+
+        cancelled = create_schedule_upload(
+            self.get_conn, 1, "2026-09", image,
+        )
+        self.assertEqual(cancel_schedule_upload(self.get_conn, cancelled["upload_id"], 1)["status"], "cancelled")
+        self.assertEqual(cancel_schedule_upload(self.get_conn, cancelled["upload_id"], 1)["status"], "cancelled")
+        self.assertIsNone(self.query_one(
+            "SELECT telegram_file_id FROM club_schedules WHERE schedule_month = '2026-09'"
+        ))
 
     def test_restore_access_stripe_identity_changed_fails_closed_real_postgres(self):
         run_migrations(self.get_conn)
@@ -8091,8 +8186,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 17)
-        self.assertEqual(system["migrations"]["latest"], "0017_miniapp_admin_sessions")
+        self.assertEqual(system["migrations"]["count"], 18)
+        self.assertEqual(system["migrations"]["latest"], "0018_miniapp_schedule_uploads")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

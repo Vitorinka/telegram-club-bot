@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import BufferedInputFile, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -144,6 +144,21 @@ from admin_gifts import (
     get_admin_gift_details,
     list_admin_gifts,
     parse_gifts_limit,
+)
+from schedule_uploads import (
+    SCHEDULE_UPLOAD_ACTION_TYPE,
+    SCHEDULE_UPLOAD_MAX_BYTES,
+    ScheduleUploadError,
+    apply_schedule_upload,
+    cancel_schedule_upload,
+    create_schedule_upload,
+    ensure_schedule_upload_action,
+    fail_schedule_upload,
+    get_schedule_upload,
+    get_schedule_upload_action,
+    prepare_schedule_upload_execution,
+    record_schedule_telegram_upload,
+    upsert_club_schedule,
 )
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
@@ -9410,27 +9425,6 @@ def load_club_schedule(month_key):
     finally:
         cur.close()
         conn.close()
-
-
-def upsert_club_schedule(cur, month_key, file_id, admin_id):
-    month_key = validated_schedule_month(month_key)
-    if not file_id:
-        raise ValueError("schedule_file_id_missing")
-    cur.execute(
-        """
-        INSERT INTO club_schedules (
-            schedule_month, telegram_file_id, uploaded_by_telegram_id, created_at, updated_at
-        )
-        VALUES (%s, %s, %s, NOW(), NOW())
-        ON CONFLICT (schedule_month) DO UPDATE
-        SET telegram_file_id = EXCLUDED.telegram_file_id,
-            uploaded_by_telegram_id = EXCLUDED.uploaded_by_telegram_id,
-            updated_at = NOW()
-        RETURNING schedule_month
-        """,
-        (month_key, str(file_id), int(admin_id)),
-    )
-    return cur.fetchone()[0]
 
 
 def current_schedule(now=None):
@@ -21862,6 +21856,179 @@ async def miniapp_admin_gift_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+def schedule_upload_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status
+    ))
+
+
+async def read_bounded_schedule_multipart(request):
+    content_length = request.content_length
+    if content_length is not None and content_length > SCHEDULE_UPLOAD_MAX_BYTES + 1024 * 1024:
+        raise ScheduleUploadError("schedule_image_too_large", status=413)
+    try:
+        reader = await request.multipart()
+    except Exception:
+        raise ScheduleUploadError("invalid_multipart_upload") from None
+    month = None
+    image = None
+    async for field in reader:
+        if field.name == "month":
+            if month is not None:
+                raise ScheduleUploadError("duplicate_schedule_month")
+            month = (await field.text()).strip()
+        elif field.name == "image":
+            if image is not None:
+                raise ScheduleUploadError("duplicate_schedule_image")
+            buffer = bytearray()
+            while True:
+                chunk = await field.read_chunk(size=64 * 1024)
+                if not chunk:
+                    break
+                if len(buffer) + len(chunk) > SCHEDULE_UPLOAD_MAX_BYTES:
+                    raise ScheduleUploadError("schedule_image_too_large", status=413)
+                buffer.extend(chunk)
+            image = bytes(buffer)
+        else:
+            raise ScheduleUploadError("unexpected_upload_field")
+    if month is None:
+        raise ScheduleUploadError("schedule_month_missing")
+    if not image:
+        raise ScheduleUploadError("schedule_image_missing")
+    return month, image
+
+
+async def miniapp_admin_schedule_upload_preview(request):
+    session = request["miniapp_admin"]
+    try:
+        month, image_bytes = await read_bounded_schedule_multipart(request)
+        result = create_schedule_upload(
+            get_db_conn, session.telegram_id, month, image_bytes
+        )
+    except ScheduleUploadError as error:
+        return schedule_upload_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_schedule_upload_image(request):
+    session = request["miniapp_admin"]
+    try:
+        upload = get_schedule_upload(
+            get_db_conn, request.match_info.get("upload_id"),
+            session.telegram_id, include_bytes=True,
+        )
+    except ScheduleUploadError as error:
+        return schedule_upload_error_response(error)
+    if upload is None:
+        return schedule_upload_error_response(
+            ScheduleUploadError("schedule_upload_not_found", status=404)
+        )
+    response = web.Response(
+        body=upload["image_bytes"], content_type=upload["content_type"]
+    )
+    response.headers["Content-Disposition"] = "inline"
+    apply_miniapp_security_headers(response)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+async def execute_miniapp_schedule_upload(upload_id, action_id, admin_id):
+    state = prepare_schedule_upload_execution(
+        get_db_conn, upload_id, action_id, admin_id
+    )
+    if state["mode"] == "upload":
+        extension = {
+            "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+        }[state["content_type"]]
+        photo = BufferedInputFile(
+            state["image_bytes"], filename=f"club_schedule.{extension}"
+        )
+        try:
+            message = await bot.send_photo(
+                int(admin_id), photo,
+                caption=(
+                    f"📅 Загружено из админ-платформы: "
+                    f"{schedule_month_label(state['schedule_month'])}"
+                ),
+            )
+            telegram_file_id = message.photo[-1].file_id
+        except Exception:
+            fail_schedule_upload(
+                get_db_conn, upload_id, action_id, admin_id,
+                "telegram_upload_failed",
+            )
+            logging.warning(
+                "MINIAPP_SCHEDULE_UPLOAD_FAILED: action_id=%s month=%s category=telegram_upload_failed",
+                action_id,
+                state["schedule_month"],
+            )
+            return {"status": "failed", "failure_category": "telegram_upload_failed"}
+        record_schedule_telegram_upload(
+            get_db_conn, upload_id, action_id, admin_id, telegram_file_id
+        )
+        state = {"mode": "apply"}
+    if state["mode"] == "apply":
+        return apply_schedule_upload(get_db_conn, upload_id, action_id, admin_id)
+    if state["mode"] == "completed":
+        return {"status": "completed", "schedule_month": state.get("schedule_month")}
+    return {
+        "status": state["mode"],
+        "failure_category": state.get("failure_category"),
+    }
+
+
+async def miniapp_admin_schedule_upload_confirm(request):
+    session = request["miniapp_admin"]
+    upload_id = request.match_info.get("upload_id")
+    try:
+        action = ensure_schedule_upload_action(
+            get_db_conn, upload_id, session.telegram_id
+        )
+        if action is None:
+            raise ScheduleUploadError("schedule_upload_not_found", status=404)
+        result = await execute_miniapp_schedule_upload(
+            upload_id, action["action_id"], session.telegram_id
+        )
+    except ScheduleUploadError as error:
+        return schedule_upload_error_response(error)
+    status = 200 if result.get("status") in ("completed", "failed") else 202
+    return apply_miniapp_security_headers(web.json_response({
+        "action_id": action["action_id"],
+        "action_type": SCHEDULE_UPLOAD_ACTION_TYPE,
+        **result,
+    }, status=status))
+
+
+async def miniapp_admin_schedule_upload_cancel(request):
+    session = request["miniapp_admin"]
+    try:
+        result = cancel_schedule_upload(
+            get_db_conn, request.match_info.get("upload_id"), session.telegram_id
+        )
+    except ScheduleUploadError as error:
+        return schedule_upload_error_response(error)
+    if result is None:
+        return schedule_upload_error_response(
+            ScheduleUploadError("schedule_upload_not_found", status=404)
+        )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_schedule_upload_action(request):
+    session = request["miniapp_admin"]
+    try:
+        result = get_schedule_upload_action(
+            get_db_conn, request.match_info.get("action_id"), session.telegram_id
+        )
+    except ScheduleUploadError as error:
+        return schedule_upload_error_response(error)
+    if result is None:
+        return schedule_upload_error_response(
+            ScheduleUploadError("schedule_action_not_found", status=404)
+        )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21873,7 +22040,10 @@ def _route_exists(app, method, path):
 
 
 def create_app():
-    app = web.Application(middlewares=[miniapp_admin_auth_middleware])
+    app = web.Application(
+        middlewares=[miniapp_admin_auth_middleware],
+        client_max_size=SCHEDULE_UPLOAD_MAX_BYTES + 1024 * 1024,
+    )
     telegram_path = get_telegram_webhook_path()
     if not _route_exists(app, "POST", telegram_path):
         SimpleRequestHandler(
@@ -21925,6 +22095,31 @@ def create_app():
         )
     if not _route_exists(app, "GET", "/api/admin/schedule"):
         app.router.add_get('/api/admin/schedule', miniapp_admin_schedule)
+    if not _route_exists(app, "POST", "/api/admin/schedule/upload-preview"):
+        app.router.add_post(
+            '/api/admin/schedule/upload-preview',
+            miniapp_admin_schedule_upload_preview,
+        )
+    if not _route_exists(app, "GET", "/api/admin/schedule/uploads/{upload_id}/image"):
+        app.router.add_get(
+            '/api/admin/schedule/uploads/{upload_id}/image',
+            miniapp_admin_schedule_upload_image,
+        )
+    if not _route_exists(app, "POST", "/api/admin/schedule/uploads/{upload_id}/confirm"):
+        app.router.add_post(
+            '/api/admin/schedule/uploads/{upload_id}/confirm',
+            miniapp_admin_schedule_upload_confirm,
+        )
+    if not _route_exists(app, "POST", "/api/admin/schedule/uploads/{upload_id}/cancel"):
+        app.router.add_post(
+            '/api/admin/schedule/uploads/{upload_id}/cancel',
+            miniapp_admin_schedule_upload_cancel,
+        )
+    if not _route_exists(app, "GET", "/api/admin/schedule/actions/{action_id}"):
+        app.router.add_get(
+            '/api/admin/schedule/actions/{action_id}',
+            miniapp_admin_schedule_upload_action,
+        )
     if not _route_exists(app, "GET", "/api/admin/schedule/{schedule_id}/image"):
         app.router.add_get(
             '/api/admin/schedule/{schedule_id}/image',

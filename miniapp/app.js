@@ -31,6 +31,11 @@
   const scheduleMore = document.getElementById("schedule-more");
   const scheduleDetailsContent = document.getElementById("schedule-details-content");
   const scheduleMetricNodes = document.querySelectorAll("[data-schedule-metric]");
+  const scheduleUploadMonth = document.getElementById("schedule-upload-month");
+  const scheduleUploadFile = document.getElementById("schedule-upload-file");
+  const scheduleUploadPreview = document.getElementById("schedule-upload-preview");
+  const scheduleUploadMessage = document.getElementById("schedule-upload-message");
+  const scheduleUploadConfirm = document.getElementById("schedule-upload-confirm");
   const giftsSearch = document.getElementById("gifts-search");
   const giftsStatus = document.getElementById("gifts-status");
   const giftsDuration = document.getElementById("gifts-duration");
@@ -52,6 +57,9 @@
   let scheduleRange = "future";
   let scheduleImageGeneration = 0;
   const scheduleImageUrls = new Map();
+  let scheduleUploadLocalUrl = null;
+  let scheduleUploadServerUrl = null;
+  let scheduleUploadId = null;
   let giftsCursor = null;
   let giftsSearchTimer = null;
 
@@ -80,13 +88,40 @@
     scheduleImageUrls.forEach((url) => URL.revokeObjectURL(url));
     scheduleImageUrls.clear();
   };
+  const clearScheduleUploadUrls = () => {
+    if (scheduleUploadLocalUrl) URL.revokeObjectURL(scheduleUploadLocalUrl);
+    if (scheduleUploadServerUrl) URL.revokeObjectURL(scheduleUploadServerUrl);
+    scheduleUploadLocalUrl = null;
+    scheduleUploadServerUrl = null;
+  };
+  const resetScheduleUpload = () => {
+    clearScheduleUploadUrls();
+    scheduleUploadId = null;
+    scheduleUploadFile.value = "";
+    scheduleUploadConfirm.hidden = true;
+    scheduleUploadPreview.replaceChildren(text("span", "Выберите изображение", "schedule-image-loading"));
+    scheduleUploadMessage.textContent = "Сначала проверьте локальное изображение, затем отправьте его на безопасную проверку.";
+  };
   const showScreen = (name) => {
     if (name !== "schedule" && name !== "schedule-details" && scheduleImageUrls.size) {
       clearScheduleImages();
     }
+    if (name !== "schedule-upload" && (scheduleUploadLocalUrl || scheduleUploadServerUrl)) {
+      clearScheduleUploadUrls();
+    }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = node.dataset.screen !== name; });
     document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === name); });
   };
+  const postAdmin = (path, body) => fetch(path, {
+    method: "POST", headers: {Authorization: `Bearer ${sessionToken}`}, body,
+    cache: "no-store", credentials: "omit",
+  }).then(async (response) => {
+    if (response.status === 401) throw new Error("session_ended");
+    if (response.status === 403) throw new Error("access_revoked");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "api_failed");
+    return data;
+  });
   const valueAtPath = (object, path) => path.split(".").reduce((value, key) => value && value[key], object);
   const loadDashboard = () => {
     status.textContent = "Загружаем данные…";
@@ -435,6 +470,75 @@
     }).catch(showApiError);
   }
 
+  const showScheduleUploadImage = (url, alt) => {
+    const image = document.createElement("img");
+    image.className = "schedule-image";
+    image.alt = alt;
+    image.src = url;
+    scheduleUploadPreview.replaceChildren(image);
+  };
+  const openScheduleUpload = () => {
+    resetScheduleUpload();
+    scheduleUploadMonth.value = new Date().toISOString().slice(0, 7);
+    showScreen("schedule-upload");
+    status.textContent = "Выберите месяц и изображение";
+  };
+  const validateScheduleUpload = () => {
+    const file = scheduleUploadFile.files[0];
+    if (!scheduleUploadMonth.value || !file) {
+      scheduleUploadMessage.textContent = "Выберите месяц и изображение.";
+      return Promise.resolve();
+    }
+    const form = new FormData();
+    form.append("month", scheduleUploadMonth.value);
+    form.append("image", file);
+    scheduleUploadMessage.textContent = "Проверяем изображение…";
+    scheduleUploadConfirm.hidden = true;
+    return postAdmin("/api/admin/schedule/upload-preview", form).then((draft) => {
+      scheduleUploadId = draft.upload_id;
+      return fetch(`/api/admin/schedule/uploads/${encodeURIComponent(draft.upload_id)}/image`, {
+        headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+      }).then((response) => {
+        if (!response.ok) throw new Error("preview_failed");
+        return response.blob();
+      }).then((blob) => {
+        if (scheduleUploadServerUrl) URL.revokeObjectURL(scheduleUploadServerUrl);
+        scheduleUploadServerUrl = URL.createObjectURL(blob);
+        showScheduleUploadImage(scheduleUploadServerUrl, `Расписание ${draft.schedule_month}`);
+        scheduleUploadMessage.textContent = draft.existing_schedule
+          ? "Расписание за этот месяц уже существует. После подтверждения текущая картинка будет заменена."
+          : "Будет создано новое расписание.";
+        scheduleUploadConfirm.hidden = false;
+      });
+    }).catch((error) => {
+      scheduleUploadMessage.textContent = error.message === "schedule_image_too_large"
+        ? "Изображение превышает 10 МиБ."
+        : "Изображение не прошло безопасную проверку.";
+    });
+  };
+  const confirmScheduleUpload = () => {
+    if (!scheduleUploadId) return Promise.resolve();
+    scheduleUploadConfirm.disabled = true;
+    scheduleUploadMessage.textContent = "Загружаем расписание…";
+    return postAdmin(`/api/admin/schedule/uploads/${encodeURIComponent(scheduleUploadId)}/confirm`).then((result) => {
+      if (result.status !== "completed") throw new Error(result.failure_category || result.status);
+      const month = scheduleUploadMonth.value;
+      resetScheduleUpload();
+      status.textContent = `Расписание за ${month} обновлено.`;
+      return loadSchedule(false);
+    }).catch((error) => {
+      scheduleUploadMessage.textContent = error.message === "stale_schedule_preview"
+        ? "Расписание изменилось после предварительного просмотра. Обновите данные и повторите."
+        : "Не удалось обновить расписание. Повторите безопасную проверку.";
+    }).finally(() => { scheduleUploadConfirm.disabled = false; });
+  };
+  const cancelScheduleUploadDraft = () => {
+    const request = scheduleUploadId
+      ? postAdmin(`/api/admin/schedule/uploads/${encodeURIComponent(scheduleUploadId)}/cancel`).catch(() => null)
+      : Promise.resolve();
+    return request.then(() => { resetScheduleUpload(); return loadSchedule(false); });
+  };
+
   const giftProfileLabel = (profile) => {
     if (!profile) return "Не указан";
     const name = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
@@ -548,6 +652,22 @@
     });
   });
   document.getElementById("schedule-back").addEventListener("click", () => showScreen("schedule"));
+  document.getElementById("schedule-upload-open").addEventListener("click", openScheduleUpload);
+  document.getElementById("schedule-upload-back").addEventListener("click", cancelScheduleUploadDraft);
+  document.getElementById("schedule-upload-cancel").addEventListener("click", cancelScheduleUploadDraft);
+  document.getElementById("schedule-upload-validate").addEventListener("click", validateScheduleUpload);
+  scheduleUploadConfirm.addEventListener("click", confirmScheduleUpload);
+  scheduleUploadFile.addEventListener("change", () => {
+    clearScheduleUploadUrls();
+    scheduleUploadId = null;
+    scheduleUploadConfirm.hidden = true;
+    const file = scheduleUploadFile.files[0];
+    if (file) {
+      scheduleUploadLocalUrl = URL.createObjectURL(file);
+      showScheduleUploadImage(scheduleUploadLocalUrl, "Локальное предварительное изображение расписания");
+      scheduleUploadMessage.textContent = "Локальный просмотр готов. Нажмите «Проверить».";
+    }
+  });
   giftsMore.addEventListener("click", () => loadGifts(true).catch(showApiError));
   giftsStatus.addEventListener("change", () => loadGifts(false).catch(showApiError));
   giftsDuration.addEventListener("change", () => loadGifts(false).catch(showApiError));
