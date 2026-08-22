@@ -92,8 +92,35 @@
       <button id="subscriptions-back" class="secondary" type="button">← К подпискам</button>
       <div id="subscription-details-content" class="dashboard"></div>
     </section>
-    <section class="screen page" data-screen="system" hidden>
-      <article class="card"><h2>Система</h2><p>Системные показатели доступны в разделе «Обзор».</p></article>
+    <section id="system-screen" class="screen page" data-screen="system" hidden>
+      <article class="card">
+        <h2>Система / Ошибки</h2>
+        <div class="summary-grid">
+          <div><span>DB</span><strong data-system-metric="database">—</strong></div>
+          <div><span>Scheduler jobs</span><strong data-system-metric="scheduler.known_jobs">—</strong></div>
+          <div><span>Failed jobs 24h</span><strong data-system-metric="scheduler.failed_last_24h">—</strong></div>
+          <div><span>Permanently failed</span><strong data-system-metric="deliveries.permanently_failed">—</strong></div>
+          <div><span>Retryable removals</span><strong data-system-metric="removals.retryable">—</strong></div>
+        </div>
+      </article>
+      <article class="card"><h2>Требуют внимания</h2><dl id="system-attention"></dl></article>
+      <article class="card"><h2>Доставка</h2><dl id="system-delivery-metrics"></dl></article>
+      <article class="card">
+        <h2>События доставки</h2>
+        <select id="deliveries-status" aria-label="Статус доставки">
+          <option value="all">Все</option><option value="pending">Pending</option>
+          <option value="failed">Failed</option><option value="permanently_failed">Permanently failed</option>
+          <option value="sent">Sent</option>
+        </select>
+      </article>
+      <div id="deliveries-list" class="user-list"></div>
+      <button id="deliveries-more" type="button" hidden>Показать ещё</button>
+      <article class="card"><h2>Планировщик</h2><div id="scheduler-runs" class="compact-list"></div></article>
+      <article class="card"><h2>Миграции</h2><dl id="system-migrations"></dl></article>
+    </section>
+    <section id="delivery-details" class="screen page" data-screen="delivery-details" hidden>
+      <button id="deliveries-back" class="secondary" type="button">← К системе</button>
+      <div id="delivery-details-content" class="dashboard"></div>
     </section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>

@@ -125,6 +125,13 @@ from admin_subscriptions import (
     list_admin_subscriptions,
     parse_subscriptions_limit,
 )
+from admin_system import (
+    AdminSystemQueryError,
+    collect_admin_system,
+    get_admin_delivery_details,
+    list_admin_deliveries,
+    parse_deliveries_limit,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21643,6 +21650,47 @@ async def miniapp_admin_subscription_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+async def miniapp_admin_system(request):
+    result = collect_admin_system(
+        get_db_conn, db_pool_health, len(scheduler.get_jobs())
+    )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_deliveries(request):
+    try:
+        result = list_admin_deliveries(
+            get_db_conn,
+            status=request.query.get("status", "all"),
+            limit=parse_deliveries_limit(request.query.get("limit")),
+            cursor=request.query.get("cursor"),
+            delivery_type=request.query.get("type"),
+        )
+    except AdminSystemQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_delivery_details(request):
+    try:
+        details = get_admin_delivery_details(
+            get_db_conn, request.match_info.get("delivery_id")
+        )
+    except AdminSystemQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_delivery_id"},
+            status=400,
+        ))
+    if details is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "delivery_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(details))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21694,6 +21742,15 @@ def create_app():
         app.router.add_get(
             '/api/admin/subscriptions/{telegram_id}',
             miniapp_admin_subscription_details,
+        )
+    if not _route_exists(app, "GET", "/api/admin/system"):
+        app.router.add_get('/api/admin/system', miniapp_admin_system)
+    if not _route_exists(app, "GET", "/api/admin/deliveries"):
+        app.router.add_get('/api/admin/deliveries', miniapp_admin_deliveries)
+    if not _route_exists(app, "GET", "/api/admin/deliveries/{delivery_id}"):
+        app.router.add_get(
+            '/api/admin/deliveries/{delivery_id}',
+            miniapp_admin_delivery_details,
         )
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:

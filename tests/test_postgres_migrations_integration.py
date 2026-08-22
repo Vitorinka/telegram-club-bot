@@ -38,6 +38,11 @@ from admin_subscriptions import (
     get_admin_subscription_details,
     list_admin_subscriptions,
 )
+from admin_system import (
+    collect_admin_system,
+    get_admin_delivery_details,
+    list_admin_deliveries,
+)
 from scheduled_jobs import (
     claim_pending_message_deliveries,
     enqueue_message_delivery,
@@ -8017,6 +8022,105 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
         self.assertEqual(len(details["access_history"]), 1)
         self.assertEqual(len(details["payment_history"]), 1)
+
+    def test_miniapp_system_deliveries_and_scheduler_projection_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO message_delivery_events (
+                        delivery_key, telegram_id, delivery_type, status,
+                        attempt_count, claimed_at, lease_until, sent_at,
+                        next_attempt_at, payload_json, invite_link, last_error
+                    ) VALUES
+                        ('system-private-pending', 9801, 'stripe_user_message', 'pending', 0, NULL, NULL, NULL, NOW() + INTERVAL '1 hour', '{"text":"private cus_secret"}', 'https://private.example/invite', NULL),
+                        ('system-private-failed', 9802, 'access_restore_invite', 'failed', 3, NOW() - INTERVAL '2 hours', NULL, NULL, NOW() + INTERVAL '5 minutes', '{"token":"gift_secret"}', NULL, 'network timeout for sub_secret'),
+                        ('system-private-permanent', 9803, 'subscription_expired_user', 'permanently_failed', 9, NOW() - INTERVAL '3 hours', NULL, NULL, NULL, '{"text":"private pi_secret"}', NULL, 'forbidden cus_secret'),
+                        ('system-private-sent', 9804, 'free_lesson', 'sent', 1, NOW() - INTERVAL '1 hour', NULL, NOW(), NULL, '{"text":"private"}', NULL, NULL)
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO scheduled_job_runs (
+                        job_key, job_name, schedule_slot, status, owner_id,
+                        lease_until, started_at, updated_at, completed_at,
+                        error_text
+                    ) VALUES
+                        ('system-running-private', 'delivery_worker', 'slot-a', 'running', 'owner-private', NOW() - INTERVAL '1 minute', NOW() - INTERVAL '2 hours', NOW(), NULL, NULL),
+                        ('system-failed-private', 'subscription_check', 'slot-b', 'failed', NULL, NULL, NOW() - INTERVAL '1 hour', NOW(), NULL, 'failure with cus_secret')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, updated_at
+                    ) VALUES (9802, 'telegram_failed', 'subscription_expired', NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO admin_alerts (
+                        alert_key, severity, text, status, created_at, updated_at
+                    ) VALUES ('system-alert-private', 'HIGH', 'private alert payload', 'delivered', NOW(), NOW())
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        system = collect_admin_system(
+            self.get_conn,
+            lambda: {"pool_available": 4, "pool_used": 1, "db_url": "private"},
+            9,
+        )
+        self.assertEqual(system["deliveries"], {
+            "pending": 1, "processing": 0, "failed": 1,
+            "permanently_failed": 1, "sent_last_24h": 1,
+        })
+        self.assertEqual(system["scheduler"]["running"], 1)
+        self.assertEqual(system["scheduler"]["failed_last_24h"], 1)
+        self.assertEqual(system["scheduler"]["stale"], 1)
+        self.assertEqual(system["removals"]["retryable"], 1)
+        self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
+        self.assertEqual(system["migrations"]["count"], 17)
+        self.assertEqual(system["migrations"]["latest"], "0017_miniapp_admin_sessions")
+        self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
+        system_json = json.dumps(system)
+        for forbidden in (
+            "system-running-private", "owner-private", "failure with cus_secret",
+            "private alert payload", "db_url",
+        ):
+            self.assertNotIn(forbidden, system_json)
+
+        permanent = list_admin_deliveries(
+            self.get_conn, status="permanently_failed", limit=50
+        )
+        self.assertEqual(len(permanent["items"]), 1)
+        item = permanent["items"][0]
+        self.assertEqual(item["delivery_label"], "Сообщение о завершении подписки")
+        self.assertTrue(item["requires_attention"])
+        self.assertEqual(item["telegram_id"], 9803)
+        serialized = json.dumps(item)
+        for forbidden in (
+            "system-private-permanent", "private pi_secret", "forbidden cus_secret",
+            "payload_json", "invite_link",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+        details = get_admin_delivery_details(self.get_conn, item["delivery_id"])
+        self.assertEqual(details["delivery_reference"], item["delivery_reference"])
+        self.assertEqual(details["last_error"]["category"], "recipient_unavailable")
+        self.assertNotIn("cus_secret", json.dumps(details))
+
+        first = list_admin_deliveries(self.get_conn, limit=2)
+        second = list_admin_deliveries(
+            self.get_conn, limit=2, cursor=first["next_cursor"]
+        )
+        first_ids = {item["delivery_id"] for item in first["items"]}
+        second_ids = {item["delivery_id"] for item in second["items"]}
+        self.assertFalse(first_ids & second_ids)
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -17,6 +17,15 @@
   const subscriptionsMore = document.getElementById("subscriptions-more");
   const subscriptionDetailsContent = document.getElementById("subscription-details-content");
   const subscriptionMetricNodes = document.querySelectorAll("[data-subscription-metric]");
+  const systemMetricNodes = document.querySelectorAll("[data-system-metric]");
+  const systemAttention = document.getElementById("system-attention");
+  const systemDeliveryMetrics = document.getElementById("system-delivery-metrics");
+  const systemMigrations = document.getElementById("system-migrations");
+  const schedulerRuns = document.getElementById("scheduler-runs");
+  const deliveriesStatus = document.getElementById("deliveries-status");
+  const deliveriesList = document.getElementById("deliveries-list");
+  const deliveriesMore = document.getElementById("deliveries-more");
+  const deliveryDetailsContent = document.getElementById("delivery-details-content");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -25,6 +34,7 @@
   let searchTimer = null;
   let subscriptionsCursor = null;
   let subscriptionsSearchTimer = null;
+  let deliveriesCursor = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -186,6 +196,94 @@
     }).catch(showApiError);
   }
 
+  const replaceDefinitionList = (container, pairs) => {
+    container.replaceChildren();
+    pairs.forEach(([label, value]) => {
+      const row = document.createElement("div");
+      row.append(text("dt", label), text("dd", value));
+      container.append(row);
+    });
+  };
+  const deliveryCard = (delivery) => {
+    const article = document.createElement("article");
+    article.className = `card user-card${delivery.requires_attention ? " attention" : ""}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("h2", delivery.delivery_label));
+    button.append(text("p", `Telegram ID: ${delivery.telegram_id}`));
+    button.append(text("p", `Reference: ${delivery.delivery_reference}`));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", delivery.status, "badge"));
+    badges.append(text("span", `Попыток: ${delivery.attempt_count}`, "badge"));
+    if (delivery.requires_attention) badges.append(text("span", "⚠️ Требует внимания", "badge attention-label"));
+    button.append(badges);
+    if (delivery.explanation) button.append(text("p", delivery.explanation));
+    button.addEventListener("click", () => loadDeliveryDetails(delivery.delivery_id));
+    article.append(button);
+    return article;
+  };
+  const loadDeliveries = (append = false) => {
+    const params = new URLSearchParams({limit: "25", status: deliveriesStatus.value});
+    if (append && deliveriesCursor) params.set("cursor", deliveriesCursor);
+    return api(`/api/admin/deliveries?${params.toString()}`).then((data) => {
+      if (!append) deliveriesList.replaceChildren();
+      data.items.forEach((delivery) => deliveriesList.append(deliveryCard(delivery)));
+      deliveriesCursor = data.next_cursor;
+      deliveriesMore.hidden = !data.has_more;
+    });
+  };
+  const loadSystem = () => {
+    status.textContent = "Загружаем состояние системы…";
+    return Promise.all([api("/api/admin/system"), loadDeliveries(false)]).then(([data]) => {
+      systemMetricNodes.forEach((node) => {
+        if (node.dataset.systemMetric === "database") {
+          node.textContent = data.database.connection_errors ? "Проблема" : "OK";
+        } else {
+          node.textContent = String(valueAtPath(data, node.dataset.systemMetric) ?? "—");
+        }
+      });
+      replaceDefinitionList(systemAttention, [
+        ["Permanently failed deliveries", data.deliveries.permanently_failed],
+        ["Failed scheduler jobs 24h", data.scheduler.failed_last_24h],
+        ["Retryable removals", data.removals.retryable],
+      ]);
+      replaceDefinitionList(systemDeliveryMetrics, [
+        ["Pending", data.deliveries.pending], ["Processing", data.deliveries.processing],
+        ["Failed", data.deliveries.failed], ["Permanently failed", data.deliveries.permanently_failed],
+        ["Sent 24h", data.deliveries.sent_last_24h],
+      ]);
+      replaceDefinitionList(systemMigrations, [
+        ["Количество", data.migrations.count], ["Последняя", data.migrations.latest],
+        ["Применена", formatDate(data.migrations.latest_applied_at)],
+      ]);
+      schedulerRuns.replaceChildren();
+      data.scheduler.recent_runs.forEach((run) => {
+        const item = document.createElement("div");
+        item.className = "compact-item";
+        item.append(text("strong", run.job_name), text("span", run.status));
+        if (run.stale) item.append(text("span", "⚠️ Просроченный lease", "attention-label"));
+        if (run.error.category) item.append(text("span", `${run.error.category} · ${run.error.reference}`));
+        schedulerRuns.append(item);
+      });
+      showScreen("system");
+      status.textContent = "Состояние системы";
+    });
+  };
+  function loadDeliveryDetails(deliveryId) {
+    status.textContent = "Загружаем доставку…";
+    return api(`/api/admin/deliveries/${encodeURIComponent(deliveryId)}`).then((delivery) => {
+      deliveryDetailsContent.replaceChildren();
+      deliveryDetailsContent.append(
+        detailCard("Доставка", [["Reference", delivery.delivery_reference], ["Тип", delivery.delivery_label], ["Статус", delivery.status], ["Telegram ID", delivery.telegram_id], ["Попытки", delivery.attempt_count]]),
+        detailCard("Время", [["Claimed", formatDate(delivery.claimed_at)], ["Lease до", formatDate(delivery.lease_until)], ["Следующая попытка", formatDate(delivery.next_attempt_at)], ["Отправлено", formatDate(delivery.sent_at)]]),
+        detailCard("Ошибка", [["Категория", delivery.last_error.category], ["Safe reference", delivery.last_error.reference], ["Пояснение", delivery.explanation]])
+      );
+      showScreen("delivery-details");
+      status.textContent = "Событие доставки";
+    }).catch(showApiError);
+  }
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -198,6 +296,7 @@
       if (button.dataset.nav === "overview") loadDashboard().catch(showApiError);
       else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
       else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
+      else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
       else showScreen(button.dataset.nav);
     });
   });
@@ -216,6 +315,9 @@
     subscriptionsSearchTimer = window.setTimeout(() => loadSubscriptions().catch(showApiError), 300);
   });
   document.getElementById("subscriptions-back").addEventListener("click", () => showScreen("subscriptions"));
+  deliveriesMore.addEventListener("click", () => loadDeliveries(true).catch(showApiError));
+  deliveriesStatus.addEventListener("change", () => loadDeliveries(false).catch(showApiError));
+  document.getElementById("deliveries-back").addEventListener("click", () => showScreen("system"));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",
