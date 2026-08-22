@@ -57,6 +57,7 @@ from miniapp_sessions import (
     revoke_miniapp_admin_session,
 )
 from admin_dashboard import collect_admin_dashboard
+from admin_users import get_admin_user_details, list_admin_users
 
 
 POSTGRES_TEST_DSN = os.getenv("POSTGRES_TEST_DSN")
@@ -391,6 +392,91 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         serialized = json.dumps(dashboard)
         for forbidden in ("cus_private", "telegram_id", "stripe_customer_id", "payload_json"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_miniapp_users_filters_search_pagination_and_details_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        telegram_id, username, first_name, last_name, paid,
+                        expiry_date, auto_renew, payment_failed,
+                        payment_failed_at, grace_period_end, trial_used,
+                        first_payment_done, stripe_customer_id,
+                        stripe_subscription_id, registered_at
+                    ) VALUES
+                        (9101, 'active_user', 'Active', NULL, TRUE, NOW() + INTERVAL '5 days', TRUE, FALSE, NULL, NULL, FALSE, TRUE, 'cus_raw_active_123456', 'sub_raw_active_654321', NOW() - INTERVAL '1 minute'),
+                        (9102, 'trial_user', 'Trial', NULL, TRUE, NOW() + INTERVAL '2 days', FALSE, FALSE, NULL, NULL, TRUE, FALSE, NULL, NULL, NOW() - INTERVAL '2 minutes'),
+                        (9103, 'grace_user', 'Grace', NULL, TRUE, NOW() - INTERVAL '1 day', TRUE, TRUE, NOW(), NOW() + INTERVAL '1 day', FALSE, TRUE, 'cus_raw_grace_111111', 'sub_raw_grace_222222', NOW() - INTERVAL '3 minutes'),
+                        (9104, 'expired_user', 'Expired', NULL, TRUE, NOW() - INTERVAL '2 days', FALSE, FALSE, NULL, NULL, FALSE, TRUE, NULL, NULL, NOW() - INTERVAL '4 minutes'),
+                        (9105, 'percent%name', 'Percent', NULL, FALSE, NULL, FALSE, FALSE, NULL, NULL, FALSE, FALSE, NULL, NULL, NOW() - INTERVAL '5 minutes'),
+                        (9106, 'inactive_user', 'Inactive', NULL, FALSE, NULL, TRUE, FALSE, NULL, NULL, FALSE, FALSE, NULL, NULL, NOW() - INTERVAL '6 minutes')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, access_expiry, updated_at
+                    ) VALUES (9101, 'pending', 'subscription_expired', NOW() + INTERVAL '5 days', NOW())
+                    """
+                )
+                for index in range(12):
+                    cur.execute(
+                        """
+                        INSERT INTO access_events (
+                            telegram_id, event_type, source, old_expiry,
+                            new_expiry, created_at
+                        ) VALUES (9101, 'access_extended', 'invoice.payment_succeeded', NOW(), NOW() + INTERVAL '1 day', NOW() - (%s * INTERVAL '1 minute'))
+                        """,
+                        (index,),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        def ids(status="all", query=""):
+            return {
+                item["telegram_id"] for item in list_admin_users(
+                    self.get_conn, limit=50, status=status, query=query
+                )["items"]
+            }
+
+        self.assertEqual(ids("active"), {9101, 9102, 9103})
+        self.assertEqual(ids("trial"), {9102})
+        self.assertEqual(ids("failed_payment"), {9103})
+        self.assertEqual(ids("active_grace"), {9103})
+        self.assertEqual(ids("expired"), {9104})
+        self.assertEqual(ids("auto_renew"), {9101, 9103})
+        self.assertEqual(ids("non_renewing"), {9102, 9104})
+        self.assertEqual(ids(query="9101"), {9101})
+        self.assertEqual(ids(query="TRIAL"), {9102})
+        self.assertEqual(ids(query="%"), {9105})
+
+        first_page = list_admin_users(self.get_conn, limit=2)
+        second_page = list_admin_users(
+            self.get_conn, limit=2, cursor=first_page["next_cursor"]
+        )
+        first_ids = [item["telegram_id"] for item in first_page["items"]]
+        second_ids = [item["telegram_id"] for item in second_page["items"]]
+        self.assertEqual(first_ids, [9101, 9102])
+        self.assertEqual(second_ids, [9103, 9104])
+        self.assertFalse(set(first_ids) & set(second_ids))
+
+        details = get_admin_user_details(self.get_conn, 9101)
+        self.assertEqual(details["access_status"], "active")
+        self.assertEqual(details["access_type"], "paid")
+        self.assertEqual(details["removal"]["status"], "pending")
+        self.assertEqual(len(details["access_history"]), 10)
+        serialized = json.dumps(details)
+        self.assertIn("cus_***123456", serialized)
+        self.assertIn("sub_***654321", serialized)
+        self.assertNotIn("cus_raw_active_123456", serialized)
+        self.assertNotIn("sub_raw_active_654321", serialized)
+        list_serialized = json.dumps(first_page)
+        self.assertNotIn("cus_", list_serialized)
+        self.assertNotIn("sub_", list_serialized)
 
     def test_subscription_removal_fencing_migration_is_idempotent_and_rejects_new_invalid_rows(self):
         first = run_migrations(self.get_conn)

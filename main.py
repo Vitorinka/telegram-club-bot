@@ -113,6 +113,12 @@ from miniapp_sessions import (
     revoke_miniapp_admin_session,
 )
 from admin_dashboard import collect_admin_dashboard
+from admin_users import (
+    AdminUsersQueryError,
+    get_admin_user_details,
+    list_admin_users,
+    parse_users_limit,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21562,6 +21568,41 @@ async def miniapp_admin_dashboard(request):
     return apply_miniapp_security_headers(web.json_response(dashboard))
 
 
+async def miniapp_admin_users(request):
+    try:
+        limit = parse_users_limit(request.query.get("limit"))
+        result = list_admin_users(
+            get_db_conn,
+            limit=limit,
+            cursor=request.query.get("cursor"),
+            query=request.query.get("q", ""),
+            status=request.query.get("status", "all"),
+        )
+    except AdminUsersQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_user_details(request):
+    try:
+        details = get_admin_user_details(
+            get_db_conn, request.match_info.get("telegram_id")
+        )
+    except AdminUsersQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_telegram_id"},
+            status=400,
+        ))
+    if details is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "user_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(details))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21599,6 +21640,12 @@ def create_app():
         app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     if not _route_exists(app, "GET", "/api/admin/dashboard"):
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
+    if not _route_exists(app, "GET", "/api/admin/users"):
+        app.router.add_get('/api/admin/users', miniapp_admin_users)
+    if not _route_exists(app, "GET", "/api/admin/users/{telegram_id}"):
+        app.router.add_get(
+            '/api/admin/users/{telegram_id}', miniapp_admin_user_details
+        )
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
         app.on_startup.append(on_startup)
