@@ -119,6 +119,12 @@ from admin_users import (
     list_admin_users,
     parse_users_limit,
 )
+from admin_subscriptions import (
+    AdminSubscriptionsQueryError,
+    get_admin_subscription_details,
+    list_admin_subscriptions,
+    parse_subscriptions_limit,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21603,6 +21609,40 @@ async def miniapp_admin_user_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+async def miniapp_admin_subscriptions(request):
+    try:
+        result = list_admin_subscriptions(
+            get_db_conn,
+            limit=parse_subscriptions_limit(request.query.get("limit")),
+            cursor=request.query.get("cursor"),
+            query=request.query.get("q", ""),
+            state=request.query.get("state", "all"),
+        )
+    except AdminSubscriptionsQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_subscription_details(request):
+    try:
+        details = get_admin_subscription_details(
+            get_db_conn, request.match_info.get("telegram_id")
+        )
+    except AdminSubscriptionsQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_telegram_id"},
+            status=400,
+        ))
+    if details is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "subscription_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(details))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21645,6 +21685,15 @@ def create_app():
     if not _route_exists(app, "GET", "/api/admin/users/{telegram_id}"):
         app.router.add_get(
             '/api/admin/users/{telegram_id}', miniapp_admin_user_details
+        )
+    if not _route_exists(app, "GET", "/api/admin/subscriptions"):
+        app.router.add_get(
+            '/api/admin/subscriptions', miniapp_admin_subscriptions
+        )
+    if not _route_exists(app, "GET", "/api/admin/subscriptions/{telegram_id}"):
+        app.router.add_get(
+            '/api/admin/subscriptions/{telegram_id}',
+            miniapp_admin_subscription_details,
         )
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:

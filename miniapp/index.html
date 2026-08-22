@@ -64,8 +64,33 @@
       <button id="users-back" class="secondary" type="button">← К пользователям</button>
       <div id="user-details-content" class="dashboard"></div>
     </section>
-    <section class="screen page" data-screen="subscriptions" hidden>
-      <article class="card"><h2>Подписки</h2><p>Раздел в разработке</p></article>
+    <section id="subscriptions-screen" class="screen page" data-screen="subscriptions" hidden>
+      <article class="card">
+        <h2>Подписки</h2>
+        <div id="subscriptions-summary" class="summary-grid" aria-label="Сводка подписок">
+          <div><span>Активные</span><strong data-subscription-metric="active">—</strong></div>
+          <div><span>Grace</span><strong data-subscription-metric="grace">—</strong></div>
+          <div><span>Ошибка оплаты</span><strong data-subscription-metric="failed_payment">—</strong></div>
+          <div><span>Не продлеваются</span><strong data-subscription-metric="non_renewing">—</strong></div>
+          <div><span>Требуют внимания</span><strong data-subscription-metric="needs_attention">—</strong></div>
+        </div>
+        <label class="search-label" for="subscriptions-search">Telegram ID или username</label>
+        <input id="subscriptions-search" type="search" maxlength="64" autocomplete="off">
+        <select id="subscriptions-state" aria-label="Статус подписок">
+          <option value="all">Все</option>
+          <option value="active">Активные</option>
+          <option value="active_grace">Grace</option>
+          <option value="failed_payment">Ошибка оплаты</option>
+          <option value="non_renewing">Без автопродления</option>
+          <option value="completed">Завершённые</option>
+        </select>
+      </article>
+      <div id="subscriptions-list" class="user-list"></div>
+      <button id="subscriptions-more" type="button" hidden>Показать ещё</button>
+    </section>
+    <section id="subscription-details" class="screen page" data-screen="subscription-details" hidden>
+      <button id="subscriptions-back" class="secondary" type="button">← К подпискам</button>
+      <div id="subscription-details-content" class="dashboard"></div>
     </section>
     <section class="screen page" data-screen="system" hidden>
       <article class="card"><h2>Система</h2><p>Системные показатели доступны в разделе «Обзор».</p></article>

@@ -34,6 +34,10 @@ from access_mismatch_observability import (
     load_access_mismatch_counts,
     load_access_mismatch_samples,
 )
+from admin_subscriptions import (
+    get_admin_subscription_details,
+    list_admin_subscriptions,
+)
 from scheduled_jobs import (
     claim_pending_message_deliveries,
     enqueue_message_delivery,
@@ -7908,6 +7912,111 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     ),
                     ("pending", None, None, None, None, None, 0, None),
                 )
+
+    def test_miniapp_subscriptions_filters_pagination_and_details_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        telegram_id, username, first_name, paid, expiry_date,
+                        auto_renew, payment_failed, payment_failed_at,
+                        grace_period_end, trial_used, first_payment_done,
+                        stripe_customer_id, stripe_subscription_id, registered_at
+                    ) VALUES
+                        (9701, 'renewing', 'Renewing', TRUE, NOW() + INTERVAL '10 days', TRUE, FALSE, NULL, NULL, FALSE, TRUE, 'cus_private_9701', 'sub_private_9701', NOW()),
+                        (9702, 'nonrenewing', 'Nonrenewing', TRUE, NOW() + INTERVAL '5 days', FALSE, FALSE, NULL, NULL, FALSE, TRUE, 'cus_private_9702', NULL, NOW()),
+                        (9703, 'active_grace', 'Grace', TRUE, NOW() - INTERVAL '1 day', TRUE, TRUE, NOW(), NOW() + INTERVAL '1 day', FALSE, TRUE, 'cus_private_9703', 'sub_private_9703', NOW()),
+                        (9704, 'expired_grace', 'Expired Grace', TRUE, NOW() - INTERVAL '2 days', TRUE, TRUE, NOW() - INTERVAL '3 days', NOW() - INTERVAL '1 day', FALSE, TRUE, 'cus_private_9704', 'sub_private_9704', NOW()),
+                        (9705, 'ordinary_expired', 'Expired', TRUE, NOW() - INTERVAL '3 days', FALSE, FALSE, NULL, NULL, FALSE, TRUE, NULL, NULL, NOW()),
+                        (9706, 'no_stripe', 'No Stripe', FALSE, NULL, FALSE, FALSE, NULL, NULL, FALSE, FALSE, NULL, NULL, NOW()),
+                        (9707, 'retry_removal', 'Retry', TRUE, NOW() - INTERVAL '4 days', TRUE, FALSE, NULL, NULL, FALSE, TRUE, 'cus_private_9707', 'sub_private_9707', NOW()),
+                        (9708, 'completed_removal', 'Completed', FALSE, NOW() - INTERVAL '5 days', FALSE, FALSE, NULL, NULL, FALSE, TRUE, NULL, NULL, NOW()),
+                        (9709, 'literal_percent%name', 'Wildcard', FALSE, NULL, FALSE, FALSE, NULL, NULL, FALSE, FALSE, NULL, NULL, NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, access_expiry,
+                        stripe_canceled_at, telegram_banned_at, updated_at
+                    ) VALUES
+                        (9707, 'telegram_failed', 'subscription_expired', NOW() - INTERVAL '4 days', NOW(), NULL, NOW()),
+                        (9708, 'db_finalized', 'subscription_expired', NOW() - INTERVAL '5 days', NOW(), NOW(), NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO access_events (
+                        telegram_id, event_type, source, old_expiry,
+                        new_expiry, created_at
+                    ) VALUES (9701, 'access_extended', 'stripe_invoice', NULL, NOW() + INTERVAL '10 days', NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO payment_events (
+                        stripe_event_id, event_type, telegram_id,
+                        payment_status, payment_kind, tariff_code,
+                        stripe_customer_id, stripe_subscription_id, created_at
+                    ) VALUES ('evt_private_9701', 'invoice.payment_succeeded', 9701,
+                              'succeeded', 'initial_subscription', 'monthly',
+                              'cus_private_9701', 'sub_private_9701', NOW())
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        def ids(state, query=""):
+            return [
+                item["telegram_id"] for item in list_admin_subscriptions(
+                    self.get_conn, state=state, query=query, limit=50
+                )["items"]
+            ]
+
+        self.assertIn(9701, ids("active"))
+        self.assertIn(9703, ids("active"))
+        self.assertNotIn(9704, ids("active"))
+        self.assertEqual(ids("active_grace"), [9703])
+        self.assertEqual(ids("expired_grace"), [9704])
+        self.assertEqual(set(ids("failed_payment")), {9703, 9704})
+        self.assertIn(9702, ids("non_renewing"))
+        self.assertIn(9706, ids("no_stripe"))
+        self.assertEqual(ids("removal_retry"), [9707])
+        self.assertEqual(ids("completed"), [9708])
+        self.assertEqual(ids("all", "9701"), [9701])
+        self.assertEqual(ids("all", "percent%"), [9709])
+
+        first = list_admin_subscriptions(self.get_conn, limit=3)
+        second = list_admin_subscriptions(
+            self.get_conn, limit=3, cursor=first["next_cursor"]
+        )
+        first_ids = {row["telegram_id"] for row in first["items"]}
+        second_ids = {row["telegram_id"] for row in second["items"]}
+        self.assertFalse(first_ids & second_ids)
+
+        grace = next(
+            row for row in list_admin_subscriptions(
+                self.get_conn, state="active_grace"
+            )["items"] if row["telegram_id"] == 9703
+        )
+        self.assertEqual(grace["subscription_state"], "active_grace")
+        self.assertEqual(grace["access_status"], "active_grace")
+        self.assertTrue(grace["needs_attention"])
+        self.assertNotIn("cus_private", json.dumps(grace))
+        self.assertNotIn("sub_private", json.dumps(grace))
+
+        details = get_admin_subscription_details(self.get_conn, 9701)
+        self.assertEqual(details["stripe"]["customer_id"], "cus_***e_9701")
+        self.assertEqual(details["stripe"]["subscription_id"], "sub_***e_9701")
+        serialized = json.dumps(details)
+        for forbidden in ("cus_private_9701", "sub_private_9701", "evt_private_9701"):
+            self.assertNotIn(forbidden, serialized)
+        self.assertEqual(len(details["access_history"]), 1)
+        self.assertEqual(len(details["payment_history"]), 1)
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:
