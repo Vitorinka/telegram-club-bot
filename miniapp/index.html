@@ -98,7 +98,7 @@
     </section>
     <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
       <article class="card">
-        <h2>Расписание</h2>
+        <h2 id="schedule-heading">Расписание</h2>
         <p class="hint">В проекте расписание хранится как одна опубликованная картинка на месяц.</p>
         <button id="schedule-upload-open" type="button">Загрузить расписание</button>
         <div class="summary-grid">
@@ -111,6 +111,7 @@
           <button type="button" data-schedule-range="7">7 дней</button>
           <button type="button" data-schedule-range="30">30 дней</button>
           <button type="button" data-schedule-range="future">Все будущие</button>
+          <button type="button" data-schedule-range="archive">Архив</button>
         </div>
       </article>
       <div id="schedule-list" class="user-list"></div>

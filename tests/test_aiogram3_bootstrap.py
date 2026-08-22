@@ -9182,7 +9182,22 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         list_schedule.assert_called_once_with(
             self.main.get_db_conn, from_value="2026-08-01", to_value="2026-10-01",
-            status="upcoming", limit=50, cursor=None,
+            status="upcoming", period="range", limit=50, cursor=None,
+        )
+
+        archive_request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/schedule",
+            query={"period": "archive", "limit": "25"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_schedule", return_value=result) as archive_list:
+            archive_response = await self.main.miniapp_admin_auth_middleware(
+                archive_request, handler
+            )
+        self.assertEqual(archive_response.status, 200)
+        archive_list.assert_called_once_with(
+            self.main.get_db_conn, from_value=None, to_value=None,
+            status="all", period="archive", limit=25, cursor=None,
         )
 
     async def test_miniapp_schedule_write_routes_are_centrally_bearer_protected(self):
@@ -9257,7 +9272,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for query in (
             {"from": "bad"}, {"to": "bad"},
             {"from": "2026-10-01", "to": "2026-08-01"},
-            {"limit": "51"}, {"status": "active"},
+            {"limit": "51"}, {"status": "active"}, {"period": "history"},
         ):
             request = FakeMiniAppRequest(
                 app, "Bearer token", path="/api/admin/schedule", query=query
@@ -9495,6 +9510,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("loadSystem", javascript)
         self.assertIn("data-nav=\"schedule\"", index)
         self.assertIn("loadSchedule", javascript)
+        self.assertIn('data-schedule-range="archive"', index)
+        self.assertIn('params.set("period", "archive")', javascript)
+        self.assertIn("Архивных расписаний пока нет.", javascript)
         self.assertIn("/image`,", javascript)
         self.assertIn("Authorization: `Bearer ${sessionToken}`", javascript)
         self.assertIn("response.blob()", javascript)

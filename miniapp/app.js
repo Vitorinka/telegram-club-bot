@@ -27,6 +27,7 @@
   const deliveriesMore = document.getElementById("deliveries-more");
   const deliveryDetailsContent = document.getElementById("delivery-details-content");
   const scheduleList = document.getElementById("schedule-list");
+  const scheduleHeading = document.getElementById("schedule-heading");
   const scheduleEmpty = document.getElementById("schedule-empty");
   const scheduleMore = document.getElementById("schedule-more");
   const scheduleDetailsContent = document.getElementById("schedule-details-content");
@@ -363,7 +364,9 @@
   const scheduleParams = (append) => {
     const today = moscowDate();
     const params = new URLSearchParams({limit: "25", status: "all"});
-    if (scheduleRange === "today") {
+    if (scheduleRange === "archive") {
+      params.set("period", "archive");
+    } else if (scheduleRange === "today") {
       params.set("from", today); params.set("to", today);
     } else if (scheduleRange === "7" || scheduleRange === "30") {
       params.set("from", today); params.set("to", addDays(today, Number(scheduleRange)));
@@ -431,6 +434,7 @@
     badges.append(text("span", schedule.status === "upcoming" ? "Опубликовано" : "Прошедшее", "badge"));
     badges.append(text("span", "Изображение загружено", "badge"));
     button.append(badges);
+    button.append(text("p", `Обновлено: ${formatDate(schedule.updated_at)}`, "hint"));
     button.addEventListener("click", () => loadScheduleDetails(schedule.schedule_id));
     article.append(button);
     return article;
@@ -447,11 +451,18 @@
       scheduleCursor = data.next_cursor;
       scheduleMore.hidden = !data.has_more;
       scheduleEmpty.hidden = scheduleList.children.length !== 0;
+      const archive = scheduleRange === "archive";
+      scheduleHeading.textContent = archive ? "Архив расписаний" : "Расписание";
+      scheduleEmpty.textContent = archive
+        ? "Архивных расписаний пока нет."
+        : "На выбранный период расписаний нет.";
       scheduleMetricNodes.forEach((node) => {
         node.textContent = String(data.summary[node.dataset.scheduleMetric] ?? "—");
       });
       showScreen("schedule");
-      status.textContent = data.items.length ? "Расписание клуба" : "На выбранный период расписаний нет";
+      status.textContent = data.items.length
+        ? (archive ? "Архив расписаний" : "Расписание клуба")
+        : scheduleEmpty.textContent;
     });
   };
   function loadScheduleDetails(scheduleId) {

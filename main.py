@@ -21729,6 +21729,7 @@ async def miniapp_admin_schedule(request):
             from_value=request.query.get("from"),
             to_value=request.query.get("to"),
             status=request.query.get("status", "all"),
+            period=request.query.get("period", "range"),
             limit=parse_schedule_limit(request.query.get("limit")),
             cursor=request.query.get("cursor"),
         )
