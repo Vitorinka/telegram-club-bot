@@ -68,6 +68,12 @@ input, select {
 .user-card button { margin: 0; text-align: left; background: transparent; color: inherit; padding: 0; }
 .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .badge { padding: 4px 8px; border: 1px solid currentColor; border-radius: 999px; font-size: 12px; }
+.summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 18px; }
+.summary-grid div { display: grid; gap: 4px; padding: 10px; border-radius: 12px; background: var(--tg-theme-bg-color, #f4f7f7); }
+.summary-grid span { color: var(--tg-theme-hint-color, #618080); font-size: 12px; }
+.summary-grid strong { font-size: 20px; }
+.user-card.attention { border: 2px solid var(--tg-theme-destructive-text-color, #b34747); }
+.attention-label { font-weight: 800; }
 .secondary { background: transparent; color: var(--tg-theme-link-color, #168787); border: 1px solid currentColor; }
 .bottom-nav {
   position: fixed; z-index: 10; left: 0; right: 0; bottom: 0;

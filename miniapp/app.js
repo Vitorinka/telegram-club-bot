@@ -11,12 +11,20 @@
   const usersList = document.getElementById("users-list");
   const usersMore = document.getElementById("users-more");
   const detailsContent = document.getElementById("user-details-content");
+  const subscriptionsSearch = document.getElementById("subscriptions-search");
+  const subscriptionsState = document.getElementById("subscriptions-state");
+  const subscriptionsList = document.getElementById("subscriptions-list");
+  const subscriptionsMore = document.getElementById("subscriptions-more");
+  const subscriptionDetailsContent = document.getElementById("subscription-details-content");
+  const subscriptionMetricNodes = document.querySelectorAll("[data-subscription-metric]");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
   let sessionToken = null;
   let usersCursor = null;
   let searchTimer = null;
+  let subscriptionsCursor = null;
+  let subscriptionsSearchTimer = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -117,6 +125,67 @@
     }).catch(showApiError);
   }
 
+  const subscriptionStateLabels = {
+    active_grace: "Активный grace", failed_payment: "Ошибка оплаты",
+    active_renewing: "Активна", active_non_renewing: "Не продлевается",
+    expired_grace: "Grace истёк", expired: "Истекла", inactive: "Неактивна",
+    unknown: "Статус неизвестен",
+  };
+  const formatDate = (value) => value ? new Date(value).toLocaleString("ru-RU") : "—";
+  const subscriptionCard = (subscription) => {
+    const article = document.createElement("article");
+    article.className = `card user-card${subscription.needs_attention ? " attention" : ""}`;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("h2", subscription.username ? `@${subscription.username}` : (subscription.first_name || "Без username")));
+    button.append(text("p", `Telegram ID: ${subscription.telegram_id}`));
+    button.append(text("p", `Доступ до: ${formatDate(subscription.expiry_date)}`));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", subscriptionStateLabels[subscription.subscription_state] || subscription.subscription_state, "badge"));
+    if (subscription.auto_renew) badges.append(text("span", "Автопродление", "badge"));
+    if (subscription.grace_period_end) badges.append(text("span", `Grace до ${formatDate(subscription.grace_period_end)}`, "badge"));
+    if (subscription.needs_attention) badges.append(text("span", "⚠️ Требует внимания", "badge attention-label"));
+    button.append(badges);
+    button.addEventListener("click", () => loadSubscriptionDetails(subscription.telegram_id));
+    article.append(button);
+    return article;
+  };
+  const loadSubscriptions = (append = false) => {
+    status.textContent = "Загружаем подписки…";
+    const params = new URLSearchParams({limit: "25", state: subscriptionsState.value});
+    if (subscriptionsSearch.value.trim()) params.set("q", subscriptionsSearch.value.trim());
+    if (append && subscriptionsCursor) params.set("cursor", subscriptionsCursor);
+    return api(`/api/admin/subscriptions?${params.toString()}`).then((data) => {
+      if (!append) subscriptionsList.replaceChildren();
+      data.items.forEach((subscription) => subscriptionsList.append(subscriptionCard(subscription)));
+      subscriptionsCursor = data.next_cursor;
+      subscriptionsMore.hidden = !data.has_more;
+      subscriptionMetricNodes.forEach((node) => {
+        node.textContent = String(data.summary[node.dataset.subscriptionMetric] ?? "—");
+      });
+      showScreen("subscriptions");
+      status.textContent = `Подписок показано: ${subscriptionsList.children.length}`;
+    });
+  };
+  function loadSubscriptionDetails(userId) {
+    status.textContent = "Загружаем подписку…";
+    return api(`/api/admin/subscriptions/${encodeURIComponent(userId)}`).then((subscription) => {
+      subscriptionDetailsContent.replaceChildren();
+      subscriptionDetailsContent.append(
+        detailCard("Пользователь", [["Telegram ID", subscription.telegram_id], ["Username", subscription.username ? `@${subscription.username}` : "—"], ["Имя", [subscription.first_name, subscription.last_name].filter(Boolean).join(" ") || "—"]]),
+        detailCard("Доступ", [["Статус", statusLabels[subscription.access_status] || subscription.access_status], ["Тип", typeLabels[subscription.access_type] || subscription.access_type], ["До", formatDate(subscription.expiry_date)], ["Состояние подписки", subscriptionStateLabels[subscription.subscription_state] || subscription.subscription_state]]),
+        detailCard("Оплата", [["Paid", subscription.paid ? "Да" : "Нет"], ["Автопродление", subscription.auto_renew ? "Да" : "Нет"], ["Ошибка оплаты", subscription.payment_failed ? "Да" : "Нет"], ["Ошибка с", formatDate(subscription.payment_failed_at)], ["Grace до", formatDate(subscription.grace_period_end)], ["Первый платёж", subscription.first_payment_done ? "Да" : "Нет"], ["Trial использован", subscription.trial_used ? "Да" : "Нет"]]),
+        detailCard("Stripe linkage", [["Customer", subscription.stripe.customer_id], ["Subscription", subscription.stripe.subscription_id]]),
+        detailCard("Удаление", subscription.removal ? [["Статус", subscription.removal.status], ["Причина", subscription.removal.reason], ["Access expiry", formatDate(subscription.removal.access_expiry)], ["Stripe отменена", formatDate(subscription.removal.stripe_canceled_at)], ["Telegram ban", formatDate(subscription.removal.telegram_banned_at)], ["Обновлено", formatDate(subscription.removal.updated_at)]] : [["Статус", "Нет операции"]]),
+        detailCard("История доступа", subscription.access_history.length ? subscription.access_history.map((event) => [event.event_type, `${event.source}: ${formatDate(event.old_expiry)} → ${formatDate(event.new_expiry)}`]) : [["События", "Нет"]]),
+        detailCard("История оплаты", subscription.payment_history.length ? subscription.payment_history.map((event) => [event.event_type, `${event.payment_status} · ${event.payment_kind} · ${event.tariff_code}`]) : [["События", "Нет"]])
+      );
+      showScreen("subscription-details");
+      status.textContent = "Подписка пользователя";
+    }).catch(showApiError);
+  }
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -128,6 +197,7 @@
     button.addEventListener("click", () => {
       if (button.dataset.nav === "overview") loadDashboard().catch(showApiError);
       else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
+      else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
       else showScreen(button.dataset.nav);
     });
   });
@@ -139,6 +209,13 @@
     searchTimer = window.setTimeout(() => loadUsers().catch(showApiError), 300);
   });
   document.getElementById("users-back").addEventListener("click", () => showScreen("users"));
+  subscriptionsMore.addEventListener("click", () => loadSubscriptions(true).catch(showApiError));
+  subscriptionsState.addEventListener("change", () => loadSubscriptions().catch(showApiError));
+  subscriptionsSearch.addEventListener("input", () => {
+    window.clearTimeout(subscriptionsSearchTimer);
+    subscriptionsSearchTimer = window.setTimeout(() => loadSubscriptions().catch(showApiError), 300);
+  });
+  document.getElementById("subscriptions-back").addEventListener("click", () => showScreen("subscriptions"));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",
