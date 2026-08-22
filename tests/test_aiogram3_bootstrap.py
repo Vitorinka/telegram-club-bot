@@ -9335,6 +9335,60 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(raw_file_id, combined)
         self.assertNotIn(raw_path, combined)
 
+    async def test_miniapp_gifts_routes_are_centrally_protected_and_read_only(self):
+        app = self.main.create_app()
+        list_handler = self.route_handler(app, "GET", "/api/admin/gifts")
+        details_handler = self.route_handler(app, "GET", "/api/admin/gifts/{gift_id}")
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/gifts"), list_handler
+        )
+        self.assertEqual(missing.status, 401)
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        result = {"items": [], "next_cursor": None, "has_more": False, "summary": {}}
+        request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/gifts",
+            query={"limit": "50", "status": "redeemed", "duration": "gift_6m", "q": "777"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_gifts", return_value=result) as list_gifts, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(request, list_handler)
+        self.assertEqual(response.status, 200)
+        list_gifts.assert_called_once_with(
+            self.main.get_db_conn, limit=50, cursor=None, query="777",
+            status="redeemed", duration="gift_6m",
+        )
+
+        details_request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/gifts/GIFT-ABCDEF0123456789",
+            match_info={"gift_id": "GIFT-ABCDEF0123456789"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_gift_details", return_value=None) as details:
+            missing_gift = await self.main.miniapp_admin_auth_middleware(
+                details_request, details_handler
+            )
+        self.assertEqual(missing_gift.status, 404)
+        details.assert_called_once_with(self.main.get_db_conn, "GIFT-ABCDEF0123456789")
+
+    async def test_miniapp_gifts_reject_invalid_queries(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/gifts")
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        for query in (
+            {"limit": "51"}, {"status": "expired"}, {"duration": "6m"},
+            {"q": "x" * 65}, {"cursor": "invalid"},
+        ):
+            request = FakeMiniAppRequest(
+                app, "Bearer token", path="/api/admin/gifts", query=query
+            )
+            with self.subTest(query=query), patch.object(
+                self.main, "load_miniapp_admin_session", return_value=session
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(request, handler)
+            self.assertEqual(response.status, 400)
+
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
         expected = {
@@ -9359,6 +9413,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/system", javascript)
         self.assertIn("/api/admin/deliveries", javascript)
         self.assertIn("/api/admin/schedule", javascript)
+        self.assertIn("/api/admin/gifts", javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
         self.assertIn("data-nav=", index)
@@ -9376,6 +9431,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("URL.revokeObjectURL", javascript)
         self.assertIn("Не удалось загрузить изображение", javascript)
         self.assertIn("blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
+        self.assertIn("id=\"open-gifts\"", index)
+        self.assertIn("Подарков пока нет.", index)
+        self.assertIn("loadGifts", javascript)
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):

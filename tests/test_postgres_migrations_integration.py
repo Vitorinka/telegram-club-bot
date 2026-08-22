@@ -49,6 +49,7 @@ from admin_schedule import (
     get_admin_schedule_details,
     list_admin_schedule,
 )
+from admin_gifts import get_admin_gift_details, list_admin_gifts
 from scheduled_jobs import (
     claim_pending_message_deliveries,
     enqueue_message_delivery,
@@ -8235,6 +8236,120 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(empty["items"], [])
         self.assertFalse(empty["has_more"])
+
+    def test_miniapp_gifts_filters_search_pagination_and_privacy_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (telegram_id, username, first_name, last_name)
+                    VALUES
+                        (88001, 'gift_buyer', 'Покупатель', 'Один'),
+                        (88002, 'gift_recipient', 'Получатель', 'Два')
+                    ON CONFLICT (telegram_id) DO NOTHING
+                """)
+                gifts = (
+                    ("00000000-0000-0000-0000-000000008101", "GIFT-0000000000008101", "gift_1m", 30, "paid_unclaimed", "Анна"),
+                    ("00000000-0000-0000-0000-000000008102", "GIFT-0000000000008102", "gift_1m", 30, "redeemed", "Мария"),
+                    ("00000000-0000-0000-0000-000000008103", "GIFT-0000000000008103", "gift_6m", 180, "redeemed", "Анастасия Иванова"),
+                    ("00000000-0000-0000-0000-000000008104", "GIFT-0000000000008104", "gift_12m", 365, "redeemed", None),
+                    ("00000000-0000-0000-0000-000000008105", "GIFT-0000000000008105", "gift_6m", 180, "refunded", "Ольга"),
+                    ("00000000-0000-0000-0000-000000008106", "GIFT-0000000000008106", "gift_12m", 365, "review_required", "Елена"),
+                )
+                for offset, gift in enumerate(gifts):
+                    gift_id, reference, tariff, days, status, certificate_name = gift
+                    cur.execute("""
+                        INSERT INTO gift_access_grants (
+                            id, public_reference, purchaser_telegram_id,
+                            recipient_telegram_id, recipient_name, tariff_code,
+                            duration_days, status, token_hash, token_version,
+                            stripe_session_id, stripe_payment_intent_id, checkout_url,
+                            certificate_name, paid_at, redeemed_at, applied_at,
+                            applied_expiry, refunded_at, created_at, updated_at,
+                            last_error, last_error_category
+                        ) VALUES (
+                            %s, %s, 88001, %s, 'Получатель из формы', %s, %s, %s,
+                            %s, 1, %s, %s, %s, %s,
+                            CASE WHEN %s IN ('checkout_pending', 'checkout_open') THEN NULL ELSE NOW() END,
+                            CASE WHEN %s = 'redeemed' THEN NOW() ELSE NULL END,
+                            CASE WHEN %s = 'redeemed' THEN NOW() ELSE NULL END,
+                            CASE WHEN %s = 'redeemed' THEN NOW() + INTERVAL '30 days' ELSE NULL END,
+                            CASE WHEN %s = 'refunded' THEN NOW() ELSE NULL END,
+                            NOW() - (%s * INTERVAL '1 minute'), NOW(),
+                            'raw private failure text',
+                            CASE WHEN %s = 'review_required' THEN 'manual_review_required' ELSE NULL END
+                        )
+                    """, (
+                        gift_id, reference, None if status == "paid_unclaimed" else 88002,
+                        tariff, days, status, f"raw-token-hash-{offset}",
+                        f"cs_private_{offset}", f"pi_private_{offset}",
+                        f"https://checkout.example/private/{offset}", certificate_name,
+                        status, status, status, status, status, offset, status,
+                    ))
+                cur.execute("""
+                    INSERT INTO gift_access_events (
+                        gift_id, public_reference, telegram_id, event_type,
+                        source, notes, created_at
+                    ) VALUES (
+                        '00000000-0000-0000-0000-000000008103',
+                        'GIFT-0000000000008103', 88002, 'gift_redeemed',
+                        'recipient_activation', 'raw token and Stripe secret', NOW()
+                    )
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        all_gifts = list_admin_gifts(self.get_conn)
+        self.assertEqual(len(all_gifts["items"]), 6)
+        self.assertEqual(all_gifts["summary"], {
+            "total": 6, "awaiting_activation": 1, "redeemed": 3,
+            "cancelled_or_refunded": 1, "requires_attention": 1,
+        })
+        self.assertEqual(len(list_admin_gifts(self.get_conn, query="88001")["items"]), 6)
+        self.assertEqual(len(list_admin_gifts(self.get_conn, query="88002")["items"]), 5)
+        by_name = list_admin_gifts(self.get_conn, query="Анастасия Иванова")
+        self.assertEqual([item["gift_id"] for item in by_name["items"]], ["GIFT-0000000000008103"])
+        self.assertEqual(
+            len(list_admin_gifts(self.get_conn, status="redeemed")["items"]), 3
+        )
+        self.assertEqual(
+            len(list_admin_gifts(self.get_conn, status="paid_unclaimed")["items"]), 1
+        )
+        self.assertEqual(
+            len(list_admin_gifts(self.get_conn, status="refunded")["items"]), 1
+        )
+        self.assertEqual(
+            len(list_admin_gifts(self.get_conn, duration="gift_6m")["items"]), 2
+        )
+        first = list_admin_gifts(self.get_conn, limit=2)
+        second = list_admin_gifts(self.get_conn, limit=2, cursor=first["next_cursor"])
+        self.assertFalse(
+            {item["gift_id"] for item in first["items"]}
+            & {item["gift_id"] for item in second["items"]}
+        )
+
+        details = get_admin_gift_details(self.get_conn, "GIFT-0000000000008103")
+        self.assertEqual(details["certificate_name"], "Анастасия Иванова")
+        self.assertEqual(details["purchaser"]["username"], "gift_buyer")
+        self.assertEqual(details["recipient"]["username"], "gift_recipient")
+        self.assertEqual(details["lifecycle_events"][0]["event_type"], "gift_redeemed")
+        serialized = json.dumps({"list": all_gifts, "details": details}, ensure_ascii=False)
+        for forbidden in (
+            "raw-token-hash", "cs_private", "pi_private", "checkout.example",
+            "raw private failure text", "raw token and Stripe secret", "token_hash",
+            "stripe_session_id", "stripe_payment_intent_id", "checkout_url", "notes",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+        verify_conn = self.get_conn()
+        try:
+            with verify_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM gift_access_grants")
+                self.assertEqual(cur.fetchone()[0], 6)
+        finally:
+            verify_conn.close()
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:
