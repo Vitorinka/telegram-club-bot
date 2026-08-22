@@ -100,6 +100,7 @@
       <article class="card">
         <h2>Расписание</h2>
         <p class="hint">В проекте расписание хранится как одна опубликованная картинка на месяц.</p>
+        <button id="schedule-upload-open" type="button">Загрузить расписание</button>
         <div class="summary-grid">
           <div><span>Текущий месяц</span><strong data-schedule-metric="current_month">—</strong></div>
           <div><span>Ближайшие 3 месяца</span><strong data-schedule-metric="next_three_months">—</strong></div>
@@ -115,6 +116,23 @@
       <div id="schedule-list" class="user-list"></div>
       <p id="schedule-empty" class="card" hidden>На выбранный период расписаний нет.</p>
       <button id="schedule-more" type="button" hidden>Показать ещё</button>
+    </section>
+    <section id="schedule-upload-screen" class="screen page" data-screen="schedule-upload" hidden>
+      <button id="schedule-upload-back" class="secondary" type="button">← К расписанию</button>
+      <article class="card upload-card">
+        <h2>Загрузить расписание</h2>
+        <label>Месяц <input id="schedule-upload-month" type="month" required></label>
+        <label>Изображение <input id="schedule-upload-file" type="file" accept="image/jpeg,image/png,image/webp" required></label>
+        <div id="schedule-upload-preview" class="schedule-preview">
+          <span class="schedule-image-loading">Выберите изображение</span>
+        </div>
+        <p id="schedule-upload-message" class="hint">Сначала проверьте локальное изображение, затем отправьте его на безопасную проверку.</p>
+        <div class="action-row">
+          <button id="schedule-upload-validate" type="button">Проверить</button>
+          <button id="schedule-upload-confirm" type="button" hidden>Подтвердить</button>
+          <button id="schedule-upload-cancel" class="secondary" type="button">Отмена</button>
+        </div>
+      </article>
     </section>
     <section id="schedule-details" class="screen page" data-screen="schedule-details" hidden>
       <button id="schedule-back" class="secondary" type="button">← К расписанию</button>

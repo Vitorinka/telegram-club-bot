@@ -85,6 +85,9 @@ input, select {
 .schedule-image { display: block; width: 100%; max-height: 360px; object-fit: contain; }
 .schedule-preview-large .schedule-image { max-height: 70vh; }
 .schedule-image-loading, .schedule-image-error { padding: 20px; color: var(--tg-theme-hint-color, #618080); text-align: center; }
+.upload-card label { display: grid; gap: 6px; margin: 14px 0; }
+.upload-card input { width: 100%; box-sizing: border-box; }
+.action-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .secondary { background: transparent; color: var(--tg-theme-link-color, #168787); border: 1px solid currentColor; }
 .bottom-nav {
   position: fixed; z-index: 10; left: 0; right: 0; bottom: 0;
