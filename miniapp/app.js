@@ -26,6 +26,11 @@
   const deliveriesList = document.getElementById("deliveries-list");
   const deliveriesMore = document.getElementById("deliveries-more");
   const deliveryDetailsContent = document.getElementById("delivery-details-content");
+  const scheduleList = document.getElementById("schedule-list");
+  const scheduleEmpty = document.getElementById("schedule-empty");
+  const scheduleMore = document.getElementById("schedule-more");
+  const scheduleDetailsContent = document.getElementById("schedule-details-content");
+  const scheduleMetricNodes = document.querySelectorAll("[data-schedule-metric]");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -35,6 +40,8 @@
   let subscriptionsCursor = null;
   let subscriptionsSearchTimer = null;
   let deliveriesCursor = null;
+  let scheduleCursor = null;
+  let scheduleRange = "future";
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -284,6 +291,80 @@
     }).catch(showApiError);
   }
 
+  const moscowDate = () => {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Moscow", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date()).reduce((result, part) => {
+      result[part.type] = part.value;
+      return result;
+    }, {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  };
+  const addDays = (isoDate, days) => {
+    const date = new Date(`${isoDate}T00:00:00Z`);
+    date.setUTCDate(date.getUTCDate() + days);
+    return date.toISOString().slice(0, 10);
+  };
+  const scheduleParams = (append) => {
+    const today = moscowDate();
+    const params = new URLSearchParams({limit: "25", status: "all"});
+    if (scheduleRange === "today") {
+      params.set("from", today); params.set("to", today);
+    } else if (scheduleRange === "7" || scheduleRange === "30") {
+      params.set("from", today); params.set("to", addDays(today, Number(scheduleRange)));
+    } else {
+      params.set("from", today); params.set("to", addDays(today, 730));
+      params.set("status", "upcoming");
+    }
+    if (append && scheduleCursor) params.set("cursor", scheduleCursor);
+    return params;
+  };
+  const scheduleCard = (schedule) => {
+    const article = document.createElement("article");
+    article.className = "card user-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", schedule.period_label, "eyebrow"));
+    button.append(text("h2", schedule.title));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", schedule.status === "upcoming" ? "Опубликовано" : "Прошедшее", "badge"));
+    badges.append(text("span", "Изображение загружено", "badge"));
+    button.append(badges);
+    button.addEventListener("click", () => loadScheduleDetails(schedule.schedule_id));
+    article.append(button);
+    return article;
+  };
+  const loadSchedule = (append = false) => {
+    status.textContent = "Загружаем расписание…";
+    return api(`/api/admin/schedule?${scheduleParams(append).toString()}`).then((data) => {
+      if (!append) scheduleList.replaceChildren();
+      data.items.forEach((schedule) => scheduleList.append(scheduleCard(schedule)));
+      scheduleCursor = data.next_cursor;
+      scheduleMore.hidden = !data.has_more;
+      scheduleEmpty.hidden = scheduleList.children.length !== 0;
+      scheduleMetricNodes.forEach((node) => {
+        node.textContent = String(data.summary[node.dataset.scheduleMetric] ?? "—");
+      });
+      showScreen("schedule");
+      status.textContent = data.items.length ? "Расписание клуба" : "На выбранный период расписаний нет";
+    });
+  };
+  function loadScheduleDetails(scheduleId) {
+    status.textContent = "Загружаем расписание…";
+    return api(`/api/admin/schedule/${encodeURIComponent(scheduleId)}`).then((schedule) => {
+      scheduleDetailsContent.replaceChildren();
+      scheduleDetailsContent.append(
+        detailCard("Основное", [["Название", schedule.title], ["Период", schedule.period_label], ["Статус", schedule.published ? "Опубликовано" : "Не опубликовано"]]),
+        detailCard("Тип", [["Источник", "Telegram-изображение"], ["Изображение", schedule.has_image ? "Настроено" : "Нет"], ["Join link", schedule.has_join_link ? "Настроена" : "Нет"]]),
+        detailCard("Описание", [["Описание", schedule.description || "Отдельное описание не хранится"]]),
+        detailCard("Техническая информация", [["Timezone", schedule.timezone], ["Создано", formatDate(schedule.created_at)], ["Обновлено", formatDate(schedule.updated_at)], ["Состояние", schedule.technical_information]])
+      );
+      showScreen("schedule-details");
+      status.textContent = schedule.period_label;
+    }).catch(showApiError);
+  }
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -297,6 +378,7 @@
       else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
       else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
       else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
+      else if (button.dataset.nav === "schedule") loadSchedule().catch(showApiError);
       else showScreen(button.dataset.nav);
     });
   });
@@ -318,6 +400,14 @@
   deliveriesMore.addEventListener("click", () => loadDeliveries(true).catch(showApiError));
   deliveriesStatus.addEventListener("change", () => loadDeliveries(false).catch(showApiError));
   document.getElementById("deliveries-back").addEventListener("click", () => showScreen("system"));
+  scheduleMore.addEventListener("click", () => loadSchedule(true).catch(showApiError));
+  document.querySelectorAll("[data-schedule-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      scheduleRange = button.dataset.scheduleRange;
+      loadSchedule(false).catch(showApiError);
+    });
+  });
+  document.getElementById("schedule-back").addEventListener("click", () => showScreen("schedule"));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",

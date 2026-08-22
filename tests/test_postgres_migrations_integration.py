@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from aiogram.fsm.storage.base import StorageKey
@@ -42,6 +43,10 @@ from admin_system import (
     collect_admin_system,
     get_admin_delivery_details,
     list_admin_deliveries,
+)
+from admin_schedule import (
+    get_admin_schedule_details,
+    list_admin_schedule,
 )
 from scheduled_jobs import (
     claim_pending_message_deliveries,
@@ -8121,6 +8126,82 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         first_ids = {item["delivery_id"] for item in first["items"]}
         second_ids = {item["delivery_id"] for item in second["items"]}
         self.assertFalse(first_ids & second_ids)
+
+    def test_miniapp_schedule_month_catalog_filters_and_privacy_real_postgres(self):
+        run_migrations(self.get_conn)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO club_schedules (
+                        schedule_month, telegram_file_id,
+                        uploaded_by_telegram_id, created_at, updated_at
+                    ) VALUES
+                        ('2026-07', 'telegram_secret_file_july', 9001, NOW() - INTERVAL '4 months', NOW()),
+                        ('2026-08', 'telegram_secret_file_august', 9002, NOW() - INTERVAL '3 months', NOW()),
+                        ('2026-09', 'telegram_secret_file_september', 9003, NOW() - INTERVAL '2 months', NOW()),
+                        ('2026-10', 'telegram_secret_file_october', 9004, NOW() - INTERVAL '1 month', NOW())
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        now = datetime(2026, 8, 22, 12, tzinfo=ZoneInfo("Europe/Moscow"))
+        default = list_admin_schedule(self.get_conn, now=now)
+        self.assertEqual(
+            [item["schedule_id"] for item in default["items"]],
+            ["2026-08", "2026-09", "2026-10"],
+        )
+        self.assertEqual(default["window"], {"from": "2026-08-15", "to": "2026-10-21"})
+        self.assertEqual(default["timezone"], "Europe/Moscow")
+        self.assertEqual(default["summary"], {
+            "current_month": 1, "next_three_months": 3, "total_future": 3,
+        })
+
+        past = list_admin_schedule(
+            self.get_conn, from_value="2026-01-01", to_value="2026-08-31",
+            status="past", now=now,
+        )
+        self.assertEqual([item["schedule_id"] for item in past["items"]], ["2026-07"])
+        upcoming = list_admin_schedule(
+            self.get_conn, from_value="2026-08-01", to_value="2026-12-31",
+            status="upcoming", now=now,
+        )
+        self.assertEqual(
+            [item["schedule_id"] for item in upcoming["items"]],
+            ["2026-08", "2026-09", "2026-10"],
+        )
+        first = list_admin_schedule(
+            self.get_conn, from_value="2026-01-01", to_value="2026-12-31",
+            limit=2, now=now,
+        )
+        second = list_admin_schedule(
+            self.get_conn, from_value="2026-01-01", to_value="2026-12-31",
+            limit=2, cursor=first["next_cursor"], now=now,
+        )
+        first_ids = {item["schedule_id"] for item in first["items"]}
+        second_ids = {item["schedule_id"] for item in second["items"]}
+        self.assertFalse(first_ids & second_ids)
+
+        details = get_admin_schedule_details(self.get_conn, "2026-09", now=now)
+        self.assertEqual(details["period_label"], "Сентябрь 2026")
+        self.assertTrue(details["has_image"])
+        self.assertFalse(details["has_join_link"])
+        serialized = json.dumps({"list": default, "details": details})
+        for forbidden in (
+            "telegram_secret_file", "uploaded_by_telegram_id", "9003",
+            "zoom", "password", "token",
+        ):
+            self.assertNotIn(forbidden, serialized.lower())
+
+        empty = list_admin_schedule(
+            self.get_conn, from_value="2027-01-01", to_value="2027-02-01",
+            now=now,
+        )
+        self.assertEqual(empty["items"], [])
+        self.assertFalse(empty["has_more"])
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:

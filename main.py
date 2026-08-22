@@ -132,6 +132,12 @@ from admin_system import (
     list_admin_deliveries,
     parse_deliveries_limit,
 )
+from admin_schedule import (
+    AdminScheduleQueryError,
+    get_admin_schedule_details,
+    list_admin_schedule,
+    parse_schedule_limit,
+)
 from gift_certificate import (
     CERTIFICATE_NAME_TOO_LONG_TEXT,
     CertificateNameError,
@@ -21691,6 +21697,41 @@ async def miniapp_admin_delivery_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+async def miniapp_admin_schedule(request):
+    try:
+        result = list_admin_schedule(
+            get_db_conn,
+            from_value=request.query.get("from"),
+            to_value=request.query.get("to"),
+            status=request.query.get("status", "all"),
+            limit=parse_schedule_limit(request.query.get("limit")),
+            cursor=request.query.get("cursor"),
+        )
+    except AdminScheduleQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_schedule_details(request):
+    try:
+        details = get_admin_schedule_details(
+            get_db_conn, request.match_info.get("schedule_id")
+        )
+    except AdminScheduleQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_schedule_id"},
+            status=400,
+        ))
+    if details is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "schedule_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(details))
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21751,6 +21792,12 @@ def create_app():
         app.router.add_get(
             '/api/admin/deliveries/{delivery_id}',
             miniapp_admin_delivery_details,
+        )
+    if not _route_exists(app, "GET", "/api/admin/schedule"):
+        app.router.add_get('/api/admin/schedule', miniapp_admin_schedule)
+    if not _route_exists(app, "GET", "/api/admin/schedule/{schedule_id}"):
+        app.router.add_get(
+            '/api/admin/schedule/{schedule_id}', miniapp_admin_schedule_details
         )
     setup_application(app, dp, bot=bot)
     if on_startup not in app.on_startup:
