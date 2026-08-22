@@ -9203,6 +9203,138 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.main.miniapp_admin_auth_middleware(request, handler)
             self.assertEqual(response.status, 400)
 
+    async def test_miniapp_schedule_image_is_protected_and_proxies_safe_images(self):
+        app = self.main.create_app()
+        handler = self.route_handler(
+            app, "GET", "/api/admin/schedule/{schedule_id}/image"
+        )
+        path = "/api/admin/schedule/2026-08/image"
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path=path, match_info={"schedule_id": "2026-08"}
+            ),
+            handler,
+        )
+        self.assertEqual(missing.status, 401)
+        with patch.object(
+            self.main, "load_miniapp_admin_session",
+            return_value=SimpleNamespace(telegram_id=999, session_id="revoked-admin"),
+        ), patch.object(self.main, "ADMIN_IDS", [1]), patch.object(
+            self.main.bot, "get_file", new=AsyncMock()
+        ) as forbidden_get_file:
+            forbidden = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path=path,
+                    match_info={"schedule_id": "2026-08"},
+                ),
+                handler,
+            )
+        self.assertEqual(forbidden.status, 403)
+        forbidden_get_file.assert_not_awaited()
+
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        for image_bytes, content_type in (
+            (b"\xff\xd8\xffsafe-jpeg", "image/jpeg"),
+            (b"\x89PNG\r\n\x1a\nsafe-png", "image/png"),
+        ):
+            async def download_file(file_path, destination, **kwargs):
+                self.assertEqual(file_path, "documents/server-only-path")
+                destination.write(image_bytes)
+                destination.seek(0)
+                return destination
+
+            request = FakeMiniAppRequest(
+                app, "Bearer token", path=path,
+                query={"file_id": "client_override_forbidden"},
+                match_info={"schedule_id": "2026-08"},
+            )
+            with self.subTest(content_type=content_type), \
+                 patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+                 patch.object(self.main, "get_admin_schedule_image_file_id", return_value="server_secret_file_id") as lookup, \
+                 patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_size=len(image_bytes), file_path="documents/server-only-path"))) as get_file, \
+                 patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download_file)):
+                response = await self.main.miniapp_admin_auth_middleware(request, handler)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.content_type, content_type)
+            self.assertEqual(response.body, image_bytes)
+            self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+            self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+            self.assertIsNone(response.headers.get("Location"))
+            lookup.assert_called_once_with(self.main.get_db_conn, "2026-08")
+            get_file.assert_awaited_once_with("server_secret_file_id")
+            self.assertNotIn(b"server_secret_file_id", response.body)
+            self.assertNotIn(b"server-only-path", response.body)
+
+    async def test_miniapp_schedule_image_rejects_missing_unsupported_and_oversized(self):
+        app = self.main.create_app()
+        handler = self.route_handler(
+            app, "GET", "/api/admin/schedule/{schedule_id}/image"
+        )
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/schedule/2026-08/image",
+            match_info={"schedule_id": "2026-08"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_schedule_image_file_id", return_value=None), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock()) as get_file:
+            missing = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(missing.status, 404)
+        get_file.assert_not_awaited()
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_schedule_image_file_id", return_value="private-file"), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_size=self.main.SCHEDULE_IMAGE_MAX_BYTES + 1, file_path="private-path"))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock()) as download:
+            oversized = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(oversized.status, 413)
+        download.assert_not_awaited()
+
+        async def oversized_stream(file_path, destination, **kwargs):
+            destination.write(b"x" * (self.main.SCHEDULE_IMAGE_MAX_BYTES + 1))
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_schedule_image_file_id", return_value="private-file"), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_size=1, file_path="private-path"))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=oversized_stream)):
+            bounded = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(bounded.status, 413)
+
+        async def unsupported_download(file_path, destination, **kwargs):
+            destination.write(b"<svg>not allowed</svg>")
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_schedule_image_file_id", return_value="private-file"), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_size=22, file_path="private-path"))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=unsupported_download)):
+            unsupported = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(unsupported.status, 415)
+        self.assertEqual(json.loads(unsupported.text), {"error": "unsupported_schedule_image"})
+
+    async def test_miniapp_schedule_image_telegram_failure_is_generic_and_private(self):
+        app = self.main.create_app()
+        handler = self.route_handler(
+            app, "GET", "/api/admin/schedule/{schedule_id}/image"
+        )
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/schedule/2026-08/image",
+            match_info={"schedule_id": "2026-08"},
+        )
+        raw_file_id = "telegram_private_file_id"
+        raw_path = "photos/private_bot_token_path"
+        with self.assertLogs(level="WARNING") as logs, \
+             patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_schedule_image_file_id", return_value=raw_file_id), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_size=100, file_path=raw_path))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=self.main.TelegramNetworkError(method=None, message=f"failed {raw_file_id} {raw_path}"))):
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(response.status, 503)
+        self.assertEqual(json.loads(response.text), {"error": "schedule_image_unavailable"})
+        combined = response.text + "\n" + "\n".join(logs.output)
+        self.assertNotIn(raw_file_id, combined)
+        self.assertNotIn(raw_path, combined)
+
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
         expected = {
@@ -9237,6 +9369,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("loadSystem", javascript)
         self.assertIn("data-nav=\"schedule\"", index)
         self.assertIn("loadSchedule", javascript)
+        self.assertIn("/image`,", javascript)
+        self.assertIn("Authorization: `Bearer ${sessionToken}`", javascript)
+        self.assertIn("response.blob()", javascript)
+        self.assertIn("URL.createObjectURL", javascript)
+        self.assertIn("URL.revokeObjectURL", javascript)
+        self.assertIn("Не удалось загрузить изображение", javascript)
+        self.assertIn("blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("textContent", javascript)
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):

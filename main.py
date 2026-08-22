@@ -134,6 +134,7 @@ from admin_system import (
 )
 from admin_schedule import (
     AdminScheduleQueryError,
+    get_admin_schedule_image_file_id,
     get_admin_schedule_details,
     list_admin_schedule,
     parse_schedule_limit,
@@ -283,6 +284,7 @@ def normalize_miniapp_base_url(value):
 
 MINIAPP_PUBLIC_URL = normalize_miniapp_base_url(os.getenv("MINIAPP_BASE_URL"))
 MINIAPP_ASSET_DIR = Path(__file__).resolve().parent / "miniapp"
+SCHEDULE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 MINIAPP_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -292,11 +294,32 @@ MINIAPP_SECURITY_HEADERS = {
         "script-src 'self' https://telegram.org; "
         "style-src 'self'; "
         "connect-src 'self'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "base-uri 'none'; form-action 'none'; "
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     ),
 }
+
+
+class ScheduleImageTooLarge(Exception):
+    pass
+
+
+class BoundedScheduleImageBuffer(io.BytesIO):
+    def write(self, data):
+        if self.tell() + len(data) > SCHEDULE_IMAGE_MAX_BYTES:
+            raise ScheduleImageTooLarge
+        return super().write(data)
+
+
+def schedule_image_content_type(data):
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 PHOTO_URL_INTRO = "AgACAgIAAxkBAAMPaee4TD_FGuIQ4LProdOdL5XV5EkAAiYRaxulqkBL5YKQtOj0fV4BAAMCAAN5AAM7BA"
 PHOTO_URL_RULES = "AgACAgIAAxkBAAMSaee9wO7psIiqhOR3M52AQ_aRwPgAAjgRaxulqkBLRv00tJs-NW8BAAMCAAN5AAM7BA"
@@ -21468,6 +21491,8 @@ async def health(request):
 
 def apply_miniapp_security_headers(response):
     for name, value in MINIAPP_SECURITY_HEADERS.items():
+        if name == "Cache-Control" and response.headers.get(name) == "private, no-store":
+            continue
         response.headers[name] = value
     return response
 
@@ -21732,6 +21757,70 @@ async def miniapp_admin_schedule_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+def schedule_image_error_response(error, status):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error}, status=status
+    ))
+
+
+async def miniapp_admin_schedule_image(request):
+    schedule_id = request.match_info.get("schedule_id")
+    try:
+        file_id = get_admin_schedule_image_file_id(get_db_conn, schedule_id)
+    except AdminScheduleQueryError:
+        return schedule_image_error_response("invalid_schedule_id", 400)
+    if file_id is None:
+        return schedule_image_error_response("schedule_not_found", 404)
+
+    try:
+        telegram_file = await bot.get_file(file_id)
+        file_size = getattr(telegram_file, "file_size", None)
+        file_path = getattr(telegram_file, "file_path", None)
+        if file_size is not None and int(file_size) > SCHEDULE_IMAGE_MAX_BYTES:
+            return schedule_image_error_response("schedule_image_too_large", 413)
+        if not file_path:
+            logging.warning(
+                "MINIAPP_SCHEDULE_IMAGE_FAILED: schedule_id=%s category=file_path_missing",
+                schedule_id,
+            )
+            return schedule_image_error_response("schedule_image_unavailable", 502)
+        destination = BoundedScheduleImageBuffer()
+        await bot.download_file(
+            file_path,
+            destination=destination,
+            timeout=30,
+            chunk_size=64 * 1024,
+        )
+        image_bytes = destination.getvalue()
+    except ScheduleImageTooLarge:
+        return schedule_image_error_response("schedule_image_too_large", 413)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logging.warning(
+            "MINIAPP_SCHEDULE_IMAGE_FAILED: schedule_id=%s category=telegram_file_unavailable",
+            schedule_id,
+        )
+        return schedule_image_error_response("schedule_image_unavailable", 502)
+    except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError):
+        logging.warning(
+            "MINIAPP_SCHEDULE_IMAGE_FAILED: schedule_id=%s category=telegram_temporary_failure",
+            schedule_id,
+        )
+        return schedule_image_error_response("schedule_image_unavailable", 503)
+
+    content_type = schedule_image_content_type(image_bytes)
+    if content_type is None:
+        logging.warning(
+            "MINIAPP_SCHEDULE_IMAGE_FAILED: schedule_id=%s category=unsupported_media_type",
+            schedule_id,
+        )
+        return schedule_image_error_response("unsupported_schedule_image", 415)
+    response = web.Response(body=image_bytes, content_type=content_type)
+    response.headers["Content-Disposition"] = "inline"
+    apply_miniapp_security_headers(response)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
 def _route_exists(app, method, path):
     expected_method = method.upper()
     for route in app.router.routes():
@@ -21795,6 +21884,11 @@ def create_app():
         )
     if not _route_exists(app, "GET", "/api/admin/schedule"):
         app.router.add_get('/api/admin/schedule', miniapp_admin_schedule)
+    if not _route_exists(app, "GET", "/api/admin/schedule/{schedule_id}/image"):
+        app.router.add_get(
+            '/api/admin/schedule/{schedule_id}/image',
+            miniapp_admin_schedule_image,
+        )
     if not _route_exists(app, "GET", "/api/admin/schedule/{schedule_id}"):
         app.router.add_get(
             '/api/admin/schedule/{schedule_id}', miniapp_admin_schedule_details

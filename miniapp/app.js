@@ -42,6 +42,8 @@
   let deliveriesCursor = null;
   let scheduleCursor = null;
   let scheduleRange = "future";
+  let scheduleImageGeneration = 0;
+  const scheduleImageUrls = new Map();
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -63,7 +65,15 @@
     else if (error.message === "access_revoked") status.textContent = "У вас больше нет доступа к админ-платформе.";
     else status.textContent = "Не удалось загрузить данные. Попробуйте обновить.";
   };
+  const clearScheduleImages = () => {
+    scheduleImageGeneration += 1;
+    scheduleImageUrls.forEach((url) => URL.revokeObjectURL(url));
+    scheduleImageUrls.clear();
+  };
   const showScreen = (name) => {
+    if (name !== "schedule" && name !== "schedule-details" && scheduleImageUrls.size) {
+      clearScheduleImages();
+    }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = node.dataset.screen !== name; });
     document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === name); });
   };
@@ -319,13 +329,58 @@
     if (append && scheduleCursor) params.set("cursor", scheduleCursor);
     return params;
   };
-  const scheduleCard = (schedule) => {
+  const fetchScheduleImage = (schedule, container, generation) => {
+    const existing = scheduleImageUrls.get(schedule.schedule_id);
+    if (existing) {
+      const image = document.createElement("img");
+      image.className = "schedule-image";
+      image.alt = schedule.title;
+      image.src = existing;
+      container.replaceChildren(image);
+      return Promise.resolve();
+    }
+    return fetch(`/api/admin/schedule/${encodeURIComponent(schedule.schedule_id)}/image`, {
+      method: "GET", headers: {Authorization: `Bearer ${sessionToken}`},
+      cache: "no-store", credentials: "omit",
+    }).then((response) => {
+      if (response.status === 401) throw new Error("session_ended");
+      if (response.status === 403) throw new Error("access_revoked");
+      if (!response.ok) throw new Error("schedule_image_failed");
+      return response.blob();
+    }).then((blob) => {
+      if (generation !== scheduleImageGeneration) return;
+      const objectUrl = URL.createObjectURL(blob);
+      const previous = scheduleImageUrls.get(schedule.schedule_id);
+      if (previous) URL.revokeObjectURL(previous);
+      scheduleImageUrls.set(schedule.schedule_id, objectUrl);
+      const image = document.createElement("img");
+      image.className = "schedule-image";
+      image.alt = schedule.title;
+      image.src = objectUrl;
+      container.replaceChildren(image);
+    }).catch((error) => {
+      if (generation !== scheduleImageGeneration) return;
+      container.replaceChildren(text("span", "Не удалось загрузить изображение", "schedule-image-error"));
+      if (error.message === "session_ended" || error.message === "access_revoked") {
+        showApiError(error);
+      }
+    });
+  };
+  const scheduleImageContainer = (schedule, generation, large = false) => {
+    const container = document.createElement("div");
+    container.className = large ? "schedule-preview schedule-preview-large" : "schedule-preview";
+    container.append(text("span", "Загружаем расписание…", "schedule-image-loading"));
+    fetchScheduleImage(schedule, container, generation);
+    return container;
+  };
+  const scheduleCard = (schedule, generation) => {
     const article = document.createElement("article");
     article.className = "card user-card";
     const button = document.createElement("button");
     button.type = "button";
     button.append(text("p", schedule.period_label, "eyebrow"));
     button.append(text("h2", schedule.title));
+    button.append(scheduleImageContainer(schedule, generation));
     const badges = document.createElement("div");
     badges.className = "badges";
     badges.append(text("span", schedule.status === "upcoming" ? "Опубликовано" : "Прошедшее", "badge"));
@@ -338,8 +393,12 @@
   const loadSchedule = (append = false) => {
     status.textContent = "Загружаем расписание…";
     return api(`/api/admin/schedule?${scheduleParams(append).toString()}`).then((data) => {
-      if (!append) scheduleList.replaceChildren();
-      data.items.forEach((schedule) => scheduleList.append(scheduleCard(schedule)));
+      if (!append) {
+        clearScheduleImages();
+        scheduleList.replaceChildren();
+      }
+      const generation = scheduleImageGeneration;
+      data.items.forEach((schedule) => scheduleList.append(scheduleCard(schedule, generation)));
       scheduleCursor = data.next_cursor;
       scheduleMore.hidden = !data.has_more;
       scheduleEmpty.hidden = scheduleList.children.length !== 0;
@@ -355,6 +414,7 @@
     return api(`/api/admin/schedule/${encodeURIComponent(scheduleId)}`).then((schedule) => {
       scheduleDetailsContent.replaceChildren();
       scheduleDetailsContent.append(
+        scheduleImageContainer(schedule, scheduleImageGeneration, true),
         detailCard("Основное", [["Название", schedule.title], ["Период", schedule.period_label], ["Статус", schedule.published ? "Опубликовано" : "Не опубликовано"]]),
         detailCard("Тип", [["Источник", "Telegram-изображение"], ["Изображение", schedule.has_image ? "Настроено" : "Нет"], ["Join link", schedule.has_join_link ? "Настроена" : "Нет"]]),
         detailCard("Описание", [["Описание", schedule.description || "Отдельное описание не хранится"]]),

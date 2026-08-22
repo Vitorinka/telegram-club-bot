@@ -253,3 +253,25 @@ def get_admin_schedule_details(get_connection, schedule_id, now=None):
         "timezone": "Europe/Moscow",
     })
     return result
+
+
+def get_admin_schedule_image_file_id(get_connection, schedule_id):
+    if not isinstance(schedule_id, str) or not MONTH_PATTERN.fullmatch(schedule_id):
+        raise AdminScheduleQueryError("invalid_schedule_id")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        _begin_read_only(cur)
+        cur.execute(
+            "SELECT telegram_file_id FROM club_schedules WHERE schedule_month = %s",
+            (schedule_id,),
+        )
+        row = cur.fetchone()
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+    return row[0] if row else None

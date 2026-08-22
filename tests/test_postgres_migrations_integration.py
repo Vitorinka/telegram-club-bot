@@ -45,6 +45,7 @@ from admin_system import (
     list_admin_deliveries,
 )
 from admin_schedule import (
+    get_admin_schedule_image_file_id,
     get_admin_schedule_details,
     list_admin_schedule,
 )
@@ -8195,6 +8196,38 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "zoom", "password", "token",
         ):
             self.assertNotIn(forbidden, serialized.lower())
+
+        self.assertEqual(
+            get_admin_schedule_image_file_id(self.get_conn, "2026-09"),
+            "telegram_secret_file_september",
+        )
+        main = import_main()
+
+        async def download_schedule(file_path, destination, **kwargs):
+            self.assertEqual(file_path, "telegram/server/path")
+            destination.write(b"\x89PNG\r\n\x1a\nproxied-schedule")
+            destination.seek(0)
+            return destination
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "get_file", new=mock.AsyncMock(return_value=SimpleNamespace(file_size=24, file_path="telegram/server/path"))) as get_file, \
+             mock.patch.object(main.bot, "download_file", new=mock.AsyncMock(side_effect=download_schedule)):
+            image_response = asyncio.run(main.miniapp_admin_schedule_image(
+                SimpleNamespace(match_info={"schedule_id": "2026-09"})
+            ))
+        self.assertEqual(image_response.status, 200)
+        self.assertEqual(image_response.content_type, "image/png")
+        self.assertEqual(image_response.body, b"\x89PNG\r\n\x1a\nproxied-schedule")
+        get_file.assert_awaited_once_with("telegram_secret_file_september")
+        self.assertNotIn(b"telegram_secret_file_september", image_response.body)
+        self.assertNotIn(b"telegram/server/path", image_response.body)
+        verify_conn = self.get_conn()
+        try:
+            with verify_conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM club_schedules")
+                self.assertEqual(cur.fetchone()[0], 4)
+        finally:
+            verify_conn.close()
 
         empty = list_admin_schedule(
             self.get_conn, from_value="2027-01-01", to_value="2027-02-01",
