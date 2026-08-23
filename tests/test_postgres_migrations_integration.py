@@ -8810,9 +8810,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                       (88304, 'manual_exact', TRUE, %s, FALSE, FALSE, NULL, FALSE, FALSE, NULL, NULL),
                       (88305, 'manual_short_active', TRUE, %s, FALSE, FALSE, NULL, FALSE, FALSE, NULL, NULL),
                       (88306, 'manual_short_grace', TRUE, %s, TRUE, TRUE, %s, FALSE, TRUE,
-                       'cus_private_short', 'sub_private_short')
+                       'cus_private_short', 'sub_private_short'),
+                      (88307, 'manual_short_active_success', TRUE, %s, FALSE, FALSE, NULL,
+                       FALSE, FALSE, NULL, NULL)
                 """, (expired, active, expired, grace, expired, now + timedelta(minutes=5),
-                       expired, now + timedelta(minutes=5)))
+                       expired, now + timedelta(minutes=5), now + timedelta(minutes=5)))
                 cur.execute("""
                     INSERT INTO subscription_removal_events
                         (telegram_id, status, reason, access_expiry, claim_generation, created_at, updated_at)
@@ -8871,6 +8873,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 cur.execute("SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
                             (exact_preview["action_id"],))
                 exact_payload = json.loads(cur.fetchone()[0])
+                self.assertEqual(
+                    datetime.fromisoformat(exact_preview["preview_expires_at"]),
+                    datetime.fromisoformat(exact_payload["preview_created_at"])
+                    + main.MANUAL_ACCESS_PREVIEW_TTL,
+                )
                 delayed_created = datetime.utcnow() - timedelta(minutes=5)
                 exact_payload["preview_created_at"] = delayed_created.isoformat()
                 exact_payload["preview_expires_at"] = (
@@ -8941,14 +8948,39 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 JsonAdminRequest(1, {"telegram_id": "88305"}, {"duration": "7d"}))).text)
             short_grace_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
                 JsonAdminRequest(1, {"telegram_id": "88306"}, {"duration": "7d"}))).text)
+            short_success_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88307"}, {"duration": "7d"}))).text)
 
-        class ElevenMinutesLater(datetime):
+        self.assertEqual(datetime.fromisoformat(short_active_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(short_grace_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(short_success_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+
+        class FourMinutesLater(datetime):
             @classmethod
             def utcnow(cls):
-                return datetime.utcnow() + timedelta(minutes=11)
+                return datetime.utcnow() + timedelta(minutes=4)
 
         with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
-             mock.patch.object(main, "datetime", ElevenMinutesLater):
+             mock.patch.object(main, "datetime", FourMinutesLater):
+            short_success_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88307"},
+                                 {"action_id": short_success_preview["action_id"]})))
+        self.assertEqual(short_success_confirm.status, 200)
+        self.assertEqual(
+            datetime.fromisoformat(json.loads(short_success_confirm.text)["expiry_date"]),
+            datetime.fromisoformat(short_success_preview["proposed_expiry"]),
+        )
+
+        class SixMinutesLater(datetime):
+            @classmethod
+            def utcnow(cls):
+                return datetime.utcnow() + timedelta(minutes=6)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "datetime", SixMinutesLater):
             short_active_confirm = asyncio.run(main.miniapp_admin_access_confirm(
                 JsonAdminRequest(1, {"telegram_id": "88305"},
                                  {"action_id": short_active_preview["action_id"]})))
@@ -8968,6 +9000,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     (88305, now + timedelta(minutes=5), False, None),
                     (88306, expired, True, now + timedelta(minutes=5)),
                 ])
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88307")
+                self.assertEqual(
+                    cur.fetchone()[0], datetime.fromisoformat(short_success_preview["proposed_expiry"])
+                )
         finally:
             passage_verify.close()
 

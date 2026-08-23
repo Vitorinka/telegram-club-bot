@@ -21750,6 +21750,17 @@ def manual_access_preview_projection(state, duration, now=None):
     }
 
 
+def manual_access_preview_deadline(state, preview_created_at):
+    deadline = preview_created_at + MANUAL_ACCESS_PREVIEW_TTL
+    expiry_date = state.get("expiry_date")
+    if expiry_date and expiry_date > preview_created_at:
+        deadline = min(deadline, expiry_date)
+    grace_period_end = state.get("grace_period_end")
+    if state.get("payment_failed") and grace_period_end and grace_period_end > preview_created_at:
+        deadline = min(deadline, grace_period_end)
+    return deadline
+
+
 def parse_manual_access_preview_payload(payload):
     if not isinstance(payload, dict) or payload.get("duration") not in MANUAL_ACCESS_DURATIONS:
         raise ValueError("invalid manual access preview")
@@ -21769,8 +21780,9 @@ def parse_manual_access_preview_payload(payload):
             raise ValueError("invalid manual access preview")
         parsed[field] = timestamp
     if (
-        parsed["preview_expires_at"] - parsed["preview_created_at"]
-        != MANUAL_ACCESS_PREVIEW_TTL
+        parsed["preview_expires_at"] <= parsed["preview_created_at"]
+        or parsed["preview_expires_at"]
+        > parsed["preview_created_at"] + MANUAL_ACCESS_PREVIEW_TTL
         or parsed["proposed_expiry"] <= parsed["preview_created_at"]
     ):
         raise ValueError("invalid manual access preview")
@@ -21870,7 +21882,7 @@ async def miniapp_admin_access_preview(request):
         if not state:
             conn.rollback(); return manual_access_error("user_not_found", 404)
         preview_created_at = datetime.utcnow()
-        preview_expires_at = preview_created_at + MANUAL_ACCESS_PREVIEW_TTL
+        preview_expires_at = manual_access_preview_deadline(state, preview_created_at)
         preview = manual_access_preview_projection(state, duration, now=preview_created_at)
         action_id = make_action_request(cur, session.telegram_id, MANUAL_ACCESS_ACTION_TYPE, {
             "telegram_id": telegram_id, "duration": duration,
@@ -21883,6 +21895,7 @@ async def miniapp_admin_access_preview(request):
     finally:
         cur.close(); conn.close()
     preview["action_id"] = action_id
+    preview["preview_expires_at"] = preview_expires_at.isoformat()
     return apply_miniapp_security_headers(web.json_response(preview, status=201))
 
 
