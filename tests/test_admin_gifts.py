@@ -4,6 +4,8 @@ from datetime import datetime
 from admin_gifts import (
     AdminGiftsQueryError,
     GIFT_DURATIONS,
+    GIFT_RESEND_ELIGIBLE_STATUSES,
+    GIFT_RESEND_TARGETS,
     GIFT_STATUSES,
     decode_gifts_cursor,
     encode_gifts_cursor,
@@ -16,6 +18,15 @@ from admin_gifts import (
 
 
 class AdminGiftsTests(unittest.TestCase):
+    def test_resend_uses_closed_targets_and_only_unclaimed_safe_states(self):
+        self.assertEqual(
+            GIFT_RESEND_ELIGIBLE_STATUSES,
+            frozenset({"paid_unclaimed", "reserved"}),
+        )
+        self.assertEqual(GIFT_RESEND_TARGETS, frozenset({"purchaser", "recipient"}))
+        for unsafe in ("redeemed", "cancelled", "refunded", "review_required"):
+            self.assertNotIn(unsafe, GIFT_RESEND_ELIGIBLE_STATUSES)
+
     def test_limit_status_and_duration_use_closed_schema_values(self):
         self.assertEqual(parse_gifts_limit(None), 25)
         self.assertEqual(parse_gifts_limit("50"), 50)

@@ -177,6 +177,23 @@
     <section id="gift-details" class="screen page" data-screen="gift-details" hidden>
       <button id="gifts-back" class="secondary" type="button">← К подаркам</button>
       <div id="gift-details-content" class="dashboard"></div>
+      <article id="gift-resend-card" class="card" hidden>
+        <h2>Действия</h2>
+        <p id="gift-resend-unavailable" class="hint" hidden>Повторная отправка недоступна для текущего состояния подарка.</p>
+        <div id="gift-resend-controls">
+          <label class="search-label" for="gift-resend-target">Кому отправить</label>
+          <select id="gift-resend-target" aria-label="Адресат повторной отправки"></select>
+          <button id="gift-resend-preview" type="button">Повторно отправить</button>
+        </div>
+        <div id="gift-resend-confirmation" hidden>
+          <div id="gift-resend-summary" class="compact-list"></div>
+          <p id="gift-resend-message" class="hint"></p>
+          <div class="action-row">
+            <button id="gift-resend-confirm" type="button">Отправить</button>
+            <button id="gift-resend-cancel" class="secondary" type="button">Отмена</button>
+          </div>
+        </div>
+      </article>
     </section>
     <section id="system-screen" class="screen page" data-screen="system" hidden>
       <article class="card">
