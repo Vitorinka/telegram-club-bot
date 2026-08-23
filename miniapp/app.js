@@ -270,9 +270,11 @@
       return loadUserDetails(manualAccessUserId);
     }).catch((error) => {
       manualAccessConfirm.disabled = false;
-      manualAccessMessage.textContent = error.message === "user_access_state_changed"
-        ? "Состояние пользователя изменилось. Обновите данные и повторите."
-        : "Не удалось изменить доступ.";
+      manualAccessMessage.textContent = error.message === "manual_access_preview_expired"
+        ? "Предварительный расчёт устарел. Обновите данные и повторите."
+        : error.message === "user_access_state_changed"
+          ? "Состояние пользователя изменилось. Обновите данные и повторите."
+          : "Не удалось изменить доступ.";
     });
   };
   const cancelManualAccess = () => {

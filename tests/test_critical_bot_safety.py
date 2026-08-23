@@ -1101,7 +1101,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_perform_give_access_preserves_manual_semantics(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def perform_give_access"):MAIN_SOURCE.index("async def perform_set_expiry")]
-        self.assertIn("base_expiry = old_expiry if old_expiry and old_expiry > datetime.utcnow() else datetime.utcnow()", source)
+        self.assertIn("new_expiry = canonical_manual_access_expiry(old_expiry, days)", source)
         self.assertIn("manual_give_access", source)
         self.assertIn("payment_failed = FALSE", source)
         self.assertNotIn("trial_used", source)
