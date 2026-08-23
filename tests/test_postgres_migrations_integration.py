@@ -166,6 +166,16 @@ def drop_temp_db(name):
         conn.close()
 
 
+class JsonAdminRequest(dict):
+    def __init__(self, admin_id, match_info, payload=None):
+        super().__init__(miniapp_admin=SimpleNamespace(telegram_id=admin_id))
+        self.match_info = match_info
+        self._payload = payload or {}
+
+    async def json(self):
+        return self._payload
+
+
 class TrackingConnection:
     closed_count = 0
     cursor_closed_count = 0
@@ -8472,6 +8482,313 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.assertEqual(cur.fetchone()[0], 6)
         finally:
             verify_conn.close()
+
+    def test_miniapp_gift_resend_is_fenced_durable_and_idempotent_real_postgres(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        reference = "GIFT-0000000000008201"
+        purchaser_reference = "GIFT-0000000000008202"
+        token_version = 1
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (telegram_id, username)
+                    VALUES
+                        (88201, 'resend_buyer'),
+                        (88202, 'resend_recipient'),
+                        (88203, 'resend_recipient_changed')
+                    ON CONFLICT (telegram_id) DO NOTHING
+                """)
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id,
+                        recipient_telegram_id, recipient_name, tariff_code,
+                        duration_days, status, token_hash, token_version,
+                        certificate_name, paid_at, created_at, updated_at
+                    ) VALUES (
+                        '00000000-0000-0000-0000-000000008201', %s, 88201,
+                        88202, 'Анна', 'gift_6m', 180, 'reserved', %s, %s,
+                        'Анна', NOW(), NOW(), NOW()
+                    )
+                """, (
+                    reference,
+                    main.gift_token_hash_for_reference(reference, token_version),
+                    token_version,
+                ))
+                for sequence, unsafe_status in enumerate(
+                    ("redeemed", "cancelled", "refunded", "review_required"),
+                    start=3,
+                ):
+                    unsafe_reference = f"GIFT-00000000000082{sequence:02d}"
+                    cur.execute("""
+                        INSERT INTO gift_access_grants (
+                            id, public_reference, purchaser_telegram_id,
+                            tariff_code, duration_days, status, token_hash,
+                            token_version, paid_at, created_at, updated_at
+                        ) VALUES (
+                            %s, %s, 88201, 'gift_1m', 30, %s, %s, 1,
+                            NOW(), NOW(), NOW()
+                        )
+                    """, (
+                        f"00000000-0000-0000-0000-0000000082{sequence:02d}",
+                        unsafe_reference,
+                        unsafe_status,
+                        main.gift_token_hash_for_reference(unsafe_reference, 1),
+                    ))
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id,
+                        tariff_code, duration_days, status, token_hash,
+                        token_version, paid_at, created_at, updated_at
+                    ) VALUES (
+                        '00000000-0000-0000-0000-000000008202', %s, 88201,
+                        'gift_1m', 30, 'paid_unclaimed', %s, 1,
+                        NOW(), NOW(), NOW()
+                    )
+                """, (
+                    purchaser_reference,
+                    main.gift_token_hash_for_reference(purchaser_reference, 1),
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            missing_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": "GIFT-FFFFFFFFFFFFFFFF"}, {"target": "purchaser"})
+            ))
+            missing_recipient_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": purchaser_reference}, {"target": "recipient"})
+            ))
+            unsafe_responses = [
+                asyncio.run(main.miniapp_admin_gift_resend_preview(
+                    JsonAdminRequest(
+                        1,
+                        {"gift_id": f"GIFT-00000000000082{sequence:02d}"},
+                        {"target": "purchaser"},
+                    )
+                ))
+                for sequence in range(3, 7)
+            ]
+            purchaser_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": purchaser_reference}, {"target": "purchaser"})
+            ))
+            purchaser_preview = json.loads(purchaser_preview_response.text)
+            purchaser_confirm_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": purchaser_reference},
+                    {"action_id": purchaser_preview["action_id"], "telegram_id": 999999},
+                )
+            ))
+        self.assertEqual(missing_response.status, 404)
+        self.assertEqual(missing_recipient_response.status, 409)
+        self.assertTrue(all(response.status == 409 for response in unsafe_responses))
+        self.assertEqual(purchaser_preview_response.status, 201)
+        self.assertEqual(purchaser_confirm_response.status, 200)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            cancel_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
+            ))
+        self.assertEqual(cancel_preview_response.status, 201)
+        cancel_preview = json.loads(cancel_preview_response.text)
+        self.assertEqual(cancel_preview["target_telegram_id"], 88202)
+        self.assertEqual(cancel_preview["target_username"], "resend_recipient")
+        self.assertEqual(cancel_preview["duration"], "6 месяцев")
+        serialized_preview = json.dumps(cancel_preview, ensure_ascii=False)
+        for forbidden in ("token_hash", "activation_token", "checkout_url", "stripe_", "file_id"):
+            self.assertNotIn(forbidden, serialized_preview)
+
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM message_delivery_events")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute(
+                    "SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
+                    (cancel_preview["action_id"],),
+                )
+                action_payload = cur.fetchone()[0]
+                for forbidden in ("token_hash", "activation_token", "file_id", "stripe", "checkout", "88202"):
+                    self.assertNotIn(forbidden, action_payload)
+        finally:
+            verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            forged_cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    2,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            duplicate_cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            cancelled_confirm_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+        self.assertEqual(forged_cancel_response.status, 404)
+        self.assertEqual(json.loads(cancel_response.text)["status"], "cancelled")
+        self.assertEqual(json.loads(duplicate_cancel_response.text)["status"], "cancelled")
+        self.assertEqual(cancelled_confirm_response.status, 409)
+        self.assertEqual(
+            json.loads(cancelled_confirm_response.text)["error"],
+            "gift_resend_action_cancelled",
+        )
+
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM admin_action_requests WHERE action_id = %s",
+                    (cancel_preview["action_id"],),
+                )
+                self.assertEqual(cur.fetchone()[0], "cancelled")
+                cur.execute("SELECT COUNT(*) FROM message_delivery_events")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("""
+                    SELECT status, recipient_telegram_id, applied_expiry, refunded_at,
+                           cancelled_at, token_version
+                    FROM gift_access_grants WHERE public_reference = %s
+                """, (reference,))
+                self.assertEqual(cur.fetchone(), ("reserved", 88202, None, None, None, 1))
+        finally:
+            verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            changed_target_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
+            ))
+        changed_target_preview = json.loads(changed_target_preview_response.text)
+        mutate_target = self.get_conn()
+        try:
+            with mutate_target.cursor() as cur:
+                cur.execute(
+                    "UPDATE gift_access_grants SET recipient_telegram_id = 88203, updated_at = NOW() "
+                    "WHERE public_reference = %s",
+                    (reference,),
+                )
+            mutate_target.commit()
+        finally:
+            mutate_target.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            changed_target_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": changed_target_preview["action_id"]},
+                )
+            ))
+        self.assertEqual(changed_target_response.status, 409)
+        self.assertEqual(json.loads(changed_target_response.text)["error"], "gift_target_changed")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
+            ))
+        self.assertEqual(preview_response.status, 201)
+        preview = json.loads(preview_response.text)
+        self.assertEqual(preview["target_telegram_id"], 88203)
+        self.assertEqual(preview["target_username"], "resend_recipient_changed")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            confirm_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": preview["action_id"], "telegram_id": 999999},
+                )
+            ))
+            duplicate_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(1, {"gift_id": reference}, {"action_id": preview["action_id"]})
+            ))
+            forged_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(2, {"gift_id": reference}, {"action_id": preview["action_id"]})
+            ))
+        self.assertEqual(confirm_response.status, 200)
+        self.assertEqual(json.loads(confirm_response.text)["delivery_status"], "queued")
+        self.assertEqual(duplicate_response.status, 200)
+        self.assertEqual(forged_response.status, 404)
+
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute("""
+                    SELECT telegram_id, delivery_type, status, payload_json
+                    FROM message_delivery_events
+                """)
+                deliveries = cur.fetchall()
+                self.assertEqual(len(deliveries), 2)
+                self.assertEqual(
+                    {(row[0], row[1], row[2]) for row in deliveries},
+                    {
+                        (88201, main.GIFT_CERTIFICATE_BUYER, "pending"),
+                        (88203, main.GIFT_CERTIFICATE_RECIPIENT, "pending"),
+                    },
+                )
+                self.assertTrue(all("999999" not in row[3] for row in deliveries))
+                cur.execute("""
+                    SELECT status, recipient_telegram_id, applied_expiry, refunded_at,
+                           cancelled_at, token_version
+                    FROM gift_access_grants WHERE public_reference = %s
+                """, (reference,))
+                self.assertEqual(cur.fetchone(), ("reserved", 88203, None, None, None, 1))
+        finally:
+            verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            stale_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "purchaser"})
+            ))
+        stale_preview = json.loads(stale_preview_response.text)
+        mutate = self.get_conn()
+        try:
+            with mutate.cursor() as cur:
+                cur.execute(
+                    "UPDATE gift_access_grants SET status = 'redeemed', updated_at = NOW() WHERE public_reference = %s",
+                    (reference,),
+                )
+            mutate.commit()
+        finally:
+            mutate.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            stale_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(1, {"gift_id": reference}, {"action_id": stale_preview["action_id"]})
+            ))
+        self.assertEqual(stale_response.status, 409)
+        self.assertEqual(json.loads(stale_response.text)["error"], "gift_state_changed")
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM message_delivery_events")
+                self.assertEqual(cur.fetchone()[0], 2)
+                cur.execute(
+                    "SELECT status, payload_json FROM admin_action_requests WHERE action_id = %s",
+                    (stale_preview["action_id"],),
+                )
+                status_value, safe_payload = cur.fetchone()
+                self.assertEqual(status_value, "failed")
+                self.assertIn("gift_state_changed", safe_payload)
+        finally:
+            verify.close()
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:

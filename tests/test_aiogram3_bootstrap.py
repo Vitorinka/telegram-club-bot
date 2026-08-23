@@ -93,7 +93,7 @@ def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=Non
 class FakeMiniAppRequest(dict):
     def __init__(
         self, app, authorization=None, path="/api/admin/me", method="GET",
-        query=None, match_info=None,
+        query=None, match_info=None, json_data=None,
     ):
         super().__init__()
         self.app = app
@@ -101,9 +101,13 @@ class FakeMiniAppRequest(dict):
         self.method = method
         self.query = query or {}
         self.match_info = match_info or {}
+        self.json_data = json_data or {}
         self.headers = {}
         if authorization is not None:
             self.headers["Authorization"] = authorization
+
+    async def json(self):
+        return self.json_data
 
 
 def import_main():
@@ -9452,6 +9456,47 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing_gift.status, 404)
         details.assert_called_once_with(self.main.get_db_conn, "GIFT-ABCDEF0123456789")
 
+    async def test_miniapp_gift_resend_routes_require_admin_bearer_auth(self):
+        app = self.main.create_app()
+        self.route_handler(
+            app, "POST", "/api/admin/gifts/{gift_id}/resend-cancel"
+        )
+        path = "/api/admin/gifts/GIFT-ABCDEF0123456789/resend-preview"
+        handler = self.route_handler(
+            app, "POST", "/api/admin/gifts/{gift_id}/resend-preview"
+        )
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path=path, method="POST",
+                match_info={"gift_id": "GIFT-ABCDEF0123456789"},
+                json_data={"target": "purchaser"},
+            ),
+            handler,
+        )
+        self.assertEqual(missing.status, 401)
+        non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=non_admin):
+            forbidden = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path=path, method="POST",
+                    match_info={"gift_id": "GIFT-ABCDEF0123456789"},
+                    json_data={"target": "purchaser"},
+                ),
+                handler,
+            )
+        self.assertEqual(forbidden.status, 403)
+
+    def test_miniapp_gift_resend_reuses_canonical_durable_delivery(self):
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        start = source.index("async def miniapp_admin_gift_resend_confirm")
+        end = source.index("async def miniapp_admin_gift_resend_action", start)
+        helper = source[start:end]
+        self.assertIn("claim_admin_action", helper)
+        self.assertIn("enqueue_gift_certificate_delivery", helper)
+        self.assertIn("complete_admin_action", helper)
+        self.assertNotIn("bot.send_message", helper)
+        self.assertNotIn("bot.send_photo", helper)
+
     async def test_miniapp_gifts_reject_invalid_queries(self):
         app = self.main.create_app()
         handler = self.route_handler(app, "GET", "/api/admin/gifts")
@@ -9501,6 +9546,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("scheduleUploadId", javascript)
         self.assertIn("URL.revokeObjectURL", javascript)
         self.assertIn("/api/admin/gifts", javascript)
+        self.assertIn("/resend-preview", javascript)
+        self.assertIn("/resend-confirm", javascript)
+        self.assertIn("/resend-cancel", javascript)
+        self.assertIn("gift-resend-card", index)
+        self.assertIn("Повторно отправить", index)
+        self.assertIn("JSON.stringify(body)", javascript)
+        self.assertIn("giftResendCancel.addEventListener", javascript)
+        self.assertNotIn('telegram_id: giftResend', javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
         self.assertIn("data-nav=", index)

@@ -32,6 +32,7 @@ EXPECTED_VALUES = {
         "broadcast", "give_access", "set_expiry", "link_stripe_user",
         "resolve_checkout", "revoke_invite_links", "retry_delivery",
         "restore_access", "revoke_access", "gift_cancel", "gift_reissue",
+        "gift_resend",
         "schedule_upload_replace",
         "billing_portal_resend",
     )),

@@ -44,6 +44,15 @@
   const giftsEmpty = document.getElementById("gifts-empty");
   const giftsMore = document.getElementById("gifts-more");
   const giftDetailsContent = document.getElementById("gift-details-content");
+  const giftResendCard = document.getElementById("gift-resend-card");
+  const giftResendUnavailable = document.getElementById("gift-resend-unavailable");
+  const giftResendControls = document.getElementById("gift-resend-controls");
+  const giftResendTarget = document.getElementById("gift-resend-target");
+  const giftResendConfirmation = document.getElementById("gift-resend-confirmation");
+  const giftResendSummary = document.getElementById("gift-resend-summary");
+  const giftResendMessage = document.getElementById("gift-resend-message");
+  const giftResendConfirm = document.getElementById("gift-resend-confirm");
+  const giftResendCancel = document.getElementById("gift-resend-cancel");
   const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
@@ -63,6 +72,8 @@
   let scheduleUploadId = null;
   let giftsCursor = null;
   let giftsSearchTimer = null;
+  let giftResendGiftId = null;
+  let giftResendActionId = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -116,6 +127,22 @@
   const postAdmin = (path, body) => fetch(path, {
     method: "POST", headers: {Authorization: `Bearer ${sessionToken}`}, body,
     cache: "no-store", credentials: "omit",
+  }).then(async (response) => {
+    if (response.status === 401) throw new Error("session_ended");
+    if (response.status === 403) throw new Error("access_revoked");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "api_failed");
+    return data;
+  });
+  const postAdminJson = (path, body) => fetch(path, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    cache: "no-store",
+    credentials: "omit",
   }).then(async (response) => {
     if (response.status === 401) throw new Error("session_ended");
     if (response.status === 403) throw new Error("access_revoked");
@@ -599,6 +626,97 @@
       status.textContent = data.items.length ? `Подарков показано: ${giftsList.children.length}` : "Подарков пока нет.";
     });
   };
+  const resetGiftResend = () => {
+    giftResendActionId = null;
+    giftResendConfirmation.hidden = true;
+    giftResendControls.hidden = false;
+    giftResendSummary.replaceChildren();
+    giftResendMessage.textContent = "";
+    giftResendConfirm.disabled = false;
+    giftResendConfirm.hidden = false;
+  };
+  const configureGiftResend = (gift) => {
+    giftResendGiftId = gift.gift_id;
+    resetGiftResend();
+    giftResendCard.hidden = false;
+    giftResendTarget.replaceChildren();
+    const resend = gift.resend || {eligible: false, targets: []};
+    giftResendUnavailable.hidden = resend.eligible;
+    giftResendControls.hidden = !resend.eligible;
+    if (!resend.eligible) return;
+    resend.targets.forEach((target) => {
+      const option = document.createElement("option");
+      option.value = target;
+      option.textContent = target === "purchaser" ? "Покупателю" : "Получателю";
+      giftResendTarget.append(option);
+    });
+  };
+  const previewGiftResend = () => {
+    if (!giftResendGiftId || !giftResendTarget.value) return Promise.resolve();
+    status.textContent = "Готовим подтверждение…";
+    return postAdminJson(
+      `/api/admin/gifts/${encodeURIComponent(giftResendGiftId)}/resend-preview`,
+      {target: giftResendTarget.value}
+    ).then((preview) => {
+      giftResendActionId = preview.action_id;
+      giftResendSummary.replaceChildren(
+        text("strong", `Подарок на ${preview.duration}`),
+        text("span", `${preview.target_type}: ${preview.target_username ? `@${preview.target_username}` : `Telegram ID ${preview.target_telegram_id}`}`),
+        text("span", `Имя на сертификате: ${preview.certificate_name || "Без имени"}`),
+        text("span", `Будет отправлено: ${preview.delivery_kind}`)
+      );
+      giftResendMessage.textContent = preview.confirmation_text;
+      giftResendControls.hidden = true;
+      giftResendConfirmation.hidden = false;
+      status.textContent = "Подтвердите повторную отправку";
+    }).catch((error) => {
+      status.textContent = error.message === "gift_state_not_resendable"
+        ? "Повторная отправка недоступна для текущего состояния подарка."
+        : "Не удалось подготовить повторную отправку.";
+    });
+  };
+  const confirmGiftResend = () => {
+    if (!giftResendGiftId || !giftResendActionId) return Promise.resolve();
+    giftResendConfirm.disabled = true;
+    status.textContent = "Ставим сообщение в очередь…";
+    return postAdminJson(
+      `/api/admin/gifts/${encodeURIComponent(giftResendGiftId)}/resend-confirm`,
+      {action_id: giftResendActionId}
+    ).then((result) => {
+      giftResendMessage.textContent = result.delivery_status === "queued"
+        ? "Сообщение поставлено в очередь на отправку."
+        : "Действие уже обработано.";
+      giftResendConfirm.hidden = true;
+      status.textContent = "Повторная отправка поставлена в очередь";
+    }).catch((error) => {
+      giftResendConfirm.disabled = false;
+      giftResendMessage.textContent = error.message === "gift_state_changed"
+        ? "Состояние подарка изменилось. Обновите данные и повторите."
+        : error.message === "gift_target_changed"
+          ? "Получатель подарка изменился. Обновите данные и повторите."
+          : "Не удалось поставить сообщение в очередь.";
+      status.textContent = "Повторная отправка не выполнена";
+    });
+  };
+  const cancelGiftResend = () => {
+    if (!giftResendGiftId || !giftResendActionId) {
+      resetGiftResend();
+      return Promise.resolve();
+    }
+    giftResendCancel.disabled = true;
+    status.textContent = "Отменяем запрос…";
+    return postAdminJson(
+      `/api/admin/gifts/${encodeURIComponent(giftResendGiftId)}/resend-cancel`,
+      {action_id: giftResendActionId}
+    ).then(() => {
+      resetGiftResend();
+      status.textContent = "Повторная отправка отменена";
+    }).catch(() => {
+      status.textContent = "Не удалось отменить запрос. Обновите данные.";
+    }).finally(() => {
+      giftResendCancel.disabled = false;
+    });
+  };
   function loadGiftDetails(giftId) {
     status.textContent = "Загружаем подарок…";
     return api(`/api/admin/gifts/${encodeURIComponent(giftId)}`).then((gift) => {
@@ -614,6 +732,7 @@
         detailCard("Завершение", [["Возвращён", formatDate(gift.refunded_at)], ["Отменён", formatDate(gift.cancelled_at)]]),
         detailCard("Lifecycle", lifecycle)
       );
+      configureGiftResend(gift);
       showScreen("gift-details");
       status.textContent = gift.public_reference;
     }).catch(showApiError);
@@ -686,6 +805,9 @@
     window.clearTimeout(giftsSearchTimer);
     giftsSearchTimer = window.setTimeout(() => loadGifts(false).catch(showApiError), 300);
   });
+  document.getElementById("gift-resend-preview").addEventListener("click", previewGiftResend);
+  giftResendConfirm.addEventListener("click", confirmGiftResend);
+  giftResendCancel.addEventListener("click", cancelGiftResend);
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {

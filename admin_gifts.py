@@ -32,6 +32,8 @@ GIFT_DURATION_LABELS = {
     "gift_6m": "6 месяцев",
     "gift_12m": "12 месяцев",
 }
+GIFT_RESEND_ELIGIBLE_STATUSES = frozenset({"paid_unclaimed", "reserved"})
+GIFT_RESEND_TARGETS = frozenset({"purchaser", "recipient"})
 
 
 class AdminGiftsQueryError(ValueError):
@@ -138,7 +140,7 @@ def _gift_projection(row):
         redeemed_at, applied_at, applied_expiry, refunded_at, cancelled_at,
         _ordering_created_at,
     ) = row
-    return {
+    result = {
         "gift_id": public_reference,
         "public_reference": public_reference,
         "status": status,
@@ -165,6 +167,18 @@ def _gift_projection(row):
         "cancelled_at": _iso(cancelled_at),
         "requires_attention": status == "review_required",
     }
+    resend_targets = ["purchaser"] if purchaser_id is not None else []
+    if recipient_id is not None:
+        resend_targets.append("recipient")
+    result["resend"] = {
+        "eligible": status in GIFT_RESEND_ELIGIBLE_STATUSES,
+        "targets": resend_targets if status in GIFT_RESEND_ELIGIBLE_STATUSES else [],
+        "unavailable_reason": (
+            None if status in GIFT_RESEND_ELIGIBLE_STATUSES
+            else "gift_state_not_resendable"
+        ),
+    }
+    return result
 
 
 GIFT_SELECT = """
