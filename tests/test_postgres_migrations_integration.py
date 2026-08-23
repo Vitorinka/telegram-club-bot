@@ -8494,7 +8494,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO users (telegram_id, username)
-                    VALUES (88201, 'resend_buyer'), (88202, 'resend_recipient')
+                    VALUES
+                        (88201, 'resend_buyer'),
+                        (88202, 'resend_recipient'),
+                        (88203, 'resend_recipient_changed')
                     ON CONFLICT (telegram_id) DO NOTHING
                 """)
                 cur.execute("""
@@ -8586,15 +8589,15 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(purchaser_confirm_response.status, 200)
 
         with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
-            preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+            cancel_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
                 JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
             ))
-        self.assertEqual(preview_response.status, 201)
-        preview = json.loads(preview_response.text)
-        self.assertEqual(preview["target_telegram_id"], 88202)
-        self.assertEqual(preview["target_username"], "resend_recipient")
-        self.assertEqual(preview["duration"], "6 месяцев")
-        serialized_preview = json.dumps(preview, ensure_ascii=False)
+        self.assertEqual(cancel_preview_response.status, 201)
+        cancel_preview = json.loads(cancel_preview_response.text)
+        self.assertEqual(cancel_preview["target_telegram_id"], 88202)
+        self.assertEqual(cancel_preview["target_username"], "resend_recipient")
+        self.assertEqual(cancel_preview["duration"], "6 месяцев")
+        serialized_preview = json.dumps(cancel_preview, ensure_ascii=False)
         for forbidden in ("token_hash", "activation_token", "checkout_url", "stripe_", "file_id"):
             self.assertNotIn(forbidden, serialized_preview)
 
@@ -8605,13 +8608,106 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.assertEqual(cur.fetchone()[0], 1)
                 cur.execute(
                     "SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
-                    (preview["action_id"],),
+                    (cancel_preview["action_id"],),
                 )
                 action_payload = cur.fetchone()[0]
                 for forbidden in ("token_hash", "activation_token", "file_id", "stripe", "checkout", "88202"):
                     self.assertNotIn(forbidden, action_payload)
         finally:
             verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            forged_cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    2,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            duplicate_cancel_response = asyncio.run(main.miniapp_admin_gift_resend_cancel(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+            cancelled_confirm_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": cancel_preview["action_id"]},
+                )
+            ))
+        self.assertEqual(forged_cancel_response.status, 404)
+        self.assertEqual(json.loads(cancel_response.text)["status"], "cancelled")
+        self.assertEqual(json.loads(duplicate_cancel_response.text)["status"], "cancelled")
+        self.assertEqual(cancelled_confirm_response.status, 409)
+        self.assertEqual(
+            json.loads(cancelled_confirm_response.text)["error"],
+            "gift_resend_action_cancelled",
+        )
+
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM admin_action_requests WHERE action_id = %s",
+                    (cancel_preview["action_id"],),
+                )
+                self.assertEqual(cur.fetchone()[0], "cancelled")
+                cur.execute("SELECT COUNT(*) FROM message_delivery_events")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("""
+                    SELECT status, recipient_telegram_id, applied_expiry, refunded_at,
+                           cancelled_at, token_version
+                    FROM gift_access_grants WHERE public_reference = %s
+                """, (reference,))
+                self.assertEqual(cur.fetchone(), ("reserved", 88202, None, None, None, 1))
+        finally:
+            verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            changed_target_preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
+            ))
+        changed_target_preview = json.loads(changed_target_preview_response.text)
+        mutate_target = self.get_conn()
+        try:
+            with mutate_target.cursor() as cur:
+                cur.execute(
+                    "UPDATE gift_access_grants SET recipient_telegram_id = 88203, updated_at = NOW() "
+                    "WHERE public_reference = %s",
+                    (reference,),
+                )
+            mutate_target.commit()
+        finally:
+            mutate_target.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            changed_target_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
+                JsonAdminRequest(
+                    1,
+                    {"gift_id": reference},
+                    {"action_id": changed_target_preview["action_id"]},
+                )
+            ))
+        self.assertEqual(changed_target_response.status, 409)
+        self.assertEqual(json.loads(changed_target_response.text)["error"], "gift_target_changed")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            preview_response = asyncio.run(main.miniapp_admin_gift_resend_preview(
+                JsonAdminRequest(1, {"gift_id": reference}, {"target": "recipient"})
+            ))
+        self.assertEqual(preview_response.status, 201)
+        preview = json.loads(preview_response.text)
+        self.assertEqual(preview["target_telegram_id"], 88203)
+        self.assertEqual(preview["target_username"], "resend_recipient_changed")
 
         with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
             confirm_response = asyncio.run(main.miniapp_admin_gift_resend_confirm(
@@ -8645,7 +8741,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     {(row[0], row[1], row[2]) for row in deliveries},
                     {
                         (88201, main.GIFT_CERTIFICATE_BUYER, "pending"),
-                        (88202, main.GIFT_CERTIFICATE_RECIPIENT, "pending"),
+                        (88203, main.GIFT_CERTIFICATE_RECIPIENT, "pending"),
                     },
                 )
                 self.assertTrue(all("999999" not in row[3] for row in deliveries))
@@ -8654,7 +8750,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                            cancelled_at, token_version
                     FROM gift_access_grants WHERE public_reference = %s
                 """, (reference,))
-                self.assertEqual(cur.fetchone(), ("reserved", 88202, None, None, None, 1))
+                self.assertEqual(cur.fetchone(), ("reserved", 88203, None, None, None, 1))
         finally:
             verify.close()
 

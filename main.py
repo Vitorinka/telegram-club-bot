@@ -21868,6 +21868,15 @@ def gift_resend_delivery_key(public_reference, target, action_id):
     return f"gift:{public_reference}:admin_resend:{target}:{action_id}"
 
 
+def gift_resend_target_identity(public_reference, target, telegram_id):
+    material = (
+        f"gift-resend-target-v1:{public_reference}:{target}:{int(telegram_id)}"
+    ).encode("utf-8")
+    return hmac.new(
+        gift_token_secret().encode("utf-8"), material, hashlib.sha256
+    ).hexdigest()
+
+
 def gift_resend_action_error(category, status=400):
     return apply_miniapp_security_headers(web.json_response(
         {"error": category}, status=status
@@ -21939,6 +21948,7 @@ def fail_gift_resend_action(cur, action_id, payload, category):
         "target": payload.get("target"),
         "expected_status": payload.get("expected_status"),
         "expected_token_version": payload.get("expected_token_version"),
+        "expected_target_identity": payload.get("expected_target_identity"),
         "failure_category": category,
     }
     cur.execute("""
@@ -21980,6 +21990,9 @@ async def miniapp_admin_gift_resend_preview(request):
             "target": target,
             "expected_status": gift_row["status"],
             "expected_token_version": int(gift_row["token_version"]),
+            "expected_target_identity": gift_resend_target_identity(
+                public_reference, target, target_telegram_id
+            ),
         }
         action_id = make_action_request(
             cur, session.telegram_id, GIFT_RESEND_ACTION_TYPE, action_payload
@@ -22034,6 +22047,8 @@ async def miniapp_admin_gift_resend_confirm(request):
             return gift_resend_action_error("gift_resend_action_mismatch", 409)
         if existing["status"] != "pending":
             conn.rollback()
+            if existing["status"] == "cancelled":
+                return gift_resend_action_error("gift_resend_action_cancelled", 409)
             return apply_miniapp_security_headers(web.json_response(
                 gift_resend_action_projection(action_id, existing)
             ))
@@ -22055,7 +22070,23 @@ async def miniapp_admin_gift_resend_confirm(request):
             return gift_resend_action_error("gift_state_changed", 409)
 
         target = payload.get("target")
-        target_telegram_id, delivery_type = gift_resend_target(gift_row, target)
+        try:
+            target_telegram_id, delivery_type = gift_resend_target(gift_row, target)
+        except AdminGiftsQueryError:
+            fail_gift_resend_action(cur, action_id, payload, "gift_target_changed")
+            conn.commit()
+            return gift_resend_action_error("gift_target_changed", 409)
+        expected_target_identity = payload.get("expected_target_identity")
+        current_target_identity = gift_resend_target_identity(
+            public_reference, target, target_telegram_id
+        )
+        if (
+            not isinstance(expected_target_identity, str)
+            or not hmac.compare_digest(expected_target_identity, current_target_identity)
+        ):
+            fail_gift_resend_action(cur, action_id, payload, "gift_target_changed")
+            conn.commit()
+            return gift_resend_action_error("gift_target_changed", 409)
         delivery_key = gift_resend_delivery_key(public_reference, target, action_id)
         enqueue_gift_certificate_delivery(
             cur,
@@ -22101,6 +22132,47 @@ async def miniapp_admin_gift_resend_action(request):
     return apply_miniapp_security_headers(web.json_response(
         gift_resend_action_projection(action_id, action)
     ))
+
+
+async def miniapp_admin_gift_resend_cancel(request):
+    session = request["miniapp_admin"]
+    try:
+        public_reference = validate_gift_reference(request.match_info.get("gift_id"))
+        body = await read_gift_resend_json(request)
+        action_id = str(uuid.UUID(str(body.get("action_id"))))
+    except (AdminGiftsQueryError, TypeError, ValueError, AttributeError):
+        return gift_resend_action_error("invalid_gift_resend_cancellation")
+
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        action = load_gift_resend_action(cur, action_id, session.telegram_id)
+        if not action or action["action_type"] != GIFT_RESEND_ACTION_TYPE:
+            conn.rollback()
+            return gift_resend_action_error("gift_resend_action_not_found", 404)
+        if action["payload"].get("public_reference") != public_reference:
+            conn.rollback()
+            return gift_resend_action_error("gift_resend_action_mismatch", 409)
+        if action["status"] == "cancelled":
+            conn.rollback()
+            return apply_miniapp_security_headers(web.json_response(
+                gift_resend_action_projection(action_id, action)
+            ))
+        if action["status"] != "pending":
+            conn.rollback()
+            return gift_resend_action_error("gift_resend_action_unavailable", 409)
+        cancelled = cancel_admin_action(cur, action_id, session.telegram_id)
+        if not cancelled:
+            conn.rollback()
+            return gift_resend_action_error("gift_resend_action_unavailable", 409)
+        conn.commit()
+        cancelled_action = load_gift_resend_action(cur, action_id, session.telegram_id)
+        result = gift_resend_action_projection(action_id, cancelled_action)
+        conn.rollback()
+        return apply_miniapp_security_headers(web.json_response(result))
+    finally:
+        cur.close()
+        conn.close()
 
 
 def schedule_upload_error_response(error):
@@ -22387,6 +22459,11 @@ def create_app():
         app.router.add_post(
             '/api/admin/gifts/{gift_id}/resend-confirm',
             miniapp_admin_gift_resend_confirm,
+        )
+    if not _route_exists(app, "POST", "/api/admin/gifts/{gift_id}/resend-cancel"):
+        app.router.add_post(
+            '/api/admin/gifts/{gift_id}/resend-cancel',
+            miniapp_admin_gift_resend_cancel,
         )
     if not _route_exists(app, "GET", "/api/admin/gifts/actions/{action_id}"):
         app.router.add_get(

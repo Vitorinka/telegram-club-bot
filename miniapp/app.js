@@ -52,6 +52,7 @@
   const giftResendSummary = document.getElementById("gift-resend-summary");
   const giftResendMessage = document.getElementById("gift-resend-message");
   const giftResendConfirm = document.getElementById("gift-resend-confirm");
+  const giftResendCancel = document.getElementById("gift-resend-cancel");
   const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
@@ -691,8 +692,29 @@
       giftResendConfirm.disabled = false;
       giftResendMessage.textContent = error.message === "gift_state_changed"
         ? "Состояние подарка изменилось. Обновите данные и повторите."
-        : "Не удалось поставить сообщение в очередь.";
+        : error.message === "gift_target_changed"
+          ? "Получатель подарка изменился. Обновите данные и повторите."
+          : "Не удалось поставить сообщение в очередь.";
       status.textContent = "Повторная отправка не выполнена";
+    });
+  };
+  const cancelGiftResend = () => {
+    if (!giftResendGiftId || !giftResendActionId) {
+      resetGiftResend();
+      return Promise.resolve();
+    }
+    giftResendCancel.disabled = true;
+    status.textContent = "Отменяем запрос…";
+    return postAdminJson(
+      `/api/admin/gifts/${encodeURIComponent(giftResendGiftId)}/resend-cancel`,
+      {action_id: giftResendActionId}
+    ).then(() => {
+      resetGiftResend();
+      status.textContent = "Повторная отправка отменена";
+    }).catch(() => {
+      status.textContent = "Не удалось отменить запрос. Обновите данные.";
+    }).finally(() => {
+      giftResendCancel.disabled = false;
     });
   };
   function loadGiftDetails(giftId) {
@@ -785,7 +807,7 @@
   });
   document.getElementById("gift-resend-preview").addEventListener("click", previewGiftResend);
   giftResendConfirm.addEventListener("click", confirmGiftResend);
-  document.getElementById("gift-resend-cancel").addEventListener("click", resetGiftResend);
+  giftResendCancel.addEventListener("click", cancelGiftResend);
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {

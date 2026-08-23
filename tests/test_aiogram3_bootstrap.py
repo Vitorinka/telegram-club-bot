@@ -9458,6 +9458,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_miniapp_gift_resend_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
+        self.route_handler(
+            app, "POST", "/api/admin/gifts/{gift_id}/resend-cancel"
+        )
         path = "/api/admin/gifts/GIFT-ABCDEF0123456789/resend-preview"
         handler = self.route_handler(
             app, "POST", "/api/admin/gifts/{gift_id}/resend-preview"
@@ -9545,9 +9548,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/gifts", javascript)
         self.assertIn("/resend-preview", javascript)
         self.assertIn("/resend-confirm", javascript)
+        self.assertIn("/resend-cancel", javascript)
         self.assertIn("gift-resend-card", index)
         self.assertIn("Повторно отправить", index)
         self.assertIn("JSON.stringify(body)", javascript)
+        self.assertIn("giftResendCancel.addEventListener", javascript)
         self.assertNotIn('telegram_id: giftResend', javascript)
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
