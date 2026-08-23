@@ -19321,6 +19321,12 @@ async def user_is_current_group_member(telegram_id):
     )
 
 
+def canonical_manual_access_expiry(old_expiry, days, now=None):
+    now = now or datetime.utcnow()
+    base_expiry = old_expiry if old_expiry and old_expiry > now else now
+    return base_expiry + timedelta(days=int(days))
+
+
 async def perform_give_access(payload):
     telegram_id = int(payload["telegram_id"])
     days = int(payload.get("days", 30))
@@ -19329,35 +19335,27 @@ async def perform_give_access(payload):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT expiry_date, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s", (telegram_id,))
+        cur.execute(
+            "SELECT expiry_date, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (telegram_id,),
+        )
         row = cur.fetchone()
         old_expiry = row[0] if row else None
-        base_expiry = old_expiry if old_expiry and old_expiry > datetime.utcnow() else datetime.utcnow()
-        new_expiry = base_expiry + timedelta(days=days)
-        cur.execute(
-            """
+        new_expiry = canonical_manual_access_expiry(old_expiry, days)
+        cur.execute("""
             INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, blocked_bot)
             VALUES (%s, TRUE, %s, FALSE, FALSE)
             ON CONFLICT (telegram_id) DO UPDATE SET
-                paid = TRUE,
-                expiry_date = EXCLUDED.expiry_date,
-                payment_failed = FALSE,
-                payment_failed_at = NULL,
-                grace_period_end = NULL,
-                reminder_sent = FALSE,
-                blocked_bot = FALSE,
+                paid = TRUE, expiry_date = EXCLUDED.expiry_date,
+                payment_failed = FALSE, payment_failed_at = NULL,
+                grace_period_end = NULL, reminder_sent = FALSE, blocked_bot = FALSE,
                 auto_renew = CASE
                     WHEN users.stripe_subscription_id IS NULL THEN FALSE
                     ELSE users.auto_renew
                 END
-            """,
-            (telegram_id, new_expiry),
-        )
+        """, (telegram_id, new_expiry))
         repair_enqueued = enqueue_automatic_membership_repair(
-            cur,
-            telegram_id,
-            new_expiry,
-            ACCESS_RESTORE_SOURCE_ADMIN,
+            cur, telegram_id, new_expiry, ACCESS_RESTORE_SOURCE_ADMIN,
             requested_by_admin_id=payload.get("admin_id"),
             admin_action_id=payload.get("action_id"),
             reason="manual_give_access_confirmed",
@@ -21651,6 +21649,370 @@ async def miniapp_admin_user_details(request):
     return apply_miniapp_security_headers(web.json_response(details))
 
 
+MANUAL_ACCESS_ACTION_TYPE = "manual_access_change"
+MANUAL_ACCESS_DURATIONS = {
+    "7d": 7,
+    "30d": 30,
+    "90d": 90,
+    "180d": 180,
+    "365d": 365,
+}
+MANUAL_ACCESS_PREVIEW_TTL = timedelta(minutes=10)
+ACTIVE_REMOVAL_STATUSES = frozenset({
+    "pending", "processing", "stripe_canceled", "telegram_failed", "telegram_removed",
+})
+
+
+def load_manual_access_state(cur, telegram_id, for_update=False):
+    cur.execute("""
+        SELECT status, claim_generation, access_expiry
+        FROM subscription_removal_events WHERE telegram_id = %s
+    """ + (" FOR UPDATE" if for_update else ""), (int(telegram_id),))
+    removal = cur.fetchone()
+    cur.execute(f"""
+        SELECT telegram_id, username, paid, expiry_date, auto_renew,
+               payment_failed, grace_period_end, trial_used, first_payment_done,
+               stripe_customer_id, stripe_subscription_id
+        FROM users WHERE telegram_id = %s
+        {'FOR UPDATE' if for_update else ''}
+    """, (int(telegram_id),))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "telegram_id": int(row[0]), "username": row[1], "paid": bool(row[2]),
+        "expiry_date": row[3], "auto_renew": bool(row[4]),
+        "payment_failed": bool(row[5]), "grace_period_end": row[6],
+        "trial_used": bool(row[7]), "first_payment_done": bool(row[8]),
+        "stripe_customer_id": row[9], "stripe_subscription_id": row[10],
+        "removal_status": removal[0] if removal else None,
+        "removal_generation": int(removal[1] or 0) if removal else None,
+        "removal_access_expiry": removal[2] if removal else None,
+    }
+
+
+def manual_access_state_identity(state):
+    def iso(value):
+        return value.isoformat() if value else None
+    material = json.dumps({
+        "telegram_id": state["telegram_id"], "paid": state["paid"],
+        "expiry_date": iso(state["expiry_date"]), "auto_renew": state["auto_renew"],
+        "payment_failed": state["payment_failed"],
+        "grace_period_end": iso(state["grace_period_end"]),
+        "trial_used": state["trial_used"], "first_payment_done": state["first_payment_done"],
+        "stripe_customer_id": state["stripe_customer_id"],
+        "stripe_subscription_id": state["stripe_subscription_id"],
+        "removal_status": state["removal_status"],
+        "removal_generation": state["removal_generation"],
+        "removal_access_expiry": iso(state["removal_access_expiry"]),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(WEBHOOK_SECRET.encode("utf-8"), material, hashlib.sha256).hexdigest()
+
+
+def manual_access_preview_projection(state, duration, now=None):
+    now = now or datetime.utcnow()
+    days = MANUAL_ACCESS_DURATIONS[duration]
+    old_expiry = state["expiry_date"]
+    active_expiry = bool(old_expiry and old_expiry > now)
+    active_grace = bool(
+        state["payment_failed"] and state["grace_period_end"]
+        and state["grace_period_end"] > now
+    )
+    proposed_expiry = canonical_manual_access_expiry(old_expiry, days, now=now)
+    stripe_linked = bool(state["stripe_customer_id"] or state["stripe_subscription_id"])
+    warnings = []
+    if stripe_linked or state["auto_renew"]:
+        warnings.append(
+            "У пользователя есть Stripe-подписка или связанная Stripe-запись. "
+            "Ручное изменение доступа не изменит состояние подписки в Stripe."
+        )
+    if state["payment_failed"] or active_grace:
+        warnings.append(
+            "У пользователя есть failed-payment/grace состояние. Ручная выдача доступа "
+            "применит существующие правила manual access и очистит локальный failed-payment grace."
+        )
+    if state["removal_status"] in ACTIVE_REMOVAL_STATUSES:
+        warnings.append(
+            "Есть активная операция удаления. Новый срок доступа защитит пользователя через "
+            "существующее lifecycle fencing и поставит восстановление членства в durable очередь."
+        )
+    return {
+        "telegram_id": state["telegram_id"], "username": state["username"],
+        "current_access_status": "active_grace" if active_grace else (
+            "active" if active_expiry else ("expired" if old_expiry else "inactive")
+        ),
+        "current_expiry": old_expiry.isoformat() if old_expiry else None,
+        "proposed_expiry": proposed_expiry.isoformat(), "duration": duration,
+        "operation": "extend" if active_expiry else "grant",
+        "stripe_linked": stripe_linked, "auto_renew": state["auto_renew"],
+        "payment_failed": state["payment_failed"], "active_grace": active_grace,
+        "removal_status": state["removal_status"], "warnings": warnings,
+    }
+
+
+def manual_access_preview_deadline(state, preview_created_at):
+    deadline = preview_created_at + MANUAL_ACCESS_PREVIEW_TTL
+    expiry_date = state.get("expiry_date")
+    if expiry_date and expiry_date > preview_created_at:
+        deadline = min(deadline, expiry_date)
+    grace_period_end = state.get("grace_period_end")
+    if state.get("payment_failed") and grace_period_end and grace_period_end > preview_created_at:
+        deadline = min(deadline, grace_period_end)
+    return deadline
+
+
+def parse_manual_access_preview_payload(payload):
+    if not isinstance(payload, dict) or payload.get("duration") not in MANUAL_ACCESS_DURATIONS:
+        raise ValueError("invalid manual access preview")
+    telegram_id = payload.get("telegram_id")
+    if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+        raise ValueError("invalid manual access preview")
+    parsed = {}
+    for field in ("preview_created_at", "preview_expires_at", "proposed_expiry"):
+        value = payload.get(field)
+        if not isinstance(value, str):
+            raise ValueError("invalid manual access preview")
+        try:
+            timestamp = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            raise ValueError("invalid manual access preview") from None
+        if timestamp.tzinfo is not None:
+            raise ValueError("invalid manual access preview")
+        parsed[field] = timestamp
+    if (
+        parsed["preview_expires_at"] <= parsed["preview_created_at"]
+        or parsed["preview_expires_at"]
+        > parsed["preview_created_at"] + MANUAL_ACCESS_PREVIEW_TTL
+        or parsed["proposed_expiry"] <= parsed["preview_created_at"]
+    ):
+        raise ValueError("invalid manual access preview")
+    identity = payload.get("expected_state_identity")
+    if (
+        not isinstance(identity, str) or len(identity) != hashlib.sha256().digest_size * 2
+        or any(character not in "0123456789abcdef" for character in identity)
+    ):
+        raise ValueError("invalid manual access preview")
+    return parsed
+
+
+def apply_manual_access_change_cur(
+    cur, state, duration, admin_id, action_id, new_expiry, record_event=True,
+):
+    days = MANUAL_ACCESS_DURATIONS[duration] if duration in MANUAL_ACCESS_DURATIONS else int(duration)
+    duration_label = duration if duration in MANUAL_ACCESS_DURATIONS else f"{days}d"
+    old_expiry = state["expiry_date"]
+    cur.execute("""
+        INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, blocked_bot)
+        VALUES (%s, TRUE, %s, FALSE, FALSE)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            paid = TRUE, expiry_date = EXCLUDED.expiry_date,
+            payment_failed = FALSE, payment_failed_at = NULL,
+            grace_period_end = NULL, reminder_sent = FALSE, blocked_bot = FALSE,
+            auto_renew = CASE
+                WHEN users.stripe_subscription_id IS NULL THEN FALSE
+                ELSE users.auto_renew
+            END
+    """, (state["telegram_id"], new_expiry))
+    repair_enqueued = enqueue_automatic_membership_repair(
+        cur, state["telegram_id"], new_expiry, ACCESS_RESTORE_SOURCE_ADMIN,
+        requested_by_admin_id=admin_id, admin_action_id=action_id,
+        reason="manual_give_access_confirmed",
+    )
+    if record_event:
+        record_access_event_cur(
+            cur, state["telegram_id"], "manual_give_access",
+            source="miniapp_admin_action", old_expiry=old_expiry, new_expiry=new_expiry,
+            notes=f"duration={duration_label}; admin_action_id={action_id}",
+        )
+    return new_expiry, repair_enqueued
+
+
+def manual_access_error(category, status=400):
+    return apply_miniapp_security_headers(web.json_response({"error": category}, status=status))
+
+
+def load_manual_access_action(cur, action_id, admin_id):
+    cur.execute("""
+        SELECT action_type, payload_json, status, created_at, completed_at
+        FROM admin_action_requests WHERE action_id = %s AND admin_id = %s
+    """, (action_id, int(admin_id)))
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row[1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    return {"action_type": row[0], "payload": payload, "status": row[2],
+            "created_at": row[3], "completed_at": row[4]}
+
+
+def manual_access_action_projection(action_id, action):
+    payload = action.get("payload") or {}
+    return {"action_id": action_id, "status": action.get("status"),
+            "telegram_id": payload.get("telegram_id"), "duration": payload.get("duration"),
+            "operation": payload.get("result_operation"),
+            "expiry_date": payload.get("result_expiry"),
+            "failure_category": payload.get("failure_category")}
+
+
+def fail_manual_access_action(cur, action_id, payload, category, expected_status):
+    failed_payload = dict(payload)
+    failed_payload["failure_category"] = category
+    cur.execute("""
+        UPDATE admin_action_requests
+        SET payload_json = %s, status = 'failed', completed_at = NOW()
+        WHERE action_id = %s AND status = %s
+    """, (json.dumps(failed_payload, sort_keys=True), action_id, expected_status))
+
+
+async def miniapp_admin_access_preview(request):
+    session = request["miniapp_admin"]
+    try:
+        telegram_id = int(request.match_info.get("telegram_id"))
+        body = await read_gift_resend_json(request)
+        duration = body.get("duration")
+        if telegram_id <= 0 or duration not in MANUAL_ACCESS_DURATIONS:
+            raise ValueError
+    except (TypeError, ValueError, AdminGiftsQueryError):
+        return manual_access_error("invalid_manual_access_request")
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        state = load_manual_access_state(cur, telegram_id, for_update=True)
+        if not state:
+            conn.rollback(); return manual_access_error("user_not_found", 404)
+        preview_created_at = datetime.utcnow()
+        preview_expires_at = manual_access_preview_deadline(state, preview_created_at)
+        preview = manual_access_preview_projection(state, duration, now=preview_created_at)
+        action_id = make_action_request(cur, session.telegram_id, MANUAL_ACCESS_ACTION_TYPE, {
+            "telegram_id": telegram_id, "duration": duration,
+            "expected_state_identity": manual_access_state_identity(state),
+            "preview_created_at": preview_created_at.isoformat(),
+            "preview_expires_at": preview_expires_at.isoformat(),
+            "proposed_expiry": preview["proposed_expiry"],
+        }, ttl_minutes=10, now=preview_created_at)
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+    preview["action_id"] = action_id
+    preview["preview_expires_at"] = preview_expires_at.isoformat()
+    return apply_miniapp_security_headers(web.json_response(preview, status=201))
+
+
+async def miniapp_admin_access_confirm(request):
+    session = request["miniapp_admin"]
+    try:
+        telegram_id = int(request.match_info.get("telegram_id"))
+        body = await read_gift_resend_json(request)
+        action_id = str(uuid.UUID(str(body.get("action_id"))))
+    except (TypeError, ValueError, AdminGiftsQueryError):
+        return manual_access_error("invalid_manual_access_confirmation")
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        action = load_manual_access_action(cur, action_id, session.telegram_id)
+        if not action or action["action_type"] != MANUAL_ACCESS_ACTION_TYPE:
+            conn.rollback(); return manual_access_error("manual_access_action_not_found", 404)
+        if action["status"] != "pending":
+            conn.rollback()
+            if action["status"] == "cancelled":
+                return manual_access_error("manual_access_action_cancelled", 409)
+            return apply_miniapp_security_headers(web.json_response(
+                manual_access_action_projection(action_id, action)
+            ))
+        try:
+            preview_metadata = parse_manual_access_preview_payload(action["payload"])
+        except ValueError:
+            fail_manual_access_action(
+                cur, action_id, action["payload"], "manual_access_action_invalid", "pending"
+            )
+            conn.commit(); return manual_access_error("manual_access_action_invalid", 409)
+        if action["payload"]["telegram_id"] != telegram_id:
+            conn.rollback(); return manual_access_error("manual_access_action_mismatch", 409)
+        if datetime.utcnow() >= preview_metadata["preview_expires_at"]:
+            fail_manual_access_action(
+                cur, action_id, action["payload"], "manual_access_preview_expired", "pending"
+            )
+            conn.commit(); return manual_access_error("manual_access_preview_expired", 409)
+        claim = claim_admin_action(cur, action_id, session.telegram_id)
+        if claim["status"] != "claimed" or claim["action_type"] != MANUAL_ACCESS_ACTION_TYPE:
+            conn.rollback(); return manual_access_error("manual_access_action_unavailable", 409)
+        payload = claim["payload"]
+        try:
+            preview_metadata = parse_manual_access_preview_payload(payload)
+        except ValueError:
+            fail_manual_access_action(
+                cur, action_id, payload, "manual_access_action_invalid", "processing"
+            )
+            conn.commit(); return manual_access_error("manual_access_action_invalid", 409)
+        if datetime.utcnow() >= preview_metadata["preview_expires_at"]:
+            fail_manual_access_action(
+                cur, action_id, payload, "manual_access_preview_expired", "processing"
+            )
+            conn.commit(); return manual_access_error("manual_access_preview_expired", 409)
+        state = load_manual_access_state(cur, telegram_id, for_update=True)
+        if (
+            not state or payload.get("duration") not in MANUAL_ACCESS_DURATIONS
+            or not isinstance(payload.get("expected_state_identity"), str)
+            or not hmac.compare_digest(
+                payload["expected_state_identity"], manual_access_state_identity(state)
+            )
+        ):
+            fail_manual_access_action(
+                cur, action_id, payload, "user_access_state_changed", "processing"
+            )
+            conn.commit(); return manual_access_error("user_access_state_changed", 409)
+        preview = manual_access_preview_projection(
+            state, payload["duration"], now=preview_metadata["preview_created_at"]
+        )
+        new_expiry, repair_enqueued = apply_manual_access_change_cur(
+            cur, state, payload["duration"], session.telegram_id, action_id,
+            preview_metadata["proposed_expiry"],
+        )
+        payload["result_expiry"] = new_expiry.isoformat()
+        payload["result_operation"] = preview["operation"]
+        payload["repair_enqueued"] = bool(repair_enqueued)
+        cur.execute("UPDATE admin_action_requests SET payload_json = %s WHERE action_id = %s AND status = 'processing'",
+                    (json.dumps(payload, sort_keys=True), action_id))
+        complete_admin_action(cur, action_id)
+        conn.commit()
+        result = {"action_id": action_id, "status": "completed", "telegram_id": telegram_id,
+                  "duration": payload["duration"], "operation": preview["operation"],
+                  "expiry_date": new_expiry.isoformat(), "repair_enqueued": bool(repair_enqueued)}
+        return apply_miniapp_security_headers(web.json_response(result))
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+async def miniapp_admin_access_cancel(request):
+    session = request["miniapp_admin"]
+    try:
+        telegram_id = int(request.match_info.get("telegram_id"))
+        body = await read_gift_resend_json(request)
+        action_id = str(uuid.UUID(str(body.get("action_id"))))
+    except (TypeError, ValueError, AdminGiftsQueryError):
+        return manual_access_error("invalid_manual_access_cancellation")
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        action = load_manual_access_action(cur, action_id, session.telegram_id)
+        if not action or action["action_type"] != MANUAL_ACCESS_ACTION_TYPE:
+            conn.rollback(); return manual_access_error("manual_access_action_not_found", 404)
+        if int(action["payload"].get("telegram_id", -1)) != telegram_id:
+            conn.rollback(); return manual_access_error("manual_access_action_mismatch", 409)
+        if action["status"] == "cancelled":
+            conn.rollback(); return apply_miniapp_security_headers(web.json_response(
+                manual_access_action_projection(action_id, action)))
+        if action["status"] != "pending" or not cancel_admin_action(cur, action_id, session.telegram_id):
+            conn.rollback(); return manual_access_error("manual_access_action_unavailable", 409)
+        conn.commit()
+        return apply_miniapp_security_headers(web.json_response({
+            "action_id": action_id, "status": "cancelled", "telegram_id": telegram_id,
+        }))
+    finally:
+        cur.close(); conn.close()
+
+
 async def miniapp_admin_subscriptions(request):
     try:
         result = list_admin_subscriptions(
@@ -22390,6 +22752,12 @@ def create_app():
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
     if not _route_exists(app, "GET", "/api/admin/users"):
         app.router.add_get('/api/admin/users', miniapp_admin_users)
+    if not _route_exists(app, "POST", "/api/admin/users/{telegram_id}/access-preview"):
+        app.router.add_post('/api/admin/users/{telegram_id}/access-preview', miniapp_admin_access_preview)
+    if not _route_exists(app, "POST", "/api/admin/users/{telegram_id}/access-confirm"):
+        app.router.add_post('/api/admin/users/{telegram_id}/access-confirm', miniapp_admin_access_confirm)
+    if not _route_exists(app, "POST", "/api/admin/users/{telegram_id}/access-cancel"):
+        app.router.add_post('/api/admin/users/{telegram_id}/access-cancel', miniapp_admin_access_cancel)
     if not _route_exists(app, "GET", "/api/admin/users/{telegram_id}"):
         app.router.add_get(
             '/api/admin/users/{telegram_id}', miniapp_admin_user_details

@@ -8790,6 +8790,277 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             verify.close()
 
+    def test_miniapp_manual_access_is_atomic_fenced_and_idempotent_real_postgres(self):
+        main = import_main()
+        run_migrations(self.get_conn)
+        now = datetime.utcnow()
+        expired, active, grace = now - timedelta(days=2), now + timedelta(days=10), now + timedelta(days=1)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users (telegram_id, username, paid, expiry_date, auto_renew,
+                        payment_failed, grace_period_end, trial_used, first_payment_done,
+                        stripe_customer_id, stripe_subscription_id)
+                    VALUES
+                      (88301, 'manual_expired', TRUE, %s, FALSE, FALSE, NULL, TRUE, FALSE, NULL, NULL),
+                      (88302, 'manual_active', TRUE, %s, FALSE, FALSE, NULL, FALSE, FALSE, NULL, NULL),
+                      (88303, 'manual_grace', TRUE, %s, TRUE, TRUE, %s, FALSE, TRUE,
+                       'cus_private_manual', 'sub_private_manual'),
+                      (88304, 'manual_exact', TRUE, %s, FALSE, FALSE, NULL, FALSE, FALSE, NULL, NULL),
+                      (88305, 'manual_short_active', TRUE, %s, FALSE, FALSE, NULL, FALSE, FALSE, NULL, NULL),
+                      (88306, 'manual_short_grace', TRUE, %s, TRUE, TRUE, %s, FALSE, TRUE,
+                       'cus_private_short', 'sub_private_short'),
+                      (88307, 'manual_short_active_success', TRUE, %s, FALSE, FALSE, NULL,
+                       FALSE, FALSE, NULL, NULL)
+                """, (expired, active, expired, grace, expired, now + timedelta(minutes=5),
+                       expired, now + timedelta(minutes=5), now + timedelta(minutes=5)))
+                cur.execute("""
+                    INSERT INTO subscription_removal_events
+                        (telegram_id, status, reason, access_expiry, claim_generation, created_at, updated_at)
+                    VALUES (88303, 'pending', 'subscription_expired', %s, 4, NOW(), NOW())
+                """, (expired,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            invalid = asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"duration": "31d"})))
+            cancel_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"duration": "30d"}))).text)
+            forged_cancel = asyncio.run(main.miniapp_admin_access_cancel(
+                JsonAdminRequest(2, {"telegram_id": "88301"}, {"action_id": cancel_preview["action_id"]})))
+            cancel = asyncio.run(main.miniapp_admin_access_cancel(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": cancel_preview["action_id"]})))
+            double_cancel = asyncio.run(main.miniapp_admin_access_cancel(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": cancel_preview["action_id"]})))
+            cancelled_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": cancel_preview["action_id"]})))
+        self.assertEqual(invalid.status, 400)
+        self.assertEqual(cancel_preview["operation"], "grant")
+        self.assertEqual(forged_cancel.status, 404)
+        self.assertEqual(json.loads(cancel.text)["status"], "cancelled")
+        self.assertEqual(json.loads(double_cancel.text)["status"], "cancelled")
+        self.assertEqual(cancelled_confirm.status, 409)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            atomic_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"duration": "7d"}))).text)
+            with mock.patch.object(main, "record_access_event_cur", side_effect=RuntimeError("fault")):
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(main.miniapp_admin_access_confirm(
+                        JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": atomic_preview["action_id"]})))
+        atomic_verify = self.get_conn()
+        try:
+            with atomic_verify.cursor() as cur:
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88301")
+                self.assertEqual(cur.fetchone()[0], expired)
+                cur.execute("SELECT status FROM admin_action_requests WHERE action_id = %s", (atomic_preview["action_id"],))
+                self.assertEqual(cur.fetchone()[0], "pending")
+                cur.execute("SELECT COUNT(*) FROM access_events WHERE telegram_id = 88301")
+                self.assertEqual(cur.fetchone()[0], 0)
+        finally:
+            atomic_verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            exact_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88304"}, {"duration": "7d"}))).text)
+        exact_expected = datetime.fromisoformat(exact_preview["proposed_expiry"])
+        exact_action = self.get_conn()
+        try:
+            with exact_action.cursor() as cur:
+                cur.execute("SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
+                            (exact_preview["action_id"],))
+                exact_payload = json.loads(cur.fetchone()[0])
+                self.assertEqual(
+                    datetime.fromisoformat(exact_preview["preview_expires_at"]),
+                    datetime.fromisoformat(exact_payload["preview_created_at"])
+                    + main.MANUAL_ACCESS_PREVIEW_TTL,
+                )
+                delayed_created = datetime.utcnow() - timedelta(minutes=5)
+                exact_payload["preview_created_at"] = delayed_created.isoformat()
+                exact_payload["preview_expires_at"] = (
+                    delayed_created + main.MANUAL_ACCESS_PREVIEW_TTL
+                ).isoformat()
+                cur.execute("UPDATE admin_action_requests SET payload_json = %s WHERE action_id = %s",
+                            (json.dumps(exact_payload, sort_keys=True), exact_preview["action_id"]))
+            exact_action.commit()
+        finally:
+            exact_action.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            exact_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88304"}, {"action_id": exact_preview["action_id"]})))
+        self.assertEqual(exact_confirm.status, 200)
+        self.assertEqual(datetime.fromisoformat(json.loads(exact_confirm.text)["expiry_date"]), exact_expected)
+        exact_verify = self.get_conn()
+        try:
+            with exact_verify.cursor() as cur:
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88304")
+                self.assertEqual(cur.fetchone()[0], exact_expected)
+        finally:
+            exact_verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            expired_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"duration": "90d"}))).text)
+        expired_action = self.get_conn()
+        try:
+            with expired_action.cursor() as cur:
+                cur.execute("SELECT payload_json FROM admin_action_requests WHERE action_id = %s",
+                            (expired_preview["action_id"],))
+                expired_payload = json.loads(cur.fetchone()[0])
+                old_preview_time = datetime.utcnow() - timedelta(minutes=11)
+                expired_payload["preview_created_at"] = old_preview_time.isoformat()
+                expired_payload["preview_expires_at"] = (
+                    old_preview_time + main.MANUAL_ACCESS_PREVIEW_TTL
+                ).isoformat()
+                cur.execute("UPDATE admin_action_requests SET payload_json = %s WHERE action_id = %s",
+                            (json.dumps(expired_payload, sort_keys=True), expired_preview["action_id"]))
+                # Even if time-sensitive access state crosses its deadline, TTL rejection wins
+                # before the unchanged state HMAC can authorize a stale preview.
+                cur.execute("UPDATE users SET expiry_date = expiry_date WHERE telegram_id = 88301")
+            expired_action.commit()
+        finally:
+            expired_action.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            expired_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": expired_preview["action_id"]})))
+            expired_duplicate = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88301"}, {"action_id": expired_preview["action_id"]})))
+        self.assertEqual(expired_confirm.status, 409)
+        self.assertEqual(json.loads(expired_confirm.text)["error"], "manual_access_preview_expired")
+        self.assertEqual(json.loads(expired_duplicate.text)["failure_category"],
+                         "manual_access_preview_expired")
+        expired_verify = self.get_conn()
+        try:
+            with expired_verify.cursor() as cur:
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88301")
+                self.assertEqual(cur.fetchone()[0], expired)
+                cur.execute("SELECT status FROM admin_action_requests WHERE action_id = %s",
+                            (expired_preview["action_id"],))
+                self.assertEqual(cur.fetchone()[0], "failed")
+        finally:
+            expired_verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            short_active_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88305"}, {"duration": "7d"}))).text)
+            short_grace_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88306"}, {"duration": "7d"}))).text)
+            short_success_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88307"}, {"duration": "7d"}))).text)
+
+        self.assertEqual(datetime.fromisoformat(short_active_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(short_grace_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(short_success_preview["preview_expires_at"]),
+                         now + timedelta(minutes=5))
+
+        class FourMinutesLater(datetime):
+            @classmethod
+            def utcnow(cls):
+                return datetime.utcnow() + timedelta(minutes=4)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "datetime", FourMinutesLater):
+            short_success_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88307"},
+                                 {"action_id": short_success_preview["action_id"]})))
+        self.assertEqual(short_success_confirm.status, 200)
+        self.assertEqual(
+            datetime.fromisoformat(json.loads(short_success_confirm.text)["expiry_date"]),
+            datetime.fromisoformat(short_success_preview["proposed_expiry"]),
+        )
+
+        class SixMinutesLater(datetime):
+            @classmethod
+            def utcnow(cls):
+                return datetime.utcnow() + timedelta(minutes=6)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "datetime", SixMinutesLater):
+            short_active_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88305"},
+                                 {"action_id": short_active_preview["action_id"]})))
+            short_grace_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88306"},
+                                 {"action_id": short_grace_preview["action_id"]})))
+        self.assertEqual(json.loads(short_active_confirm.text)["error"],
+                         "manual_access_preview_expired")
+        self.assertEqual(json.loads(short_grace_confirm.text)["error"],
+                         "manual_access_preview_expired")
+        passage_verify = self.get_conn()
+        try:
+            with passage_verify.cursor() as cur:
+                cur.execute("SELECT telegram_id, expiry_date, payment_failed, grace_period_end "
+                            "FROM users WHERE telegram_id IN (88305, 88306) ORDER BY telegram_id")
+                self.assertEqual(cur.fetchall(), [
+                    (88305, now + timedelta(minutes=5), False, None),
+                    (88306, expired, True, now + timedelta(minutes=5)),
+                ])
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88307")
+                self.assertEqual(
+                    cur.fetchone()[0], datetime.fromisoformat(short_success_preview["proposed_expiry"])
+                )
+        finally:
+            passage_verify.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            first = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88302"}, {"duration": "30d"}))).text)
+            second = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(2, {"telegram_id": "88302"}, {"duration": "7d"}))).text)
+            confirmed = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88302"}, {"action_id": first["action_id"]})))
+            duplicate = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(1, {"telegram_id": "88302"}, {"action_id": first["action_id"]})))
+            stale = asyncio.run(main.miniapp_admin_access_confirm(
+                JsonAdminRequest(2, {"telegram_id": "88302"}, {"action_id": second["action_id"]})))
+        self.assertEqual(first["operation"], "extend")
+        self.assertEqual(datetime.fromisoformat(first["proposed_expiry"]), active + timedelta(days=30))
+        self.assertEqual(confirmed.status, 200)
+        self.assertEqual(json.loads(duplicate.text)["status"], "completed")
+        self.assertEqual(json.loads(stale.text)["error"], "user_access_state_changed")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            grace_preview = json.loads(asyncio.run(main.miniapp_admin_access_preview(
+                JsonAdminRequest(1, {"telegram_id": "88303"}, {"duration": "7d"}))).text)
+            with mock.patch.object(main.stripe, "Subscription") as stripe_api, \
+                 mock.patch.object(main.bot, "send_message") as telegram_send:
+                grace_confirm = asyncio.run(main.miniapp_admin_access_confirm(
+                    JsonAdminRequest(1, {"telegram_id": "88303"}, {"action_id": grace_preview["action_id"]})))
+        self.assertTrue(grace_preview["stripe_linked"] and grace_preview["active_grace"])
+        self.assertEqual(grace_preview["removal_status"], "pending")
+        self.assertGreaterEqual(len(grace_preview["warnings"]), 3)
+        self.assertEqual(grace_confirm.status, 200)
+        stripe_api.assert_not_called(); telegram_send.assert_not_called()
+
+        verify = self.get_conn()
+        try:
+            with verify.cursor() as cur:
+                cur.execute("SELECT expiry_date FROM users WHERE telegram_id = 88301")
+                self.assertEqual(cur.fetchone()[0], expired)
+                cur.execute("""SELECT paid, auto_renew, payment_failed, grace_period_end,
+                    stripe_customer_id, stripe_subscription_id FROM users WHERE telegram_id = 88303""")
+                self.assertEqual(cur.fetchone(), (True, True, False, None, "cus_private_manual", "sub_private_manual"))
+                cur.execute("SELECT status, claim_generation FROM subscription_removal_events WHERE telegram_id = 88303")
+                self.assertEqual(cur.fetchone(), ("pending", 4))
+                cur.execute("SELECT telegram_id, COUNT(*) FROM access_events WHERE telegram_id BETWEEN 88301 AND 88303 GROUP BY telegram_id ORDER BY telegram_id")
+                self.assertEqual(cur.fetchall(), [(88302, 1), (88303, 1)])
+                cur.execute("SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = 88303")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("SELECT payload_json FROM admin_action_requests WHERE action_id = %s", (grace_preview["action_id"],))
+                payload = cur.fetchone()[0]
+                self.assertNotIn("cus_private_manual", payload); self.assertNotIn("sub_private_manual", payload)
+                parsed_payload = json.loads(payload)
+                self.assertEqual(parsed_payload["proposed_expiry"], grace_preview["proposed_expiry"])
+                self.assertIn("preview_created_at", parsed_payload)
+                self.assertIn("preview_expires_at", parsed_payload)
+        finally:
+            verify.close()
+
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "0001_drop.sql").write_text("DROP TABLE users;", encoding="utf-8")

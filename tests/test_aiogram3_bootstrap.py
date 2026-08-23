@@ -9486,6 +9486,24 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(forbidden.status, 403)
 
+    def test_miniapp_manual_access_routes_are_registered_and_isolated(self):
+        app = self.main.create_app()
+        for path in (
+            "/api/admin/users/{telegram_id}/access-preview",
+            "/api/admin/users/{telegram_id}/access-confirm",
+            "/api/admin/users/{telegram_id}/access-cancel",
+        ):
+            self.route_handler(app, "POST", path)
+        source = Path(self.main.__file__).read_text(encoding="utf-8")
+        start = source.index("async def miniapp_admin_access_preview")
+        end = source.index("async def miniapp_admin_subscriptions", start)
+        flow = source[start:end]
+        self.assertIn("claim_admin_action", flow)
+        self.assertIn("apply_manual_access_change_cur", flow)
+        self.assertIn("complete_admin_action", flow)
+        self.assertNotIn("stripe.", flow)
+        self.assertNotIn("bot.", flow)
+
     def test_miniapp_gift_resend_reuses_canonical_durable_delivery(self):
         source = Path(self.main.__file__).read_text(encoding="utf-8")
         start = source.index("async def miniapp_admin_gift_resend_confirm")
