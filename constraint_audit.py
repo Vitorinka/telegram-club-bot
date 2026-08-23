@@ -33,6 +33,7 @@ EXPECTED_VALUES = {
         "resolve_checkout", "revoke_invite_links", "retry_delivery",
         "restore_access", "revoke_access", "gift_cancel", "gift_reissue",
         "gift_resend",
+        "manual_access_change",
         "schedule_upload_replace",
         "billing_portal_resend",
     )),

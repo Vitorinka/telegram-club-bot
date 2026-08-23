@@ -66,6 +66,27 @@
     <section id="user-details" class="screen page" data-screen="user-details" hidden>
       <button id="users-back" class="secondary" type="button">← К пользователям</button>
       <div id="user-details-content" class="dashboard"></div>
+      <article id="manual-access-card" class="card" hidden>
+        <h2>Действия</h2>
+        <div id="manual-access-controls">
+          <label class="search-label" for="manual-access-duration">Изменить доступ</label>
+          <select id="manual-access-duration" aria-label="Срок ручного доступа">
+            <option value="7d">7 дней</option><option value="30d" selected>30 дней</option>
+            <option value="90d">90 дней</option><option value="180d">180 дней</option>
+            <option value="365d">365 дней</option>
+          </select>
+          <button id="manual-access-preview" type="button">Изменить доступ</button>
+        </div>
+        <div id="manual-access-confirmation" hidden>
+          <div id="manual-access-summary" class="compact-list"></div>
+          <div id="manual-access-warnings" class="compact-list"></div>
+          <p id="manual-access-message" class="hint"></p>
+          <div class="action-row">
+            <button id="manual-access-confirm" type="button">Подтвердить</button>
+            <button id="manual-access-cancel" class="secondary" type="button">Отмена</button>
+          </div>
+        </div>
+      </article>
     </section>
     <section id="subscriptions-screen" class="screen page" data-screen="subscriptions" hidden>
       <article class="card subscriptions-toolbar">

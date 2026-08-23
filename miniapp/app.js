@@ -11,6 +11,15 @@
   const usersList = document.getElementById("users-list");
   const usersMore = document.getElementById("users-more");
   const detailsContent = document.getElementById("user-details-content");
+  const manualAccessCard = document.getElementById("manual-access-card");
+  const manualAccessControls = document.getElementById("manual-access-controls");
+  const manualAccessDuration = document.getElementById("manual-access-duration");
+  const manualAccessConfirmation = document.getElementById("manual-access-confirmation");
+  const manualAccessSummary = document.getElementById("manual-access-summary");
+  const manualAccessWarnings = document.getElementById("manual-access-warnings");
+  const manualAccessMessage = document.getElementById("manual-access-message");
+  const manualAccessConfirm = document.getElementById("manual-access-confirm");
+  const manualAccessCancel = document.getElementById("manual-access-cancel");
   const subscriptionsSearch = document.getElementById("subscriptions-search");
   const subscriptionsState = document.getElementById("subscriptions-state");
   const subscriptionsList = document.getElementById("subscriptions-list");
@@ -74,6 +83,8 @@
   let giftsSearchTimer = null;
   let giftResendGiftId = null;
   let giftResendActionId = null;
+  let manualAccessUserId = null;
+  let manualAccessActionId = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -209,6 +220,76 @@
     article.append(list);
     return article;
   };
+  const resetManualAccess = () => {
+    manualAccessActionId = null;
+    manualAccessControls.hidden = false;
+    manualAccessConfirmation.hidden = true;
+    manualAccessSummary.replaceChildren();
+    manualAccessWarnings.replaceChildren();
+    manualAccessMessage.textContent = "";
+    manualAccessConfirm.disabled = false;
+    manualAccessCancel.disabled = false;
+  };
+  const configureManualAccess = (user) => {
+    manualAccessUserId = user.telegram_id;
+    resetManualAccess();
+    manualAccessCard.hidden = false;
+  };
+  const previewManualAccess = () => {
+    if (!manualAccessUserId) return Promise.resolve();
+    status.textContent = "Готовим изменение доступа…";
+    return postAdminJson(
+      `/api/admin/users/${encodeURIComponent(manualAccessUserId)}/access-preview`,
+      {duration: manualAccessDuration.value}
+    ).then((preview) => {
+      manualAccessActionId = preview.action_id;
+      const operation = preview.operation === "extend" ? "Продлить" : "Выдать";
+      manualAccessSummary.replaceChildren(
+        text("strong", preview.username ? `@${preview.username}` : `ID ${preview.telegram_id}`),
+        text("span", `Telegram ID: ${preview.telegram_id}`),
+        text("span", `Текущий доступ: ${formatDate(preview.current_expiry)}`),
+        text("span", `После изменения: ${formatDate(preview.proposed_expiry)}`),
+        text("span", `Будет выполнено: ${operation} доступ (${preview.duration})`)
+      );
+      manualAccessWarnings.replaceChildren();
+      preview.warnings.forEach((warning) => manualAccessWarnings.append(text("p", `⚠ ${warning}`, "hint")));
+      manualAccessControls.hidden = true;
+      manualAccessConfirmation.hidden = false;
+      manualAccessMessage.textContent = "Подтвердите ручное изменение локального доступа.";
+      status.textContent = "Подтвердите изменение доступа";
+    }).catch(showApiError);
+  };
+  const confirmManualAccess = () => {
+    if (!manualAccessUserId || !manualAccessActionId) return Promise.resolve();
+    manualAccessConfirm.disabled = true;
+    return postAdminJson(
+      `/api/admin/users/${encodeURIComponent(manualAccessUserId)}/access-confirm`,
+      {action_id: manualAccessActionId}
+    ).then(() => {
+      status.textContent = "Доступ обновлён.";
+      return loadUserDetails(manualAccessUserId);
+    }).catch((error) => {
+      manualAccessConfirm.disabled = false;
+      manualAccessMessage.textContent = error.message === "user_access_state_changed"
+        ? "Состояние пользователя изменилось. Обновите данные и повторите."
+        : "Не удалось изменить доступ.";
+    });
+  };
+  const cancelManualAccess = () => {
+    if (!manualAccessUserId || !manualAccessActionId) {
+      resetManualAccess(); return Promise.resolve();
+    }
+    manualAccessCancel.disabled = true;
+    return postAdminJson(
+      `/api/admin/users/${encodeURIComponent(manualAccessUserId)}/access-cancel`,
+      {action_id: manualAccessActionId}
+    ).then(() => {
+      resetManualAccess(); status.textContent = "Изменение доступа отменено";
+    }).catch(() => {
+      manualAccessCancel.disabled = false;
+      status.textContent = "Не удалось отменить запрос. Обновите данные.";
+    });
+  };
   function loadUserDetails(userId) {
     status.textContent = "Загружаем профиль…";
     return api(`/api/admin/users/${encodeURIComponent(userId)}`).then((user) => {
@@ -220,6 +301,7 @@
         detailCard("Удаление", user.removal ? [["Статус", user.removal.status], ["Причина", user.removal.reason], ["Access expiry", user.removal.access_expiry], ["Обновлено", user.removal.updated_at]] : [["Статус", "Нет операции"]]),
         detailCard("История", user.access_history.length ? user.access_history.map((event) => [event.event_type, `${event.source}: ${event.old_expiry || "—"} → ${event.new_expiry || "—"}`]) : [["События", "Нет"]])
       );
+      configureManualAccess(user);
       showScreen("user-details");
       status.textContent = "Профиль пользователя";
     }).catch(showApiError);
@@ -808,6 +890,9 @@
   document.getElementById("gift-resend-preview").addEventListener("click", previewGiftResend);
   giftResendConfirm.addEventListener("click", confirmGiftResend);
   giftResendCancel.addEventListener("click", cancelGiftResend);
+  document.getElementById("manual-access-preview").addEventListener("click", previewManualAccess);
+  manualAccessConfirm.addEventListener("click", confirmManualAccess);
+  manualAccessCancel.addEventListener("click", cancelManualAccess);
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {
