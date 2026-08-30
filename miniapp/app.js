@@ -82,6 +82,17 @@
   const contentEditDuration = document.getElementById("content-edit-duration");
   const contentEditOrder = document.getElementById("content-edit-order");
   const contentEditMessage = document.getElementById("content-edit-message");
+  const contentMediaCard = document.getElementById("content-media-card");
+  const contentCoverCurrent = document.getElementById("content-cover-current");
+  const contentVideoCurrent = document.getElementById("content-video-current");
+  const contentCoverFile = document.getElementById("content-cover-file");
+  const contentVideoFile = document.getElementById("content-video-file");
+  const contentMediaConfirmation = document.getElementById("content-media-confirmation");
+  const contentMediaPreview = document.getElementById("content-media-preview");
+  const contentMediaSummary = document.getElementById("content-media-summary");
+  const contentMediaMessage = document.getElementById("content-media-message");
+  const contentMediaConfirm = document.getElementById("content-media-confirm");
+  const contentMediaCancel = document.getElementById("content-media-cancel");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -106,6 +117,10 @@
   let manualAccessActionId = null;
   let contentSearchTimer = null;
   let currentCmsContent = null;
+  let contentMediaUploadId = null;
+  let contentMediaLocalUrl = null;
+  let contentMediaServerUrl = null;
+  let contentMediaAttachedCoverUrl = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -138,6 +153,27 @@
     scheduleUploadLocalUrl = null;
     scheduleUploadServerUrl = null;
   };
+  const clearContentMediaUrls = () => {
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+    if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
+    contentMediaLocalUrl = null;
+    contentMediaServerUrl = null;
+    contentMediaAttachedCoverUrl = null;
+  };
+  const resetContentMediaDraft = () => {
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+    contentMediaLocalUrl = null;
+    contentMediaServerUrl = null;
+    contentMediaUploadId = null;
+    contentCoverFile.value = "";
+    contentVideoFile.value = "";
+    contentMediaConfirmation.hidden = true;
+    contentMediaPreview.replaceChildren(text("span", "Предварительный просмотр", "schedule-image-loading"));
+    contentMediaSummary.replaceChildren();
+    contentMediaMessage.textContent = "";
+  };
   const resetScheduleUpload = () => {
     clearScheduleUploadUrls();
     scheduleUploadId = null;
@@ -152,6 +188,10 @@
     }
     if (name !== "schedule-upload" && (scheduleUploadLocalUrl || scheduleUploadServerUrl)) {
       clearScheduleUploadUrls();
+    }
+    if (name !== "content-details") {
+      clearContentMediaUrls();
+      contentMediaUploadId = null;
     }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = node.dataset.screen !== name; });
     document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === name); });
@@ -926,6 +966,8 @@
     return article;
   };
   const loadCmsContentDetails = (contentId) => {
+    clearContentMediaUrls();
+    resetContentMediaDraft();
     status.textContent = "Загружаем черновик…";
     return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
       currentCmsContent = item;
@@ -936,15 +978,117 @@
         ["Статус", item.status], ["Версия", item.version],
       ]));
       contentEditCard.hidden = item.status !== "draft";
+      contentMediaCard.hidden = item.status !== "draft";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
       contentEditDescription.value = item.description || "";
       contentEditDuration.value = item.duration_seconds || "";
       contentEditOrder.value = item.sort_order;
       contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
+      renderContentMedia(item);
       showScreen("content-details");
       status.textContent = item.title;
     }).catch(showApiError);
+  };
+  const mediaImage = (url, alt) => {
+    const image = document.createElement("img");
+    image.className = "schedule-image";
+    image.alt = alt;
+    image.src = url;
+    return image;
+  };
+  const fetchContentCover = (item, media) => fetch(
+    `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(media.media_id)}`,
+    {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
+  ).then((response) => {
+    if (!response.ok) throw new Error("content_media_preview_failed");
+    return response.blob();
+  }).then((blob) => {
+    if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
+    contentMediaAttachedCoverUrl = URL.createObjectURL(blob);
+    contentCoverCurrent.replaceChildren(mediaImage(contentMediaAttachedCoverUrl, `Обложка ${item.title}`));
+  }).catch(() => {
+    contentCoverCurrent.replaceChildren(text("span", "Обложка недоступна", "schedule-image-loading"));
+  });
+  function renderContentMedia(item) {
+    const cover = (item.media || []).find((entry) => entry.media_type === "cover");
+    const video = (item.media || []).find((entry) => entry.media_type === "video");
+    contentCoverCurrent.replaceChildren(text("span", cover ? "Загружаем обложку…" : "Обложка не прикреплена", "schedule-image-loading"));
+    contentVideoCurrent.textContent = video
+      ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
+      : "Видео не прикреплено";
+    if (cover) fetchContentCover(item, cover);
+  }
+  const showLocalContentMedia = (mediaType) => {
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
+    contentMediaPreview.replaceChildren();
+    if (!file) contentMediaPreview.append(text("span", "Выберите файл", "schedule-image-loading"));
+    else if (mediaType === "cover") contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки"));
+    else contentMediaPreview.append(text("span", `Локально выбрано видео: ${file.name}`, "schedule-image-loading"));
+  };
+  const validateContentMedia = (mediaType) => {
+    if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    if (!file) {
+      contentMediaMessage.textContent = "Выберите файл.";
+      contentMediaConfirmation.hidden = false;
+      return Promise.resolve();
+    }
+    const form = new FormData();
+    form.append("media_type", mediaType);
+    form.append("file", file);
+    contentMediaMessage.textContent = "Проверяем файл…";
+    contentMediaConfirmation.hidden = false;
+    return postAdmin(`/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/media-preview`, form)
+      .then((draft) => {
+        contentMediaUploadId = draft.upload_id;
+        contentMediaSummary.replaceChildren(
+          text("strong", currentCmsContent.title),
+          text("span", mediaType === "cover" ? "Обложка" : "Видео"),
+          text("span", `${draft.mime_type} · ${Math.ceil(draft.size_bytes / 1024)} КиБ`)
+        );
+        contentMediaMessage.textContent = draft.existing_media
+          ? "Текущий файл будет заменён после подтверждения."
+          : "Файл будет прикреплён только после подтверждения.";
+        if (mediaType !== "cover") return null;
+        return fetch(`/api/admin/content/media/uploads/${encodeURIComponent(draft.upload_id)}/preview`, {
+          headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+        }).then((response) => {
+          if (!response.ok) throw new Error("content_media_preview_failed");
+          return response.blob();
+        }).then((blob) => {
+          if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+          contentMediaServerUrl = URL.createObjectURL(blob);
+          contentMediaPreview.replaceChildren(mediaImage(contentMediaServerUrl, "Проверенная обложка"));
+        });
+      }).catch((error) => {
+        contentMediaUploadId = null;
+        contentMediaMessage.textContent = error.message === "content_media_too_large"
+          ? "Файл превышает допустимый размер."
+          : "Файл не прошёл безопасную проверку.";
+      });
+  };
+  const confirmContentMedia = () => {
+    if (!contentMediaUploadId || !currentCmsContent) return Promise.resolve();
+    contentMediaConfirm.disabled = true;
+    contentMediaMessage.textContent = "Загружаем и прикрепляем…";
+    return postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`)
+      .then((result) => {
+        if (result.status !== "completed") throw new Error(result.failure_category || result.status);
+        return loadCmsContentDetails(currentCmsContent.content_id);
+      }).catch((error) => {
+        contentMediaMessage.textContent = error.message === "content_version_changed"
+          ? "Материал изменился после проверки. Обновите данные и повторите."
+          : "Не удалось прикрепить файл. Повторите безопасную проверку.";
+      }).finally(() => { contentMediaConfirm.disabled = false; });
+  };
+  const cancelContentMedia = () => {
+    const request = contentMediaUploadId
+      ? postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/cancel`).catch(() => null)
+      : Promise.resolve();
+    return request.then(() => { resetContentMediaDraft(); status.textContent = "Загрузка медиа отменена"; });
   };
   const optionalNumber = (input) => input.value === "" ? null : Number(input.value);
   const createCmsDraft = () => {
@@ -1003,6 +1147,12 @@
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
   document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
+  document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
+  document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
+  contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
+  contentVideoFile.addEventListener("change", () => showLocalContentMedia("video"));
+  contentMediaConfirm.addEventListener("click", confirmContentMedia);
+  contentMediaCancel.addEventListener("click", cancelContentMedia);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {

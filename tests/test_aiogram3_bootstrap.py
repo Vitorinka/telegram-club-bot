@@ -9542,6 +9542,80 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(patch_handler)
 
+    async def test_miniapp_content_media_routes_require_admin_bearer_auth(self):
+        app = self.main.create_app()
+        routes = (
+            ("POST", "/api/admin/content/cms/{content_id}/media-preview"),
+            ("GET", "/api/admin/content/media/uploads/{upload_id}/preview"),
+            ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
+            ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
+            ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}"),
+        )
+        for method, resource in routes:
+            handler = self.route_handler(app, method, resource)
+            request = FakeMiniAppRequest(
+                app, path=resource, method=method,
+                match_info={
+                    "content_id": "00000000-0000-0000-0000-000000000001",
+                    "upload_id": "00000000-0000-0000-0000-000000000002",
+                    "media_id": "00000000-0000-0000-0000-000000000003",
+                },
+            )
+            with self.subTest(resource=resource):
+                response = await self.main.miniapp_admin_auth_middleware(
+                    request, handler
+                )
+                self.assertEqual(response.status, 401)
+
+        non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+        handler = self.route_handler(
+            app, "POST", "/api/admin/content/media/uploads/{upload_id}/confirm"
+        )
+        with patch.object(
+            self.main, "load_miniapp_admin_session", return_value=non_admin
+        ):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token",
+                    path="/api/admin/content/media/uploads/id/confirm",
+                    method="POST", match_info={"upload_id": "id"},
+                ), handler,
+            )
+        self.assertEqual(response.status, 403)
+
+    async def test_content_media_storage_failure_is_safe_and_does_not_attach(self):
+        raw_reference = "private-telegram-reference"
+        state = {
+            "mode": "upload", "media_bytes": b"\x89PNG\r\n\x1a\nimage",
+            "mime_type": "image/png", "media_type": "cover",
+        }
+        with patch.object(
+            self.main, "prepare_media_execution", return_value=state
+        ), patch.object(
+            self.main.bot, "send_photo",
+            new=AsyncMock(side_effect=RuntimeError(raw_reference)),
+        ) as send, patch.object(
+            self.main, "fail_media_upload"
+        ) as failed, patch.object(
+            self.main, "record_telegram_upload"
+        ) as recorded, patch.object(
+            self.main, "apply_media_upload"
+        ) as applied, self.assertLogs(level="WARNING") as logs:
+            result = await self.main.execute_content_media_upload(
+                "upload-id", "action-id", 1
+            )
+        send.assert_awaited_once()
+        failed.assert_called_once_with(
+            self.main.get_db_conn, "upload-id", "action-id", 1,
+            "telegram_upload_failed",
+        )
+        recorded.assert_not_called()
+        applied.assert_not_called()
+        self.assertEqual(result, {
+            "status": "failed", "failure_category": "telegram_upload_failed",
+        })
+        self.assertNotIn(raw_reference, "\n".join(logs.output))
+
     async def test_miniapp_gift_resend_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         self.route_handler(
@@ -9654,6 +9728,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/content/drafts", javascript)
         self.assertIn("/api/admin/content/cms", javascript)
         self.assertIn('"PATCH", `/api/admin/content/cms/', javascript)
+        self.assertIn("/media-preview", javascript)
+        self.assertIn("/media/uploads/", javascript)
+        self.assertIn("content-media-card", index)
+        self.assertIn('accept="video/mp4"', index)
+        self.assertIn("contentMediaLocalUrl", javascript)
+        self.assertIn("contentMediaServerUrl", javascript)
+        self.assertIn("URL.revokeObjectURL(contentMedia", javascript)
+        self.assertNotIn("server_reference", javascript)
+        self.assertNotIn("file_path", javascript)
         self.assertIn("/resend-preview", javascript)
         self.assertIn("/resend-confirm", javascript)
         self.assertIn("/resend-cancel", javascript)

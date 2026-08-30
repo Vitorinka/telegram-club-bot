@@ -161,6 +161,21 @@ from content_cms import (
     list_cms_content,
     update_content_draft,
 )
+from content_media import (
+    COVER_MAX_BYTES,
+    VIDEO_MAX_BYTES,
+    ContentMediaError,
+    apply_media_upload,
+    cancel_media_upload,
+    create_media_upload,
+    ensure_media_action,
+    fail_media_upload,
+    get_media_reference,
+    get_media_upload,
+    list_content_media,
+    prepare_media_execution,
+    record_telegram_upload,
+)
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -345,6 +360,17 @@ class ScheduleImageTooLarge(Exception):
 class BoundedScheduleImageBuffer(io.BytesIO):
     def write(self, data):
         if self.tell() + len(data) > SCHEDULE_IMAGE_MAX_BYTES:
+            raise ScheduleImageTooLarge
+        return super().write(data)
+
+
+class BoundedContentMediaBuffer(io.BytesIO):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = int(limit)
+
+    def write(self, data):
+        if self.tell() + len(data) > self.limit:
             raise ScheduleImageTooLarge
         return super().write(data)
 
@@ -21701,6 +21727,9 @@ async def miniapp_admin_cms_content_details(request):
         return content_cms_error_response(error)
     if result is None:
         return content_cms_error_response(ContentCmsError("content_not_found", 404))
+    result["media"] = list_content_media(
+        get_db_conn, request.match_info.get("content_id")
+    )
     return apply_miniapp_security_headers(web.json_response(result))
 
 
@@ -21713,6 +21742,219 @@ async def miniapp_admin_cms_content_update(request):
     except ContentCmsError as error:
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result))
+
+
+def content_media_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status
+    ))
+
+
+async def read_bounded_content_media_multipart(request):
+    if (
+        request.content_length is not None
+        and request.content_length > VIDEO_MAX_BYTES + 1024 * 1024
+    ):
+        raise ContentMediaError("content_media_too_large", 413)
+    try:
+        reader = await request.multipart()
+    except Exception:
+        raise ContentMediaError("invalid_multipart_upload") from None
+    media_type = None
+    media = None
+    async for field in reader:
+        if field.name == "media_type":
+            if media_type is not None:
+                raise ContentMediaError("duplicate_content_media_type")
+            media_type = (await field.text()).strip()
+        elif field.name == "file":
+            if media is not None:
+                raise ContentMediaError("duplicate_content_media_file")
+            buffer = bytearray()
+            while True:
+                chunk = await field.read_chunk(size=64 * 1024)
+                if not chunk:
+                    break
+                if len(buffer) + len(chunk) > VIDEO_MAX_BYTES:
+                    raise ContentMediaError("content_media_too_large", 413)
+                buffer.extend(chunk)
+            media = bytes(buffer)
+        else:
+            raise ContentMediaError("unexpected_upload_field")
+    if media_type is None:
+        raise ContentMediaError("content_media_type_missing")
+    if not media:
+        raise ContentMediaError("content_media_missing")
+    return media_type, media
+
+
+async def miniapp_admin_content_media_preview(request):
+    session = request["miniapp_admin"]
+    try:
+        media_type, data = await read_bounded_content_media_multipart(request)
+        result = create_media_upload(
+            get_db_conn, session.telegram_id,
+            request.match_info.get("content_id"), media_type, data,
+        )
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_content_media_staged_preview(request):
+    session = request["miniapp_admin"]
+    try:
+        upload = get_media_upload(
+            get_db_conn, request.match_info.get("upload_id"),
+            session.telegram_id, include_bytes=True,
+        )
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    if upload is None:
+        return content_media_error_response(
+            ContentMediaError("content_media_upload_not_found", 404)
+        )
+    if upload["media_type"] != "cover":
+        return content_media_error_response(
+            ContentMediaError("video_preview_not_supported", 409)
+        )
+    response = web.Response(
+        body=upload["media_bytes"], content_type=upload["mime_type"]
+    )
+    response.headers["Content-Disposition"] = "inline"
+    apply_miniapp_security_headers(response)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+async def execute_content_media_upload(upload_id, action_id, admin_id):
+    state = prepare_media_execution(get_db_conn, upload_id, action_id, admin_id)
+    if state["mode"] == "upload":
+        extension = {
+            "image/jpeg": "jpg", "image/png": "png",
+            "image/webp": "webp", "video/mp4": "mp4",
+        }[state["mime_type"]]
+        media = BufferedInputFile(
+            state["media_bytes"], filename=f"cms_media.{extension}"
+        )
+        try:
+            if state["media_type"] == "cover":
+                message = await bot.send_photo(
+                    int(admin_id), media,
+                    caption="CMS: загружена обложка черновика",
+                )
+                file_id = message.photo[-1].file_id
+            else:
+                message = await bot.send_video(
+                    int(admin_id), media,
+                    caption="CMS: загружено видео черновика",
+                    supports_streaming=True,
+                )
+                file_id = message.video.file_id
+        except Exception:
+            fail_media_upload(
+                get_db_conn, upload_id, action_id, admin_id,
+                "telegram_upload_failed",
+            )
+            logging.warning(
+                "MINIAPP_CONTENT_MEDIA_UPLOAD_FAILED: "
+                "action_id=%s category=telegram_upload_failed",
+                action_id,
+            )
+            return {
+                "status": "failed",
+                "failure_category": "telegram_upload_failed",
+            }
+        record_telegram_upload(get_db_conn, upload_id, action_id, admin_id, file_id)
+        state = {"mode":"apply"}
+    if state["mode"] == "apply":
+        return apply_media_upload(get_db_conn, upload_id, action_id, admin_id)
+    if state["mode"] == "completed":
+        return {"status": "completed", "media_id": state.get("media_id")}
+    return {
+        "status": state["mode"],
+        "failure_category": state.get("failure_category"),
+    }
+
+
+async def miniapp_admin_content_media_confirm(request):
+    session = request["miniapp_admin"]
+    upload_id = request.match_info.get("upload_id")
+    try:
+        action = ensure_media_action(get_db_conn, upload_id, session.telegram_id)
+        if action is None:
+            raise ContentMediaError("content_media_upload_not_found", 404)
+        result = await execute_content_media_upload(
+            upload_id, action["action_id"], session.telegram_id
+        )
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    status = 200 if result.get("status") in ("completed", "failed") else 202
+    return apply_miniapp_security_headers(web.json_response(
+        {"action_id": action["action_id"], **result}, status=status
+    ))
+
+
+async def miniapp_admin_content_media_cancel(request):
+    session = request["miniapp_admin"]
+    try:
+        result = cancel_media_upload(
+            get_db_conn, request.match_info.get("upload_id"),
+            session.telegram_id,
+        )
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    if result is None:
+        return content_media_error_response(
+            ContentMediaError("content_media_upload_not_found", 404)
+        )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_media_proxy(request):
+    try:
+        media = get_media_reference(
+            get_db_conn, request.match_info.get("content_id"),
+            request.match_info.get("media_id"),
+        )
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    if media is None:
+        return content_media_error_response(
+            ContentMediaError("content_media_not_found", 404)
+        )
+    if media["media_type"] != "cover":
+        return content_media_error_response(
+            ContentMediaError("video_preview_not_supported", 409)
+        )
+    try:
+        telegram_file = await bot.get_file(media["server_reference"])
+        file_path = getattr(telegram_file, "file_path", None)
+        file_size = getattr(telegram_file, "file_size", None)
+        if not file_path or (file_size is not None and int(file_size) > COVER_MAX_BYTES):
+            raise ContentMediaError("content_media_unavailable", 502)
+        destination = BoundedContentMediaBuffer(COVER_MAX_BYTES)
+        await bot.download_file(
+            file_path, destination=destination, timeout=30,
+            chunk_size=64 * 1024,
+        )
+        data = destination.getvalue()
+        if schedule_image_content_type(data) != media["mime_type"]:
+            raise ContentMediaError("content_media_unavailable", 502)
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return content_media_error_response(ContentMediaError("content_media_unavailable", 502))
+    except (
+        TelegramNetworkError, TelegramRetryAfter,
+        asyncio.TimeoutError, ScheduleImageTooLarge,
+    ):
+        return content_media_error_response(ContentMediaError("content_media_unavailable", 503))
+    response = web.Response(body=data, content_type=media["mime_type"])
+    response.headers["Content-Disposition"] = "inline"
+    apply_miniapp_security_headers(response)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 async def miniapp_admin_users(request):
@@ -22824,7 +23066,7 @@ def _route_exists(app, method, path):
 def create_app():
     app = web.Application(
         middlewares=[miniapp_admin_auth_middleware],
-        client_max_size=SCHEDULE_UPLOAD_MAX_BYTES + 1024 * 1024,
+        client_max_size=VIDEO_MAX_BYTES + 1024 * 1024,
     )
     telegram_path = get_telegram_webhook_path()
     if not _route_exists(app, "POST", telegram_path):
@@ -22859,6 +23101,16 @@ def create_app():
         )
     if not _route_exists(app, "GET", "/api/admin/content/cms"):
         app.router.add_get('/api/admin/content/cms', miniapp_admin_cms_content)
+    if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/media-preview"):
+        app.router.add_post('/api/admin/content/cms/{content_id}/media-preview', miniapp_admin_content_media_preview)
+    if not _route_exists(app, "GET", "/api/admin/content/media/uploads/{upload_id}/preview"):
+        app.router.add_get('/api/admin/content/media/uploads/{upload_id}/preview', miniapp_admin_content_media_staged_preview)
+    if not _route_exists(app, "POST", "/api/admin/content/media/uploads/{upload_id}/confirm"):
+        app.router.add_post('/api/admin/content/media/uploads/{upload_id}/confirm', miniapp_admin_content_media_confirm)
+    if not _route_exists(app, "POST", "/api/admin/content/media/uploads/{upload_id}/cancel"):
+        app.router.add_post('/api/admin/content/media/uploads/{upload_id}/cancel', miniapp_admin_content_media_cancel)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/media/{media_id}', miniapp_admin_content_media_proxy)
     if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}"):
         app.router.add_get(
             '/api/admin/content/cms/{content_id}',

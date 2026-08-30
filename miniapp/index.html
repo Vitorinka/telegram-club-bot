@@ -96,6 +96,36 @@
         <p id="content-edit-message" class="hint"></p>
         <button id="content-edit-save" type="button">Сохранить</button>
       </article>
+      <article id="content-media-card" class="card" hidden>
+        <h2>Медиа</h2>
+        <p class="hint">Медиа прикрепляется только к черновику и не публикуется для участников клуба.</p>
+        <section class="content-media-control">
+          <h3>Обложка</h3>
+          <div id="content-cover-current" class="schedule-preview"><span class="schedule-image-loading">Обложка не прикреплена</span></div>
+          <label>Загрузить или заменить
+            <input id="content-cover-file" type="file" accept="image/jpeg,image/png,image/webp">
+          </label>
+          <button id="content-cover-validate" type="button">Проверить обложку</button>
+        </section>
+        <section class="content-media-control">
+          <h3>Видео</h3>
+          <div id="content-video-current" class="hint">Видео не прикреплено</div>
+          <label>Загрузить или заменить
+            <input id="content-video-file" type="file" accept="video/mp4">
+          </label>
+          <button id="content-video-validate" type="button">Проверить видео</button>
+        </section>
+        <section id="content-media-confirmation" hidden>
+          <h3>Подтверждение</h3>
+          <div id="content-media-preview" class="schedule-preview"><span class="schedule-image-loading">Предварительный просмотр</span></div>
+          <div id="content-media-summary" class="confirmation-summary"></div>
+          <p id="content-media-message" class="hint"></p>
+          <div class="confirmation-actions">
+            <button id="content-media-confirm" type="button">Прикрепить</button>
+            <button id="content-media-cancel" class="secondary" type="button">Отмена</button>
+          </div>
+        </section>
+      </article>
     </section>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
