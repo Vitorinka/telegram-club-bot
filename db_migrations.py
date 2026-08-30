@@ -598,6 +598,93 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0019_content_items": {
+        "tables": ("content_items",),
+        "columns": {
+            "content_items": (
+                "content_id", "content_type", "category", "title",
+                "description", "duration_seconds", "sort_order", "status",
+                "version", "created_by_telegram_id", "created_at",
+                "updated_at", "published_at", "archived_at",
+            ),
+        },
+        "indexes": (
+            "content_items_status_updated_idx",
+            "content_items_category_sort_idx",
+        ),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("content_type", "lesson"),
+                "validated": True,
+            },
+            "content_items_status_check": {
+                "table": "content_items",
+                "definition_contains": ("status", "draft", "published", "archived"),
+                "validated": True,
+            },
+            "content_items_version_check": {
+                "table": "content_items",
+                "definition_contains": ("version", ">=", "1"),
+                "validated": True,
+            },
+        },
+    },
+    "0020_content_media": {
+        "tables": ("content_media", "content_media_uploads"),
+        "columns": {
+            "content_media": (
+                "media_id", "content_id", "media_type", "storage_kind",
+                "server_reference", "mime_type", "size_bytes", "sha256",
+                "sort_order", "version", "created_by_telegram_id",
+                "replaces_media_id", "created_at", "updated_at", "deleted_at",
+            ),
+            "content_media_uploads": (
+                "upload_id", "admin_telegram_id", "content_id",
+                "expected_content_version", "media_type", "media_bytes",
+                "mime_type", "byte_size", "sha256", "status", "action_id",
+                "expires_at",
+            ),
+        },
+        "indexes": (
+            "content_media_one_active_type_idx",
+            "content_media_content_history_idx",
+            "content_media_uploads_action_idx",
+            "content_media_uploads_owner_created_idx",
+            "content_media_uploads_expiry_idx",
+        ),
+        "constraints": {
+            "content_media_type_check": {
+                "table": "content_media",
+                "definition_contains": ("media_type", "cover", "video"),
+                "validated": True,
+            },
+            "content_media_storage_check": {
+                "table": "content_media",
+                "definition_contains": ("storage_kind", "telegram_file_id"),
+                "validated": True,
+            },
+            "content_media_size_check": {
+                "table": "content_media",
+                "definition_contains": ("size_bytes", "10485760", "20971520"),
+                "validated": True,
+            },
+            "content_media_uploads_size_check": {
+                "table": "content_media_uploads",
+                "definition_contains": (
+                    "media_type", "cover", "video", "10485760", "20971520",
+                ),
+                "validated": True,
+            },
+            "content_media_uploads_status_check": {
+                "table": "content_media_uploads",
+                "definition_contains": (
+                    "status", "pending", "uploaded", "applied", "cancelled",
+                ),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

@@ -9456,6 +9456,166 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing_gift.status, 404)
         details.assert_called_once_with(self.main.get_db_conn, "GIFT-ABCDEF0123456789")
 
+    async def test_miniapp_content_routes_are_centrally_protected_and_isolated(self):
+        app = self.main.create_app()
+        list_handler = self.route_handler(app, "GET", "/api/admin/content")
+        details_handler = self.route_handler(
+            app, "GET", "/api/admin/content/{content_id}"
+        )
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/content"), list_handler
+        )
+        self.assertEqual(missing.status, 401)
+
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/content",
+            query={"category": "onboarding", "q": "клуб"},
+        )
+        safe_result = {"items": [], "summary": {}, "filters": [], "read_only": True}
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_content", return_value=safe_result) as listing, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(
+                request, list_handler
+            )
+        self.assertEqual(response.status, 200)
+        listing.assert_called_once_with(
+            free_lesson_configured=bool(os.getenv("FREE_LESSON_VIDEO_ID")),
+            category="onboarding", query="клуб",
+        )
+
+        details_request = FakeMiniAppRequest(
+            app, "Bearer token", path="/api/admin/content/free-lesson",
+            match_info={"content_id": "free-lesson"},
+        )
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "get_admin_content", return_value=None):
+            missing_item = await self.main.miniapp_admin_auth_middleware(
+                details_request, details_handler
+            )
+        self.assertEqual(missing_item.status, 404)
+
+    async def test_miniapp_content_cms_mutations_require_admin_and_are_isolated(self):
+        app = self.main.create_app()
+        create_handler = self.route_handler(
+            app, "POST", "/api/admin/content/drafts"
+        )
+        patch_handler = self.route_handler(
+            app, "PATCH", "/api/admin/content/cms/{content_id}"
+        )
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path="/api/admin/content/drafts", method="POST",
+                json_data={"content_type": "lesson", "title": "Урок"},
+            ), create_handler,
+        )
+        self.assertEqual(missing.status, 401)
+
+        non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=non_admin):
+            forbidden = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/content/drafts",
+                    method="POST", json_data={"content_type": "lesson", "title": "Урок"},
+                ), create_handler,
+            )
+        self.assertEqual(forbidden.status, 403)
+
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        draft = {"content_id": "00000000-0000-0000-0000-000000000001", "status": "draft"}
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "create_content_draft", return_value=draft) as create, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/content/drafts",
+                    method="POST", json_data={"content_type": "lesson", "title": "Урок"},
+                ), create_handler,
+            )
+        self.assertEqual(response.status, 201)
+        create.assert_called_once_with(
+            self.main.get_db_conn, 1,
+            {"content_type": "lesson", "title": "Урок"},
+        )
+        self.assertIsNotNone(patch_handler)
+
+    async def test_miniapp_content_media_routes_require_admin_bearer_auth(self):
+        app = self.main.create_app()
+        routes = (
+            ("POST", "/api/admin/content/cms/{content_id}/media-preview"),
+            ("GET", "/api/admin/content/media/uploads/{upload_id}/preview"),
+            ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
+            ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
+            ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}"),
+        )
+        for method, resource in routes:
+            handler = self.route_handler(app, method, resource)
+            request = FakeMiniAppRequest(
+                app, path=resource, method=method,
+                match_info={
+                    "content_id": "00000000-0000-0000-0000-000000000001",
+                    "upload_id": "00000000-0000-0000-0000-000000000002",
+                    "media_id": "00000000-0000-0000-0000-000000000003",
+                },
+            )
+            with self.subTest(resource=resource):
+                response = await self.main.miniapp_admin_auth_middleware(
+                    request, handler
+                )
+                self.assertEqual(response.status, 401)
+
+        non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+        handler = self.route_handler(
+            app, "POST", "/api/admin/content/media/uploads/{upload_id}/confirm"
+        )
+        with patch.object(
+            self.main, "load_miniapp_admin_session", return_value=non_admin
+        ):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token",
+                    path="/api/admin/content/media/uploads/id/confirm",
+                    method="POST", match_info={"upload_id": "id"},
+                ), handler,
+            )
+        self.assertEqual(response.status, 403)
+
+    async def test_content_media_storage_failure_is_safe_and_does_not_attach(self):
+        raw_reference = "private-telegram-reference"
+        state = {
+            "mode": "upload", "media_bytes": b"\x89PNG\r\n\x1a\nimage",
+            "mime_type": "image/png", "media_type": "cover",
+        }
+        with patch.object(
+            self.main, "prepare_media_execution", return_value=state
+        ), patch.object(
+            self.main.bot, "send_photo",
+            new=AsyncMock(side_effect=RuntimeError(raw_reference)),
+        ) as send, patch.object(
+            self.main, "fail_media_upload"
+        ) as failed, patch.object(
+            self.main, "record_telegram_upload"
+        ) as recorded, patch.object(
+            self.main, "apply_media_upload"
+        ) as applied, self.assertLogs(level="WARNING") as logs:
+            result = await self.main.execute_content_media_upload(
+                "upload-id", "action-id", 1
+            )
+        send.assert_awaited_once()
+        failed.assert_called_once_with(
+            self.main.get_db_conn, "upload-id", "action-id", 1,
+            "telegram_upload_failed",
+        )
+        recorded.assert_not_called()
+        applied.assert_not_called()
+        self.assertEqual(result, {
+            "status": "failed", "failure_category": "telegram_upload_failed",
+        })
+        self.assertNotIn(raw_reference, "\n".join(logs.output))
+
     async def test_miniapp_gift_resend_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         self.route_handler(
@@ -9564,6 +9724,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("scheduleUploadId", javascript)
         self.assertIn("URL.revokeObjectURL", javascript)
         self.assertIn("/api/admin/gifts", javascript)
+        self.assertIn("/api/admin/content", javascript)
+        self.assertIn("/api/admin/content/drafts", javascript)
+        self.assertIn("/api/admin/content/cms", javascript)
+        self.assertIn('"PATCH", `/api/admin/content/cms/', javascript)
+        self.assertIn("/media-preview", javascript)
+        self.assertIn("/media/uploads/", javascript)
+        self.assertIn("content-media-card", index)
+        self.assertIn('accept="video/mp4"', index)
+        self.assertIn("contentMediaLocalUrl", javascript)
+        self.assertIn("contentMediaServerUrl", javascript)
+        self.assertIn("URL.revokeObjectURL(contentMedia", javascript)
+        self.assertNotIn("server_reference", javascript)
+        self.assertNotIn("file_path", javascript)
         self.assertIn("/resend-preview", javascript)
         self.assertIn("/resend-confirm", javascript)
         self.assertIn("/resend-cancel", javascript)
@@ -9593,6 +9766,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не удалось загрузить изображение", javascript)
         self.assertIn("blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("id=\"open-gifts\"", index)
+        self.assertIn("id=\"open-content\"", index)
+        self.assertIn("id=\"content-screen\"", index)
+        self.assertIn("loadContent", javascript)
+        self.assertIn("content-create-submit", index)
+        self.assertIn("content-edit-save", index)
+        self.assertIn("Legacy content", index)
+        self.assertIn("CMS content", index)
         self.assertIn("Подарков пока нет.", index)
         self.assertIn("loadGifts", javascript)
         self.assertIn("admin-status-line", index)

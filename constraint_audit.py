@@ -35,6 +35,7 @@ EXPECTED_VALUES = {
         "gift_resend",
         "manual_access_change",
         "schedule_upload_replace",
+        "content_media_attach",
         "billing_portal_resend",
     )),
     "scheduled_job_runs.status": frozenset(("running", "completed", "failed")),

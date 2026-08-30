@@ -50,6 +50,25 @@ from admin_schedule import (
     list_admin_schedule,
 )
 from admin_gifts import get_admin_gift_details, list_admin_gifts
+from admin_content import list_admin_content
+from content_cms import (
+    ContentCmsError,
+    create_content_draft,
+    get_cms_content,
+    list_cms_content,
+    update_content_draft,
+)
+from content_media import (
+    ContentMediaError,
+    apply_media_upload,
+    cancel_media_upload,
+    create_media_upload,
+    ensure_media_action,
+    get_media_upload,
+    list_content_media,
+    prepare_media_execution,
+    record_telegram_upload,
+)
 from schedule_uploads import (
     apply_schedule_upload,
     cancel_schedule_upload,
@@ -416,8 +435,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 18,
-            "latest": "0018_miniapp_schedule_uploads",
+            "count": 20,
+            "latest": "0020_content_media",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1901,7 +1920,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 18)
+        self.assertEqual(len(migrations), 20)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -1942,6 +1961,341 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         rows_after = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual(rows, rows_after)
 
+    def test_content_cms_draft_crud_fencing_and_constraints_real_postgres(self):
+        run_migrations(self.get_conn)
+        legacy_before = list_admin_content(free_lesson_configured=True)
+        created = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson",
+            "title": "  Первая   тренировка ",
+            "category": "main_workout",
+            "description": " Безопасный черновик ",
+            "duration_seconds": 1200,
+        })
+        self.assertEqual(created["status"], "draft")
+        self.assertEqual(created["version"], 1)
+        self.assertEqual(created["title"], "Первая тренировка")
+        self.assertFalse(created["has_media"])
+
+        listing = list_cms_content(self.get_conn, status="draft", limit=25)
+        self.assertEqual([item["content_id"] for item in listing["items"]], [created["content_id"]])
+        details = get_cms_content(self.get_conn, created["content_id"])
+        self.assertEqual(details["created_by_telegram_id"], 1)
+
+        updated = update_content_draft(self.get_conn, created["content_id"], {
+            "expected_version": 1,
+            "title": "Первая тренировка — обновлено",
+            "category": "warmup",
+            "description": None,
+            "duration_seconds": 900,
+            "sort_order": 7,
+        })
+        self.assertEqual(updated["version"], 2)
+        self.assertEqual(updated["sort_order"], 7)
+        self.assertIsNone(updated["description"])
+
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 1, "title": "Устаревшая запись",
+            })
+        self.assertEqual(
+            get_cms_content(self.get_conn, created["content_id"])["title"],
+            "Первая тренировка — обновлено",
+        )
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status = 'published', published_at = NOW() WHERE content_id = %s",
+                    (created["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 2, "title": "Нельзя менять",
+            })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status = 'archived', archived_at = NOW() WHERE content_id = %s",
+                    (created["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 2, "title": "Архив неизменяем",
+            })
+
+        migration_sql = (
+            MIGRATIONS_DIR / "0019_content_items.sql"
+        ).read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            get_cms_content(self.get_conn, created["content_id"])["status"],
+            "archived",
+        )
+
+        constraint_names = {
+            row[0] for row in self.query_all(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'content_items'::regclass"
+            )
+        }
+        self.assertTrue({
+            "content_items_type_check", "content_items_category_check",
+            "content_items_title_check", "content_items_description_check",
+            "content_items_duration_check", "content_items_sort_order_check",
+            "content_items_status_check", "content_items_version_check",
+            "content_items_lifecycle_timestamps_check",
+        }.issubset(constraint_names))
+
+        invalid_rows = (
+            ("recipe", "Valid", None, None, 1, 0, "draft", 1, None, None),
+            ("lesson", "", None, None, 1, 0, "draft", 1, None, None),
+            ("lesson", "Valid", "Bad category", None, 1, 0, "draft", 1, None, None),
+            ("lesson", "Valid", None, None, 0, 0, "draft", 1, None, None),
+            ("lesson", "Valid", None, None, 1, 0, "draft", 0, None, None),
+            ("lesson", "Valid", None, None, 1, 0, "published", 1, None, None),
+        )
+        for index, row in enumerate(invalid_rows):
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur, self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO content_items (
+                            content_id, content_type, title, category, description,
+                            duration_seconds, sort_order, status, version,
+                            created_by_telegram_id, published_at, archived_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
+                        """,
+                        (str(uuid.uuid4()),) + row,
+                    )
+            finally:
+                conn.rollback(); conn.close()
+        self.assertEqual(
+            list_admin_content(free_lesson_configured=True), legacy_before
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM users")[0], 0)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM gift_access_grants")[0], 0
+        )
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM message_delivery_events")[0], 0
+        )
+
+    def test_content_media_staging_attach_replace_and_fencing_real_postgres(self):
+        run_migrations(self.get_conn)
+        draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Урок с медиа",
+            "category": "main_workout", "description": None,
+            "duration_seconds": 600,
+        })
+        png = b"\x89PNG\r\n\x1a\ncover-one"
+        staged = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "cover", png
+        )
+        self.assertFalse(staged["existing_media"])
+        self.assertEqual(list_content_media(self.get_conn, draft["content_id"]), [])
+        self.assertIsNone(get_media_upload(self.get_conn, staged["upload_id"], 2))
+
+        action = ensure_media_action(self.get_conn, staged["upload_id"], 1)
+        execution = prepare_media_execution(
+            self.get_conn, staged["upload_id"], action["action_id"], 1
+        )
+        self.assertEqual(execution["mode"], "upload")
+        self.assertEqual(execution["media_bytes"], png)
+        record_telegram_upload(
+            self.get_conn, staged["upload_id"], action["action_id"], 1,
+            "telegram-private-cover-reference",
+        )
+        applied = apply_media_upload(
+            self.get_conn, staged["upload_id"], action["action_id"], 1
+        )
+        self.assertEqual(applied["status"], "completed")
+        self.assertEqual(applied["content_version"], 2)
+        first_media = list_content_media(self.get_conn, draft["content_id"])
+        self.assertEqual(len(first_media), 1)
+        self.assertEqual(first_media[0]["version"], 1)
+        serialized = json.dumps(first_media)
+        self.assertNotIn("telegram-private-cover-reference", serialized)
+        self.assertNotIn("server_reference", serialized)
+
+        duplicate = prepare_media_execution(
+            self.get_conn, staged["upload_id"], action["action_id"], 1
+        )
+        self.assertEqual(duplicate["mode"], "completed")
+        self.assertEqual(len(list_content_media(self.get_conn, draft["content_id"])), 1)
+
+        video = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "video",
+            b"\x00\x00\x00\x18ftypisomvideo-primary",
+        )
+        video_action = ensure_media_action(self.get_conn, video["upload_id"], 1)
+        self.assertEqual(
+            prepare_media_execution(
+                self.get_conn, video["upload_id"], video_action["action_id"], 1
+            )["mode"],
+            "upload",
+        )
+        record_telegram_upload(
+            self.get_conn, video["upload_id"], video_action["action_id"], 1,
+            "telegram-private-video-reference",
+        )
+        video_applied = apply_media_upload(
+            self.get_conn, video["upload_id"], video_action["action_id"], 1
+        )
+        self.assertEqual(video_applied["status"], "completed")
+        self.assertEqual(video_applied["content_version"], 3)
+        self.assertEqual(
+            {item["media_type"] for item in list_content_media(
+                self.get_conn, draft["content_id"]
+            )},
+            {"cover", "video"},
+        )
+
+        replacement = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\ncover-two",
+        )
+        self.assertTrue(replacement["existing_media"])
+        replacement_action = ensure_media_action(
+            self.get_conn, replacement["upload_id"], 1
+        )
+        self.assertEqual(
+            prepare_media_execution(
+                self.get_conn, replacement["upload_id"],
+                replacement_action["action_id"], 1,
+            )["mode"],
+            "upload",
+        )
+        record_telegram_upload(
+            self.get_conn, replacement["upload_id"],
+            replacement_action["action_id"], 1, "telegram-private-cover-two",
+        )
+        replaced = apply_media_upload(
+            self.get_conn, replacement["upload_id"],
+            replacement_action["action_id"], 1,
+        )
+        self.assertEqual(replaced["status"], "completed")
+        active = list_content_media(self.get_conn, draft["content_id"])
+        self.assertEqual(len(active), 2)
+        active_cover = next(item for item in active if item["media_type"] == "cover")
+        self.assertEqual(active_cover["version"], 2)
+        self.assertEqual(
+            active_cover["replaces_media_id"], first_media[0]["media_id"]
+        )
+        history = self.query_all(
+            "SELECT version, deleted_at IS NOT NULL FROM content_media "
+            "WHERE content_id=%s AND media_type='cover' ORDER BY version",
+            (draft["content_id"],),
+        )
+        self.assertEqual(history, [(1, True), (2, False)])
+
+        faulted = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\ncover-fault",
+        )
+        faulted_action = ensure_media_action(
+            self.get_conn, faulted["upload_id"], 1
+        )
+        prepare_media_execution(
+            self.get_conn, faulted["upload_id"], faulted_action["action_id"], 1
+        )
+        record_telegram_upload(
+            self.get_conn, faulted["upload_id"], faulted_action["action_id"], 1,
+            "telegram-private-cover-fault",
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION reject_content_media_insert()
+                    RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN RAISE EXCEPTION 'synthetic media insert failure'; END $$
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_content_media_insert_trigger
+                    BEFORE INSERT ON content_media FOR EACH ROW
+                    EXECUTE FUNCTION reject_content_media_insert()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.DatabaseError):
+            apply_media_upload(
+                self.get_conn, faulted["upload_id"],
+                faulted_action["action_id"], 1,
+            )
+        self.assertEqual(
+            list_content_media(self.get_conn, draft["content_id"])[0]["media_id"],
+            active_cover["media_id"],
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DROP TRIGGER reject_content_media_insert_trigger ON content_media"
+                )
+                cur.execute("DROP FUNCTION reject_content_media_insert()")
+            conn.commit()
+        finally:
+            conn.close()
+        retried = apply_media_upload(
+            self.get_conn, faulted["upload_id"], faulted_action["action_id"], 1
+        )
+        self.assertEqual(retried["status"], "completed")
+
+        cancelled = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "video",
+            b"\x00\x00\x00\x18ftypisomvideo",
+        )
+        self.assertEqual(
+            cancel_media_upload(self.get_conn, cancelled["upload_id"], 1)["status"],
+            "cancelled",
+        )
+        self.assertEqual(len(list_content_media(self.get_conn, draft["content_id"])), 2)
+
+        stale = create_media_upload(
+            self.get_conn, 1, draft["content_id"], "video",
+            b"\x00\x00\x00\x18ftypisomstale",
+        )
+        update_content_draft(self.get_conn, draft["content_id"], {
+            "expected_version": 5, "title": "Урок изменился",
+        })
+        stale_action = ensure_media_action(self.get_conn, stale["upload_id"], 1)
+        stale_execution = prepare_media_execution(
+            self.get_conn, stale["upload_id"], stale_action["action_id"], 1
+        )
+        self.assertEqual(stale_execution, {
+            "mode": "failed", "failure_category": "content_version_changed",
+        })
+        self.assertEqual(len(list_content_media(self.get_conn, draft["content_id"])), 2)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published', published_at=NOW() "
+                    "WHERE content_id=%s", (draft["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentMediaError, "content_not_editable"):
+            create_media_upload(
+                self.get_conn, 1, draft["content_id"], "cover", png
+            )
     def test_minimal_old_schema_is_upgraded_without_fictitious_baseline(self):
         conn = self.get_conn()
         cur = conn.cursor()
@@ -8196,8 +8550,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 18)
-        self.assertEqual(system["migrations"]["latest"], "0018_miniapp_schedule_uploads")
+        self.assertEqual(system["migrations"]["count"], 20)
+        self.assertEqual(system["migrations"]["latest"], "0020_content_media")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

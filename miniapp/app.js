@@ -63,6 +63,36 @@
   const giftResendConfirm = document.getElementById("gift-resend-confirm");
   const giftResendCancel = document.getElementById("gift-resend-cancel");
   const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
+  const contentSearch = document.getElementById("content-search");
+  const contentCategory = document.getElementById("content-category");
+  const contentList = document.getElementById("content-list");
+  const contentEmpty = document.getElementById("content-empty");
+  const contentDetailsContent = document.getElementById("content-details-content");
+  const cmsContentList = document.getElementById("cms-content-list");
+  const cmsContentEmpty = document.getElementById("cms-content-empty");
+  const contentCreateTitle = document.getElementById("content-create-title");
+  const contentCreateCategory = document.getElementById("content-create-category");
+  const contentCreateDescription = document.getElementById("content-create-description");
+  const contentCreateDuration = document.getElementById("content-create-duration");
+  const contentCreateMessage = document.getElementById("content-create-message");
+  const contentEditCard = document.getElementById("content-edit-card");
+  const contentEditTitle = document.getElementById("content-edit-title");
+  const contentEditCategory = document.getElementById("content-edit-category");
+  const contentEditDescription = document.getElementById("content-edit-description");
+  const contentEditDuration = document.getElementById("content-edit-duration");
+  const contentEditOrder = document.getElementById("content-edit-order");
+  const contentEditMessage = document.getElementById("content-edit-message");
+  const contentMediaCard = document.getElementById("content-media-card");
+  const contentCoverCurrent = document.getElementById("content-cover-current");
+  const contentVideoCurrent = document.getElementById("content-video-current");
+  const contentCoverFile = document.getElementById("content-cover-file");
+  const contentVideoFile = document.getElementById("content-video-file");
+  const contentMediaConfirmation = document.getElementById("content-media-confirmation");
+  const contentMediaPreview = document.getElementById("content-media-preview");
+  const contentMediaSummary = document.getElementById("content-media-summary");
+  const contentMediaMessage = document.getElementById("content-media-message");
+  const contentMediaConfirm = document.getElementById("content-media-confirm");
+  const contentMediaCancel = document.getElementById("content-media-cancel");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -85,6 +115,12 @@
   let giftResendActionId = null;
   let manualAccessUserId = null;
   let manualAccessActionId = null;
+  let contentSearchTimer = null;
+  let currentCmsContent = null;
+  let contentMediaUploadId = null;
+  let contentMediaLocalUrl = null;
+  let contentMediaServerUrl = null;
+  let contentMediaAttachedCoverUrl = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -117,6 +153,27 @@
     scheduleUploadLocalUrl = null;
     scheduleUploadServerUrl = null;
   };
+  const clearContentMediaUrls = () => {
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+    if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
+    contentMediaLocalUrl = null;
+    contentMediaServerUrl = null;
+    contentMediaAttachedCoverUrl = null;
+  };
+  const resetContentMediaDraft = () => {
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+    contentMediaLocalUrl = null;
+    contentMediaServerUrl = null;
+    contentMediaUploadId = null;
+    contentCoverFile.value = "";
+    contentVideoFile.value = "";
+    contentMediaConfirmation.hidden = true;
+    contentMediaPreview.replaceChildren(text("span", "Предварительный просмотр", "schedule-image-loading"));
+    contentMediaSummary.replaceChildren();
+    contentMediaMessage.textContent = "";
+  };
   const resetScheduleUpload = () => {
     clearScheduleUploadUrls();
     scheduleUploadId = null;
@@ -131,6 +188,10 @@
     }
     if (name !== "schedule-upload" && (scheduleUploadLocalUrl || scheduleUploadServerUrl)) {
       clearScheduleUploadUrls();
+    }
+    if (name !== "content-details") {
+      clearContentMediaUrls();
+      contentMediaUploadId = null;
     }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = node.dataset.screen !== name; });
     document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === name); });
@@ -154,6 +215,17 @@
     body: JSON.stringify(body),
     cache: "no-store",
     credentials: "omit",
+  }).then(async (response) => {
+    if (response.status === 401) throw new Error("session_ended");
+    if (response.status === 403) throw new Error("access_revoked");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "api_failed");
+    return data;
+  });
+  const writeAdminJson = (method, path, body) => fetch(path, {
+    method,
+    headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
+    body: JSON.stringify(body), cache: "no-store", credentials: "omit",
   }).then(async (response) => {
     if (response.status === 401) throw new Error("session_ended");
     if (response.status === 403) throw new Error("access_revoked");
@@ -822,6 +894,235 @@
     }).catch(showApiError);
   }
 
+  const contentCard = (item) => {
+    const article = document.createElement("article");
+    article.className = "card user-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", item.category_label, "eyebrow"));
+    button.append(text("h2", item.title));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", item.media_type, "badge"));
+    badges.append(text("span", item.availability === "configured" ? "Настроен" : "Нет медиа", "badge"));
+    button.append(badges);
+    button.append(text("p", item.short_description));
+    if (item.duration_minutes) button.append(text("p", `Длительность: ${item.duration_minutes} мин.`));
+    button.addEventListener("click", () => loadContentDetails(item.content_id));
+    article.append(button);
+    return article;
+  };
+  const loadContent = () => {
+    status.textContent = "Загружаем контент…";
+    const params = new URLSearchParams({category: contentCategory.value});
+    if (contentSearch.value.trim()) params.set("q", contentSearch.value.trim());
+    return Promise.all([
+      api(`/api/admin/content?${params.toString()}`),
+      api("/api/admin/content/cms?status=all&limit=50"),
+    ]).then(([data, cms]) => {
+      contentList.replaceChildren();
+      data.items.forEach((item) => contentList.append(contentCard(item)));
+      contentEmpty.hidden = data.items.length !== 0;
+      cmsContentList.replaceChildren();
+      cms.items.forEach((item) => cmsContentList.append(cmsContentCard(item)));
+      cmsContentEmpty.hidden = cms.items.length !== 0;
+      showScreen("content");
+      status.textContent = `Legacy: ${data.items.length} · CMS: ${cms.items.length}`;
+    });
+  };
+  function loadContentDetails(contentId) {
+    currentCmsContent = null;
+    contentEditCard.hidden = true;
+    status.textContent = "Загружаем материал…";
+    return api(`/api/admin/content/${encodeURIComponent(contentId)}`).then((item) => {
+      contentDetailsContent.replaceChildren(detailCard("Материал", [
+        ["Название", item.title],
+        ["Тип", item.content_type],
+        ["Категория", item.category_label],
+        ["Описание", item.short_description],
+        ["Длительность", item.duration_minutes ? `${item.duration_minutes} мин.` : null],
+        ["Порядок", item.ordering],
+        ["Медиа", item.media_type],
+        ["Медиа настроено", item.has_media ? "Да" : "Нет"],
+        ["Состояние", item.availability === "configured" ? "Настроен" : "Нет медиа"],
+      ]));
+      showScreen("content-details");
+      status.textContent = item.title;
+    }).catch(showApiError);
+  }
+
+  const cmsContentCard = (item) => {
+    const article = document.createElement("article");
+    article.className = "card user-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", "CMS", "eyebrow"), text("h2", item.title));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", item.status, "badge"), text("span", `v${item.version}`, "badge"));
+    button.append(badges, text("p", item.category || "Без категории"));
+    button.addEventListener("click", () => loadCmsContentDetails(item.content_id));
+    article.append(button);
+    return article;
+  };
+  const loadCmsContentDetails = (contentId) => {
+    clearContentMediaUrls();
+    resetContentMediaDraft();
+    status.textContent = "Загружаем черновик…";
+    return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
+      currentCmsContent = item;
+      contentDetailsContent.replaceChildren(detailCard("CMS material", [
+        ["Название", item.title], ["Тип", item.content_type],
+        ["Категория", item.category], ["Описание", item.description],
+        ["Длительность", item.duration_seconds ? `${item.duration_seconds} сек.` : null],
+        ["Статус", item.status], ["Версия", item.version],
+      ]));
+      contentEditCard.hidden = item.status !== "draft";
+      contentMediaCard.hidden = item.status !== "draft";
+      contentEditTitle.value = item.title;
+      contentEditCategory.value = item.category || "";
+      contentEditDescription.value = item.description || "";
+      contentEditDuration.value = item.duration_seconds || "";
+      contentEditOrder.value = item.sort_order;
+      contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
+      renderContentMedia(item);
+      showScreen("content-details");
+      status.textContent = item.title;
+    }).catch(showApiError);
+  };
+  const mediaImage = (url, alt) => {
+    const image = document.createElement("img");
+    image.className = "schedule-image";
+    image.alt = alt;
+    image.src = url;
+    return image;
+  };
+  const fetchContentCover = (item, media) => fetch(
+    `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(media.media_id)}`,
+    {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
+  ).then((response) => {
+    if (!response.ok) throw new Error("content_media_preview_failed");
+    return response.blob();
+  }).then((blob) => {
+    if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
+    contentMediaAttachedCoverUrl = URL.createObjectURL(blob);
+    contentCoverCurrent.replaceChildren(mediaImage(contentMediaAttachedCoverUrl, `Обложка ${item.title}`));
+  }).catch(() => {
+    contentCoverCurrent.replaceChildren(text("span", "Обложка недоступна", "schedule-image-loading"));
+  });
+  function renderContentMedia(item) {
+    const cover = (item.media || []).find((entry) => entry.media_type === "cover");
+    const video = (item.media || []).find((entry) => entry.media_type === "video");
+    contentCoverCurrent.replaceChildren(text("span", cover ? "Загружаем обложку…" : "Обложка не прикреплена", "schedule-image-loading"));
+    contentVideoCurrent.textContent = video
+      ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
+      : "Видео не прикреплено";
+    if (cover) fetchContentCover(item, cover);
+  }
+  const showLocalContentMedia = (mediaType) => {
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
+    contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
+    contentMediaPreview.replaceChildren();
+    if (!file) contentMediaPreview.append(text("span", "Выберите файл", "schedule-image-loading"));
+    else if (mediaType === "cover") contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки"));
+    else contentMediaPreview.append(text("span", `Локально выбрано видео: ${file.name}`, "schedule-image-loading"));
+  };
+  const validateContentMedia = (mediaType) => {
+    if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    if (!file) {
+      contentMediaMessage.textContent = "Выберите файл.";
+      contentMediaConfirmation.hidden = false;
+      return Promise.resolve();
+    }
+    const form = new FormData();
+    form.append("media_type", mediaType);
+    form.append("file", file);
+    contentMediaMessage.textContent = "Проверяем файл…";
+    contentMediaConfirmation.hidden = false;
+    return postAdmin(`/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/media-preview`, form)
+      .then((draft) => {
+        contentMediaUploadId = draft.upload_id;
+        contentMediaSummary.replaceChildren(
+          text("strong", currentCmsContent.title),
+          text("span", mediaType === "cover" ? "Обложка" : "Видео"),
+          text("span", `${draft.mime_type} · ${Math.ceil(draft.size_bytes / 1024)} КиБ`)
+        );
+        contentMediaMessage.textContent = draft.existing_media
+          ? "Текущий файл будет заменён после подтверждения."
+          : "Файл будет прикреплён только после подтверждения.";
+        if (mediaType !== "cover") return null;
+        return fetch(`/api/admin/content/media/uploads/${encodeURIComponent(draft.upload_id)}/preview`, {
+          headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+        }).then((response) => {
+          if (!response.ok) throw new Error("content_media_preview_failed");
+          return response.blob();
+        }).then((blob) => {
+          if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
+          contentMediaServerUrl = URL.createObjectURL(blob);
+          contentMediaPreview.replaceChildren(mediaImage(contentMediaServerUrl, "Проверенная обложка"));
+        });
+      }).catch((error) => {
+        contentMediaUploadId = null;
+        contentMediaMessage.textContent = error.message === "content_media_too_large"
+          ? "Файл превышает допустимый размер."
+          : "Файл не прошёл безопасную проверку.";
+      });
+  };
+  const confirmContentMedia = () => {
+    if (!contentMediaUploadId || !currentCmsContent) return Promise.resolve();
+    contentMediaConfirm.disabled = true;
+    contentMediaMessage.textContent = "Загружаем и прикрепляем…";
+    return postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`)
+      .then((result) => {
+        if (result.status !== "completed") throw new Error(result.failure_category || result.status);
+        return loadCmsContentDetails(currentCmsContent.content_id);
+      }).catch((error) => {
+        contentMediaMessage.textContent = error.message === "content_version_changed"
+          ? "Материал изменился после проверки. Обновите данные и повторите."
+          : "Не удалось прикрепить файл. Повторите безопасную проверку.";
+      }).finally(() => { contentMediaConfirm.disabled = false; });
+  };
+  const cancelContentMedia = () => {
+    const request = contentMediaUploadId
+      ? postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/cancel`).catch(() => null)
+      : Promise.resolve();
+    return request.then(() => { resetContentMediaDraft(); status.textContent = "Загрузка медиа отменена"; });
+  };
+  const optionalNumber = (input) => input.value === "" ? null : Number(input.value);
+  const createCmsDraft = () => {
+    contentCreateMessage.textContent = "Создаём черновик…";
+    return writeAdminJson("POST", "/api/admin/content/drafts", {
+      content_type: "lesson", title: contentCreateTitle.value,
+      category: contentCreateCategory.value || null,
+      description: contentCreateDescription.value || null,
+      duration_seconds: optionalNumber(contentCreateDuration),
+    }).then((item) => {
+      contentCreateTitle.value = ""; contentCreateCategory.value = "";
+      contentCreateDescription.value = ""; contentCreateDuration.value = "";
+      return loadCmsContentDetails(item.content_id);
+    }).catch((error) => {
+      contentCreateMessage.textContent = `Не удалось создать черновик: ${error.message}`;
+    });
+  };
+  const saveCmsDraft = () => {
+    if (!currentCmsContent) return Promise.resolve();
+    contentEditMessage.textContent = "Сохраняем…";
+    return writeAdminJson(
+      "PATCH", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}`,
+      {expected_version: currentCmsContent.version, title: contentEditTitle.value,
+       category: contentEditCategory.value || null,
+       description: contentEditDescription.value || null,
+       duration_seconds: optionalNumber(contentEditDuration),
+       sort_order: Number(contentEditOrder.value)}
+    ).then((item) => loadCmsContentDetails(item.content_id)).catch((error) => {
+      contentEditMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить: ${error.message}`;
+    });
+  };
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -841,6 +1142,17 @@
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("content-create-open").addEventListener("click", () => showScreen("content-create"));
+  document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
+  document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
+  document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
+  document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
+  contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
+  contentVideoFile.addEventListener("change", () => showLocalContentMedia("video"));
+  contentMediaConfirm.addEventListener("click", confirmContentMedia);
+  contentMediaCancel.addEventListener("click", cancelContentMedia);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {
@@ -897,6 +1209,13 @@
   manualAccessCancel.addEventListener("click", cancelManualAccess);
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
+  contentCategory.addEventListener("change", () => loadContent().catch(showApiError));
+  contentSearch.addEventListener("input", () => {
+    window.clearTimeout(contentSearchTimer);
+    contentSearchTimer = window.setTimeout(() => loadContent().catch(showApiError), 300);
+  });
+  document.getElementById("content-back").addEventListener("click", () => showScreen("content"));
+  document.getElementById("content-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",
