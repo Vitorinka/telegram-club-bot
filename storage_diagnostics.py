@@ -10,7 +10,7 @@ APPLICATION_TABLES = (
     "bot_invite_links", "admin_alerts", "stripe_identity_conflicts",
     "aiogram_fsm_states", "gift_access_grants", "gift_certificate_templates",
     "gift_access_events", "subscription_refund_reconciliations",
-    "subscription_refund_events", "schema_migrations",
+    "subscription_refund_events", "content_items", "schema_migrations",
 )
 
 CATALOG_SQL = """

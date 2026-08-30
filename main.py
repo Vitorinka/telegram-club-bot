@@ -154,6 +154,13 @@ from admin_content import (
     get_admin_content,
     list_admin_content,
 )
+from content_cms import (
+    ContentCmsError,
+    create_content_draft,
+    get_cms_content,
+    list_cms_content,
+    update_content_draft,
+)
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -21646,6 +21653,68 @@ async def miniapp_admin_content_details(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+def content_cms_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status
+    ))
+
+
+async def read_content_cms_json(request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise ContentCmsError("invalid_content_payload") from None
+    if not isinstance(body, dict):
+        raise ContentCmsError("invalid_content_payload")
+    return body
+
+
+async def miniapp_admin_content_draft_create(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = create_content_draft(
+            get_db_conn, request["miniapp_admin"].telegram_id, body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_cms_content(request):
+    try:
+        result = list_cms_content(
+            get_db_conn,
+            status=request.query.get("status", "all"),
+            limit=request.query.get("limit", "25"),
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_cms_content_details(request):
+    try:
+        result = get_cms_content(
+            get_db_conn, request.match_info.get("content_id")
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    if result is None:
+        return content_cms_error_response(ContentCmsError("content_not_found", 404))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_cms_content_update(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = update_content_draft(
+            get_db_conn, request.match_info.get("content_id"), body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_users(request):
     try:
         limit = parse_users_limit(request.query.get("limit"))
@@ -22784,6 +22853,22 @@ def create_app():
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
     if not _route_exists(app, "GET", "/api/admin/content"):
         app.router.add_get('/api/admin/content', miniapp_admin_content)
+    if not _route_exists(app, "POST", "/api/admin/content/drafts"):
+        app.router.add_post(
+            '/api/admin/content/drafts', miniapp_admin_content_draft_create
+        )
+    if not _route_exists(app, "GET", "/api/admin/content/cms"):
+        app.router.add_get('/api/admin/content/cms', miniapp_admin_cms_content)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}"):
+        app.router.add_get(
+            '/api/admin/content/cms/{content_id}',
+            miniapp_admin_cms_content_details,
+        )
+    if not _route_exists(app, "PATCH", "/api/admin/content/cms/{content_id}"):
+        app.router.add_patch(
+            '/api/admin/content/cms/{content_id}',
+            miniapp_admin_cms_content_update,
+        )
     if not _route_exists(app, "GET", "/api/admin/content/{content_id}"):
         app.router.add_get(
             '/api/admin/content/{content_id}', miniapp_admin_content_details

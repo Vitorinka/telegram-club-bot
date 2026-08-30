@@ -50,6 +50,14 @@ from admin_schedule import (
     list_admin_schedule,
 )
 from admin_gifts import get_admin_gift_details, list_admin_gifts
+from admin_content import list_admin_content
+from content_cms import (
+    ContentCmsError,
+    create_content_draft,
+    get_cms_content,
+    list_cms_content,
+    update_content_draft,
+)
 from schedule_uploads import (
     apply_schedule_upload,
     cancel_schedule_upload,
@@ -416,8 +424,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 18,
-            "latest": "0018_miniapp_schedule_uploads",
+            "count": 19,
+            "latest": "0019_content_items",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1901,7 +1909,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 18)
+        self.assertEqual(len(migrations), 19)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -1941,6 +1949,139 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         run_migrations(self.get_conn)
         rows_after = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual(rows, rows_after)
+
+    def test_content_cms_draft_crud_fencing_and_constraints_real_postgres(self):
+        run_migrations(self.get_conn)
+        legacy_before = list_admin_content(free_lesson_configured=True)
+        created = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson",
+            "title": "  Первая   тренировка ",
+            "category": "main_workout",
+            "description": " Безопасный черновик ",
+            "duration_seconds": 1200,
+        })
+        self.assertEqual(created["status"], "draft")
+        self.assertEqual(created["version"], 1)
+        self.assertEqual(created["title"], "Первая тренировка")
+        self.assertFalse(created["has_media"])
+
+        listing = list_cms_content(self.get_conn, status="draft", limit=25)
+        self.assertEqual([item["content_id"] for item in listing["items"]], [created["content_id"]])
+        details = get_cms_content(self.get_conn, created["content_id"])
+        self.assertEqual(details["created_by_telegram_id"], 1)
+
+        updated = update_content_draft(self.get_conn, created["content_id"], {
+            "expected_version": 1,
+            "title": "Первая тренировка — обновлено",
+            "category": "warmup",
+            "description": None,
+            "duration_seconds": 900,
+            "sort_order": 7,
+        })
+        self.assertEqual(updated["version"], 2)
+        self.assertEqual(updated["sort_order"], 7)
+        self.assertIsNone(updated["description"])
+
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 1, "title": "Устаревшая запись",
+            })
+        self.assertEqual(
+            get_cms_content(self.get_conn, created["content_id"])["title"],
+            "Первая тренировка — обновлено",
+        )
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status = 'published', published_at = NOW() WHERE content_id = %s",
+                    (created["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 2, "title": "Нельзя менять",
+            })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status = 'archived', archived_at = NOW() WHERE content_id = %s",
+                    (created["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_content_draft(self.get_conn, created["content_id"], {
+                "expected_version": 2, "title": "Архив неизменяем",
+            })
+
+        migration_sql = (
+            MIGRATIONS_DIR / "0019_content_items.sql"
+        ).read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            get_cms_content(self.get_conn, created["content_id"])["status"],
+            "archived",
+        )
+
+        constraint_names = {
+            row[0] for row in self.query_all(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'content_items'::regclass"
+            )
+        }
+        self.assertTrue({
+            "content_items_type_check", "content_items_category_check",
+            "content_items_title_check", "content_items_description_check",
+            "content_items_duration_check", "content_items_sort_order_check",
+            "content_items_status_check", "content_items_version_check",
+            "content_items_lifecycle_timestamps_check",
+        }.issubset(constraint_names))
+
+        invalid_rows = (
+            ("recipe", "Valid", None, None, 1, 0, "draft", 1, None, None),
+            ("lesson", "", None, None, 1, 0, "draft", 1, None, None),
+            ("lesson", "Valid", "Bad category", None, 1, 0, "draft", 1, None, None),
+            ("lesson", "Valid", None, None, 0, 0, "draft", 1, None, None),
+            ("lesson", "Valid", None, None, 1, 0, "draft", 0, None, None),
+            ("lesson", "Valid", None, None, 1, 0, "published", 1, None, None),
+        )
+        for index, row in enumerate(invalid_rows):
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur, self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO content_items (
+                            content_id, content_type, title, category, description,
+                            duration_seconds, sort_order, status, version,
+                            created_by_telegram_id, published_at, archived_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, %s, %s)
+                        """,
+                        (str(uuid.uuid4()),) + row,
+                    )
+            finally:
+                conn.rollback(); conn.close()
+        self.assertEqual(
+            list_admin_content(free_lesson_configured=True), legacy_before
+        )
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM users")[0], 0)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM gift_access_grants")[0], 0
+        )
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM message_delivery_events")[0], 0
+        )
 
     def test_minimal_old_schema_is_upgraded_without_fictitious_baseline(self):
         conn = self.get_conn()
@@ -8196,8 +8337,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 18)
-        self.assertEqual(system["migrations"]["latest"], "0018_miniapp_schedule_uploads")
+        self.assertEqual(system["migrations"]["count"], 19)
+        self.assertEqual(system["migrations"]["latest"], "0019_content_items")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

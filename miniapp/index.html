@@ -52,7 +52,8 @@
     <section id="content-screen" class="screen page" data-screen="content" hidden>
       <article class="card">
         <h2>Контент</h2>
-        <p class="hint">Материалы, которыми бот управляет напрямую. Раздел только для просмотра.</p>
+        <p class="hint">Legacy-материалы продолжают работать как раньше. CMS пока используется только для черновиков.</p>
+        <button id="content-create-open" type="button">+ Новый материал</button>
         <label class="search-label" for="content-search">Поиск по названию</label>
         <input id="content-search" type="search" maxlength="80" autocomplete="off">
         <select id="content-category" aria-label="Категория контента">
@@ -62,13 +63,39 @@
           <option value="free_materials">Бесплатные материалы</option>
         </select>
       </article>
+      <h2>Legacy content</h2>
       <div id="content-list" class="user-list"></div>
       <p id="content-empty" class="card" hidden>Материалов по выбранному фильтру нет.</p>
+      <h2>CMS content</h2>
+      <div id="cms-content-list" class="user-list"></div>
+      <p id="cms-content-empty" class="card" hidden>Черновиков CMS пока нет.</p>
       <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
+    </section>
+    <section id="content-create" class="screen page" data-screen="content-create" hidden>
+      <button id="content-create-back" class="secondary" type="button">← К контенту</button>
+      <article class="card">
+        <h2>Новый урок</h2>
+        <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
+        <label>Категория <input id="content-create-category" type="text" maxlength="48" placeholder="например, meditation"></label>
+        <label>Описание <textarea id="content-create-description" maxlength="5000"></textarea></label>
+        <label>Длительность, секунд <input id="content-create-duration" type="number" min="1" max="86400"></label>
+        <p id="content-create-message" class="hint">Материал будет создан только в статусе draft.</p>
+        <button id="content-create-submit" type="button">Создать черновик</button>
+      </article>
     </section>
     <section id="content-details" class="screen page" data-screen="content-details" hidden>
       <button id="content-back" class="secondary" type="button">← К контенту</button>
       <div id="content-details-content" class="dashboard"></div>
+      <article id="content-edit-card" class="card" hidden>
+        <h2>Редактировать черновик</h2>
+        <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
+        <label>Категория <input id="content-edit-category" type="text" maxlength="48"></label>
+        <label>Описание <textarea id="content-edit-description" maxlength="5000"></textarea></label>
+        <label>Длительность, секунд <input id="content-edit-duration" type="number" min="1" max="86400"></label>
+        <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
+        <p id="content-edit-message" class="hint"></p>
+        <button id="content-edit-save" type="button">Сохранить</button>
+      </article>
     </section>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">

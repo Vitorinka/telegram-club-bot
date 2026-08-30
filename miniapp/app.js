@@ -68,6 +68,20 @@
   const contentList = document.getElementById("content-list");
   const contentEmpty = document.getElementById("content-empty");
   const contentDetailsContent = document.getElementById("content-details-content");
+  const cmsContentList = document.getElementById("cms-content-list");
+  const cmsContentEmpty = document.getElementById("cms-content-empty");
+  const contentCreateTitle = document.getElementById("content-create-title");
+  const contentCreateCategory = document.getElementById("content-create-category");
+  const contentCreateDescription = document.getElementById("content-create-description");
+  const contentCreateDuration = document.getElementById("content-create-duration");
+  const contentCreateMessage = document.getElementById("content-create-message");
+  const contentEditCard = document.getElementById("content-edit-card");
+  const contentEditTitle = document.getElementById("content-edit-title");
+  const contentEditCategory = document.getElementById("content-edit-category");
+  const contentEditDescription = document.getElementById("content-edit-description");
+  const contentEditDuration = document.getElementById("content-edit-duration");
+  const contentEditOrder = document.getElementById("content-edit-order");
+  const contentEditMessage = document.getElementById("content-edit-message");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -91,6 +105,7 @@
   let manualAccessUserId = null;
   let manualAccessActionId = null;
   let contentSearchTimer = null;
+  let currentCmsContent = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -160,6 +175,17 @@
     body: JSON.stringify(body),
     cache: "no-store",
     credentials: "omit",
+  }).then(async (response) => {
+    if (response.status === 401) throw new Error("session_ended");
+    if (response.status === 403) throw new Error("access_revoked");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "api_failed");
+    return data;
+  });
+  const writeAdminJson = (method, path, body) => fetch(path, {
+    method,
+    headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
+    body: JSON.stringify(body), cache: "no-store", credentials: "omit",
   }).then(async (response) => {
     if (response.status === 401) throw new Error("session_ended");
     if (response.status === 403) throw new Error("access_revoked");
@@ -850,15 +876,23 @@
     status.textContent = "Загружаем контент…";
     const params = new URLSearchParams({category: contentCategory.value});
     if (contentSearch.value.trim()) params.set("q", contentSearch.value.trim());
-    return api(`/api/admin/content?${params.toString()}`).then((data) => {
+    return Promise.all([
+      api(`/api/admin/content?${params.toString()}`),
+      api("/api/admin/content/cms?status=all&limit=50"),
+    ]).then(([data, cms]) => {
       contentList.replaceChildren();
       data.items.forEach((item) => contentList.append(contentCard(item)));
       contentEmpty.hidden = data.items.length !== 0;
+      cmsContentList.replaceChildren();
+      cms.items.forEach((item) => cmsContentList.append(cmsContentCard(item)));
+      cmsContentEmpty.hidden = cms.items.length !== 0;
       showScreen("content");
-      status.textContent = `Материалов показано: ${data.items.length}`;
+      status.textContent = `Legacy: ${data.items.length} · CMS: ${cms.items.length}`;
     });
   };
   function loadContentDetails(contentId) {
+    currentCmsContent = null;
+    contentEditCard.hidden = true;
     status.textContent = "Загружаем материал…";
     return api(`/api/admin/content/${encodeURIComponent(contentId)}`).then((item) => {
       contentDetailsContent.replaceChildren(detailCard("Материал", [
@@ -876,6 +910,74 @@
       status.textContent = item.title;
     }).catch(showApiError);
   }
+
+  const cmsContentCard = (item) => {
+    const article = document.createElement("article");
+    article.className = "card user-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", "CMS", "eyebrow"), text("h2", item.title));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", item.status, "badge"), text("span", `v${item.version}`, "badge"));
+    button.append(badges, text("p", item.category || "Без категории"));
+    button.addEventListener("click", () => loadCmsContentDetails(item.content_id));
+    article.append(button);
+    return article;
+  };
+  const loadCmsContentDetails = (contentId) => {
+    status.textContent = "Загружаем черновик…";
+    return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
+      currentCmsContent = item;
+      contentDetailsContent.replaceChildren(detailCard("CMS material", [
+        ["Название", item.title], ["Тип", item.content_type],
+        ["Категория", item.category], ["Описание", item.description],
+        ["Длительность", item.duration_seconds ? `${item.duration_seconds} сек.` : null],
+        ["Статус", item.status], ["Версия", item.version],
+      ]));
+      contentEditCard.hidden = item.status !== "draft";
+      contentEditTitle.value = item.title;
+      contentEditCategory.value = item.category || "";
+      contentEditDescription.value = item.description || "";
+      contentEditDuration.value = item.duration_seconds || "";
+      contentEditOrder.value = item.sort_order;
+      contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
+      showScreen("content-details");
+      status.textContent = item.title;
+    }).catch(showApiError);
+  };
+  const optionalNumber = (input) => input.value === "" ? null : Number(input.value);
+  const createCmsDraft = () => {
+    contentCreateMessage.textContent = "Создаём черновик…";
+    return writeAdminJson("POST", "/api/admin/content/drafts", {
+      content_type: "lesson", title: contentCreateTitle.value,
+      category: contentCreateCategory.value || null,
+      description: contentCreateDescription.value || null,
+      duration_seconds: optionalNumber(contentCreateDuration),
+    }).then((item) => {
+      contentCreateTitle.value = ""; contentCreateCategory.value = "";
+      contentCreateDescription.value = ""; contentCreateDuration.value = "";
+      return loadCmsContentDetails(item.content_id);
+    }).catch((error) => {
+      contentCreateMessage.textContent = `Не удалось создать черновик: ${error.message}`;
+    });
+  };
+  const saveCmsDraft = () => {
+    if (!currentCmsContent) return Promise.resolve();
+    contentEditMessage.textContent = "Сохраняем…";
+    return writeAdminJson(
+      "PATCH", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}`,
+      {expected_version: currentCmsContent.version, title: contentEditTitle.value,
+       category: contentEditCategory.value || null,
+       description: contentEditDescription.value || null,
+       duration_seconds: optionalNumber(contentEditDuration),
+       sort_order: Number(contentEditOrder.value)}
+    ).then((item) => loadCmsContentDetails(item.content_id)).catch((error) => {
+      contentEditMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить: ${error.message}`;
+    });
+  };
 
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
@@ -897,6 +999,10 @@
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("content-create-open").addEventListener("click", () => showScreen("content-create"));
+  document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
+  document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {

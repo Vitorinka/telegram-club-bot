@@ -9497,6 +9497,51 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(missing_item.status, 404)
 
+    async def test_miniapp_content_cms_mutations_require_admin_and_are_isolated(self):
+        app = self.main.create_app()
+        create_handler = self.route_handler(
+            app, "POST", "/api/admin/content/drafts"
+        )
+        patch_handler = self.route_handler(
+            app, "PATCH", "/api/admin/content/cms/{content_id}"
+        )
+        missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path="/api/admin/content/drafts", method="POST",
+                json_data={"content_type": "lesson", "title": "Урок"},
+            ), create_handler,
+        )
+        self.assertEqual(missing.status, 401)
+
+        non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=non_admin):
+            forbidden = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/content/drafts",
+                    method="POST", json_data={"content_type": "lesson", "title": "Урок"},
+                ), create_handler,
+            )
+        self.assertEqual(forbidden.status, 403)
+
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        draft = {"content_id": "00000000-0000-0000-0000-000000000001", "status": "draft"}
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "create_content_draft", return_value=draft) as create, \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/content/drafts",
+                    method="POST", json_data={"content_type": "lesson", "title": "Урок"},
+                ), create_handler,
+            )
+        self.assertEqual(response.status, 201)
+        create.assert_called_once_with(
+            self.main.get_db_conn, 1,
+            {"content_type": "lesson", "title": "Урок"},
+        )
+        self.assertIsNotNone(patch_handler)
+
     async def test_miniapp_gift_resend_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         self.route_handler(
@@ -9606,6 +9651,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("URL.revokeObjectURL", javascript)
         self.assertIn("/api/admin/gifts", javascript)
         self.assertIn("/api/admin/content", javascript)
+        self.assertIn("/api/admin/content/drafts", javascript)
+        self.assertIn("/api/admin/content/cms", javascript)
+        self.assertIn('"PATCH", `/api/admin/content/cms/', javascript)
         self.assertIn("/resend-preview", javascript)
         self.assertIn("/resend-confirm", javascript)
         self.assertIn("/resend-cancel", javascript)
@@ -9638,6 +9686,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id=\"open-content\"", index)
         self.assertIn("id=\"content-screen\"", index)
         self.assertIn("loadContent", javascript)
+        self.assertIn("content-create-submit", index)
+        self.assertIn("content-edit-save", index)
+        self.assertIn("Legacy content", index)
+        self.assertIn("CMS content", index)
         self.assertIn("Подарков пока нет.", index)
         self.assertIn("loadGifts", javascript)
         self.assertIn("admin-status-line", index)
