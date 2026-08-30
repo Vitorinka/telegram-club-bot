@@ -9542,6 +9542,74 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(patch_handler)
 
+    async def test_member_preview_routes_are_admin_only_and_safely_projected(self):
+        app = self.main.create_app()
+        routes = (
+            ("/api/admin/member-preview/home", {}),
+            ("/api/admin/member-preview/content", {}),
+            (
+                "/api/admin/member-preview/content/{content_id}",
+                {"content_id": "00000000-0000-0000-0000-000000000001"},
+            ),
+        )
+        for resource, match_info in routes:
+            handler = self.route_handler(app, "GET", resource)
+            missing = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, path=resource, match_info=match_info),
+                handler,
+            )
+            self.assertEqual(missing.status, 401)
+            non_admin = SimpleNamespace(telegram_id=999, session_id="session-ref")
+            with patch.object(
+                self.main, "load_miniapp_admin_session", return_value=non_admin
+            ):
+                forbidden = await self.main.miniapp_admin_auth_middleware(
+                    FakeMiniAppRequest(
+                        app, "Bearer token", path=resource,
+                        match_info=match_info,
+                    ),
+                    handler,
+                )
+            self.assertEqual(forbidden.status, 403)
+
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        safe_item = {
+            "content_id": "00000000-0000-0000-0000-000000000001",
+            "title": "Тренировка", "description": "Описание",
+            "category": "main_workout", "duration_seconds": 600,
+            "status": "draft", "sort_order": 0,
+            "cover_media_id": None, "has_cover": False, "has_video": True,
+        }
+        handler = self.route_handler(
+            app, "GET", "/api/admin/member-preview/content"
+        )
+        with patch.object(
+            self.main, "load_miniapp_admin_session", return_value=session
+        ), patch.object(
+            self.main, "list_member_preview_content",
+            return_value={"items": [safe_item], "read_only": True, "preview": True},
+        ), patch.object(
+            self.main.stripe.Subscription, "retrieve",
+            side_effect=AssertionError("Stripe must not be called"),
+        ), patch.object(
+            self.main.bot, "send_message",
+            side_effect=AssertionError("Telegram must not be called"),
+        ):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token",
+                    path="/api/admin/member-preview/content",
+                ),
+                handler,
+            )
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.text)
+        serialized = json.dumps(payload)
+        self.assertNotIn("created_by_telegram_id", serialized)
+        self.assertNotIn("version", serialized)
+        self.assertNotIn("telegram_file_id", serialized)
+        self.assertNotIn("server_reference", serialized)
+
     async def test_miniapp_content_media_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         routes = (
@@ -9767,6 +9835,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("id=\"open-gifts\"", index)
         self.assertIn("id=\"open-content\"", index)
+        self.assertIn('id="open-member-preview"', index)
+        self.assertIn("/api/admin/member-preview/home", javascript)
+        self.assertIn("/api/admin/member-preview/content", javascript)
+        self.assertIn('id="member-bottom-nav"', index)
+        self.assertIn("Режим предпросмотра", index)
+        self.assertIn("Медитации появятся здесь", index)
+        self.assertIn("Рецепты появятся здесь", index)
+        self.assertIn("adminHero.hidden = true", javascript)
+        self.assertIn("bottomNav.hidden = true", javascript)
+        self.assertIn("memberBottomNav.hidden = false", javascript)
+        self.assertIn("bottomNav.hidden = false", javascript)
+        self.assertIn("member-training-group", javascript)
+        self.assertIn("env(safe-area-inset-bottom)", stylesheet)
+        self.assertNotIn("telegram_file_id", javascript)
         self.assertIn("id=\"content-screen\"", index)
         self.assertIn("loadContent", javascript)
         self.assertIn("content-create-submit", index)
