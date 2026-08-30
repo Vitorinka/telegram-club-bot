@@ -8,6 +8,7 @@
   const adminHero = document.getElementById("admin-hero");
   const bottomNav = document.getElementById("bottom-nav");
   const memberBottomNav = document.getElementById("member-bottom-nav");
+  const memberShellHeader = document.getElementById("member-shell-header");
   const usersSearch = document.getElementById("users-search");
   const usersStatus = document.getElementById("users-status");
   const usersList = document.getElementById("users-list");
@@ -101,6 +102,8 @@
   const memberTrainingList = document.getElementById("member-training-list");
   const memberTrainingEmpty = document.getElementById("member-training-empty");
   const memberLessonContent = document.getElementById("member-lesson-content");
+  const memberLibrarySearch = document.getElementById("member-library-search");
+  const memberLibraryChips = document.getElementById("member-library-chips");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -132,6 +135,8 @@
   let memberPreviewMode = false;
   let memberCoverGeneration = 0;
   const memberCoverUrls = new Map();
+  let memberLibraryItems = [];
+  let memberLibraryCategory = "all";
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -155,6 +160,13 @@
   };
   const memberCategoryLabel = (category) => {
     if (!category) return "Другое";
+    const labels = {
+      strength: "Сила", strength_training: "Сила", flexibility: "Гибкость",
+      glutes: "Ягодицы", posture: "Осанка", pelvic_floor: "Тазовое дно",
+      mobility: "Мобилити", feet: "Стопы", recovery: "Восстановление",
+      main_workout: "Основные тренировки", warmup: "Зарядки",
+    };
+    if (labels[category]) return labels[category];
     return category.split("_").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
   };
   const clearMemberCoverUrls = () => {
@@ -195,7 +207,7 @@
   };
   const memberLessonCard = (item) => {
     const article = document.createElement("article");
-    article.className = "member-lesson-card";
+    article.className = "member-card member-content-card member-lesson-card";
     const button = document.createElement("button");
     button.type = "button";
     button.append(memberCover(item));
@@ -205,8 +217,12 @@
     meta.className = "member-lesson-meta";
     meta.append(text("span", memberCategoryLabel(item.category)));
     if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
+    const bookmark = text("span", "☆");
+    bookmark.setAttribute("aria-hidden", "true");
+    meta.append(bookmark);
     copy.append(meta, text("h2", item.title));
     if (item.duration_seconds) copy.append(text("p", `${Math.ceil(item.duration_seconds / 60)} мин.`));
+    if (item.description) copy.append(text("p", item.description, "member-description-excerpt"));
     button.append(copy);
     button.addEventListener("click", () => loadMemberLesson(item.content_id).catch(showApiError));
     article.append(button);
@@ -214,12 +230,18 @@
   };
   const showMemberScreen = (name) => {
     memberPreviewMode = true;
+    document.body.classList.add("member-preview-mode");
     adminHero.hidden = true;
     bottomNav.hidden = true;
     memberBottomNav.hidden = false;
+    memberShellHeader.hidden = false;
     showScreen(name);
+    const navigationName = (
+      name === "member-lesson" || name === "member-meditations"
+      || name === "member-recipes"
+    ) ? "member-library" : name;
     document.querySelectorAll("[data-member-nav]").forEach((button) => {
-      button.classList.toggle("active", button.dataset.memberNav === name);
+      button.classList.toggle("active", button.dataset.memberNav === navigationName);
     });
   };
   const loadMemberHome = () => {
@@ -230,34 +252,57 @@
       memberHomeEmpty.hidden = data.latest_lessons.length !== 0;
       memberHomeCategories.replaceChildren();
       data.categories.forEach((entry) => {
-        const chip = text("span", `${memberCategoryLabel(entry.category)} · ${entry.count}`, "member-category-chip");
-        memberHomeCategories.append(chip);
+        const card = document.createElement("article");
+        card.className = "member-category-card";
+        card.append(
+          text("strong", memberCategoryLabel(entry.category)),
+          text("span", `${entry.count} ${entry.count === 1 ? "материал" : "материалов"}`)
+        );
+        memberHomeCategories.append(card);
       });
       showMemberScreen("member-home");
     });
   };
-  const loadMemberTrainings = () => {
+  const renderMemberLibrary = () => {
+    const query = memberLibrarySearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberLibraryItems.filter((item) => {
+      const categoryMatches = memberLibraryCategory === "all"
+        || (item.category || "other") === memberLibraryCategory;
+      return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
+    });
+    clearMemberCoverUrls();
+    memberTrainingList.replaceChildren();
+    items.forEach((item) => memberTrainingList.append(memberLessonCard(item)));
+    memberTrainingEmpty.hidden = items.length !== 0;
+  };
+  const configureMemberLibraryFilters = () => {
+    const categories = [...new Set(memberLibraryItems.map((item) => item.category || "other"))];
+    memberLibraryChips.replaceChildren();
+    [{key: "all", label: "Все"}, ...categories.map((key) => ({key, label: memberCategoryLabel(key)}))]
+      .forEach((entry) => {
+        const chip = text("button", entry.label, "member-chip");
+        chip.type = "button";
+        chip.dataset.memberCategory = entry.key;
+        chip.classList.toggle("active", entry.key === memberLibraryCategory);
+        chip.addEventListener("click", () => {
+          memberLibraryCategory = entry.key;
+          memberLibraryChips.querySelectorAll("button").forEach((button) => {
+            button.classList.toggle("active", button.dataset.memberCategory === entry.key);
+          });
+          renderMemberLibrary();
+        });
+        memberLibraryChips.append(chip);
+      });
+  };
+  const loadMemberLibrary = (category = "all") => {
     return api("/api/admin/member-preview/content?limit=50").then((data) => {
-      clearMemberCoverUrls();
-      memberTrainingList.replaceChildren();
-      const grouped = new Map();
-      data.items.forEach((item) => {
-        const key = item.category || "other";
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key).push(item);
-      });
-      grouped.forEach((items, category) => {
-        const section = document.createElement("section");
-        section.className = "member-training-group";
-        section.append(text("h2", memberCategoryLabel(category)));
-        const grid = document.createElement("div");
-        grid.className = "member-content-grid";
-        items.forEach((item) => grid.append(memberLessonCard(item)));
-        section.append(grid);
-        memberTrainingList.append(section);
-      });
-      memberTrainingEmpty.hidden = data.items.length !== 0;
-      showMemberScreen("member-trainings");
+      memberLibraryItems = data.items;
+      memberLibraryCategory = memberLibraryItems.some(
+        (item) => (item.category || "other") === category
+      ) ? category : "all";
+      configureMemberLibraryFilters();
+      renderMemberLibrary();
+      showMemberScreen("member-library");
     });
   };
   const loadMemberLesson = (contentId) => {
@@ -286,7 +331,9 @@
   const exitMemberPreview = () => {
     memberPreviewMode = false;
     clearMemberCoverUrls();
+    document.body.classList.remove("member-preview-mode");
     memberBottomNav.hidden = true;
+    memberShellHeader.hidden = true;
     adminHero.hidden = false;
     bottomNav.hidden = false;
     return loadDashboard();
@@ -1293,15 +1340,25 @@
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
-  document.getElementById("member-home-all").addEventListener("click", () => loadMemberTrainings().catch(showApiError));
-  document.getElementById("member-lesson-back").addEventListener("click", () => loadMemberTrainings().catch(showApiError));
+  document.getElementById("member-home-all").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
+  document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
+  document.getElementById("member-continue").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
+  document.getElementById("member-lesson-back").addEventListener("click", () => loadMemberLibrary(memberLibraryCategory).catch(showApiError));
+  document.getElementById("member-open-meditations").addEventListener("click", () => showMemberScreen("member-meditations"));
+  document.getElementById("member-open-recipes").addEventListener("click", () => showMemberScreen("member-recipes"));
+  document.getElementById("member-open-nutrition").addEventListener("click", () => showMemberScreen("member-recipes"));
+  document.getElementById("member-open-schedule").addEventListener("click", () => showMemberScreen("member-schedule"));
+  document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
+    button.addEventListener("click", () => loadMemberLibrary(button.dataset.memberCategoryNav).catch(showApiError));
+  });
+  memberLibrarySearch.addEventListener("input", renderMemberLibrary);
   document.querySelectorAll(".member-exit").forEach((button) => {
     button.addEventListener("click", () => exitMemberPreview().catch(showApiError));
   });
   document.querySelectorAll("[data-member-nav]").forEach((button) => {
     button.addEventListener("click", () => {
       if (button.dataset.memberNav === "member-home") loadMemberHome().catch(showApiError);
-      else if (button.dataset.memberNav === "member-trainings") loadMemberTrainings().catch(showApiError);
+      else if (button.dataset.memberNav === "member-library") loadMemberLibrary().catch(showApiError);
       else showMemberScreen(button.dataset.memberNav);
     });
   });

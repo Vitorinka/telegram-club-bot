@@ -326,53 +326,57 @@
       <button id="deliveries-back" class="secondary" type="button">← К системе</button>
       <div id="delivery-details-content" class="dashboard"></div>
     </section>
-    <section id="member-home" class="screen member-screen" data-screen="member-home" hidden>
-      <div class="member-preview-banner">
-        <strong>Режим предпросмотра</strong>
-        <span>Этот интерфейс пока доступен только администраторам</span>
-        <button class="member-exit secondary" type="button">Вернуться в админку</button>
-      </div>
-      <header class="member-hero">
-        <p class="member-kicker">Ваш клуб</p>
-        <h1>Добро пожаловать</h1>
-        <p>Тренировки и новые материалы клуба в одном месте.</p>
-      </header>
+    <div id="member-shell-header" class="member-shell-header" hidden>
+      <div class="member-preview-strip"><span>Режим предпросмотра</span><button class="member-exit" type="button">Вернуться в админку</button></div>
+      <header class="member-header"><div><span>Закрытый клуб</span><strong>Натальи Ребковец</strong></div><span class="member-header-mark" aria-hidden="true">✦</span></header>
+    </div>
+    <section id="member-home" class="screen member-page" data-screen="member-home" hidden>
+      <article class="member-hero member-card">
+        <div><p class="member-kicker">Здравствуйте!</p><h1>Рады видеть вас<br>в клубе Natalia_SoulFit</h1><button id="member-continue" class="member-button" type="button">Продолжить тренировку</button></div>
+        <div class="member-hero-art" aria-hidden="true"><span></span><i></i></div>
+      </article>
       <section class="member-section">
-        <div class="member-section-heading"><h2>Новые материалы</h2><button id="member-home-all" type="button">Все</button></div>
-        <div id="member-home-lessons" class="member-content-grid"></div>
-        <p id="member-home-empty" class="member-empty" hidden>Материалы клуба появятся здесь.</p>
+        <div class="member-section-title"><h2>Тренировки</h2><button id="member-home-all" type="button">Все тренировки</button></div>
+        <div class="member-grid member-training-tiles" aria-label="Направления тренировок">
+          <button type="button" data-member-category-nav="strength"><span>◒</span>Силовые</button>
+          <button type="button" data-member-category-nav="flexibility"><span>⌁</span>Гибкость</button>
+          <button type="button" data-member-category-nav="glutes"><span>◡</span>Ягодицы</button>
+          <button type="button" data-member-category-nav="posture"><span>│</span>Осанка</button>
+          <button type="button" data-member-category-nav="pelvic_floor"><span>◉</span>Тазовое дно</button>
+          <button type="button" data-member-category-nav="mobility"><span>∞</span>Мобилити</button>
+          <button type="button" data-member-category-nav="feet"><span>⌇</span>Стопы</button>
+          <button type="button" data-member-category-nav="recovery"><span>◌</span>Восстановление</button>
+        </div>
       </section>
       <section class="member-section">
-        <h2>Категории</h2>
-        <div id="member-home-categories" class="member-category-row"></div>
+        <div class="member-wellness-row">
+          <article class="member-card member-first-aid"><div class="member-section-title"><h2>Фитнес-аптечка</h2></div><div class="member-mini-tiles"><span>Шея</span><span>Спина</span><span>Поясница</span><span>Ноги</span></div></article>
+          <article class="member-card member-meditation-promo"><span class="member-orbit" aria-hidden="true">◌</span><h2>Медитации</h2><p>Баланс и внутренняя опора</p><button id="member-open-meditations" class="member-button secondary" type="button">Открыть</button></article>
+        </div>
       </section>
+      <section class="member-section">
+        <div class="member-section-title"><h2>Питание</h2></div>
+        <div class="member-two-column">
+          <button id="member-open-recipes" class="member-card member-link-card" type="button"><span class="member-link-icon">◇</span><strong>Рецепты</strong><small>Полезные и вкусные блюда</small></button>
+          <button id="member-open-nutrition" class="member-card member-link-card" type="button"><span class="member-link-icon">▤</span><strong>Материалы нутрициолога</strong><small>Статьи, гайды, рекомендации</small></button>
+        </div>
+      </section>
+      <section class="member-section"><div class="member-section-title"><h2>Новые материалы</h2><button id="member-home-library" type="button">Библиотека</button></div><div id="member-home-lessons" class="member-grid member-content-grid"></div><p id="member-home-empty" class="member-empty-state" hidden>Материалы клуба появятся здесь.</p></section>
+      <section class="member-section"><article class="member-card member-zoom-card"><div><p class="member-kicker">Zoom</p><h2>Расписание клуба</h2><p>Актуальное месячное расписание встреч и занятий.</p></div><button id="member-open-schedule" class="member-button" type="button">Открыть расписание</button></article></section>
+      <section class="member-section"><div class="member-section-title"><h2>Моё</h2></div><div class="member-my-grid"><button type="button">♡<span>Избранное</span></button><button type="button">✓<span>Пройденные</span></button><button type="button">↺<span>История</span></button><button type="button">◇<span>Подписка</span></button></div></section>
     </section>
-    <section id="member-trainings" class="screen member-screen" data-screen="member-trainings" hidden>
-      <div class="member-preview-banner compact">
-        <strong>Режим предпросмотра</strong>
-        <button class="member-exit secondary" type="button">Вернуться в админку</button>
-      </div>
-      <header class="member-page-heading"><p class="member-kicker">Библиотека клуба</p><h1>Тренировки</h1></header>
-      <div id="member-training-list" class="member-content-grid"></div>
-      <p id="member-training-empty" class="member-empty" hidden>Тренировки появятся здесь.</p>
+    <section id="member-library" class="screen member-page" data-screen="member-library" hidden>
+      <header class="member-page-heading"><p class="member-kicker">Библиотека</p><h1>Тренировки</h1><p>Эффективные занятия для тела и души</p></header>
+      <label class="member-search"><span aria-hidden="true">⌕</span><input id="member-library-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск тренировок"></label>
+      <div id="member-library-chips" class="member-chip-row"><button class="member-chip active" type="button" data-member-category="all">Все</button></div>
+      <section class="member-section"><div class="member-section-title"><h2>Категории</h2></div><div id="member-home-categories" class="member-category-grid"></div></section>
+      <section class="member-section"><div class="member-section-title"><h2>Новые тренировки</h2></div><div id="member-training-list" class="member-grid member-content-grid"></div><p id="member-training-empty" class="member-empty-state" hidden>Тренировки появятся здесь.</p></section>
     </section>
-    <section id="member-meditations" class="screen member-screen" data-screen="member-meditations" hidden>
-      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
-      <div class="member-coming-soon"><span>◌</span><h1>Медитации</h1><p>Медитации появятся здесь</p></div>
-    </section>
-    <section id="member-recipes" class="screen member-screen" data-screen="member-recipes" hidden>
-      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
-      <div class="member-coming-soon"><span>◇</span><h1>Рецепты</h1><p>Рецепты появятся здесь</p></div>
-    </section>
-    <section id="member-profile" class="screen member-screen" data-screen="member-profile" hidden>
-      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
-      <div class="member-profile-card"><div class="member-avatar">М</div><h1>Профиль</h1><p>Демонстрация будущего кабинета участника клуба.</p><button class="member-exit" type="button">Вернуться в админку</button></div>
-    </section>
-    <section id="member-lesson" class="screen member-screen" data-screen="member-lesson" hidden>
-      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
-      <button id="member-lesson-back" class="member-back" type="button">← К тренировкам</button>
-      <article id="member-lesson-content" class="member-lesson-content"></article>
-    </section>
+    <section id="member-meditations" class="screen member-page" data-screen="member-meditations" hidden><header class="member-page-heading"><p class="member-kicker">Практики</p><h1>Медитации</h1><p>Найдите баланс и внутреннюю опору</p></header><div class="member-card member-empty-state member-empty-art"><span aria-hidden="true">◌</span><h2>Медитации появятся здесь</h2><p>Раздел готов к будущим материалам, но пока не содержит фиктивного контента.</p></div></section>
+    <section id="member-recipes" class="screen member-page" data-screen="member-recipes" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Рецепты</h1><p>Полезные и вкусные блюда для вашего баланса и энергии</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input type="search" disabled placeholder="Поиск рецептов"></label><div class="member-card member-empty-state member-empty-art"><span aria-hidden="true">◇</span><h2>Рецепты появятся здесь</h2><p>Структурированная база рецептов пока не подключена.</p></div><article class="member-card member-nutrition-note"><h2>Материалы нутрициолога</h2><p>Статьи, гайды и рекомендации появятся после подключения реального контента.</p></article></section>
+    <section id="member-schedule" class="screen member-page" data-screen="member-schedule" hidden><header class="member-page-heading"><p class="member-kicker">Zoom и встречи</p><h1>Расписание</h1><p>Актуальное расписание клуба</p></header><article class="member-card member-empty-state member-empty-art"><span aria-hidden="true">▦</span><h2>Расписание клуба</h2><p>Информация о ближайших встречах появится здесь.</p></article></section>
+    <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1>Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span>Подписка</span><strong>Статус подписки будет отображаться здесь</strong></article><div class="member-profile-links"><button type="button">♡<span>Избранное</span><b>›</b></button><button type="button">↺<span>История</span><b>›</b></button><button type="button">◌<span>Записи на Zoom</span><b>›</b></button><button type="button">⚙<span>Настройки</span><b>›</b></button></div><button class="member-exit member-button" type="button">Вернуться в админку</button></section>
+    <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
     <button type="button" data-nav="overview">Обзор</button>
@@ -382,11 +386,10 @@
     <button type="button" data-nav="system">Система</button>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
-    <button type="button" data-member-nav="member-home">Главная</button>
-    <button type="button" data-member-nav="member-trainings">Тренировки</button>
-    <button type="button" data-member-nav="member-meditations">Медитации</button>
-    <button type="button" data-member-nav="member-recipes">Рецепты</button>
-    <button type="button" data-member-nav="member-profile">Профиль</button>
+    <button type="button" data-member-nav="member-home"><span aria-hidden="true">⌂</span><small>Главная</small></button>
+    <button type="button" data-member-nav="member-library"><span aria-hidden="true">▦</span><small>Библиотека</small></button>
+    <button type="button" data-member-nav="member-schedule"><span aria-hidden="true">▣</span><small>Расписание</small></button>
+    <button type="button" data-member-nav="member-profile"><span aria-hidden="true">○</span><small>Профиль</small></button>
   </nav>
 </body>
 </html>
