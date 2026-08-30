@@ -149,6 +149,11 @@ from admin_gifts import (
     parse_gifts_limit,
     validate_gift_reference,
 )
+from admin_content import (
+    AdminContentQueryError,
+    get_admin_content,
+    list_admin_content,
+)
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -21614,6 +21619,33 @@ async def miniapp_admin_dashboard(request):
     return apply_miniapp_security_headers(web.json_response(dashboard))
 
 
+async def miniapp_admin_content(request):
+    try:
+        result = list_admin_content(
+            free_lesson_configured=bool(os.getenv("FREE_LESSON_VIDEO_ID")),
+            category=request.query.get("category", "all"),
+            query=request.query.get("q", ""),
+        )
+    except AdminContentQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": error.args[0] if error.args else "invalid_query"},
+            status=400,
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_details(request):
+    result = get_admin_content(
+        request.match_info.get("content_id"),
+        free_lesson_configured=bool(os.getenv("FREE_LESSON_VIDEO_ID")),
+    )
+    if result is None:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": "content_not_found"}, status=404
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_users(request):
     try:
         limit = parse_users_limit(request.query.get("limit"))
@@ -22750,6 +22782,12 @@ def create_app():
         app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     if not _route_exists(app, "GET", "/api/admin/dashboard"):
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
+    if not _route_exists(app, "GET", "/api/admin/content"):
+        app.router.add_get('/api/admin/content', miniapp_admin_content)
+    if not _route_exists(app, "GET", "/api/admin/content/{content_id}"):
+        app.router.add_get(
+            '/api/admin/content/{content_id}', miniapp_admin_content_details
+        )
     if not _route_exists(app, "GET", "/api/admin/users"):
         app.router.add_get('/api/admin/users', miniapp_admin_users)
     if not _route_exists(app, "POST", "/api/admin/users/{telegram_id}/access-preview"):

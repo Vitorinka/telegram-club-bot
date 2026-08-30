@@ -63,6 +63,11 @@
   const giftResendConfirm = document.getElementById("gift-resend-confirm");
   const giftResendCancel = document.getElementById("gift-resend-cancel");
   const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
+  const contentSearch = document.getElementById("content-search");
+  const contentCategory = document.getElementById("content-category");
+  const contentList = document.getElementById("content-list");
+  const contentEmpty = document.getElementById("content-empty");
+  const contentDetailsContent = document.getElementById("content-details-content");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -85,6 +90,7 @@
   let giftResendActionId = null;
   let manualAccessUserId = null;
   let manualAccessActionId = null;
+  let contentSearchTimer = null;
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -822,6 +828,55 @@
     }).catch(showApiError);
   }
 
+  const contentCard = (item) => {
+    const article = document.createElement("article");
+    article.className = "card user-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(text("p", item.category_label, "eyebrow"));
+    button.append(text("h2", item.title));
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    badges.append(text("span", item.media_type, "badge"));
+    badges.append(text("span", item.availability === "configured" ? "Настроен" : "Нет медиа", "badge"));
+    button.append(badges);
+    button.append(text("p", item.short_description));
+    if (item.duration_minutes) button.append(text("p", `Длительность: ${item.duration_minutes} мин.`));
+    button.addEventListener("click", () => loadContentDetails(item.content_id));
+    article.append(button);
+    return article;
+  };
+  const loadContent = () => {
+    status.textContent = "Загружаем контент…";
+    const params = new URLSearchParams({category: contentCategory.value});
+    if (contentSearch.value.trim()) params.set("q", contentSearch.value.trim());
+    return api(`/api/admin/content?${params.toString()}`).then((data) => {
+      contentList.replaceChildren();
+      data.items.forEach((item) => contentList.append(contentCard(item)));
+      contentEmpty.hidden = data.items.length !== 0;
+      showScreen("content");
+      status.textContent = `Материалов показано: ${data.items.length}`;
+    });
+  };
+  function loadContentDetails(contentId) {
+    status.textContent = "Загружаем материал…";
+    return api(`/api/admin/content/${encodeURIComponent(contentId)}`).then((item) => {
+      contentDetailsContent.replaceChildren(detailCard("Материал", [
+        ["Название", item.title],
+        ["Тип", item.content_type],
+        ["Категория", item.category_label],
+        ["Описание", item.short_description],
+        ["Длительность", item.duration_minutes ? `${item.duration_minutes} мин.` : null],
+        ["Порядок", item.ordering],
+        ["Медиа", item.media_type],
+        ["Медиа настроено", item.has_media ? "Да" : "Нет"],
+        ["Состояние", item.availability === "configured" ? "Настроен" : "Нет медиа"],
+      ]));
+      showScreen("content-details");
+      status.textContent = item.title;
+    }).catch(showApiError);
+  }
+
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -841,6 +896,7 @@
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {
@@ -897,6 +953,13 @@
   manualAccessCancel.addEventListener("click", cancelManualAccess);
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
+  contentCategory.addEventListener("change", () => loadContent().catch(showApiError));
+  contentSearch.addEventListener("input", () => {
+    window.clearTimeout(contentSearchTimer);
+    contentSearchTimer = window.setTimeout(() => loadContent().catch(showApiError), 300);
+  });
+  document.getElementById("content-back").addEventListener("click", () => showScreen("content"));
+  document.getElementById("content-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",

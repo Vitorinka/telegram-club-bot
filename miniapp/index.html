@@ -46,7 +46,29 @@
       <article class="card secondary-navigation">
         <h2>Дополнительные разделы</h2>
         <button id="open-gifts" type="button">🎁 Подарки</button>
+        <button id="open-content" type="button">📚 Контент</button>
       </article>
+    </section>
+    <section id="content-screen" class="screen page" data-screen="content" hidden>
+      <article class="card">
+        <h2>Контент</h2>
+        <p class="hint">Материалы, которыми бот управляет напрямую. Раздел только для просмотра.</p>
+        <label class="search-label" for="content-search">Поиск по названию</label>
+        <input id="content-search" type="search" maxlength="80" autocomplete="off">
+        <select id="content-category" aria-label="Категория контента">
+          <option value="all">Все</option>
+          <option value="onboarding">Онбординг</option>
+          <option value="club_information">Информация клуба</option>
+          <option value="free_materials">Бесплатные материалы</option>
+        </select>
+      </article>
+      <div id="content-list" class="user-list"></div>
+      <p id="content-empty" class="card" hidden>Материалов по выбранному фильтру нет.</p>
+      <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
+    </section>
+    <section id="content-details" class="screen page" data-screen="content-details" hidden>
+      <button id="content-back" class="secondary" type="button">← К контенту</button>
+      <div id="content-details-content" class="dashboard"></div>
     </section>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
