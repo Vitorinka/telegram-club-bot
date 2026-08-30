@@ -10,7 +10,7 @@
 </head>
 <body>
   <main class="shell" aria-live="polite">
-    <section class="card hero-card">
+    <section id="admin-hero" class="card hero-card">
       <p class="eyebrow">Telegram Club Bot</p>
       <h1 id="title">Админ-платформа</h1>
       <p class="admin-status-line">
@@ -47,6 +47,7 @@
         <h2>Дополнительные разделы</h2>
         <button id="open-gifts" type="button">🎁 Подарки</button>
         <button id="open-content" type="button">📚 Контент</button>
+        <button id="open-member-preview" type="button">✨ Предпросмотр клуба</button>
       </article>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
@@ -325,6 +326,53 @@
       <button id="deliveries-back" class="secondary" type="button">← К системе</button>
       <div id="delivery-details-content" class="dashboard"></div>
     </section>
+    <section id="member-home" class="screen member-screen" data-screen="member-home" hidden>
+      <div class="member-preview-banner">
+        <strong>Режим предпросмотра</strong>
+        <span>Этот интерфейс пока доступен только администраторам</span>
+        <button class="member-exit secondary" type="button">Вернуться в админку</button>
+      </div>
+      <header class="member-hero">
+        <p class="member-kicker">Ваш клуб</p>
+        <h1>Добро пожаловать</h1>
+        <p>Тренировки и новые материалы клуба в одном месте.</p>
+      </header>
+      <section class="member-section">
+        <div class="member-section-heading"><h2>Новые материалы</h2><button id="member-home-all" type="button">Все</button></div>
+        <div id="member-home-lessons" class="member-content-grid"></div>
+        <p id="member-home-empty" class="member-empty" hidden>Материалы клуба появятся здесь.</p>
+      </section>
+      <section class="member-section">
+        <h2>Категории</h2>
+        <div id="member-home-categories" class="member-category-row"></div>
+      </section>
+    </section>
+    <section id="member-trainings" class="screen member-screen" data-screen="member-trainings" hidden>
+      <div class="member-preview-banner compact">
+        <strong>Режим предпросмотра</strong>
+        <button class="member-exit secondary" type="button">Вернуться в админку</button>
+      </div>
+      <header class="member-page-heading"><p class="member-kicker">Библиотека клуба</p><h1>Тренировки</h1></header>
+      <div id="member-training-list" class="member-content-grid"></div>
+      <p id="member-training-empty" class="member-empty" hidden>Тренировки появятся здесь.</p>
+    </section>
+    <section id="member-meditations" class="screen member-screen" data-screen="member-meditations" hidden>
+      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
+      <div class="member-coming-soon"><span>◌</span><h1>Медитации</h1><p>Медитации появятся здесь</p></div>
+    </section>
+    <section id="member-recipes" class="screen member-screen" data-screen="member-recipes" hidden>
+      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
+      <div class="member-coming-soon"><span>◇</span><h1>Рецепты</h1><p>Рецепты появятся здесь</p></div>
+    </section>
+    <section id="member-profile" class="screen member-screen" data-screen="member-profile" hidden>
+      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
+      <div class="member-profile-card"><div class="member-avatar">М</div><h1>Профиль</h1><p>Демонстрация будущего кабинета участника клуба.</p><button class="member-exit" type="button">Вернуться в админку</button></div>
+    </section>
+    <section id="member-lesson" class="screen member-screen" data-screen="member-lesson" hidden>
+      <div class="member-preview-banner compact"><strong>Режим предпросмотра</strong><button class="member-exit secondary" type="button">Вернуться в админку</button></div>
+      <button id="member-lesson-back" class="member-back" type="button">← К тренировкам</button>
+      <article id="member-lesson-content" class="member-lesson-content"></article>
+    </section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
     <button type="button" data-nav="overview">Обзор</button>
@@ -332,6 +380,13 @@
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
     <button type="button" data-nav="system">Система</button>
+  </nav>
+  <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
+    <button type="button" data-member-nav="member-home">Главная</button>
+    <button type="button" data-member-nav="member-trainings">Тренировки</button>
+    <button type="button" data-member-nav="member-meditations">Медитации</button>
+    <button type="button" data-member-nav="member-recipes">Рецепты</button>
+    <button type="button" data-member-nav="member-profile">Профиль</button>
   </nav>
 </body>
 </html>

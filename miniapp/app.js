@@ -5,7 +5,9 @@
   const identity = document.getElementById("identity");
   const telegramId = document.getElementById("telegram-id");
   const refresh = document.getElementById("refresh");
+  const adminHero = document.getElementById("admin-hero");
   const bottomNav = document.getElementById("bottom-nav");
+  const memberBottomNav = document.getElementById("member-bottom-nav");
   const usersSearch = document.getElementById("users-search");
   const usersStatus = document.getElementById("users-status");
   const usersList = document.getElementById("users-list");
@@ -93,6 +95,12 @@
   const contentMediaMessage = document.getElementById("content-media-message");
   const contentMediaConfirm = document.getElementById("content-media-confirm");
   const contentMediaCancel = document.getElementById("content-media-cancel");
+  const memberHomeLessons = document.getElementById("member-home-lessons");
+  const memberHomeEmpty = document.getElementById("member-home-empty");
+  const memberHomeCategories = document.getElementById("member-home-categories");
+  const memberTrainingList = document.getElementById("member-training-list");
+  const memberTrainingEmpty = document.getElementById("member-training-empty");
+  const memberLessonContent = document.getElementById("member-lesson-content");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -121,6 +129,9 @@
   let contentMediaLocalUrl = null;
   let contentMediaServerUrl = null;
   let contentMediaAttachedCoverUrl = null;
+  let memberPreviewMode = false;
+  let memberCoverGeneration = 0;
+  const memberCoverUrls = new Map();
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -141,6 +152,144 @@
     if (error.message === "session_ended") status.textContent = "Сессия завершена. Закройте и снова откройте админ-платформу.";
     else if (error.message === "access_revoked") status.textContent = "У вас больше нет доступа к админ-платформе.";
     else status.textContent = "Не удалось загрузить данные. Попробуйте обновить.";
+  };
+  const memberCategoryLabel = (category) => {
+    if (!category) return "Другое";
+    return category.split("_").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+  };
+  const clearMemberCoverUrls = () => {
+    memberCoverGeneration += 1;
+    memberCoverUrls.forEach((url) => URL.revokeObjectURL(url));
+    memberCoverUrls.clear();
+  };
+  const memberCover = (item, large = false) => {
+    const generation = memberCoverGeneration;
+    const container = document.createElement("div");
+    container.className = large ? "member-cover member-cover-large" : "member-cover";
+    if (!item.has_cover || !item.cover_media_id) {
+      container.append(text("span", "Материал клуба", "member-cover-placeholder"));
+      return container;
+    }
+    container.append(text("span", "Загружаем обложку…", "member-cover-placeholder"));
+    fetch(
+      `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`,
+      {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
+    ).then((response) => {
+      if (!response.ok) throw new Error("cover_unavailable");
+      return response.blob();
+    }).then((blob) => {
+      if (generation !== memberCoverGeneration) return;
+      const url = URL.createObjectURL(blob);
+      const old = memberCoverUrls.get(item.cover_media_id);
+      if (old) URL.revokeObjectURL(old);
+      memberCoverUrls.set(item.cover_media_id, url);
+      const image = document.createElement("img");
+      image.src = url;
+      image.alt = `Обложка: ${item.title}`;
+      container.replaceChildren(image);
+    }).catch(() => {
+      if (generation !== memberCoverGeneration) return;
+      container.replaceChildren(text("span", "Обложка недоступна", "member-cover-placeholder"));
+    });
+    return container;
+  };
+  const memberLessonCard = (item) => {
+    const article = document.createElement("article");
+    article.className = "member-lesson-card";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.append(memberCover(item));
+    const copy = document.createElement("div");
+    copy.className = "member-lesson-copy";
+    const meta = document.createElement("div");
+    meta.className = "member-lesson-meta";
+    meta.append(text("span", memberCategoryLabel(item.category)));
+    if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
+    copy.append(meta, text("h2", item.title));
+    if (item.duration_seconds) copy.append(text("p", `${Math.ceil(item.duration_seconds / 60)} мин.`));
+    button.append(copy);
+    button.addEventListener("click", () => loadMemberLesson(item.content_id).catch(showApiError));
+    article.append(button);
+    return article;
+  };
+  const showMemberScreen = (name) => {
+    memberPreviewMode = true;
+    adminHero.hidden = true;
+    bottomNav.hidden = true;
+    memberBottomNav.hidden = false;
+    showScreen(name);
+    document.querySelectorAll("[data-member-nav]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.memberNav === name);
+    });
+  };
+  const loadMemberHome = () => {
+    return api("/api/admin/member-preview/home").then((data) => {
+      clearMemberCoverUrls();
+      memberHomeLessons.replaceChildren();
+      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberLessonCard(item)));
+      memberHomeEmpty.hidden = data.latest_lessons.length !== 0;
+      memberHomeCategories.replaceChildren();
+      data.categories.forEach((entry) => {
+        const chip = text("span", `${memberCategoryLabel(entry.category)} · ${entry.count}`, "member-category-chip");
+        memberHomeCategories.append(chip);
+      });
+      showMemberScreen("member-home");
+    });
+  };
+  const loadMemberTrainings = () => {
+    return api("/api/admin/member-preview/content?limit=50").then((data) => {
+      clearMemberCoverUrls();
+      memberTrainingList.replaceChildren();
+      const grouped = new Map();
+      data.items.forEach((item) => {
+        const key = item.category || "other";
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key).push(item);
+      });
+      grouped.forEach((items, category) => {
+        const section = document.createElement("section");
+        section.className = "member-training-group";
+        section.append(text("h2", memberCategoryLabel(category)));
+        const grid = document.createElement("div");
+        grid.className = "member-content-grid";
+        items.forEach((item) => grid.append(memberLessonCard(item)));
+        section.append(grid);
+        memberTrainingList.append(section);
+      });
+      memberTrainingEmpty.hidden = data.items.length !== 0;
+      showMemberScreen("member-trainings");
+    });
+  };
+  const loadMemberLesson = (contentId) => {
+    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}`).then((item) => {
+      clearMemberCoverUrls();
+      memberLessonContent.replaceChildren();
+      memberLessonContent.append(memberCover(item, true));
+      const heading = document.createElement("header");
+      const meta = document.createElement("div");
+      meta.className = "member-lesson-meta";
+      meta.append(text("span", memberCategoryLabel(item.category)));
+      if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
+      heading.append(meta, text("h1", item.title));
+      if (item.duration_seconds) heading.append(text("p", `${Math.ceil(item.duration_seconds / 60)} минут`));
+      memberLessonContent.append(heading);
+      if (item.description) memberLessonContent.append(text("p", item.description, "member-description"));
+      const video = document.createElement("section");
+      video.className = "member-video-shell";
+      video.append(text("span", "▶", "member-play-icon"));
+      video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
+      video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
+      memberLessonContent.append(video);
+      showMemberScreen("member-lesson");
+    });
+  };
+  const exitMemberPreview = () => {
+    memberPreviewMode = false;
+    clearMemberCoverUrls();
+    memberBottomNav.hidden = true;
+    adminHero.hidden = false;
+    bottomNav.hidden = false;
+    return loadDashboard();
   };
   const clearScheduleImages = () => {
     scheduleImageGeneration += 1;
@@ -1143,6 +1292,19 @@
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
+  document.getElementById("member-home-all").addEventListener("click", () => loadMemberTrainings().catch(showApiError));
+  document.getElementById("member-lesson-back").addEventListener("click", () => loadMemberTrainings().catch(showApiError));
+  document.querySelectorAll(".member-exit").forEach((button) => {
+    button.addEventListener("click", () => exitMemberPreview().catch(showApiError));
+  });
+  document.querySelectorAll("[data-member-nav]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.memberNav === "member-home") loadMemberHome().catch(showApiError);
+      else if (button.dataset.memberNav === "member-trainings") loadMemberTrainings().catch(showApiError);
+      else showMemberScreen(button.dataset.memberNav);
+    });
+  });
   document.getElementById("content-create-open").addEventListener("click", () => showScreen("content-create"));
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);

@@ -69,6 +69,11 @@ from content_media import (
     prepare_media_execution,
     record_telegram_upload,
 )
+from member_preview import (
+    get_member_preview_content,
+    get_member_preview_home,
+    list_member_preview_content,
+)
 from schedule_uploads import (
     apply_schedule_upload,
     cancel_schedule_upload,
@@ -2296,6 +2301,88 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             create_media_upload(
                 self.get_conn, 1, draft["content_id"], "cover", png
             )
+
+    def test_member_preview_safe_read_only_projection_real_postgres(self):
+        run_migrations(self.get_conn)
+        draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Черновая тренировка",
+            "category": "main_workout", "description": "Мягкая практика",
+            "duration_seconds": 900,
+        })
+        published = create_content_draft(self.get_conn, 2, {
+            "content_type": "lesson", "title": "Опубликованный урок",
+            "category": "warmup", "description": None,
+            "duration_seconds": 300,
+        })
+        archived = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Архивный урок",
+            "category": "main_workout", "description": None,
+            "duration_seconds": None,
+        })
+        for media_type, data, reference in (
+            ("cover", b"\x89PNG\r\n\x1a\npreview-cover", "private-cover-ref"),
+            ("video", b"\x00\x00\x00\x18ftypisompreview-video", "private-video-ref"),
+        ):
+            upload = create_media_upload(
+                self.get_conn, 1, draft["content_id"], media_type, data
+            )
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            self.assertEqual(
+                prepare_media_execution(
+                    self.get_conn, upload["upload_id"], action["action_id"], 1
+                )["mode"],
+                "upload",
+            )
+            record_telegram_upload(
+                self.get_conn, upload["upload_id"], action["action_id"], 1,
+                reference,
+            )
+            self.assertEqual(
+                apply_media_upload(
+                    self.get_conn, upload["upload_id"], action["action_id"], 1
+                )["status"],
+                "completed",
+            )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published', "
+                    "published_at=NOW() WHERE content_id=%s",
+                    (published["content_id"],),
+                )
+                cur.execute(
+                    "UPDATE content_items SET status='archived', "
+                    "archived_at=NOW() WHERE content_id=%s",
+                    (archived["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        before = self.query_one("SELECT COUNT(*) FROM content_items")[0]
+        catalog = list_member_preview_content(self.get_conn)
+        self.assertEqual(
+            {item["content_id"] for item in catalog["items"]},
+            {draft["content_id"], published["content_id"]},
+        )
+        lesson = get_member_preview_content(self.get_conn, draft["content_id"])
+        self.assertEqual(lesson["status"], "draft")
+        self.assertTrue(lesson["has_cover"])
+        self.assertTrue(lesson["has_video"])
+        self.assertIsNotNone(lesson["cover_media_id"])
+        serialized = json.dumps({"catalog": catalog, "lesson": lesson})
+        for forbidden in (
+            "private-cover-ref", "private-video-ref", "telegram_file_id",
+            "server_reference", "created_by_telegram_id", '"version"',
+        ):
+            self.assertNotIn(forbidden, serialized)
+        home = get_member_preview_home(self.get_conn)
+        self.assertEqual(home["total_lessons"], 2)
+        self.assertTrue(home["read_only"])
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM content_items")[0], before
+        )
     def test_minimal_old_schema_is_upgraded_without_fictitious_baseline(self):
         conn = self.get_conn()
         cur = conn.cursor()

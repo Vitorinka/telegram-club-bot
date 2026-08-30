@@ -176,6 +176,12 @@ from content_media import (
     prepare_media_execution,
     record_telegram_upload,
 )
+from member_preview import (
+    MemberPreviewError,
+    get_member_preview_content,
+    get_member_preview_home,
+    list_member_preview_content,
+)
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -21957,6 +21963,44 @@ async def miniapp_admin_content_media_proxy(request):
     return response
 
 
+def member_preview_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status
+    ))
+
+
+async def miniapp_admin_member_preview_home(request):
+    try:
+        result = get_member_preview_home(get_db_conn)
+    except MemberPreviewError as error:
+        return member_preview_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_member_preview_content(request):
+    try:
+        result = list_member_preview_content(
+            get_db_conn, limit=request.query.get("limit", "50")
+        )
+    except MemberPreviewError as error:
+        return member_preview_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_member_preview_content_details(request):
+    try:
+        result = get_member_preview_content(
+            get_db_conn, request.match_info.get("content_id")
+        )
+    except MemberPreviewError as error:
+        return member_preview_error_response(error)
+    if result is None:
+        return member_preview_error_response(
+            MemberPreviewError("content_not_found", 404)
+        )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_users(request):
     try:
         limit = parse_users_limit(request.query.get("limit"))
@@ -23095,6 +23139,23 @@ def create_app():
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
     if not _route_exists(app, "GET", "/api/admin/content"):
         app.router.add_get('/api/admin/content', miniapp_admin_content)
+    if not _route_exists(app, "GET", "/api/admin/member-preview/home"):
+        app.router.add_get(
+            '/api/admin/member-preview/home',
+            miniapp_admin_member_preview_home,
+        )
+    if not _route_exists(app, "GET", "/api/admin/member-preview/content"):
+        app.router.add_get(
+            '/api/admin/member-preview/content',
+            miniapp_admin_member_preview_content,
+        )
+    if not _route_exists(
+        app, "GET", "/api/admin/member-preview/content/{content_id}"
+    ):
+        app.router.add_get(
+            '/api/admin/member-preview/content/{content_id}',
+            miniapp_admin_member_preview_content_details,
+        )
     if not _route_exists(app, "POST", "/api/admin/content/drafts"):
         app.router.add_post(
             '/api/admin/content/drafts', miniapp_admin_content_draft_create
