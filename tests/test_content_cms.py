@@ -8,7 +8,7 @@ from content_cms import (
 
 
 class ContentCmsValidationTests(unittest.TestCase):
-    def test_create_is_lesson_only_and_trims_values(self):
+    def test_create_supports_lessons_and_meditations_and_trims_values(self):
         values = validate_create_payload({
             "content_type": "lesson",
             "title": "  Первый   урок  ",
@@ -18,6 +18,13 @@ class ContentCmsValidationTests(unittest.TestCase):
         })
         self.assertEqual(values["title"], "Первый урок")
         self.assertEqual(values["description"], "Описание")
+
+        meditation = validate_create_payload({
+            "content_type": "meditation", "title": " Спокойствие ",
+            "category": "breathing", "duration_seconds": 600,
+        })
+        self.assertEqual(meditation["content_type"], "meditation")
+        self.assertEqual(meditation["title"], "Спокойствие")
 
         with self.assertRaisesRegex(ContentCmsError, "invalid_content_type"):
             validate_create_payload({"content_type": "recipe", "title": "X"})

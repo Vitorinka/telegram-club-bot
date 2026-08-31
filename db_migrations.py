@@ -685,6 +685,18 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0021_content_types_meditation": {
+        "tables": ("content_items",),
+        "columns": {},
+        "indexes": (),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("content_type", "lesson", "meditation"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

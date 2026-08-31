@@ -440,8 +440,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 20,
-            "latest": "0020_content_media",
+            "count": 21,
+            "latest": "0021_content_types_meditation",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1925,7 +1925,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 20)
+        self.assertEqual(len(migrations), 21)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2319,6 +2319,36 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "category": "main_workout", "description": None,
             "duration_seconds": None,
         })
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Тихое дыхание",
+            "category": "breathing", "description": "Практика покоя",
+            "duration_seconds": 600,
+        })
+        archived_meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Старая медитация",
+            "category": "breathing", "description": None,
+            "duration_seconds": 300,
+        })
+        meditation_cover = create_media_upload(
+            self.get_conn, 1, meditation["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nmeditation-cover",
+        )
+        meditation_action = ensure_media_action(
+            self.get_conn, meditation_cover["upload_id"], 1
+        )
+        self.assertEqual(prepare_media_execution(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+        )["mode"], "upload")
+        record_telegram_upload(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+            "private-meditation-cover-ref",
+        )
+        self.assertEqual(apply_media_upload(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+        )["status"], "completed")
         for media_type, data, reference in (
             ("cover", b"\x89PNG\r\n\x1a\npreview-cover", "private-cover-ref"),
             ("video", b"\x00\x00\x00\x18ftypisompreview-video", "private-video-ref"),
@@ -2356,6 +2386,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     "archived_at=NOW() WHERE content_id=%s",
                     (archived["content_id"],),
                 )
+                cur.execute(
+                    "UPDATE content_items SET status='archived', "
+                    "archived_at=NOW() WHERE content_id=%s",
+                    (archived_meditation["content_id"],),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -2367,6 +2402,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             {draft["content_id"], published["content_id"]},
         )
         lesson = get_member_preview_content(self.get_conn, draft["content_id"])
+        self.assertEqual(lesson["content_type"], "lesson")
         self.assertEqual(lesson["status"], "draft")
         self.assertTrue(lesson["has_cover"])
         self.assertTrue(lesson["has_video"])
@@ -2379,6 +2415,31 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
         home = get_member_preview_home(self.get_conn)
         self.assertEqual(home["total_lessons"], 2)
+        self.assertEqual(
+            [item["content_id"] for item in home["latest_meditations"]],
+            [meditation["content_id"]],
+        )
+        meditation_catalog = list_member_preview_content(
+            self.get_conn, content_type="meditation"
+        )
+        self.assertEqual(
+            [item["content_id"] for item in meditation_catalog["items"]],
+            [meditation["content_id"]],
+        )
+        self.assertEqual(
+            get_member_preview_content(
+                self.get_conn, meditation["content_id"],
+                content_type="meditation",
+            )["content_type"],
+            "meditation",
+        )
+        self.assertTrue(get_member_preview_content(
+            self.get_conn, meditation["content_id"],
+            content_type="meditation",
+        )["has_cover"])
+        self.assertIsNone(get_member_preview_content(
+            self.get_conn, meditation["content_id"], content_type="lesson"
+        ))
         self.assertTrue(home["read_only"])
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM content_items")[0], before
@@ -8637,8 +8698,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 20)
-        self.assertEqual(system["migrations"]["latest"], "0020_content_media")
+        self.assertEqual(system["migrations"]["count"], 21)
+        self.assertEqual(system["migrations"]["latest"], "0021_content_types_meditation")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

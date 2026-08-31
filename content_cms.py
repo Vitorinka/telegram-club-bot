@@ -10,7 +10,7 @@ MAX_DESCRIPTION_LENGTH = 5000
 MAX_DURATION_SECONDS = 86400
 MAX_SORT_ORDER = 100000
 CATEGORY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
-CONTENT_TYPES = frozenset({"lesson"})
+CONTENT_TYPES = frozenset({"lesson", "meditation"})
 CONTENT_STATUSES = frozenset({"draft", "published", "archived"})
 CREATE_FIELDS = frozenset({
     "content_type", "title", "category", "description", "duration_seconds",

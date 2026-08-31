@@ -74,6 +74,7 @@
   const cmsContentList = document.getElementById("cms-content-list");
   const cmsContentEmpty = document.getElementById("cms-content-empty");
   const contentCreateTitle = document.getElementById("content-create-title");
+  const contentCreateType = document.getElementById("content-create-type");
   const contentCreateCategory = document.getElementById("content-create-category");
   const contentCreateDescription = document.getElementById("content-create-description");
   const contentCreateDuration = document.getElementById("content-create-duration");
@@ -105,6 +106,9 @@
   const memberLibrarySearch = document.getElementById("member-library-search");
   const memberLibraryChips = document.getElementById("member-library-chips");
   const memberScheduleContent = document.getElementById("member-schedule-content");
+  const memberMeditationList = document.getElementById("member-meditation-list");
+  const memberMeditationEmpty = document.getElementById("member-meditation-empty");
+  const memberMeditationSearch = document.getElementById("member-meditation-search");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -137,6 +141,8 @@
   let memberCoverGeneration = 0;
   const memberCoverUrls = new Map();
   let memberLibraryItems = [];
+  let memberMeditationItems = [];
+  let memberDetailContentType = "lesson";
   let memberLibraryCategory = "all";
 
   const text = (tag, value, className) => {
@@ -249,7 +255,7 @@
     });
     return container;
   };
-  const memberLessonCard = (item) => {
+  const memberContentCard = (item) => {
     const article = document.createElement("article");
     article.className = "member-card member-content-card member-lesson-card";
     const button = document.createElement("button");
@@ -268,7 +274,7 @@
     if (item.duration_seconds) meta.append(text("span", `${Math.ceil(item.duration_seconds / 60)} мин.`, "member-duration-badge"));
     if (item.description) copy.append(text("p", item.description, "member-description-excerpt"));
     button.append(copy);
-    button.addEventListener("click", () => loadMemberLesson(item.content_id).catch(showApiError));
+    button.addEventListener("click", () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
     article.append(button);
     return article;
   };
@@ -292,7 +298,7 @@
     return api("/api/admin/member-preview/home").then((data) => {
       clearMemberCoverUrls();
       memberHomeLessons.replaceChildren();
-      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberLessonCard(item)));
+      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
       memberHomeEmpty.hidden = data.latest_lessons.length !== 0;
       memberHomeCategories.replaceChildren();
       data.categories.forEach((entry) => {
@@ -316,7 +322,7 @@
     });
     clearMemberCoverUrls();
     memberTrainingList.replaceChildren();
-    items.forEach((item) => memberTrainingList.append(memberLessonCard(item)));
+    items.forEach((item) => memberTrainingList.append(memberContentCard(item)));
     memberTrainingEmpty.hidden = items.length !== 0;
   };
   const configureMemberLibraryFilters = () => {
@@ -349,9 +355,10 @@
       showMemberScreen("member-library");
     });
   };
-  const loadMemberLesson = (contentId) => {
-    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}`).then((item) => {
+  const loadMemberLesson = (contentId, contentType = "lesson") => {
+    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`).then((item) => {
       clearMemberCoverUrls();
+      memberDetailContentType = contentType;
       memberLessonContent.replaceChildren();
       memberLessonContent.append(memberCover(item, true));
       const heading = document.createElement("header");
@@ -372,6 +379,19 @@
       showMemberScreen("member-lesson");
     });
   };
+  const renderMemberMeditations = () => {
+    const query = memberMeditationSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberMeditationItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
+    clearMemberCoverUrls();
+    memberMeditationList.replaceChildren();
+    items.forEach((item) => memberMeditationList.append(memberContentCard(item)));
+    memberMeditationEmpty.hidden = items.length !== 0;
+  };
+  const loadMemberMeditations = () => api("/api/admin/member-preview/content?content_type=meditation&limit=50").then((data) => {
+    memberMeditationItems = data.items;
+    renderMemberMeditations();
+    showMemberScreen("member-meditations");
+  });
   const renderMemberScheduleEmpty = () => {
     const empty = document.createElement("article");
     empty.className = "member-card member-empty-state member-empty-art member-schedule-empty";
@@ -1227,12 +1247,14 @@
     }).catch(showApiError);
   }
 
+  const cmsTypeLabel = (contentType) => contentType === "meditation" ? "Медитация" : "Урок";
   const cmsContentCard = (item) => {
     const article = document.createElement("article");
     article.className = "card user-card";
     const button = document.createElement("button");
     button.type = "button";
-    button.append(text("p", "CMS", "eyebrow"), text("h2", item.title));
+    const typeLabel = cmsTypeLabel(item.content_type);
+    button.append(text("p", `CMS · ${typeLabel}`, "eyebrow"), text("h2", item.title));
     const badges = document.createElement("div");
     badges.className = "badges";
     badges.append(text("span", item.status, "badge"), text("span", `v${item.version}`, "badge"));
@@ -1248,7 +1270,7 @@
     return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
       currentCmsContent = item;
       contentDetailsContent.replaceChildren(detailCard("CMS material", [
-        ["Название", item.title], ["Тип", item.content_type],
+        ["Название", item.title], ["Тип", cmsTypeLabel(item.content_type)],
         ["Категория", item.category], ["Описание", item.description],
         ["Длительность", item.duration_seconds ? `${item.duration_seconds} сек.` : null],
         ["Статус", item.status], ["Версия", item.version],
@@ -1370,7 +1392,7 @@
   const createCmsDraft = () => {
     contentCreateMessage.textContent = "Создаём черновик…";
     return writeAdminJson("POST", "/api/admin/content/drafts", {
-      content_type: "lesson", title: contentCreateTitle.value,
+      content_type: contentCreateType.value, title: contentCreateTitle.value,
       category: contentCreateCategory.value || null,
       description: contentCreateDescription.value || null,
       duration_seconds: optionalNumber(contentCreateDuration),
@@ -1424,8 +1446,13 @@
   document.getElementById("member-home-all").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-continue").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
-  document.getElementById("member-lesson-back").addEventListener("click", () => loadMemberLibrary(memberLibraryCategory).catch(showApiError));
-  document.getElementById("member-open-meditations").addEventListener("click", () => showMemberScreen("member-meditations"));
+  document.getElementById("member-lesson-back").addEventListener("click", () => {
+    const target = memberDetailContentType === "meditation"
+      ? loadMemberMeditations() : loadMemberLibrary(memberLibraryCategory);
+    target.catch(showApiError);
+  });
+  document.getElementById("member-open-meditations").addEventListener("click", () => loadMemberMeditations().catch(showApiError));
+  memberMeditationSearch.addEventListener("input", renderMemberMeditations);
   document.getElementById("member-open-recipes").addEventListener("click", () => showMemberScreen("member-recipes"));
   document.getElementById("member-open-nutrition").addEventListener("click", () => showMemberScreen("member-recipes"));
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));

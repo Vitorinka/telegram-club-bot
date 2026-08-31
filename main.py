@@ -21980,7 +21980,8 @@ async def miniapp_admin_member_preview_home(request):
 async def miniapp_admin_member_preview_content(request):
     try:
         result = list_member_preview_content(
-            get_db_conn, limit=request.query.get("limit", "50")
+            get_db_conn, limit=request.query.get("limit", "50"),
+            content_type=request.query.get("content_type", "lesson"),
         )
     except MemberPreviewError as error:
         return member_preview_error_response(error)
@@ -21990,7 +21991,8 @@ async def miniapp_admin_member_preview_content(request):
 async def miniapp_admin_member_preview_content_details(request):
     try:
         result = get_member_preview_content(
-            get_db_conn, request.match_info.get("content_id")
+            get_db_conn, request.match_info.get("content_id"),
+            content_type=request.query.get("content_type"),
         )
     except MemberPreviewError as error:
         return member_preview_error_response(error)
