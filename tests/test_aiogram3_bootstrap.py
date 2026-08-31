@@ -9505,6 +9505,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         patch_handler = self.route_handler(
             app, "PATCH", "/api/admin/content/cms/{content_id}"
         )
+        recipe_handler = self.route_handler(
+            app, "PUT", "/api/admin/content/cms/{content_id}/recipe"
+        )
         missing = await self.main.miniapp_admin_auth_middleware(
             FakeMiniAppRequest(
                 app, path="/api/admin/content/drafts", method="POST",
@@ -9541,6 +9544,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             {"content_type": "lesson", "title": "Урок"},
         )
         self.assertIsNotNone(patch_handler)
+        recipe_missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path="/api/admin/content/cms/item/recipe", method="PUT",
+                match_info={"content_id": "item"},
+                json_data={"expected_version": 1, "ingredients": [], "steps": []},
+            ), recipe_handler,
+        )
+        self.assertEqual(recipe_missing.status, 401)
 
     async def test_member_preview_routes_are_admin_only_and_safely_projected(self):
         app = self.main.create_app()
@@ -9839,9 +9850,17 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/admin/member-preview/home", javascript)
         self.assertIn("/api/admin/member-preview/content", javascript)
         self.assertIn('value="meditation">Новая медитация', index)
+        self.assertIn('value="recipe">Новый рецепт', index)
         self.assertIn("content_type=meditation", javascript)
+        self.assertIn("content_type=recipe", javascript)
         self.assertIn('id="member-meditation-list"', index)
+        self.assertIn('id="member-recipe-list"', index)
+        self.assertIn('id="content-recipe-card"', index)
         self.assertIn("loadMemberMeditations", javascript)
+        self.assertIn("loadMemberRecipes", javascript)
+        self.assertIn("contentVideoControl.hidden = item.content_type === \"recipe\"", javascript)
+        for invented in ("calories", "protein", "carbs", "difficulty", "servings"):
+            self.assertNotIn(invented, javascript.lower())
         self.assertIn('id="member-bottom-nav"', index)
         self.assertIn("Режим предпросмотра", index)
         self.assertIn("Медитации появятся здесь", index)

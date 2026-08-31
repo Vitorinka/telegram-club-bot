@@ -74,6 +74,7 @@ from member_preview import (
     get_member_preview_home,
     list_member_preview_content,
 )
+from recipe_cms import get_recipe_structure, replace_recipe_structure
 from schedule_uploads import (
     apply_schedule_upload,
     cancel_schedule_upload,
@@ -440,8 +441,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 21,
-            "latest": "0021_content_types_meditation",
+            "count": 22,
+            "latest": "0022_recipe_cms",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1925,7 +1926,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 21)
+        self.assertEqual(len(migrations), 22)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2065,7 +2066,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         }.issubset(constraint_names))
 
         invalid_rows = (
-            ("recipe", "Valid", None, None, 1, 0, "draft", 1, None, None),
+            ("nutrition", "Valid", None, None, 1, 0, "draft", 1, None, None),
             ("lesson", "", None, None, 1, 0, "draft", 1, None, None),
             ("lesson", "Valid", "Bad category", None, 1, 0, "draft", 1, None, None),
             ("lesson", "Valid", None, None, 0, 0, "draft", 1, None, None),
@@ -2301,6 +2302,177 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             create_media_upload(
                 self.get_conn, 1, draft["content_id"], "cover", png
             )
+
+    def test_recipe_atomic_structure_media_and_preview_real_postgres(self):
+        run_migrations(self.get_conn)
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Овощной суп",
+            "category": "soups", "description": "Домашний рецепт",
+            "duration_seconds": 1800,
+        })
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Урок остаётся валиден",
+            "category": "warmup", "duration_seconds": 300,
+        })
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Медитация остаётся валидна",
+            "category": "breathing", "duration_seconds": 300,
+        })
+        first = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [
+                {"name": "Вода", "amount": "1 л", "sort_order": 0},
+                {"name": "Овощи", "amount": "500 г", "sort_order": 1},
+            ],
+            "steps": [
+                {"step_number": 1, "instruction": "Нарезать овощи."},
+                {"step_number": 2, "instruction": "Варить до готовности."},
+            ],
+        })
+        self.assertEqual(first["version"], 2)
+        self.assertEqual([item["name"] for item in first["ingredients"]], ["Вода", "Овощи"])
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 1, "ingredients": [], "steps": [],
+            })
+        reordered = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 2,
+            "ingredients": [
+                {"name": "Овощи", "amount": "500 г", "sort_order": 0},
+                {"name": "Вода", "amount": "1 л", "sort_order": 1},
+            ],
+            "steps": [
+                {"step_number": 1, "instruction": "Варить до готовности."},
+                {"step_number": 2, "instruction": "Подать тёплым."},
+            ],
+        })
+        self.assertEqual(reordered["version"], 3)
+        self.assertEqual(reordered["ingredients"][0]["name"], "Овощи")
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_recipe_test_step() RETURNS trigger AS $$
+                    BEGIN
+                        IF NEW.instruction = 'ROLLBACK_TEST' THEN
+                            RAISE EXCEPTION 'recipe rollback injection';
+                        END IF;
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_recipe_test_step_trigger
+                    BEFORE INSERT ON recipe_steps FOR EACH ROW
+                    EXECUTE FUNCTION reject_recipe_test_step()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.Error):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 3,
+                "ingredients": [{"name": "Не сохранять", "amount": None, "sort_order": 0}],
+                "steps": [{"step_number": 1, "instruction": "ROLLBACK_TEST"}],
+            })
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["version"], 3)
+        self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"]), {
+            "ingredients": reordered["ingredients"], "steps": reordered["steps"],
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_recipe_test_step_trigger ON recipe_steps")
+                cur.execute("DROP FUNCTION reject_recipe_test_step()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        cover = create_media_upload(
+            self.get_conn, 1, recipe["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nrecipe-cover",
+        )
+        action = ensure_media_action(self.get_conn, cover["upload_id"], 1)
+        self.assertEqual(prepare_media_execution(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+        )["mode"], "upload")
+        record_telegram_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+            "private-recipe-cover-ref",
+        )
+        self.assertEqual(apply_media_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+        )["status"], "completed")
+        with self.assertRaises(ContentMediaError):
+            create_media_upload(
+                self.get_conn, 1, recipe["content_id"], "video",
+                b"\x00\x00\x00\x18ftypisomrecipe-video",
+            )
+        preview = get_member_preview_content(
+            self.get_conn, recipe["content_id"], content_type="recipe"
+        )
+        self.assertTrue(preview["has_cover"])
+        self.assertFalse(preview["has_video"])
+        self.assertEqual(preview["ingredients"][0]["name"], "Овощи")
+        serialized = json.dumps(preview)
+        self.assertNotIn("private-recipe-cover-ref", serialized)
+        self.assertNotIn("telegram_file_id", serialized)
+        self.assertEqual(
+            get_member_preview_home(self.get_conn)["latest_recipes"][0]["content_id"],
+            recipe["content_id"],
+        )
+
+        published_recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Опубликованный рецепт",
+            "category": "soups", "duration_seconds": 900,
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published',published_at=NOW() WHERE content_id=%s",
+                    (published_recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            replace_recipe_structure(self.get_conn, published_recipe["content_id"], {
+                "expected_version": 1, "ingredients": [], "steps": [],
+            })
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s",
+                    (recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            [item["content_id"] for item in list_member_preview_content(
+                self.get_conn, content_type="recipe"
+            )["items"]],
+            [published_recipe["content_id"]],
+        )
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 4, "ingredients": [], "steps": [],
+            })
+        self.assertEqual(get_cms_content(self.get_conn, lesson["content_id"])["content_type"], "lesson")
+        self.assertEqual(get_cms_content(self.get_conn, meditation["content_id"])["content_type"], "meditation")
+
+        migration_sql = (MIGRATIONS_DIR / "0022_recipe_cms.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"])["steps"], reordered["steps"])
 
     def test_member_preview_safe_read_only_projection_real_postgres(self):
         run_migrations(self.get_conn)
@@ -8698,8 +8870,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 21)
-        self.assertEqual(system["migrations"]["latest"], "0021_content_types_meditation")
+        self.assertEqual(system["migrations"]["count"], 22)
+        self.assertEqual(system["migrations"]["latest"], "0022_recipe_cms")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

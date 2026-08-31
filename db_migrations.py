@@ -697,6 +697,40 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0022_recipe_cms": {
+        "tables": ("content_items", "recipe_ingredients", "recipe_steps"),
+        "columns": {
+            "recipe_ingredients": (
+                "ingredient_id", "content_id", "name", "amount",
+                "sort_order", "created_at", "updated_at",
+            ),
+            "recipe_steps": (
+                "step_id", "content_id", "step_number", "instruction",
+                "created_at", "updated_at",
+            ),
+        },
+        "indexes": (
+            "recipe_ingredients_content_order_idx",
+            "recipe_steps_content_number_idx",
+        ),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("content_type", "lesson", "meditation", "recipe"),
+                "validated": True,
+            },
+            "recipe_ingredients_order_unique": {
+                "table": "recipe_ingredients",
+                "definition_contains": ("content_id", "sort_order", "unique"),
+                "validated": True,
+            },
+            "recipe_steps_number_unique": {
+                "table": "recipe_steps",
+                "definition_contains": ("content_id", "step_number", "unique"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

@@ -182,6 +182,7 @@ from member_preview import (
     get_member_preview_home,
     list_member_preview_content,
 )
+from recipe_cms import get_recipe_structure, replace_recipe_structure
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -21736,6 +21737,10 @@ async def miniapp_admin_cms_content_details(request):
     result["media"] = list_content_media(
         get_db_conn, request.match_info.get("content_id")
     )
+    if result["content_type"] == "recipe":
+        result["recipe"] = get_recipe_structure(
+            get_db_conn, request.match_info.get("content_id")
+        ) or {"ingredients": [], "steps": []}
     return apply_miniapp_security_headers(web.json_response(result))
 
 
@@ -21743,6 +21748,17 @@ async def miniapp_admin_cms_content_update(request):
     try:
         body = await read_content_cms_json(request)
         result = update_content_draft(
+            get_db_conn, request.match_info.get("content_id"), body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_recipe_update(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = replace_recipe_structure(
             get_db_conn, request.match_info.get("content_id"), body
         )
     except ContentCmsError as error:
@@ -23183,6 +23199,11 @@ def create_app():
         app.router.add_patch(
             '/api/admin/content/cms/{content_id}',
             miniapp_admin_cms_content_update,
+        )
+    if not _route_exists(app, "PUT", "/api/admin/content/cms/{content_id}/recipe"):
+        app.router.add_put(
+            '/api/admin/content/cms/{content_id}/recipe',
+            miniapp_admin_recipe_update,
         )
     if not _route_exists(app, "GET", "/api/admin/content/{content_id}"):
         app.router.add_get(

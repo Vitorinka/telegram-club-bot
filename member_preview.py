@@ -1,9 +1,11 @@
 import uuid
 
+from recipe_cms import get_recipe_structure
+
 
 MEMBER_PREVIEW_LIMIT = 50
 MEMBER_PREVIEW_STATUSES = ("draft", "published")
-MEMBER_PREVIEW_CONTENT_TYPES = frozenset({"lesson", "meditation"})
+MEMBER_PREVIEW_CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe"})
 
 
 class MemberPreviewError(ValueError):
@@ -110,14 +112,18 @@ def get_member_preview_content(get_connection, content_id, *, content_type=None)
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_id = %s
               AND c.content_type = COALESCE(%s, c.content_type)
-              AND c.content_type IN ('lesson', 'meditation')
+              AND c.content_type IN ('lesson', 'meditation', 'recipe')
               AND c.status IN ('draft', 'published')
             """,
             (content_id, content_type),
         )
         row = cur.fetchone()
         conn.rollback()
-        return _item(row) if row else None
+        result = _item(row) if row else None
+        if result and result["content_type"] == "recipe":
+            structure = get_recipe_structure(get_connection, content_id)
+            result.update(structure or {"ingredients": [], "steps": []})
+        return result
     except Exception:
         conn.rollback(); raise
     finally:
@@ -146,6 +152,15 @@ def get_member_preview_home(get_connection):
             """
         )
         latest_meditations = [_item(row) for row in cur.fetchall()]
+        cur.execute(
+            MEMBER_CONTENT_SELECT + """
+            WHERE c.content_type = 'recipe'
+              AND c.status IN ('draft', 'published')
+            ORDER BY c.updated_at DESC, c.content_id ASC
+            LIMIT 6
+            """
+        )
+        latest_recipes = [_item(row) for row in cur.fetchall()]
         cur.execute("""
             SELECT COALESCE(category, 'other'), COUNT(*)
             FROM content_items
@@ -163,6 +178,7 @@ def get_member_preview_home(get_connection):
         return {
             "latest_lessons": latest,
             "latest_meditations": latest_meditations,
+            "latest_recipes": latest_recipes,
             "categories": categories,
             "total_lessons": total,
             "read_only": True,

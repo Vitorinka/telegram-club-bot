@@ -15,6 +15,12 @@ VIDEO_MAX_BYTES = 20 * 1024 * 1024
 MEDIA_TYPES = frozenset({"cover", "video"})
 
 
+def media_allowed_for_content(content_type, media_type):
+    return content_type in CONTENT_TYPES and not (
+        content_type == "recipe" and media_type != "cover"
+    )
+
+
 class ContentMediaError(ValueError):
     def __init__(self, category, status=400):
         super().__init__(category)
@@ -128,6 +134,8 @@ def create_media_upload(get_connection, admin_id, content_id, media_type, data):
             raise ContentMediaError("content_not_found", 404)
         if content[1] != "draft" or content[3] not in CONTENT_TYPES:
             raise ContentMediaError("content_not_editable", 409)
+        if not media_allowed_for_content(content[3], media_type):
+            raise ContentMediaError("invalid_content_media_type")
         cur.execute("SELECT media_id FROM content_media WHERE content_id=%s AND media_type=%s AND deleted_at IS NULL", (content_id, media_type))
         existing = cur.fetchone()
         now = datetime.utcnow()
@@ -254,7 +262,8 @@ def prepare_media_execution(get_connection, upload_id, action_id, admin_id):
         if status != 'confirmed': conn.commit(); return {"mode":status}
         cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
         content = cur.fetchone()
-        if not content or content[0] != 'draft' or content[1] != expected_version or content[2] not in CONTENT_TYPES:
+        if (not content or content[0] != 'draft' or content[1] != expected_version
+                or not media_allowed_for_content(content[2], media_type)):
             cur.execute("UPDATE content_media_uploads SET status='failed',media_bytes=''::bytea,byte_size=0,consumed_at=NOW(),updated_at=NOW(),failure_category='content_version_changed' WHERE upload_id=%s", (upload_id,))
             fail_admin_action(cur, action_id); conn.commit()
             return {"mode":"failed", "failure_category":"content_version_changed"}
@@ -313,7 +322,8 @@ def apply_media_upload(get_connection, upload_id, action_id, admin_id):
         current = cur.fetchone()
         current_id = current[0] if current else None
         if (not content or content[0] != 'draft' or content[1] != expected_version
-                or content[2] not in CONTENT_TYPES or current_id != expected_existing):
+                or not media_allowed_for_content(content[2], media_type)
+                or current_id != expected_existing):
             cur.execute("UPDATE content_media_uploads SET status='failed',media_bytes=''::bytea,byte_size=0,telegram_file_id=NULL,consumed_at=NOW(),updated_at=NOW(),failure_category='content_version_changed' WHERE upload_id=%s", (upload_id,))
             fail_admin_action(cur, action_id); conn.commit()
             return {"status":"failed", "failure_category":"content_version_changed"}

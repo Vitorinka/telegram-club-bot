@@ -89,6 +89,7 @@
   const contentMediaCard = document.getElementById("content-media-card");
   const contentCoverCurrent = document.getElementById("content-cover-current");
   const contentVideoCurrent = document.getElementById("content-video-current");
+  const contentVideoControl = document.getElementById("content-video-control");
   const contentCoverFile = document.getElementById("content-cover-file");
   const contentVideoFile = document.getElementById("content-video-file");
   const contentMediaConfirmation = document.getElementById("content-media-confirmation");
@@ -109,6 +110,14 @@
   const memberMeditationList = document.getElementById("member-meditation-list");
   const memberMeditationEmpty = document.getElementById("member-meditation-empty");
   const memberMeditationSearch = document.getElementById("member-meditation-search");
+  const contentRecipeCard = document.getElementById("content-recipe-card");
+  const recipeIngredientsList = document.getElementById("recipe-ingredients-list");
+  const recipeStepsList = document.getElementById("recipe-steps-list");
+  const recipeEditMessage = document.getElementById("recipe-edit-message");
+  const memberRecipeList = document.getElementById("member-recipe-list");
+  const memberRecipeEmpty = document.getElementById("member-recipe-empty");
+  const memberRecipeSearch = document.getElementById("member-recipe-search");
+  const memberRecipeChips = document.getElementById("member-recipe-chips");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -142,7 +151,11 @@
   const memberCoverUrls = new Map();
   let memberLibraryItems = [];
   let memberMeditationItems = [];
+  let memberRecipeItems = [];
+  let memberRecipeCategory = "all";
   let memberDetailContentType = "lesson";
+  let recipeIngredients = [];
+  let recipeSteps = [];
   let memberLibraryCategory = "all";
 
   const text = (tag, value, className) => {
@@ -367,9 +380,33 @@
       meta.append(text("span", memberCategoryLabel(item.category)));
       if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
       heading.append(meta, text("h1", item.title));
-      if (item.duration_seconds) heading.append(text("p", `${Math.ceil(item.duration_seconds / 60)} минут`));
+      if (item.duration_seconds) heading.append(text(
+        "p",
+        item.content_type === "recipe"
+          ? `Время приготовления: ${Math.ceil(item.duration_seconds / 60)} минут`
+          : `${Math.ceil(item.duration_seconds / 60)} минут`
+      ));
       memberLessonContent.append(heading);
       if (item.description) memberLessonContent.append(text("p", item.description, "member-description"));
+      if (item.content_type === "recipe") {
+        const ingredients = document.createElement("section");
+        ingredients.className = "member-recipe-detail";
+        ingredients.append(text("h2", "Ингредиенты"));
+        const ingredientList = document.createElement("ul");
+        (item.ingredients || []).forEach((entry) => {
+          ingredientList.append(text("li", entry.amount ? `${entry.name} — ${entry.amount}` : entry.name));
+        });
+        if (!item.ingredients || !item.ingredients.length) ingredientList.append(text("li", "Ингредиенты пока не добавлены"));
+        ingredients.append(ingredientList);
+        const preparation = document.createElement("section");
+        preparation.className = "member-recipe-detail";
+        preparation.append(text("h2", "Способ приготовления"));
+        const stepList = document.createElement("ol");
+        (item.steps || []).forEach((entry) => stepList.append(text("li", entry.instruction)));
+        if (!item.steps || !item.steps.length) stepList.append(text("li", "Шаги пока не добавлены"));
+        preparation.append(stepList);
+        memberLessonContent.append(ingredients, preparation);
+      }
       const video = document.createElement("section");
       video.className = "member-video-shell";
       video.append(text("span", "▶", "member-play-icon"));
@@ -391,6 +428,39 @@
     memberMeditationItems = data.items;
     renderMemberMeditations();
     showMemberScreen("member-meditations");
+  });
+  const renderMemberRecipes = () => {
+    const query = memberRecipeSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberRecipeItems.filter((item) => {
+      const categoryMatches = memberRecipeCategory === "all" || (item.category || "other") === memberRecipeCategory;
+      return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
+    });
+    clearMemberCoverUrls();
+    memberRecipeList.replaceChildren();
+    items.forEach((item) => memberRecipeList.append(memberContentCard(item)));
+    memberRecipeEmpty.hidden = items.length !== 0;
+  };
+  const configureMemberRecipeFilters = () => {
+    const categories = [...new Set(memberRecipeItems.map((item) => item.category || "other"))];
+    memberRecipeChips.replaceChildren();
+    [{key: "all", label: "Все"}, ...categories.map((key) => ({key, label: memberCategoryLabel(key)}))].forEach((entry) => {
+      const chip = text("button", entry.label, "member-chip");
+      chip.type = "button";
+      chip.classList.toggle("active", entry.key === memberRecipeCategory);
+      chip.addEventListener("click", () => {
+        memberRecipeCategory = entry.key;
+        configureMemberRecipeFilters();
+        renderMemberRecipes();
+      });
+      memberRecipeChips.append(chip);
+    });
+  };
+  const loadMemberRecipes = () => api("/api/admin/member-preview/content?content_type=recipe&limit=50").then((data) => {
+    memberRecipeItems = data.items;
+    if (!memberRecipeItems.some((item) => (item.category || "other") === memberRecipeCategory)) memberRecipeCategory = "all";
+    configureMemberRecipeFilters();
+    renderMemberRecipes();
+    showMemberScreen("member-recipes");
   });
   const renderMemberScheduleEmpty = () => {
     const empty = document.createElement("article");
@@ -1247,7 +1317,41 @@
     }).catch(showApiError);
   }
 
-  const cmsTypeLabel = (contentType) => contentType === "meditation" ? "Медитация" : "Урок";
+  const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт"}[contentType] || contentType);
+  const recipeMove = (items, index, offset) => {
+    const target = index + offset;
+    if (target < 0 || target >= items.length) return;
+    [items[index], items[target]] = [items[target], items[index]];
+    renderRecipeEditor();
+  };
+  const recipeRowButton = (label, handler) => {
+    const button = text("button", label, "secondary");
+    button.type = "button";
+    button.addEventListener("click", handler);
+    return button;
+  };
+  const renderRecipeEditor = () => {
+    recipeIngredientsList.replaceChildren();
+    recipeIngredients.forEach((item, index) => {
+      const row = document.createElement("div"); row.className = "recipe-editor-row";
+      const name = document.createElement("input"); name.type = "text"; name.maxLength = 200; name.placeholder = "Ингредиент"; name.value = item.name;
+      const amount = document.createElement("input"); amount.type = "text"; amount.maxLength = 100; amount.placeholder = "Количество"; amount.value = item.amount || "";
+      name.addEventListener("input", () => { item.name = name.value; });
+      amount.addEventListener("input", () => { item.amount = amount.value; });
+      const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeIngredients, index, -1)), recipeRowButton("↓", () => recipeMove(recipeIngredients, index, 1)), recipeRowButton("Удалить", () => { recipeIngredients.splice(index, 1); renderRecipeEditor(); }));
+      row.append(name, amount, controls); recipeIngredientsList.append(row);
+    });
+    recipeStepsList.replaceChildren();
+    recipeSteps.forEach((item, index) => {
+      const row = document.createElement("div"); row.className = "recipe-editor-row";
+      const instruction = document.createElement("textarea"); instruction.maxLength = 2000; instruction.placeholder = `Шаг ${index + 1}`; instruction.value = item.instruction;
+      instruction.addEventListener("input", () => { item.instruction = instruction.value; });
+      const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeSteps, index, -1)), recipeRowButton("↓", () => recipeMove(recipeSteps, index, 1)), recipeRowButton("Удалить", () => { recipeSteps.splice(index, 1); renderRecipeEditor(); }));
+      row.append(instruction, controls); recipeStepsList.append(row);
+    });
+  };
   const cmsContentCard = (item) => {
     const article = document.createElement("article");
     article.className = "card user-card";
@@ -1277,12 +1381,17 @@
       ]));
       contentEditCard.hidden = item.status !== "draft";
       contentMediaCard.hidden = item.status !== "draft";
+      contentRecipeCard.hidden = item.status !== "draft" || item.content_type !== "recipe";
+      contentVideoControl.hidden = item.content_type === "recipe";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
       contentEditDescription.value = item.description || "";
       contentEditDuration.value = item.duration_seconds || "";
       contentEditOrder.value = item.sort_order;
       contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
+      recipeIngredients = item.recipe ? item.recipe.ingredients.map((entry) => ({name: entry.name, amount: entry.amount || ""})) : [];
+      recipeSteps = item.recipe ? item.recipe.steps.map((entry) => ({instruction: entry.instruction})) : [];
+      renderRecipeEditor();
       renderContentMedia(item);
       showScreen("content-details");
       status.textContent = item.title;
@@ -1420,6 +1529,19 @@
         : `Не удалось сохранить: ${error.message}`;
     });
   };
+  const saveRecipe = () => {
+    if (!currentCmsContent || currentCmsContent.content_type !== "recipe") return Promise.resolve();
+    recipeEditMessage.textContent = "Сохраняем…";
+    return writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/recipe`, {
+      expected_version: currentCmsContent.version,
+      ingredients: recipeIngredients.map((item, index) => ({name: item.name, amount: item.amount || null, sort_order: index})),
+      steps: recipeSteps.map((item, index) => ({step_number: index + 1, instruction: item.instruction})),
+    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+      recipeEditMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить рецепт: ${error.message}`;
+    });
+  };
 
   hydrateMemberIcons();
   if (!webApp || !webApp.initData) {
@@ -1447,14 +1569,16 @@
   document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-continue").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-lesson-back").addEventListener("click", () => {
-    const target = memberDetailContentType === "meditation"
-      ? loadMemberMeditations() : loadMemberLibrary(memberLibraryCategory);
+    const target = memberDetailContentType === "meditation" ? loadMemberMeditations()
+      : memberDetailContentType === "recipe" ? loadMemberRecipes()
+      : loadMemberLibrary(memberLibraryCategory);
     target.catch(showApiError);
   });
   document.getElementById("member-open-meditations").addEventListener("click", () => loadMemberMeditations().catch(showApiError));
   memberMeditationSearch.addEventListener("input", renderMemberMeditations);
-  document.getElementById("member-open-recipes").addEventListener("click", () => showMemberScreen("member-recipes"));
-  document.getElementById("member-open-nutrition").addEventListener("click", () => showMemberScreen("member-recipes"));
+  document.getElementById("member-open-recipes").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
+  document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
+  memberRecipeSearch.addEventListener("input", renderMemberRecipes);
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
   document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
@@ -1476,6 +1600,9 @@
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
   document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
+  document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); renderRecipeEditor(); } });
+  document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); renderRecipeEditor(); } });
+  document.getElementById("recipe-save").addEventListener("click", saveRecipe);
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
   contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));

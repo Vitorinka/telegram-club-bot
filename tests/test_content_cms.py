@@ -27,7 +27,7 @@ class ContentCmsValidationTests(unittest.TestCase):
         self.assertEqual(meditation["title"], "Спокойствие")
 
         with self.assertRaisesRegex(ContentCmsError, "invalid_content_type"):
-            validate_create_payload({"content_type": "recipe", "title": "X"})
+            validate_create_payload({"content_type": "nutrition", "title": "X"})
         with self.assertRaisesRegex(ContentCmsError, "invalid_content_payload"):
             validate_create_payload({
                 "content_type": "lesson", "title": "X", "status": "published",

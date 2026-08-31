@@ -59,7 +59,9 @@ class FakeConnection:
 class StorageDiagnosticsTests(unittest.TestCase):
     def test_allowlist_is_fixed_and_complete(self):
         self.assertIsInstance(diagnostics.APPLICATION_TABLES, tuple)
-        self.assertEqual(len(diagnostics.APPLICATION_TABLES), 28)
+        self.assertEqual(len(diagnostics.APPLICATION_TABLES), 30)
+        self.assertIn("recipe_ingredients", diagnostics.APPLICATION_TABLES)
+        self.assertIn("recipe_steps", diagnostics.APPLICATION_TABLES)
         self.assertIn("schema_migrations", diagnostics.APPLICATION_TABLES)
         self.assertIn("message_delivery_events", diagnostics.APPLICATION_TABLES)
 
