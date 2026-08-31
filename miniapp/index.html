@@ -81,12 +81,14 @@
             <option value="lesson">Новый урок</option>
             <option value="meditation">Новая медитация</option>
             <option value="recipe">Новый рецепт</option>
+            <option value="nutrition_material">Материал нутрициолога</option>
           </select>
         </label>
         <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
         <label>Категория <input id="content-create-category" type="text" maxlength="48" placeholder="например, meditation"></label>
         <label>Описание <textarea id="content-create-description" maxlength="5000"></textarea></label>
         <label>Длительность, секунд <input id="content-create-duration" type="number" min="1" max="86400"></label>
+        <label id="content-create-body-label" hidden>Основной текст <textarea id="content-create-body" maxlength="30000" rows="12"></textarea></label>
         <p id="content-create-message" class="hint">Материал будет создан только в статусе draft.</p>
         <button id="content-create-submit" type="button">Создать черновик</button>
       </article>
@@ -117,10 +119,16 @@
         <p id="recipe-edit-message" class="hint">Изменения применяются только после явного сохранения.</p>
         <button id="recipe-save" type="button">Сохранить ингредиенты и шаги</button>
       </article>
+      <article id="content-nutrition-card" class="card" hidden>
+        <h2>Текст материала</h2>
+        <label>Основной текст <textarea id="content-nutrition-body" maxlength="30000" rows="16"></textarea></label>
+        <p id="content-nutrition-message" class="hint">Plain text без HTML. Изменения применяются только после явного сохранения.</p>
+        <button id="content-nutrition-save" type="button">Сохранить материал</button>
+      </article>
       <article id="content-media-card" class="card" hidden>
         <h2>Медиа</h2>
         <p class="hint">Медиа прикрепляется только к черновику и не публикуется для участников клуба.</p>
-        <section id="content-video-control" class="content-media-control">
+        <section class="content-media-control">
           <h3>Обложка</h3>
           <div id="content-cover-current" class="schedule-preview"><span class="schedule-image-loading">Обложка не прикреплена</span></div>
           <label>Загрузить или заменить
@@ -128,7 +136,7 @@
           </label>
           <button id="content-cover-validate" type="button">Проверить обложку</button>
         </section>
-        <section class="content-media-control">
+        <section id="content-video-control" class="content-media-control">
           <h3>Видео</h3>
           <div id="content-video-current" class="hint">Видео не прикреплено</div>
           <label>Загрузить или заменить
@@ -393,7 +401,8 @@
       <section class="member-section"><div class="member-section-title"><h2>Новые тренировки</h2></div><div id="member-training-list" class="member-grid member-content-grid"></div><div id="member-training-empty" class="member-card member-empty-state member-library-empty" hidden><span data-member-icon="lotus" aria-hidden="true"></span><h2>Библиотека готовится</h2><p>Новые тренировки появятся здесь после публикации в CMS.</p><button id="member-library-empty-home" class="member-button secondary" type="button">На главную</button></div></section>
     </section>
     <section id="member-meditations" class="screen member-page" data-screen="member-meditations" hidden><header class="member-page-heading"><p class="member-kicker">Практики</p><h1>Медитации</h1><p>Найдите баланс и внутреннюю опору</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-meditation-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск медитаций"></label><div id="member-meditation-list" class="member-grid member-content-grid"></div><div id="member-meditation-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◌</span><h2>Медитации появятся здесь</h2><p>Раздел пока не содержит реальных материалов.</p></div></section>
-    <section id="member-recipes" class="screen member-page" data-screen="member-recipes" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Рецепты</h1><p>Полезные и вкусные блюда для вашего баланса и энергии</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-recipe-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск рецептов"></label><div id="member-recipe-chips" class="member-chip-row"></div><div id="member-recipe-list" class="member-grid member-content-grid"></div><div id="member-recipe-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Рецепты появятся здесь</h2><p>Раздел пока не содержит реальных рецептов.</p></div><article class="member-card member-nutrition-note"><h2>Материалы нутрициолога</h2><p>Статьи, гайды и рекомендации появятся после подключения реального контента.</p></article></section>
+    <section id="member-recipes" class="screen member-page" data-screen="member-recipes" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Рецепты</h1><p>Полезные и вкусные блюда для вашего баланса и энергии</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-recipe-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск рецептов"></label><div id="member-recipe-chips" class="member-chip-row"></div><div id="member-recipe-list" class="member-grid member-content-grid"></div><div id="member-recipe-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Рецепты появятся здесь</h2><p>Раздел пока не содержит реальных рецептов.</p></div></section>
+    <section id="member-nutrition" class="screen member-page" data-screen="member-nutrition" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Материалы нутрициолога</h1><p>Статьи, гайды, рекомендации и чек-листы</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-nutrition-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск материалов"></label><div id="member-nutrition-list" class="member-grid member-content-grid"></div><div id="member-nutrition-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Материалы появятся здесь</h2><p>Раздел пока не содержит реальных материалов нутрициолога.</p></div></section>
     <section id="member-schedule" class="screen member-page" data-screen="member-schedule" hidden><header class="member-page-heading"><p class="member-kicker">Zoom и встречи</p><h1>Расписание</h1><p>Актуальное расписание клуба</p></header><div id="member-schedule-content" class="member-schedule-shell"><article class="member-card member-empty-state member-empty-art"><span data-member-icon="calendar" aria-hidden="true"></span><h2>Расписание клуба</h2><p>Информация о ближайших встречах появится здесь.</p></article></div></section>
     <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1>Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span data-member-icon="subscription" aria-hidden="true"></span><div><small>Подписка</small><strong>Статус подписки будет отображаться здесь</strong></div></article><div class="member-profile-links"><button type="button"><i data-member-icon="heart" aria-hidden="true"></i><span>Избранное</span><b>›</b></button><button type="button"><i data-member-icon="history" aria-hidden="true"></i><span>История</span><b>›</b></button><button type="button"><i data-member-icon="calendar" aria-hidden="true"></i><span>Записи на Zoom</span><b>›</b></button><button type="button"><i data-member-icon="settings" aria-hidden="true"></i><span>Настройки</span><b>›</b></button></div><button class="member-exit member-button" type="button">Вернуться в админку</button></section>
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>

@@ -17,7 +17,7 @@ MEDIA_TYPES = frozenset({"cover", "video"})
 
 def media_allowed_for_content(content_type, media_type):
     return content_type in CONTENT_TYPES and not (
-        content_type == "recipe" and media_type != "cover"
+        content_type in {"recipe", "nutrition_material"} and media_type != "cover"
     )
 
 

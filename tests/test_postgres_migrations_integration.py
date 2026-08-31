@@ -75,6 +75,11 @@ from member_preview import (
     list_member_preview_content,
 )
 from recipe_cms import get_recipe_structure, replace_recipe_structure
+from nutrition_cms import (
+    create_nutrition_draft,
+    get_nutrition_body,
+    update_nutrition_draft,
+)
 from schedule_uploads import (
     apply_schedule_upload,
     cancel_schedule_upload,
@@ -441,8 +446,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 22,
-            "latest": "0022_recipe_cms",
+            "count": 23,
+            "latest": "0023_nutrition_materials",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1926,7 +1931,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 22)
+        self.assertEqual(len(migrations), 23)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2473,6 +2478,117 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"])["steps"], reordered["steps"])
+
+    def test_nutrition_material_atomic_body_media_and_preview_real_postgres(self):
+        run_migrations(self.get_conn)
+        material = create_nutrition_draft(self.get_conn, 1, {
+            "content_type": "nutrition_material", "title": "Водный баланс",
+            "category": "habits", "description": "Краткая рекомендация",
+            "duration_seconds": None,
+            "body": "Первый абзац.\n\n<script>alert('plain')</script>",
+        })
+        self.assertEqual(material["version"], 1)
+        self.assertIn("<script>", get_nutrition_body(
+            self.get_conn, material["content_id"]
+        )["body"])
+        updated = update_nutrition_draft(self.get_conn, material["content_id"], {
+            "expected_version": 1, "title": "Водный баланс каждый день",
+            "category": "guides", "description": "Обновлённое введение",
+            "duration_seconds": None, "sort_order": 4,
+            "body": "Абзац один.\r\n\r\nАбзац два.  ",
+        })
+        self.assertEqual(updated["version"], 2)
+        self.assertEqual(updated["body"], "Абзац один.\n\nАбзац два.")
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 1, "title": "Устарело", "body": "Не применять",
+            })
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_nutrition_body_update() RETURNS trigger AS $$
+                    BEGIN
+                        IF NEW.body = 'ROLLBACK_TEST' THEN
+                            RAISE EXCEPTION 'nutrition rollback injection';
+                        END IF;
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_nutrition_body_update_trigger
+                    BEFORE UPDATE ON nutrition_material_bodies FOR EACH ROW
+                    EXECUTE FUNCTION reject_nutrition_body_update()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.Error):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 2, "title": "Не сохранять",
+                "body": "ROLLBACK_TEST",
+            })
+        self.assertEqual(get_cms_content(self.get_conn, material["content_id"])["version"], 2)
+        self.assertEqual(get_cms_content(self.get_conn, material["content_id"])["title"], "Водный баланс каждый день")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_nutrition_body_update_trigger ON nutrition_material_bodies")
+                cur.execute("DROP FUNCTION reject_nutrition_body_update()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        cover = create_media_upload(
+            self.get_conn, 1, material["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nnutrition-cover",
+        )
+        action = ensure_media_action(self.get_conn, cover["upload_id"], 1)
+        prepare_media_execution(self.get_conn, cover["upload_id"], action["action_id"], 1)
+        record_telegram_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+            "private-nutrition-cover-ref",
+        )
+        apply_media_upload(self.get_conn, cover["upload_id"], action["action_id"], 1)
+        with self.assertRaisesRegex(ContentMediaError, "invalid_content_media_type"):
+            create_media_upload(
+                self.get_conn, 1, material["content_id"], "video",
+                b"\x00\x00\x00\x18ftypisomnutrition-video",
+            )
+        preview = get_member_preview_content(
+            self.get_conn, material["content_id"], content_type="nutrition_material"
+        )
+        self.assertTrue(preview["has_cover"])
+        self.assertFalse(preview["has_video"])
+        self.assertEqual(preview["body"], "Абзац один.\n\nАбзац два.")
+        self.assertNotIn("private-nutrition-cover-ref", json.dumps(preview))
+        self.assertEqual(
+            get_member_preview_home(self.get_conn)["latest_nutrition_materials"][0]["content_id"],
+            material["content_id"],
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s", (material["content_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(list_member_preview_content(
+            self.get_conn, content_type="nutrition_material"
+        )["items"], [])
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 3, "title": "Нельзя", "body": "Нельзя",
+            })
+        migration_sql = (MIGRATIONS_DIR / "0023_nutrition_materials.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
 
     def test_member_preview_safe_read_only_projection_real_postgres(self):
         run_migrations(self.get_conn)
@@ -8870,8 +8986,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 22)
-        self.assertEqual(system["migrations"]["latest"], "0022_recipe_cms")
+        self.assertEqual(system["migrations"]["count"], 23)
+        self.assertEqual(system["migrations"]["latest"], "0023_nutrition_materials")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

@@ -183,6 +183,11 @@ from member_preview import (
     list_member_preview_content,
 )
 from recipe_cms import get_recipe_structure, replace_recipe_structure
+from nutrition_cms import (
+    create_nutrition_draft,
+    get_nutrition_body,
+    update_nutrition_draft,
+)
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
     SCHEDULE_UPLOAD_MAX_BYTES,
@@ -21705,9 +21710,8 @@ async def read_content_cms_json(request):
 async def miniapp_admin_content_draft_create(request):
     try:
         body = await read_content_cms_json(request)
-        result = create_content_draft(
-            get_db_conn, request["miniapp_admin"].telegram_id, body
-        )
+        creator = create_nutrition_draft if body.get("content_type") == "nutrition_material" else create_content_draft
+        result = creator(get_db_conn, request["miniapp_admin"].telegram_id, body)
     except ContentCmsError as error:
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result, status=201))
@@ -21741,6 +21745,9 @@ async def miniapp_admin_cms_content_details(request):
         result["recipe"] = get_recipe_structure(
             get_db_conn, request.match_info.get("content_id")
         ) or {"ingredients": [], "steps": []}
+    if result["content_type"] == "nutrition_material":
+        body = get_nutrition_body(get_db_conn, request.match_info.get("content_id"))
+        result["nutrition"] = body or {"body": ""}
     return apply_miniapp_security_headers(web.json_response(result))
 
 
@@ -21759,6 +21766,17 @@ async def miniapp_admin_recipe_update(request):
     try:
         body = await read_content_cms_json(request)
         result = replace_recipe_structure(
+            get_db_conn, request.match_info.get("content_id"), body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_nutrition_update(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = update_nutrition_draft(
             get_db_conn, request.match_info.get("content_id"), body
         )
     except ContentCmsError as error:
@@ -23204,6 +23222,11 @@ def create_app():
         app.router.add_put(
             '/api/admin/content/cms/{content_id}/recipe',
             miniapp_admin_recipe_update,
+        )
+    if not _route_exists(app, "PUT", "/api/admin/content/cms/{content_id}/nutrition"):
+        app.router.add_put(
+            '/api/admin/content/cms/{content_id}/nutrition',
+            miniapp_admin_nutrition_update,
         )
     if not _route_exists(app, "GET", "/api/admin/content/{content_id}"):
         app.router.add_get(

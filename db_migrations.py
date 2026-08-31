@@ -731,6 +731,32 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0023_nutrition_materials": {
+        "tables": ("content_items", "nutrition_material_bodies"),
+        "columns": {
+            "nutrition_material_bodies": (
+                "content_id", "body", "created_at", "updated_at",
+            ),
+        },
+        "indexes": (),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("lesson", "meditation", "recipe", "nutrition_material"),
+                "validated": True,
+            },
+            "content_items_nutrition_duration_check": {
+                "table": "content_items",
+                "definition_contains": ("nutrition_material", "duration_seconds"),
+                "validated": True,
+            },
+            "nutrition_material_bodies_length_check": {
+                "table": "nutrition_material_bodies",
+                "definition_contains": ("body", "30000"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

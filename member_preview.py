@@ -1,11 +1,12 @@
 import uuid
 
 from recipe_cms import get_recipe_structure
+from nutrition_cms import get_nutrition_body
 
 
 MEMBER_PREVIEW_LIMIT = 50
 MEMBER_PREVIEW_STATUSES = ("draft", "published")
-MEMBER_PREVIEW_CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe"})
+MEMBER_PREVIEW_CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe", "nutrition_material"})
 
 
 class MemberPreviewError(ValueError):
@@ -112,7 +113,7 @@ def get_member_preview_content(get_connection, content_id, *, content_type=None)
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_id = %s
               AND c.content_type = COALESCE(%s, c.content_type)
-              AND c.content_type IN ('lesson', 'meditation', 'recipe')
+              AND c.content_type IN ('lesson', 'meditation', 'recipe', 'nutrition_material')
               AND c.status IN ('draft', 'published')
             """,
             (content_id, content_type),
@@ -123,6 +124,9 @@ def get_member_preview_content(get_connection, content_id, *, content_type=None)
         if result and result["content_type"] == "recipe":
             structure = get_recipe_structure(get_connection, content_id)
             result.update(structure or {"ingredients": [], "steps": []})
+        if result and result["content_type"] == "nutrition_material":
+            body = get_nutrition_body(get_connection, content_id)
+            result["body"] = body["body"] if body else ""
         return result
     except Exception:
         conn.rollback(); raise
@@ -161,6 +165,15 @@ def get_member_preview_home(get_connection):
             """
         )
         latest_recipes = [_item(row) for row in cur.fetchall()]
+        cur.execute(
+            MEMBER_CONTENT_SELECT + """
+            WHERE c.content_type = 'nutrition_material'
+              AND c.status IN ('draft', 'published')
+            ORDER BY c.updated_at DESC, c.content_id ASC
+            LIMIT 6
+            """
+        )
+        latest_nutrition_materials = [_item(row) for row in cur.fetchall()]
         cur.execute("""
             SELECT COALESCE(category, 'other'), COUNT(*)
             FROM content_items
@@ -179,6 +192,7 @@ def get_member_preview_home(get_connection):
             "latest_lessons": latest,
             "latest_meditations": latest_meditations,
             "latest_recipes": latest_recipes,
+            "latest_nutrition_materials": latest_nutrition_materials,
             "categories": categories,
             "total_lessons": total,
             "read_only": True,

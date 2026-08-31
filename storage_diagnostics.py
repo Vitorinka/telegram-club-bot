@@ -12,6 +12,7 @@ APPLICATION_TABLES = (
     "gift_access_events", "subscription_refund_reconciliations",
     "subscription_refund_events", "content_items", "content_media",
     "content_media_uploads", "recipe_ingredients", "recipe_steps",
+    "nutrition_material_bodies",
     "schema_migrations",
 )
 

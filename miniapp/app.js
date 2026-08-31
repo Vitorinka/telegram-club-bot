@@ -78,6 +78,8 @@
   const contentCreateCategory = document.getElementById("content-create-category");
   const contentCreateDescription = document.getElementById("content-create-description");
   const contentCreateDuration = document.getElementById("content-create-duration");
+  const contentCreateBody = document.getElementById("content-create-body");
+  const contentCreateBodyLabel = document.getElementById("content-create-body-label");
   const contentCreateMessage = document.getElementById("content-create-message");
   const contentEditCard = document.getElementById("content-edit-card");
   const contentEditTitle = document.getElementById("content-edit-title");
@@ -111,6 +113,9 @@
   const memberMeditationEmpty = document.getElementById("member-meditation-empty");
   const memberMeditationSearch = document.getElementById("member-meditation-search");
   const contentRecipeCard = document.getElementById("content-recipe-card");
+  const contentNutritionCard = document.getElementById("content-nutrition-card");
+  const contentNutritionBody = document.getElementById("content-nutrition-body");
+  const contentNutritionMessage = document.getElementById("content-nutrition-message");
   const recipeIngredientsList = document.getElementById("recipe-ingredients-list");
   const recipeStepsList = document.getElementById("recipe-steps-list");
   const recipeEditMessage = document.getElementById("recipe-edit-message");
@@ -118,6 +123,9 @@
   const memberRecipeEmpty = document.getElementById("member-recipe-empty");
   const memberRecipeSearch = document.getElementById("member-recipe-search");
   const memberRecipeChips = document.getElementById("member-recipe-chips");
+  const memberNutritionList = document.getElementById("member-nutrition-list");
+  const memberNutritionEmpty = document.getElementById("member-nutrition-empty");
+  const memberNutritionSearch = document.getElementById("member-nutrition-search");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -152,6 +160,7 @@
   let memberLibraryItems = [];
   let memberMeditationItems = [];
   let memberRecipeItems = [];
+  let memberNutritionItems = [];
   let memberRecipeCategory = "all";
   let memberDetailContentType = "lesson";
   let recipeIngredients = [];
@@ -301,7 +310,7 @@
     showScreen(name);
     const navigationName = (
       name === "member-lesson" || name === "member-meditations"
-      || name === "member-recipes"
+      || name === "member-recipes" || name === "member-nutrition"
     ) ? "member-library" : name;
     document.querySelectorAll("[data-member-nav]").forEach((button) => {
       button.classList.toggle("active", button.dataset.memberNav === navigationName);
@@ -407,12 +416,22 @@
         preparation.append(stepList);
         memberLessonContent.append(ingredients, preparation);
       }
-      const video = document.createElement("section");
-      video.className = "member-video-shell";
-      video.append(text("span", "▶", "member-play-icon"));
-      video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
-      video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
-      memberLessonContent.append(video);
+      if (item.content_type === "nutrition_material") {
+        const body = document.createElement("section");
+        body.className = "member-card member-nutrition-body";
+        (item.body || "").split(/\n{2,}/).filter((paragraph) => paragraph.trim()).forEach((paragraph) => {
+          body.append(text("p", paragraph));
+        });
+        memberLessonContent.append(body);
+      }
+      if (item.content_type !== "nutrition_material") {
+        const video = document.createElement("section");
+        video.className = "member-video-shell";
+        video.append(text("span", "▶", "member-play-icon"));
+        video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
+        video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
+        memberLessonContent.append(video);
+      }
       showMemberScreen("member-lesson");
     });
   };
@@ -461,6 +480,19 @@
     configureMemberRecipeFilters();
     renderMemberRecipes();
     showMemberScreen("member-recipes");
+  });
+  const renderMemberNutrition = () => {
+    const query = memberNutritionSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberNutritionItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
+    clearMemberCoverUrls();
+    memberNutritionList.replaceChildren();
+    items.forEach((item) => memberNutritionList.append(memberContentCard(item)));
+    memberNutritionEmpty.hidden = items.length !== 0;
+  };
+  const loadMemberNutrition = () => api("/api/admin/member-preview/content?content_type=nutrition_material&limit=50").then((data) => {
+    memberNutritionItems = data.items;
+    renderMemberNutrition();
+    showMemberScreen("member-nutrition");
   });
   const renderMemberScheduleEmpty = () => {
     const empty = document.createElement("article");
@@ -1317,7 +1349,7 @@
     }).catch(showApiError);
   }
 
-  const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт"}[contentType] || contentType);
+  const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт", nutrition_material: "Материал нутрициолога"}[contentType] || contentType);
   const recipeMove = (items, index, offset) => {
     const target = index + offset;
     if (target < 0 || target >= items.length) return;
@@ -1382,15 +1414,19 @@
       contentEditCard.hidden = item.status !== "draft";
       contentMediaCard.hidden = item.status !== "draft";
       contentRecipeCard.hidden = item.status !== "draft" || item.content_type !== "recipe";
-      contentVideoControl.hidden = item.content_type === "recipe";
+      contentNutritionCard.hidden = item.status !== "draft" || item.content_type !== "nutrition_material";
+      contentVideoControl.hidden = item.content_type === "recipe" || item.content_type === "nutrition_material";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
       contentEditDescription.value = item.description || "";
       contentEditDuration.value = item.duration_seconds || "";
+      contentEditDuration.closest("label").hidden = item.content_type === "nutrition_material";
+      document.getElementById("content-edit-save").hidden = item.content_type === "nutrition_material";
       contentEditOrder.value = item.sort_order;
       contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
       recipeIngredients = item.recipe ? item.recipe.ingredients.map((entry) => ({name: entry.name, amount: entry.amount || ""})) : [];
       recipeSteps = item.recipe ? item.recipe.steps.map((entry) => ({instruction: entry.instruction})) : [];
+      contentNutritionBody.value = item.nutrition ? item.nutrition.body : "";
       renderRecipeEditor();
       renderContentMedia(item);
       showScreen("content-details");
@@ -1500,14 +1536,17 @@
   const optionalNumber = (input) => input.value === "" ? null : Number(input.value);
   const createCmsDraft = () => {
     contentCreateMessage.textContent = "Создаём черновик…";
-    return writeAdminJson("POST", "/api/admin/content/drafts", {
+    const payload = {
       content_type: contentCreateType.value, title: contentCreateTitle.value,
       category: contentCreateCategory.value || null,
       description: contentCreateDescription.value || null,
-      duration_seconds: optionalNumber(contentCreateDuration),
-    }).then((item) => {
+      duration_seconds: contentCreateType.value === "nutrition_material" ? null : optionalNumber(contentCreateDuration),
+    };
+    if (contentCreateType.value === "nutrition_material") payload.body = contentCreateBody.value;
+    return writeAdminJson("POST", "/api/admin/content/drafts", payload).then((item) => {
       contentCreateTitle.value = ""; contentCreateCategory.value = "";
       contentCreateDescription.value = ""; contentCreateDuration.value = "";
+      contentCreateBody.value = "";
       return loadCmsContentDetails(item.content_id);
     }).catch((error) => {
       contentCreateMessage.textContent = `Не удалось создать черновик: ${error.message}`;
@@ -1542,6 +1581,23 @@
         : `Не удалось сохранить рецепт: ${error.message}`;
     });
   };
+  const saveNutrition = () => {
+    if (!currentCmsContent || currentCmsContent.content_type !== "nutrition_material") return Promise.resolve();
+    contentNutritionMessage.textContent = "Сохраняем…";
+    return writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/nutrition`, {
+      expected_version: currentCmsContent.version,
+      title: contentEditTitle.value,
+      category: contentEditCategory.value || null,
+      description: contentEditDescription.value || null,
+      duration_seconds: null,
+      sort_order: Number(contentEditOrder.value),
+      body: contentNutritionBody.value,
+    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+      contentNutritionMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить материал: ${error.message}`;
+    });
+  };
 
   hydrateMemberIcons();
   if (!webApp || !webApp.initData) {
@@ -1571,13 +1627,15 @@
   document.getElementById("member-lesson-back").addEventListener("click", () => {
     const target = memberDetailContentType === "meditation" ? loadMemberMeditations()
       : memberDetailContentType === "recipe" ? loadMemberRecipes()
+      : memberDetailContentType === "nutrition_material" ? loadMemberNutrition()
       : loadMemberLibrary(memberLibraryCategory);
     target.catch(showApiError);
   });
   document.getElementById("member-open-meditations").addEventListener("click", () => loadMemberMeditations().catch(showApiError));
   memberMeditationSearch.addEventListener("input", renderMemberMeditations);
   document.getElementById("member-open-recipes").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
-  document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
+  document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberNutrition().catch(showApiError));
+  memberNutritionSearch.addEventListener("input", renderMemberNutrition);
   memberRecipeSearch.addEventListener("input", renderMemberRecipes);
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
   document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
@@ -1603,6 +1661,12 @@
   document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); renderRecipeEditor(); } });
   document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); renderRecipeEditor(); } });
   document.getElementById("recipe-save").addEventListener("click", saveRecipe);
+  document.getElementById("content-nutrition-save").addEventListener("click", saveNutrition);
+  contentCreateType.addEventListener("change", () => {
+    const nutrition = contentCreateType.value === "nutrition_material";
+    contentCreateBodyLabel.hidden = !nutrition;
+    contentCreateDuration.closest("label").hidden = nutrition;
+  });
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
   contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
