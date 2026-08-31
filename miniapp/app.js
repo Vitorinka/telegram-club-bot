@@ -104,6 +104,7 @@
   const memberLessonContent = document.getElementById("member-lesson-content");
   const memberLibrarySearch = document.getElementById("member-library-search");
   const memberLibraryChips = document.getElementById("member-library-chips");
+  const memberScheduleContent = document.getElementById("member-schedule-content");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -143,6 +144,49 @@
     node.textContent = value === null || value === undefined || value === "" ? "—" : String(value);
     if (className) node.className = className;
     return node;
+  };
+  const memberIconPaths = {
+    strength: ["M5 9v6M8 7v10M16 7v10M19 9v6M8 12h8"],
+    flexibility: ["M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM12 6v6l-5 5M12 9l6 3M12 12l4 7"],
+    glutes: ["M8 5c-2 3-3 6-2 10 1 3 3 5 6 5s5-2 6-5c1-4 0-7-2-10M12 6v14"],
+    posture: ["M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 0 4ZM12 6v8M8 9h8M12 14l-3 7M12 14l3 7"],
+    pelvic_floor: ["M7 7c1 2 2 3 5 3s4-1 5-3M6 11c2 5 10 5 12 0M9 16c1 2 5 2 6 0"],
+    mobility: ["M7 7h10M17 7l-3-3M17 7l-3 3M17 17H7M7 17l3-3M7 17l3 3M12 9v6"],
+    feet: ["M10 4c2 1 2 4 1 7s-1 7-4 7-3-3-2-5 2-10 6-9ZM16 7c2 2 3 6 2 10-1 3-3 4-5 3-2-2 0-5 1-7s0-7 2-6"],
+    recovery: ["M5 18c8 0 13-5 14-13-8 1-13 6-14 13ZM6 17c3-4 6-7 11-10"],
+    neck: ["M9 4v5c0 2-1 3-3 4M15 4v5c0 2 1 3 3 4M8 19c2-3 6-3 8 0"],
+    back: ["M10 3c-2 4-2 7 0 10l-2 8M14 3c2 4 2 7 0 10l2 8M9 9h6"],
+    lower_back: ["M7 6c3 2 7 2 10 0M7 18c3-2 7-2 10 0M8 9c2 2 6 2 8 0M8 15c2-2 6-2 8 0"],
+    legs: ["M9 3l1 8-2 10M15 3l-1 8 2 10M10 11h4"],
+    recipes: ["M5 11h14c0 5-3 8-7 8s-7-3-7-8ZM8 8c0-2 1-3 3-4M13 8c0-2 1-3 3-4"],
+    nutrition: ["M6 3h12v18H6zM9 8h6M9 12h6M9 16h4"],
+    calendar: ["M5 5h14v15H5zM8 2v6M16 2v6M5 10h14M9 14h2M13 14h2"],
+    heart: ["M12 20 4 12C0 7 6 2 12 8c6-6 12-1 8 4Z"],
+    completed: ["M5 12l4 4L19 6M12 22a10 10 0 1 1 9-6"],
+    history: ["M4 5v6h6M5 11a8 8 0 1 0 2-6M12 7v5l4 2"],
+    subscription: ["M4 6h16v12H4zM4 10h16M8 15h3"],
+    settings: ["M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"],
+    lotus: ["M12 20c-5-2-7-6-7-10 4 1 6 3 7 6 1-3 3-5 7-6 0 4-2 8-7 10ZM12 16c-3-3-3-7 0-12 3 5 3 9 0 12Z"],
+  };
+  const memberIcon = (name) => {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.6");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    (memberIconPaths[name] || memberIconPaths.recovery).forEach((definition) => {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", definition);
+      svg.append(path);
+    });
+    return svg;
+  };
+  const hydrateMemberIcons = () => {
+    document.querySelectorAll("[data-member-icon]").forEach((container) => {
+      container.replaceChildren(memberIcon(container.dataset.memberIcon));
+    });
   };
   const api = (path) => fetch(path, {
     method: "GET", headers: {Authorization: `Bearer ${sessionToken}`},
@@ -221,7 +265,7 @@
     bookmark.setAttribute("aria-hidden", "true");
     meta.append(bookmark);
     copy.append(meta, text("h2", item.title));
-    if (item.duration_seconds) copy.append(text("p", `${Math.ceil(item.duration_seconds / 60)} мин.`));
+    if (item.duration_seconds) meta.append(text("span", `${Math.ceil(item.duration_seconds / 60)} мин.`, "member-duration-badge"));
     if (item.description) copy.append(text("p", item.description, "member-description-excerpt"));
     button.append(copy);
     button.addEventListener("click", () => loadMemberLesson(item.content_id).catch(showApiError));
@@ -328,6 +372,42 @@
       showMemberScreen("member-lesson");
     });
   };
+  const renderMemberScheduleEmpty = () => {
+    const empty = document.createElement("article");
+    empty.className = "member-card member-empty-state member-empty-art member-schedule-empty";
+    const icon = text("span", "");
+    icon.append(memberIcon("calendar"));
+    empty.append(icon, text("h2", "Расписание клуба"), text("p", "Информация о ближайших встречах появится здесь."));
+    memberScheduleContent.replaceChildren(empty);
+  };
+  const loadMemberSchedule = () => {
+    const today = moscowDate();
+    const params = new URLSearchParams({from: today, to: today, status: "all", limit: "1"});
+    return api(`/api/admin/schedule?${params.toString()}`).then((data) => {
+      clearScheduleImages();
+      if (!data.items.length) {
+        renderMemberScheduleEmpty();
+      } else {
+        const schedule = data.items[0];
+        const card = document.createElement("article");
+        card.className = "member-card member-monthly-schedule";
+        const heading = document.createElement("header");
+        const icon = text("span", "", "member-monthly-schedule-icon");
+        icon.append(memberIcon("calendar"));
+        heading.append(icon, text("div", ""));
+        heading.lastElementChild.append(text("p", schedule.period_label, "member-kicker"), text("h2", schedule.title));
+        const preview = scheduleImageContainer(schedule, scheduleImageGeneration, true);
+        preview.classList.add("member-schedule-preview");
+        card.append(heading, preview, text("p", `Обновлено: ${formatDate(schedule.updated_at)}`, "member-schedule-updated"));
+        memberScheduleContent.replaceChildren(card);
+      }
+      showMemberScreen("member-schedule");
+    }).catch((error) => {
+      renderMemberScheduleEmpty();
+      showMemberScreen("member-schedule");
+      if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
+    });
+  };
   const exitMemberPreview = () => {
     memberPreviewMode = false;
     clearMemberCoverUrls();
@@ -379,7 +459,7 @@
     scheduleUploadMessage.textContent = "Сначала проверьте локальное изображение, затем отправьте его на безопасную проверку.";
   };
   const showScreen = (name) => {
-    if (name !== "schedule" && name !== "schedule-details" && scheduleImageUrls.size) {
+    if (name !== "schedule" && name !== "schedule-details" && name !== "member-schedule" && scheduleImageUrls.size) {
       clearScheduleImages();
     }
     if (name !== "schedule-upload" && (scheduleUploadLocalUrl || scheduleUploadServerUrl)) {
@@ -1319,6 +1399,7 @@
     });
   };
 
+  hydrateMemberIcons();
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -1347,7 +1428,8 @@
   document.getElementById("member-open-meditations").addEventListener("click", () => showMemberScreen("member-meditations"));
   document.getElementById("member-open-recipes").addEventListener("click", () => showMemberScreen("member-recipes"));
   document.getElementById("member-open-nutrition").addEventListener("click", () => showMemberScreen("member-recipes"));
-  document.getElementById("member-open-schedule").addEventListener("click", () => showMemberScreen("member-schedule"));
+  document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
+  document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
     button.addEventListener("click", () => loadMemberLibrary(button.dataset.memberCategoryNav).catch(showApiError));
   });
@@ -1359,6 +1441,7 @@
     button.addEventListener("click", () => {
       if (button.dataset.memberNav === "member-home") loadMemberHome().catch(showApiError);
       else if (button.dataset.memberNav === "member-library") loadMemberLibrary().catch(showApiError);
+      else if (button.dataset.memberNav === "member-schedule") loadMemberSchedule().catch(showApiError);
       else showMemberScreen(button.dataset.memberNav);
     });
   });
