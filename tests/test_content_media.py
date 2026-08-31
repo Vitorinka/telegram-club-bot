@@ -1,6 +1,7 @@
 import unittest
 
 from content_media import (
+    AUDIO_MAX_BYTES,
     COVER_MAX_BYTES,
     VIDEO_MAX_BYTES,
     ContentMediaError,
@@ -43,14 +44,20 @@ class ContentMediaValidationTests(unittest.TestCase):
     def test_media_type_and_size_limits_fail_closed(self):
         self.assertEqual(COVER_MAX_BYTES, 10 * 1024 * 1024)
         self.assertEqual(VIDEO_MAX_BYTES, 20 * 1024 * 1024)
-        with self.assertRaisesRegex(ContentMediaError, "invalid_content_media_type"):
-            validate_media_bytes("audio", b"data")
+        self.assertEqual(AUDIO_MAX_BYTES, 20 * 1024 * 1024)
+        self.assertEqual(validate_media_bytes("audio", b"\xff\xfb\x90\x64payload"), "audio/mpeg")
+        self.assertEqual(validate_media_bytes("audio", b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb\x90\x64payload"), "audio/mpeg")
+        for invalid in (b"data", b"ID3\x04\x00\x00\x80\x00\x00\x00payload", b"\xff\xfb\x00\x64payload"):
+            with self.assertRaisesRegex(ContentMediaError, "unsupported_content_media"):
+                validate_media_bytes("audio", invalid)
         with self.assertRaisesRegex(ContentMediaError, "content_media_too_large"):
             validate_media_bytes("cover", b"\x89PNG\r\n\x1a\n" + b"x" * COVER_MAX_BYTES)
         with self.assertRaisesRegex(ContentMediaError, "content_media_too_large"):
             validate_media_bytes(
                 "video", b"\x00\x00\x00\x18ftypisom" + b"x" * VIDEO_MAX_BYTES
             )
+        with self.assertRaisesRegex(ContentMediaError, "content_media_too_large"):
+            validate_media_bytes("audio", b"\xff\xfb\x90\x64" + b"x" * AUDIO_MAX_BYTES)
 
 
 if __name__ == "__main__":

@@ -92,8 +92,11 @@
   const contentCoverCurrent = document.getElementById("content-cover-current");
   const contentVideoCurrent = document.getElementById("content-video-current");
   const contentVideoControl = document.getElementById("content-video-control");
+  const contentAudioControl = document.getElementById("content-audio-control");
+  const contentAudioCurrent = document.getElementById("content-audio-current");
   const contentCoverFile = document.getElementById("content-cover-file");
   const contentVideoFile = document.getElementById("content-video-file");
+  const contentAudioFile = document.getElementById("content-audio-file");
   const contentMediaConfirmation = document.getElementById("content-media-confirmation");
   const contentMediaPreview = document.getElementById("content-media-preview");
   const contentMediaSummary = document.getElementById("content-media-summary");
@@ -156,6 +159,9 @@
   let contentMediaAttachedCoverUrl = null;
   let memberPreviewMode = false;
   let memberCoverGeneration = 0;
+  let memberAudioGeneration = 0;
+  let memberAudioElement = null;
+  let memberAudioUrl = null;
   const memberCoverUrls = new Map();
   let memberLibraryItems = [];
   let memberMeditationItems = [];
@@ -246,6 +252,17 @@
     memberCoverUrls.forEach((url) => URL.revokeObjectURL(url));
     memberCoverUrls.clear();
   };
+  const clearMemberAudio = () => {
+    memberAudioGeneration += 1;
+    if (memberAudioElement) {
+      memberAudioElement.pause();
+      memberAudioElement.removeAttribute("src");
+      memberAudioElement.load();
+      memberAudioElement = null;
+    }
+    if (memberAudioUrl) URL.revokeObjectURL(memberAudioUrl);
+    memberAudioUrl = null;
+  };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
     const container = document.createElement("div");
@@ -301,6 +318,7 @@
     return article;
   };
   const showMemberScreen = (name) => {
+    if (name !== "member-lesson") clearMemberAudio();
     memberPreviewMode = true;
     document.body.classList.add("member-preview-mode");
     adminHero.hidden = true;
@@ -380,6 +398,7 @@
   const loadMemberLesson = (contentId, contentType = "lesson") => {
     return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`).then((item) => {
       clearMemberCoverUrls();
+      clearMemberAudio();
       memberDetailContentType = contentType;
       memberLessonContent.replaceChildren();
       memberLessonContent.append(memberCover(item, true));
@@ -424,7 +443,31 @@
         });
         memberLessonContent.append(body);
       }
-      if (item.content_type !== "nutrition_material") {
+      if (item.content_type === "meditation" && item.has_audio && item.audio_media_id) {
+        const generation = memberAudioGeneration;
+        const player = document.createElement("section");
+        player.className = "member-card member-audio-player";
+        const toggle = text("button", "▶"); toggle.type = "button"; toggle.disabled = true;
+        const progress = document.createElement("input"); progress.type = "range"; progress.min = "0"; progress.max = "0"; progress.value = "0"; progress.step = "0.1"; progress.setAttribute("aria-label", "Позиция аудио");
+        const times = document.createElement("div"); times.className = "member-audio-time";
+        const current = text("span", "0:00"); const total = text("span", "—"); times.append(current, total);
+        player.append(toggle, progress, times); memberLessonContent.append(player);
+        fetch(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.audio_media_id)}/audio`, {
+          headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+        }).then((response) => { if (!response.ok) throw new Error("audio_unavailable"); return response.blob(); }).then((blob) => {
+          if (generation !== memberAudioGeneration) return;
+          memberAudioUrl = URL.createObjectURL(blob);
+          const audio = document.createElement("audio"); audio.preload = "metadata"; audio.src = memberAudioUrl;
+          memberAudioElement = audio;
+          const clock = (seconds) => Number.isFinite(seconds) ? `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}` : "—";
+          audio.addEventListener("loadedmetadata", () => { progress.max = String(audio.duration || 0); total.textContent = clock(audio.duration); toggle.disabled = false; });
+          audio.addEventListener("timeupdate", () => { progress.value = String(audio.currentTime); current.textContent = clock(audio.currentTime); });
+          audio.addEventListener("ended", () => { toggle.textContent = "▶"; });
+          toggle.addEventListener("click", () => { if (audio.paused) audio.play().then(() => { toggle.textContent = "❚❚"; }).catch(() => null); else { audio.pause(); toggle.textContent = "▶"; } });
+          progress.addEventListener("input", () => { audio.currentTime = Number(progress.value); });
+        }).catch(() => { if (generation === memberAudioGeneration) player.replaceChildren(text("p", "Аудио временно недоступно.")); });
+      }
+      if (item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
         const video = document.createElement("section");
         video.className = "member-video-shell";
         video.append(text("span", "▶", "member-play-icon"));
@@ -533,6 +576,7 @@
   const exitMemberPreview = () => {
     memberPreviewMode = false;
     clearMemberCoverUrls();
+    clearMemberAudio();
     document.body.classList.remove("member-preview-mode");
     memberBottomNav.hidden = true;
     memberShellHeader.hidden = true;
@@ -567,6 +611,7 @@
     contentMediaUploadId = null;
     contentCoverFile.value = "";
     contentVideoFile.value = "";
+    contentAudioFile.value = "";
     contentMediaConfirmation.hidden = true;
     contentMediaPreview.replaceChildren(text("span", "Предварительный просмотр", "schedule-image-loading"));
     contentMediaSummary.replaceChildren();
@@ -1416,6 +1461,7 @@
       contentRecipeCard.hidden = item.status !== "draft" || item.content_type !== "recipe";
       contentNutritionCard.hidden = item.status !== "draft" || item.content_type !== "nutrition_material";
       contentVideoControl.hidden = item.content_type === "recipe" || item.content_type === "nutrition_material";
+      contentAudioControl.hidden = item.content_type !== "meditation";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
       contentEditDescription.value = item.description || "";
@@ -1456,24 +1502,28 @@
   function renderContentMedia(item) {
     const cover = (item.media || []).find((entry) => entry.media_type === "cover");
     const video = (item.media || []).find((entry) => entry.media_type === "video");
+    const audio = (item.media || []).find((entry) => entry.media_type === "audio");
     contentCoverCurrent.replaceChildren(text("span", cover ? "Загружаем обложку…" : "Обложка не прикреплена", "schedule-image-loading"));
     contentVideoCurrent.textContent = video
       ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
       : "Видео не прикреплено";
+    contentAudioCurrent.textContent = audio
+      ? `MP3 · ${Math.ceil(audio.size_bytes / 1024 / 1024)} МиБ · версия ${audio.version}`
+      : "Аудио не прикреплено";
     if (cover) fetchContentCover(item, cover);
   }
   const showLocalContentMedia = (mediaType) => {
-    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
     contentMediaPreview.replaceChildren();
     if (!file) contentMediaPreview.append(text("span", "Выберите файл", "schedule-image-loading"));
     else if (mediaType === "cover") contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки"));
-    else contentMediaPreview.append(text("span", `Локально выбрано видео: ${file.name}`, "schedule-image-loading"));
+    else contentMediaPreview.append(text("span", `Локально выбрано ${mediaType === "audio" ? "аудио" : "видео"}: ${file.name}`, "schedule-image-loading"));
   };
   const validateContentMedia = (mediaType) => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
-    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (!file) {
       contentMediaMessage.textContent = "Выберите файл.";
       contentMediaConfirmation.hidden = false;
@@ -1489,7 +1539,7 @@
         contentMediaUploadId = draft.upload_id;
         contentMediaSummary.replaceChildren(
           text("strong", currentCmsContent.title),
-          text("span", mediaType === "cover" ? "Обложка" : "Видео"),
+          text("span", mediaType === "cover" ? "Обложка" : mediaType === "audio" ? "Аудио" : "Видео"),
           text("span", `${draft.mime_type} · ${Math.ceil(draft.size_bytes / 1024)} КиБ`)
         );
         contentMediaMessage.textContent = draft.existing_media
@@ -1669,8 +1719,10 @@
   });
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
+  document.getElementById("content-audio-validate").addEventListener("click", () => validateContentMedia("audio"));
   contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
   contentVideoFile.addEventListener("change", () => showLocalContentMedia("video"));
+  contentAudioFile.addEventListener("change", () => showLocalContentMedia("audio"));
   contentMediaConfirm.addEventListener("click", confirmContentMedia);
   contentMediaCancel.addEventListener("click", cancelContentMedia);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));

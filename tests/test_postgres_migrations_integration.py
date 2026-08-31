@@ -446,8 +446,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 23,
-            "latest": "0023_nutrition_materials",
+            "count": 24,
+            "latest": "0024_meditation_audio",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1931,7 +1931,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 23)
+        self.assertEqual(len(migrations), 24)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2478,6 +2478,93 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"])["steps"], reordered["steps"])
+
+    def test_meditation_audio_attach_replace_and_fencing_real_postgres(self):
+        run_migrations(self.get_conn)
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Тихое дыхание",
+            "category": "breathing", "duration_seconds": 600,
+        })
+        audio_bytes = b"\xff\xfb\x90\x64meditation-audio"
+
+        def upload_and_apply(data, reference):
+            upload = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", data)
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            state = prepare_media_execution(self.get_conn, upload["upload_id"], action["action_id"], 1)
+            self.assertEqual(state["mode"], "upload")
+            record_telegram_upload(self.get_conn, upload["upload_id"], action["action_id"], 1, reference)
+            return upload, action, apply_media_upload(self.get_conn, upload["upload_id"], action["action_id"], 1)
+
+        first_upload, first_action, first = upload_and_apply(audio_bytes, "private-audio-v1")
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(apply_media_upload(self.get_conn, first_upload["upload_id"], first_action["action_id"], 1)["media_id"], first["media_id"])
+        second_upload, second_action, second = upload_and_apply(audio_bytes + b"2", "private-audio-v2")
+        active = list_content_media(self.get_conn, meditation["content_id"])
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["media_type"], "audio")
+        self.assertEqual(active[0]["media_id"], second["media_id"])
+        history = self.query_all("SELECT media_id,deleted_at IS NOT NULL FROM content_media WHERE content_id=%s AND media_type='audio' ORDER BY version", (meditation["content_id"],))
+        self.assertEqual(history, [(first["media_id"], True), (second["media_id"], False)])
+
+        cancelled = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"cancel")
+        self.assertEqual(cancel_media_upload(self.get_conn, cancelled["upload_id"], 1)["status"], "cancelled")
+        self.assertEqual(len(list_content_media(self.get_conn, meditation["content_id"])), 1)
+
+        rollback_upload = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"rollback")
+        rollback_action = ensure_media_action(self.get_conn, rollback_upload["upload_id"], 1)
+        prepare_media_execution(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1)
+        record_telegram_upload(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1, "private-audio-rollback")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_audio_replacement() RETURNS trigger AS $$
+                    BEGIN RAISE EXCEPTION 'audio replacement rollback'; END;
+                    $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_audio_replacement_trigger
+                    BEFORE INSERT ON content_media FOR EACH ROW
+                    WHEN (NEW.media_type = 'audio')
+                    EXECUTE FUNCTION reject_audio_replacement()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.Error):
+            apply_media_upload(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1)
+        self.assertEqual(list_content_media(self.get_conn, meditation["content_id"])[0]["media_id"], second["media_id"])
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_audio_replacement_trigger ON content_media")
+                cur.execute("DROP FUNCTION reject_audio_replacement()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        stale = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"stale")
+        update_content_draft(self.get_conn, meditation["content_id"], {"expected_version": 3, "title": "Новая версия"})
+        stale_action = ensure_media_action(self.get_conn, stale["upload_id"], 1)
+        self.assertEqual(prepare_media_execution(self.get_conn, stale["upload_id"], stale_action["action_id"], 1)["failure_category"], "content_version_changed")
+
+        for content_type in ("lesson", "recipe", "nutrition_material"):
+            other = create_content_draft(self.get_conn, 1, {"content_type": content_type, "title": content_type, "duration_seconds": None}) if content_type != "nutrition_material" else create_nutrition_draft(self.get_conn, 1, {"content_type": content_type, "title": content_type, "duration_seconds": None, "body": "body"})
+            with self.subTest(content_type=content_type), self.assertRaisesRegex(ContentMediaError, "invalid_content_media_type"):
+                create_media_upload(self.get_conn, 1, other["content_id"], "audio", audio_bytes)
+
+        preview = get_member_preview_content(self.get_conn, meditation["content_id"], content_type="meditation")
+        self.assertTrue(preview["has_audio"])
+        self.assertEqual(preview["audio_media_id"], second["media_id"])
+        self.assertNotIn("private-audio", json.dumps(preview))
+        migration_sql = (MIGRATIONS_DIR / "0024_meditation_audio.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
 
     def test_nutrition_material_atomic_body_media_and_preview_real_postgres(self):
         run_migrations(self.get_conn)
@@ -8986,8 +9073,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 23)
-        self.assertEqual(system["migrations"]["latest"], "0023_nutrition_materials")
+        self.assertEqual(system["migrations"]["count"], 24)
+        self.assertEqual(system["migrations"]["latest"], "0024_meditation_audio")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

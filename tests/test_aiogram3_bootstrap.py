@@ -9640,6 +9640,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
             ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}"),
+            ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio"),
         )
         for method, resource in routes:
             handler = self.route_handler(app, method, resource)
@@ -9672,6 +9673,54 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ), handler,
             )
         self.assertEqual(response.status, 403)
+
+    async def test_admin_audio_proxy_range_and_relationship_are_safe(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio")
+        media = {"media_type": "audio", "content_type": "meditation", "mime_type": "audio/mpeg", "size_bytes": 12, "server_reference": "private-ref"}
+        data = b"\xff\xfb\x90\x64abcdefgh"
+        async def download(_path, destination, **_kwargs):
+            destination.write(data)
+        request = FakeMiniAppRequest(app, path="/api/admin/content/cms/c/media/m/audio", match_info={"content_id": "c", "media_id": "m"})
+        request.headers["Range"] = "bytes=4-7"
+        with patch.object(self.main, "get_media_reference", return_value=media), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="private-path", file_size=len(data)))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)):
+            response = await handler(request)
+        self.assertEqual(response.status, 206)
+        self.assertEqual(response.body, data[4:8])
+        self.assertEqual(response.headers["Content-Range"], f"bytes 4-7/{len(data)}")
+        self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        self.assertNotIn("private-ref", str(response.headers))
+
+        request.headers["Range"] = "bytes=999-1000"
+        with patch.object(self.main, "get_media_reference", return_value=media), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="private-path", file_size=len(data)))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)):
+            invalid = await handler(request)
+        self.assertEqual(invalid.status, 416)
+        self.assertEqual(invalid.headers["Content-Range"], f"bytes */{len(data)}")
+
+        with patch.object(self.main, "get_media_reference", return_value={**media, "content_type": "lesson"}), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock()) as get_file:
+            wrong = await handler(FakeMiniAppRequest(app, match_info={"content_id": "c", "media_id": "m"}))
+        self.assertEqual(wrong.status, 404)
+        get_file.assert_not_awaited()
+
+    async def test_audio_upload_uses_send_audio_and_is_idempotent(self):
+        state = {"mode": "upload", "media_bytes": b"\xff\xfb\x90\x64audio", "mime_type": "audio/mpeg", "media_type": "audio"}
+        message = SimpleNamespace(audio=SimpleNamespace(file_id="private-audio-id"))
+        with patch.object(self.main, "prepare_media_execution", side_effect=[state, {"mode": "completed", "media_id": "media-id"}]), \
+             patch.object(self.main.bot, "send_audio", new=AsyncMock(return_value=message)) as send, \
+             patch.object(self.main, "record_telegram_upload") as recorded, \
+             patch.object(self.main, "apply_media_upload", return_value={"status": "completed", "media_id": "media-id"}):
+            first = await self.main.execute_content_media_upload("upload", "action", 1)
+            second = await self.main.execute_content_media_upload("upload", "action", 1)
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(second["status"], "completed")
+        send.assert_awaited_once()
+        recorded.assert_called_once_with(self.main.get_db_conn, "upload", "action", 1, "private-audio-id")
 
     async def test_content_media_storage_failure_is_safe_and_does_not_attach(self):
         raw_reference = "private-telegram-reference"
@@ -9822,6 +9871,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/media/uploads/", javascript)
         self.assertIn("content-media-card", index)
         self.assertIn('accept="video/mp4"', index)
+        self.assertIn('accept="audio/mpeg,.mp3"', index)
+        self.assertIn("content-audio-control", index)
+        self.assertIn("has_audio", javascript)
+        self.assertIn("memberAudioElement.pause()", javascript)
+        self.assertNotIn("autoplay", javascript.lower())
+        self.assertIn("media-src 'self' blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)
         self.assertIn("URL.revokeObjectURL(contentMedia", javascript)

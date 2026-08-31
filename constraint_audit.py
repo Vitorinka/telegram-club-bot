@@ -18,6 +18,8 @@ GROUPED_QUERIES = {
     "admin_alerts.status": "SELECT status, COUNT(*) FROM admin_alerts GROUP BY status ORDER BY status NULLS FIRST",
     "subscription_refund_reconciliations.reconciliation_result": "SELECT reconciliation_result, COUNT(*) FROM subscription_refund_reconciliations GROUP BY reconciliation_result ORDER BY reconciliation_result NULLS FIRST",
     "stripe_identity_conflicts.conflict_type": "SELECT conflict_type, COUNT(*) FROM stripe_identity_conflicts GROUP BY conflict_type ORDER BY conflict_type NULLS FIRST",
+    "content_media.media_type": "SELECT media_type, COUNT(*) FROM content_media GROUP BY media_type ORDER BY media_type NULLS FIRST",
+    "content_media_uploads.media_type": "SELECT media_type, COUNT(*) FROM content_media_uploads GROUP BY media_type ORDER BY media_type NULLS FIRST",
 }
 
 EXPECTED_VALUES = {
@@ -47,6 +49,8 @@ EXPECTED_VALUES = {
         "users_subscription_conflict", "users_customer_conflict",
         "stripe_links_subscription_conflict", "stripe_links_customer_conflict",
     )),
+    "content_media.media_type": frozenset(("cover", "video", "audio")),
+    "content_media_uploads.media_type": frozenset(("cover", "video", "audio")),
 }
 
 LEGACY_ALLOWED_VALUES = {

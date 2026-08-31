@@ -26,7 +26,7 @@ def _content_id(value):
 def _item(row):
     (
         content_id, content_type, title, description, category, duration_seconds,
-        status, sort_order, cover_media_id, video_media_id,
+        status, sort_order, cover_media_id, video_media_id, audio_media_id,
     ) = row
     return {
         "content_id": str(content_id),
@@ -40,13 +40,15 @@ def _item(row):
         "cover_media_id": str(cover_media_id) if cover_media_id else None,
         "has_cover": cover_media_id is not None,
         "has_video": video_media_id is not None,
+        "audio_media_id": str(audio_media_id) if audio_media_id else None,
+        "has_audio": audio_media_id is not None,
     }
 
 
 MEMBER_CONTENT_SELECT = """
     SELECT c.content_id, c.content_type, c.title, c.description, c.category,
            c.duration_seconds, c.status, c.sort_order,
-           cover.media_id, video.media_id
+           cover.media_id, video.media_id, audio.media_id
     FROM content_items c
     LEFT JOIN content_media cover
       ON cover.content_id = c.content_id
@@ -56,6 +58,10 @@ MEMBER_CONTENT_SELECT = """
       ON video.content_id = c.content_id
      AND video.media_type = 'video'
      AND video.deleted_at IS NULL
+    LEFT JOIN content_media audio
+      ON audio.content_id = c.content_id
+     AND audio.media_type = 'audio'
+     AND audio.deleted_at IS NULL
 """
 
 

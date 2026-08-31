@@ -12,13 +12,16 @@ CONTENT_MEDIA_UPLOAD_TTL_MINUTES = 30
 CONTENT_MEDIA_INFLIGHT_SECONDS = 120
 COVER_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 20 * 1024 * 1024
-MEDIA_TYPES = frozenset({"cover", "video"})
+AUDIO_MAX_BYTES = 20 * 1024 * 1024
+MEDIA_TYPES = frozenset({"cover", "video", "audio"})
 
 
 def media_allowed_for_content(content_type, media_type):
-    return content_type in CONTENT_TYPES and not (
-        content_type in {"recipe", "nutrition_material"} and media_type != "cover"
-    )
+    if content_type not in CONTENT_TYPES:
+        return False
+    if media_type == "audio":
+        return content_type == "meditation"
+    return not (content_type in {"recipe", "nutrition_material"} and media_type != "cover")
 
 
 class ContentMediaError(ValueError):
@@ -45,6 +48,23 @@ def detect_media_mime(media_type, data):
         if brand not in {b"isom", b"iso2", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash"}:
             return None
         return "video/mp4"
+    if media_type == "audio":
+        offset = 0
+        if len(data) >= 10 and data[:3] == b"ID3":
+            size_bytes = data[6:10]
+            if any(value & 0x80 for value in size_bytes):
+                return None
+            offset = 10 + sum(value << shift for value, shift in zip(size_bytes, (21, 14, 7, 0)))
+        if offset + 4 > len(data):
+            return None
+        first, second, third = data[offset], data[offset + 1], data[offset + 2]
+        if first != 0xFF or second & 0xE0 != 0xE0:
+            return None
+        if second & 0x18 == 0x08 or second & 0x06 == 0:
+            return None
+        if third >> 4 in (0, 15) or (third >> 2) & 0x03 == 0x03:
+            return None
+        return "audio/mpeg"
     return None
 
 
@@ -53,7 +73,7 @@ def validate_media_bytes(media_type, data):
         raise ContentMediaError("invalid_content_media_type")
     if not isinstance(data, bytes) or not data:
         raise ContentMediaError("content_media_missing")
-    limit = COVER_MAX_BYTES if media_type == "cover" else VIDEO_MAX_BYTES
+    limit = COVER_MAX_BYTES if media_type == "cover" else (AUDIO_MAX_BYTES if media_type == "audio" else VIDEO_MAX_BYTES)
     if len(data) > limit:
         raise ContentMediaError("content_media_too_large", 413)
     mime = detect_media_mime(media_type, data)
@@ -365,10 +385,14 @@ def get_media_reference(get_connection, content_id, media_id):
     conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
-        cur.execute("SELECT media_type,mime_type,size_bytes,server_reference FROM content_media WHERE content_id=%s AND media_id=%s AND deleted_at IS NULL", (content_id, media_id))
+        cur.execute("""
+            SELECT m.media_type,m.mime_type,m.size_bytes,m.server_reference,c.content_type
+            FROM content_media m JOIN content_items c ON c.content_id=m.content_id
+            WHERE m.content_id=%s AND m.media_id=%s AND m.deleted_at IS NULL
+        """, (content_id, media_id))
         row=cur.fetchone(); conn.rollback()
         if not row: return None
-        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3]}
+        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3], "content_type":row[4]}
     except Exception:
         conn.rollback(); raise
     finally:

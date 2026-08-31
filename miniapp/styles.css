@@ -384,6 +384,10 @@ body.member-preview-mode { background: #fbfaf7; }
 .member-nutrition-body { display: grid; gap: 12px; }
 .member-nutrition-body p { margin: 0; white-space: pre-wrap; line-height: 1.65; }
 #content-nutrition-body, #content-create-body { min-height: 220px; resize: vertical; }
+.member-audio-player { display: grid; grid-template-columns: 48px 1fr; gap: 10px 12px; align-items: center; padding: 15px; }
+.member-audio-player button { width: 48px; min-height: 48px; margin: 0; padding: 0; border-radius: 50%; }
+.member-audio-player input[type="range"] { width: 100%; min-height: 44px; margin: 0; accent-color: var(--member-teal); }
+.member-audio-time { grid-column: 2; display: flex; justify-content: space-between; color: var(--member-muted); font-size: 12px; }
 .member-description { white-space: pre-wrap; line-height: 1.65; }
 .member-video-shell { min-height: 210px; display: grid; place-items: center; align-content: center; gap: 6px; padding: 22px; border-radius: 22px; background: linear-gradient(145deg, #063e43, #087b80); color: #fff; text-align: center; }
 .member-video-shell strong { color: #fff; }
