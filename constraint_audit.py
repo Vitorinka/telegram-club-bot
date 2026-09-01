@@ -22,6 +22,7 @@ GROUPED_QUERIES = {
     "content_media_uploads.media_type": "SELECT media_type, COUNT(*) FROM content_media_uploads GROUP BY media_type ORDER BY media_type NULLS FIRST",
     "content_item_versions.event_type": "SELECT event_type, COUNT(*) FROM content_item_versions GROUP BY event_type ORDER BY event_type NULLS FIRST",
     "content_item_versions.status": "SELECT status, COUNT(*) FROM content_item_versions GROUP BY status ORDER BY status NULLS FIRST",
+    "content_categories.content_type": "SELECT content_type, COUNT(*) FROM content_categories GROUP BY content_type ORDER BY content_type NULLS FIRST",
 }
 
 EXPECTED_VALUES = {
@@ -56,6 +57,7 @@ EXPECTED_VALUES = {
     "content_media_uploads.media_type": frozenset(("cover", "video", "audio")),
     "content_item_versions.event_type": frozenset(("publish", "archive")),
     "content_item_versions.status": frozenset(("published", "archived")),
+    "content_categories.content_type": frozenset(("lesson","meditation","recipe","nutrition_material")),
 }
 
 LEGACY_ALLOWED_VALUES = {

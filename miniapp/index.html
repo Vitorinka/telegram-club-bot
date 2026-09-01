@@ -85,7 +85,8 @@
           </select>
         </label>
         <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
-        <label>Категория <input id="content-create-category" type="text" maxlength="48" placeholder="например, meditation"></label>
+        <input id="content-create-category" type="hidden">
+        <fieldset id="content-create-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
         <label>Описание <textarea id="content-create-description" maxlength="5000"></textarea></label>
         <label>Длительность, секунд <input id="content-create-duration" type="number" min="1" max="86400"></label>
         <label id="content-create-body-label" hidden>Основной текст <textarea id="content-create-body" maxlength="30000" rows="12"></textarea></label>
@@ -99,7 +100,8 @@
       <article id="content-edit-card" class="card" hidden>
         <h2>Редактировать черновик</h2>
         <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
-        <label>Категория <input id="content-edit-category" type="text" maxlength="48"></label>
+        <input id="content-edit-category" type="hidden">
+        <fieldset id="content-edit-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
         <label>Описание <textarea id="content-edit-description" maxlength="5000"></textarea></label>
         <label>Длительность, секунд <input id="content-edit-duration" type="number" min="1" max="86400"></label>
         <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>

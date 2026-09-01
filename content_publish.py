@@ -49,6 +49,8 @@ def _load_state(cur, content_id, *, lock=False):
         "version": int(item[2]), "sort_order": int(item[3]),
         "mime_type": item[4], "size_bytes": int(item[5]), "sha256": item[6],
     } for item in cur.fetchall()]
+    from content_taxonomy import categories_for_content_cur
+    state["categories"] = categories_for_content_cur(cur, content_id)
     state["ingredients"] = []
     state["steps"] = []
     state["nutrition_body"] = None
@@ -80,6 +82,7 @@ def _fingerprint(state, secret):
         "archived_at": _iso(state["archived_at"]), "media": state["media"],
         "ingredients": state["ingredients"], "steps": state["steps"],
         "nutrition_body": state["nutrition_body"],
+        "categories": state["categories"],
     }
     encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hmac.new(secret.encode(), encoded, hashlib.sha256).hexdigest()
@@ -119,6 +122,7 @@ def _safe_preview(state, action_id, expires_at):
         "category": state["category"], "description": state["description"],
         "duration_seconds": state["duration_seconds"], "media": media,
         "domain": domain, "warnings": [], "expected_version": state["version"],
+        "categories": state["categories"],
         "preview_expires_at": expires_at.isoformat(),
     }
 
@@ -194,6 +198,11 @@ def _insert_snapshot(cur, state, action_id, admin_id, event_type, now):
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """, (version_id,item["media_id"],item["media_type"],item["version"],
               item["sort_order"],item["mime_type"],item["size_bytes"],item["sha256"]))
+    for position, item in enumerate(state["categories"], 1):
+        cur.execute("""INSERT INTO content_item_version_categories
+          (version_id,position,category_id,content_type,slug,title,group_slug,sort_order)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+          (version_id,position,item["id"],state["content_type"],item["slug"],item["title"],item["group"],item["sort_order"]))
     for position, item in enumerate(state["ingredients"], 1):
         cur.execute("INSERT INTO content_item_version_recipe_ingredients (version_id,position,name,amount,sort_order) VALUES (%s,%s,%s,%s,%s)",
                     (version_id,position,item["name"],item["amount"],item["sort_order"]))
@@ -306,6 +315,8 @@ def get_version(get_connection, content_id, version_id):
         result={"version_id":str(row[0]),"version":int(row[1]),"event_type":row[2],"content_type":row[3],"status":row[4],"title":row[5],"description":row[6],"category":row[7],"duration_seconds":row[8],"sort_order":int(row[9]),"published_at":_iso(row[10]),"archived_at":_iso(row[11]),"admin_id":int(row[12]),"created_at":_iso(row[13])}
         cur.execute("SELECT media_id,media_type,media_version,sort_order,mime_type,size_bytes FROM content_item_version_media WHERE version_id=%s ORDER BY media_type", (version_id,))
         result["media"]=[{"media_id":str(r[0]),"media_type":r[1],"version":int(r[2]),"sort_order":int(r[3]),"mime_type":r[4],"size_bytes":int(r[5])} for r in cur.fetchall()]
+        cur.execute("SELECT category_id,slug,title,group_slug,sort_order FROM content_item_version_categories WHERE version_id=%s ORDER BY position", (version_id,))
+        result["categories"]=[{"id":str(r[0]),"slug":r[1],"title":r[2],"group":r[3],"sort_order":int(r[4])} for r in cur.fetchall()]
         cur.execute("SELECT name,amount,sort_order FROM content_item_version_recipe_ingredients WHERE version_id=%s ORDER BY position", (version_id,))
         result["ingredients"]=[{"name":r[0],"amount":r[1],"sort_order":int(r[2])} for r in cur.fetchall()]
         cur.execute("SELECT step_number,instruction FROM content_item_version_recipe_steps WHERE version_id=%s ORDER BY position", (version_id,))
