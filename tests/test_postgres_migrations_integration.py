@@ -76,6 +76,7 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
     get_member_preview_content,
     get_member_preview_home,
@@ -453,8 +454,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 25,
-            "latest": "0025_content_version_history",
+            "count": 26,
+            "latest": "0026_content_taxonomy",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1938,7 +1939,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 25)
+        self.assertEqual(len(migrations), 26)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2111,6 +2112,71 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM message_delivery_events")[0], 0
         )
+
+    def test_content_taxonomy_multi_category_fencing_and_snapshot_real_postgres(self):
+        run_migrations(self.get_conn)
+        lessons = list_categories(self.get_conn, "lesson")["items"]
+        recipes = list_categories(self.get_conn, "recipe")["items"]
+        self.assertEqual((len(lessons), len(recipes)), (12, 4))
+        run_migrations(self.get_conn)
+        self.assertEqual(len(list_categories(self.get_conn, "lesson")["items"]), 12)
+        by_slug = {item["slug"]: item for item in lessons}
+        selected = [by_slug[name]["id"] for name in ("strength", "glutes", "posture")]
+        lesson = create_content_draft(self.get_conn, 1, {"content_type":"lesson","title":"Три направления","duration_seconds":600,"category_ids":selected})
+        self.assertEqual([item["slug"] for item in get_content_categories(self.get_conn, lesson["content_id"])], ["strength","glutes","posture"])
+        updated = update_content_draft(self.get_conn, lesson["content_id"], {"expected_version":1,"category_ids":[by_slug["mobility"]["id"],by_slug["first_aid_back"]["id"]]})
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            update_content_draft(self.get_conn, lesson["content_id"], {"expected_version":1,"category_ids":selected})
+        with self.assertRaisesRegex(ContentCmsError, "duplicate_category"):
+            update_content_draft(self.get_conn, lesson["content_id"], {"expected_version":2,"category_ids":[selected[0],selected[0]]})
+        with self.assertRaisesRegex(ContentCmsError, "category_content_type_mismatch"):
+            update_content_draft(self.get_conn, lesson["content_id"], {"expected_version":2,"category_ids":[recipes[0]["id"]]})
+        with self.assertRaisesRegex(ContentCmsError, "invalid_categories"):
+            update_content_draft(self.get_conn, lesson["content_id"], {"expected_version":2,"category_ids":[selected[0]]*21})
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur: cur.execute("UPDATE content_categories SET is_active=FALSE WHERE category_id=%s",(by_slug["feet"]["id"],))
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaisesRegex(ContentCmsError,"inactive_category"):
+            update_content_draft(self.get_conn,lesson["content_id"],{"expected_version":2,"category_ids":[by_slug["feet"]["id"]]})
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE FUNCTION reject_taxonomy_insert() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'taxonomy rollback'; END; $$ LANGUAGE plpgsql")
+                cur.execute("CREATE TRIGGER reject_taxonomy_insert_trigger BEFORE INSERT ON content_item_categories FOR EACH ROW EXECUTE FUNCTION reject_taxonomy_insert()")
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaises(psycopg2.Error):
+            update_content_draft(self.get_conn,lesson["content_id"],{"expected_version":2,"category_ids":selected})
+        self.assertEqual(get_cms_content(self.get_conn,lesson["content_id"])["version"],2)
+        self.assertEqual([item["slug"] for item in get_content_categories(self.get_conn,lesson["content_id"])],["mobility","first_aid_back"])
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_taxonomy_insert_trigger ON content_item_categories"); cur.execute("DROP FUNCTION reject_taxonomy_insert()")
+            conn.commit()
+        finally: conn.close()
+        upload=create_media_upload(self.get_conn,1,lesson["content_id"],"video",b"\x00\x00\x00\x18ftypisomtaxonomy")
+        action=ensure_media_action(self.get_conn,upload["upload_id"],1); prepare_media_execution(self.get_conn,upload["upload_id"],action["action_id"],1)
+        record_telegram_upload(self.get_conn,upload["upload_id"],action["action_id"],1,"private-taxonomy-video")
+        media=apply_media_upload(self.get_conn,upload["upload_id"],action["action_id"],1); secret="taxonomy-secret"
+        preview=create_lifecycle_preview(self.get_conn,lesson["content_id"],1,media["content_version"],secret)
+        changed=update_content_draft(self.get_conn,lesson["content_id"],{"expected_version":media["content_version"],"category_ids":selected})
+        with self.assertRaisesRegex(ContentCmsError,"content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn,lesson["content_id"],preview["action_id"],1,secret)
+        preview=create_lifecycle_preview(self.get_conn,lesson["content_id"],1,changed["version"],secret)
+        published=confirm_lifecycle(self.get_conn,lesson["content_id"],preview["action_id"],1,secret)
+        self.assertEqual([item["slug"] for item in get_version(self.get_conn,lesson["content_id"],published["version_id"])["categories"]],["strength","glutes","posture"])
+        self.assertEqual([item["content_id"] for item in list_member_preview_content(self.get_conn,content_type="lesson",category="glutes")["items"]],[lesson["content_id"]])
+        recipe = create_content_draft(self.get_conn, 1, {"content_type":"recipe","title":"Завтрак-десерт","category_ids":[recipes[0]["id"],recipes[3]["id"]]})
+        self.assertEqual([item["slug"] for item in get_content_categories(self.get_conn,recipe["content_id"])],["breakfast","desserts"])
+        self.assertEqual([item["content_id"] for item in list_member_preview_content(self.get_conn,content_type="recipe",category="desserts")["items"]],[recipe["content_id"]])
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur, self.assertRaises(psycopg2.Error): cur.execute("DELETE FROM content_item_version_categories WHERE version_id=%s",(published["version_id"],))
+            conn.rollback()
+        finally: conn.close()
 
     def test_content_media_staging_attach_replace_and_fencing_real_postgres(self):
         run_migrations(self.get_conn)
@@ -9280,8 +9346,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 25)
-        self.assertEqual(system["migrations"]["latest"], "0025_content_version_history")
+        self.assertEqual(system["migrations"]["count"], 26)
+        self.assertEqual(system["migrations"]["latest"], "0026_content_taxonomy")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

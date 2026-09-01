@@ -14,9 +14,11 @@ CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe", "nutrition_material
 CONTENT_STATUSES = frozenset({"draft", "published", "archived"})
 CREATE_FIELDS = frozenset({
     "content_type", "title", "category", "description", "duration_seconds",
+    "category_ids",
 })
 EDITABLE_FIELDS = frozenset({
     "title", "category", "description", "duration_seconds", "sort_order",
+    "category_ids",
 })
 
 
@@ -128,6 +130,7 @@ def validate_create_payload(payload):
             "invalid_description",
         ),
         "duration_seconds": _normalize_duration(payload.get("duration_seconds")),
+        "category_ids": payload.get("category_ids", []),
     }
     if values["content_type"] == "nutrition_material" and values["duration_seconds"] is not None:
         raise ContentCmsError("invalid_nutrition_material")
@@ -144,6 +147,10 @@ def validate_update_payload(payload):
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise ContentCmsError("invalid_expected_version")
     values = {}
+    if "category_ids" in payload:
+        if not isinstance(payload["category_ids"], list):
+            raise ContentCmsError("invalid_categories")
+        values["category_ids"] = payload["category_ids"]
     if "title" in payload:
         values["title"] = _normalize_title(payload["title"])
     if "category" in payload:
@@ -204,6 +211,8 @@ def create_content_draft(get_connection, admin_id, payload):
              values["duration_seconds"], int(admin_id)),
         )
         result = _projection(cur.fetchone())
+        from content_taxonomy import replace_categories_cur
+        replace_categories_cur(cur, content_id, values["content_type"], values["category_ids"])
         conn.commit()
         return result
     except Exception:
@@ -276,6 +285,10 @@ def update_content_draft(get_connection, content_id, payload):
             raise ContentCmsError("content_not_editable", 409)
         if current[2] != expected_version:
             raise ContentCmsError("content_version_changed", 409)
+        category_ids = values.pop("category_ids", None)
+        if category_ids is not None:
+            from content_taxonomy import replace_categories_cur
+            replace_categories_cur(cur, content_id, current[0], category_ids)
         assignments = [f"{field} = %s" for field in values]
         params = list(values.values())
         assignments.extend(["version = version + 1", "updated_at = NOW()"])

@@ -16,6 +16,7 @@ APPLICATION_TABLES = (
     "content_item_versions", "content_item_version_media",
     "content_item_version_recipe_ingredients", "content_item_version_recipe_steps",
     "content_item_version_nutrition",
+    "content_categories", "content_item_categories", "content_item_version_categories",
     "schema_migrations",
 )
 

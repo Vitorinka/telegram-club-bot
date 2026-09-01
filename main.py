@@ -185,6 +185,7 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
     MemberPreviewError,
     get_member_preview_content,
@@ -21738,6 +21739,13 @@ async def miniapp_admin_cms_content(request):
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
+async def miniapp_admin_content_categories(request):
+    try:
+        result = list_categories(get_db_conn, request.query.get("content_type"))
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
 
 async def miniapp_admin_cms_content_details(request):
     try:
@@ -21749,6 +21757,9 @@ async def miniapp_admin_cms_content_details(request):
     if result is None:
         return content_cms_error_response(ContentCmsError("content_not_found", 404))
     result["media"] = list_content_media(
+        get_db_conn, request.match_info.get("content_id")
+    )
+    result["categories"] = get_content_categories(
         get_db_conn, request.match_info.get("content_id")
     )
     if result["content_type"] == "recipe":
@@ -22208,6 +22219,7 @@ async def miniapp_admin_member_preview_content(request):
         result = list_member_preview_content(
             get_db_conn, limit=request.query.get("limit", "50"),
             content_type=request.query.get("content_type", "lesson"),
+            category=request.query.get("category"),
         )
     except MemberPreviewError as error:
         return member_preview_error_response(error)
@@ -23390,6 +23402,8 @@ def create_app():
         )
     if not _route_exists(app, "GET", "/api/admin/content/cms"):
         app.router.add_get('/api/admin/content/cms', miniapp_admin_cms_content)
+    if not _route_exists(app, "GET", "/api/admin/content/categories"):
+        app.router.add_get('/api/admin/content/categories', miniapp_admin_content_categories)
     if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/media-preview"):
         app.router.add_post('/api/admin/content/cms/{content_id}/media-preview', miniapp_admin_content_media_preview)
     if not _route_exists(app, "GET", "/api/admin/content/media/uploads/{upload_id}/preview"):

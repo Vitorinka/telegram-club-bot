@@ -27,6 +27,7 @@ def _item(row):
     (
         content_id, content_type, title, description, category, duration_seconds,
         status, sort_order, cover_media_id, video_media_id, audio_media_id,
+        category_slugs, category_titles,
     ) = row
     return {
         "content_id": str(content_id),
@@ -42,13 +43,19 @@ def _item(row):
         "has_video": video_media_id is not None,
         "audio_media_id": str(audio_media_id) if audio_media_id else None,
         "has_audio": audio_media_id is not None,
+        "categories": [
+            {"slug": slug, "title": title}
+            for slug, title in zip(category_slugs or [], category_titles or [])
+        ],
     }
 
 
 MEMBER_CONTENT_SELECT = """
     SELECT c.content_id, c.content_type, c.title, c.description, c.category,
            c.duration_seconds, c.status, c.sort_order,
-           cover.media_id, video.media_id, audio.media_id
+           cover.media_id, video.media_id, audio.media_id,
+           ARRAY(SELECT cc.slug FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug),
+           ARRAY(SELECT cc.title FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug)
     FROM content_items c
     LEFT JOIN content_media cover
       ON cover.content_id = c.content_id
@@ -77,7 +84,7 @@ def _preview_content_type(value):
 
 
 def list_member_preview_content(get_connection, *, limit=MEMBER_PREVIEW_LIMIT,
-                                content_type="lesson"):
+                                content_type="lesson", category=None):
     content_type = _preview_content_type(content_type)
     if isinstance(limit, bool):
         raise MemberPreviewError("invalid_limit")
@@ -90,14 +97,20 @@ def list_member_preview_content(get_connection, *, limit=MEMBER_PREVIEW_LIMIT,
     conn = get_connection(); cur = conn.cursor()
     try:
         _begin_read(cur)
+        if category is not None and (not isinstance(category,str) or len(category)>48):
+            raise MemberPreviewError("invalid_category")
+        category_clause = """ AND (%s IS NULL OR EXISTS (
+          SELECT 1 FROM content_item_categories cic JOIN content_categories cc USING(category_id)
+          WHERE cic.content_id=c.content_id AND cc.slug=%s AND cc.content_type=c.content_type))"""
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = %s
               AND c.status IN ('draft', 'published')
+            """ + category_clause + """
             ORDER BY c.sort_order ASC, c.updated_at DESC, c.content_id ASC
             LIMIT %s
             """,
-            (content_type, limit),
+            (content_type, category, category, limit),
         )
         items = [_item(row) for row in cur.fetchall()]
         conn.rollback()
@@ -180,19 +193,16 @@ def get_member_preview_home(get_connection):
             """
         )
         latest_nutrition_materials = [_item(row) for row in cur.fetchall()]
-        cur.execute("""
-            SELECT COALESCE(category, 'other'), COUNT(*)
-            FROM content_items
-            WHERE content_type = 'lesson'
-              AND status IN ('draft', 'published')
-            GROUP BY COALESCE(category, 'other')
-            ORDER BY COALESCE(category, 'other')
-        """)
+        cur.execute("""SELECT cc.slug,cc.title,COUNT(*) FROM content_categories cc
+          JOIN content_item_categories cic USING(category_id) JOIN content_items c USING(content_id)
+          WHERE cc.content_type='lesson' AND cc.is_active=TRUE AND c.status IN ('draft','published')
+          GROUP BY cc.slug,cc.title,cc.sort_order ORDER BY cc.sort_order,cc.slug""")
         categories = [
-            {"category": row[0], "count": int(row[1])}
+            {"category": row[0], "title": row[1], "count": int(row[2])}
             for row in cur.fetchall()
         ]
-        total = sum(item["count"] for item in categories)
+        cur.execute("SELECT COUNT(*) FROM content_items WHERE content_type='lesson' AND status IN ('draft','published')")
+        total = int(cur.fetchone()[0])
         conn.rollback()
         return {
             "latest_lessons": latest,

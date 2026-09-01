@@ -791,6 +791,19 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_item_version_media_type_check": {"table":"content_item_version_media","definition_contains":("cover","video","audio"),"validated":True},
         },
     },
+    "0026_content_taxonomy": {
+        "tables": ("content_categories", "content_item_categories", "content_item_version_categories"),
+        "columns": {
+            "content_categories": ("category_id","content_type","slug","title","group_slug","sort_order","is_active","created_at","updated_at"),
+            "content_item_categories": ("content_id","category_id","sort_order","created_at"),
+            "content_item_version_categories": ("version_id","position","category_id","content_type","slug","title","group_slug","sort_order"),
+        },
+        "indexes": ("content_item_categories_category_content_idx",),
+        "constraints": {
+            "content_categories_type_check": {"table":"content_categories","definition_contains":("lesson","meditation","recipe","nutrition_material"),"validated":True},
+            "content_categories_slug_check": {"table":"content_categories","definition_contains":("slug","a-z"),"validated":True},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

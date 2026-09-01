@@ -84,6 +84,8 @@
   const contentEditCard = document.getElementById("content-edit-card");
   const contentEditTitle = document.getElementById("content-edit-title");
   const contentEditCategory = document.getElementById("content-edit-category");
+  const contentCreateTaxonomy = document.getElementById("content-create-taxonomy");
+  const contentEditTaxonomy = document.getElementById("content-edit-taxonomy");
   const contentEditDescription = document.getElementById("content-edit-description");
   const contentEditDuration = document.getElementById("content-edit-duration");
   const contentEditOrder = document.getElementById("content-edit-order");
@@ -182,6 +184,7 @@
   let memberDetailContentType = "lesson";
   let recipeIngredients = [];
   let recipeSteps = [];
+  let cmsTaxonomy = [];
   let memberLibraryCategory = "all";
 
   const text = (tag, value, className) => {
@@ -315,7 +318,7 @@
     copy.className = "member-lesson-copy";
     const meta = document.createElement("div");
     meta.className = "member-lesson-meta";
-    meta.append(text("span", memberCategoryLabel(item.category)));
+    meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
     if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
     const bookmark = text("span", "☆");
     bookmark.setAttribute("aria-hidden", "true");
@@ -368,7 +371,7 @@
     const query = memberLibrarySearch.value.trim().toLocaleLowerCase("ru");
     const items = memberLibraryItems.filter((item) => {
       const categoryMatches = memberLibraryCategory === "all"
-        || (item.category || "other") === memberLibraryCategory;
+        || (item.categories || []).some((entry) => entry.slug === memberLibraryCategory);
       return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
     });
     clearMemberCoverUrls();
@@ -377,9 +380,9 @@
     memberTrainingEmpty.hidden = items.length !== 0;
   };
   const configureMemberLibraryFilters = () => {
-    const categories = [...new Set(memberLibraryItems.map((item) => item.category || "other"))];
+    const categoryMap = new Map(); memberLibraryItems.flatMap((item) => item.categories || []).forEach((item) => categoryMap.set(item.slug,item.title));
     memberLibraryChips.replaceChildren();
-    [{key: "all", label: "Все"}, ...categories.map((key) => ({key, label: memberCategoryLabel(key)}))]
+    [{key: "all", label: "Все"}, ...[...categoryMap].map(([key,label]) => ({key,label}))]
       .forEach((entry) => {
         const chip = text("button", entry.label, "member-chip");
         chip.type = "button";
@@ -399,7 +402,7 @@
     return api("/api/admin/member-preview/content?limit=50").then((data) => {
       memberLibraryItems = data.items;
       memberLibraryCategory = memberLibraryItems.some(
-        (item) => (item.category || "other") === category
+        (item) => (item.categories || []).some((entry) => entry.slug === category)
       ) ? category : "all";
       configureMemberLibraryFilters();
       renderMemberLibrary();
@@ -416,7 +419,7 @@
       const heading = document.createElement("header");
       const meta = document.createElement("div");
       meta.className = "member-lesson-meta";
-      meta.append(text("span", memberCategoryLabel(item.category)));
+      meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
       if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
       heading.append(meta, text("h1", item.title));
       if (item.duration_seconds) heading.append(text(
@@ -505,7 +508,7 @@
   const renderMemberRecipes = () => {
     const query = memberRecipeSearch.value.trim().toLocaleLowerCase("ru");
     const items = memberRecipeItems.filter((item) => {
-      const categoryMatches = memberRecipeCategory === "all" || (item.category || "other") === memberRecipeCategory;
+      const categoryMatches = memberRecipeCategory === "all" || (item.categories || []).some((entry) => entry.slug === memberRecipeCategory);
       return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
     });
     clearMemberCoverUrls();
@@ -514,9 +517,9 @@
     memberRecipeEmpty.hidden = items.length !== 0;
   };
   const configureMemberRecipeFilters = () => {
-    const categories = [...new Set(memberRecipeItems.map((item) => item.category || "other"))];
+    const categoryMap = new Map(); memberRecipeItems.flatMap((item) => item.categories || []).forEach((item) => categoryMap.set(item.slug,item.title));
     memberRecipeChips.replaceChildren();
-    [{key: "all", label: "Все"}, ...categories.map((key) => ({key, label: memberCategoryLabel(key)}))].forEach((entry) => {
+    [{key: "all", label: "Все рецепты"}, ...[...categoryMap].map(([key,label]) => ({key,label}))].forEach((entry) => {
       const chip = text("button", entry.label, "member-chip");
       chip.type = "button";
       chip.classList.toggle("active", entry.key === memberRecipeCategory);
@@ -530,7 +533,7 @@
   };
   const loadMemberRecipes = () => api("/api/admin/member-preview/content?content_type=recipe&limit=50").then((data) => {
     memberRecipeItems = data.items;
-    if (!memberRecipeItems.some((item) => (item.category || "other") === memberRecipeCategory)) memberRecipeCategory = "all";
+    if (!memberRecipeItems.some((item) => (item.categories || []).some((entry) => entry.slug === memberRecipeCategory))) memberRecipeCategory = "all";
     configureMemberRecipeFilters();
     renderMemberRecipes();
     showMemberScreen("member-recipes");
@@ -1406,6 +1409,13 @@
   }
 
   const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт", nutrition_material: "Материал нутрициолога"}[contentType] || contentType);
+  const selectedTaxonomyIds = (fieldset) => [...fieldset.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.value);
+  const renderTaxonomy = (fieldset, categories, selected = []) => {
+    const host = fieldset.querySelector(".taxonomy-options"); host.replaceChildren(); fieldset.hidden = categories.length === 0;
+    const groups = new Map(); categories.forEach((item) => { const key=item.group || "other"; if(!groups.has(key)) groups.set(key,[]); groups.get(key).push(item); });
+    groups.forEach((items, group) => { const section=document.createElement("div"); section.className="taxonomy-group"; section.append(text("strong", group === "first_aid" ? "Фитнес-аптечка" : group === "workout" ? "Основные направления" : "Категории")); items.forEach((item) => { const label=document.createElement("label"); label.className="taxonomy-option"; const input=document.createElement("input"); input.type="checkbox"; input.value=item.id; input.checked=selected.includes(item.id); label.append(input,text("span",item.title)); section.append(label); }); host.append(section); });
+  };
+  const loadTaxonomy = (contentType, fieldset, selected=[]) => api(`/api/admin/content/categories?content_type=${encodeURIComponent(contentType)}`).then((data) => { cmsTaxonomy=data.items || []; renderTaxonomy(fieldset,cmsTaxonomy,selected); });
   const recipeMove = (items, index, offset) => {
     const target = index + offset;
     if (target < 0 || target >= items.length) return;
@@ -1550,6 +1560,7 @@
       contentAudioControl.hidden = item.content_type !== "meditation";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
+      loadTaxonomy(item.content_type, contentEditTaxonomy, (item.categories || []).map((entry) => entry.id)).catch(showApiError);
       contentEditDescription.value = item.description || "";
       contentEditDuration.value = item.duration_seconds || "";
       contentEditDuration.closest("label").hidden = item.content_type === "nutrition_material";
@@ -1680,6 +1691,7 @@
       description: contentCreateDescription.value || null,
       duration_seconds: contentCreateType.value === "nutrition_material" ? null : optionalNumber(contentCreateDuration),
     };
+    if (contentCreateType.value !== "nutrition_material") payload.category_ids = selectedTaxonomyIds(contentCreateTaxonomy);
     if (contentCreateType.value === "nutrition_material") payload.body = contentCreateBody.value;
     return writeAdminJson("POST", "/api/admin/content/drafts", payload).then((item) => {
       contentCreateTitle.value = ""; contentCreateCategory.value = "";
@@ -1697,6 +1709,7 @@
       "PATCH", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}`,
       {expected_version: currentCmsContent.version, title: contentEditTitle.value,
        category: contentEditCategory.value || null,
+       category_ids: selectedTaxonomyIds(contentEditTaxonomy),
        description: contentEditDescription.value || null,
        duration_seconds: optionalNumber(contentEditDuration),
        sort_order: Number(contentEditOrder.value)}
@@ -1792,9 +1805,10 @@
       else showMemberScreen(button.dataset.memberNav);
     });
   });
-  document.getElementById("content-create-open").addEventListener("click", () => showScreen("content-create"));
+  document.getElementById("content-create-open").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
+  contentCreateType.addEventListener("change", () => loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError));
   document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
   document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); renderRecipeEditor(); } });
   document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); renderRecipeEditor(); } });

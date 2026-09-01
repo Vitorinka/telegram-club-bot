@@ -493,3 +493,4 @@ body.member-preview-mode { background: #fbfaf7; }
 @media (min-width: 341px) and (max-width: 430px) {
   .bottom-nav button { font-size: 9.4px; letter-spacing: -.015em; }
 }
+.taxonomy-fieldset{border:1px solid var(--line);border-radius:14px;padding:12px;margin:10px 0}.taxonomy-fieldset legend{font-weight:700;padding:0 6px}.taxonomy-group{margin:8px 0}.taxonomy-group>strong{display:block;margin-bottom:5px}.taxonomy-options{display:grid;gap:6px}.taxonomy-option{min-height:44px;display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:11px;background:var(--surface-soft)}.taxonomy-option input{width:20px;height:20px;flex:none}
