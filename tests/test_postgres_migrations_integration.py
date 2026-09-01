@@ -69,6 +69,13 @@ from content_media import (
     prepare_media_execution,
     record_telegram_upload,
 )
+from content_publish import (
+    cancel_lifecycle,
+    confirm_lifecycle,
+    create_lifecycle_preview,
+    get_version,
+    list_versions,
+)
 from member_preview import (
     get_member_preview_content,
     get_member_preview_home,
@@ -446,8 +453,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 24,
-            "latest": "0024_meditation_audio",
+            "count": 25,
+            "latest": "0025_content_version_history",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1931,7 +1938,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 24)
+        self.assertEqual(len(migrations), 25)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2531,6 +2538,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+
         with self.assertRaises(psycopg2.Error):
             apply_media_upload(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1)
         self.assertEqual(list_content_media(self.get_conn, meditation["content_id"])[0]["media_id"], second["media_id"])
@@ -2565,6 +2573,205 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+
+    def test_content_publish_archive_history_and_atomicity_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "publish-fingerprint-test-secret"
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Суп", "category": "nutrition",
+            "description": "Тёплый суп", "duration_seconds": 900,
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_incomplete"):
+            create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, 1, secret)
+        structure = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [{"name":"Вода","amount":"500 мл","sort_order":0}],
+            "steps": [{"step_number":1,"instruction":"Нагреть"}],
+        })
+        cover_upload = create_media_upload(self.get_conn, 1, recipe["content_id"], "cover", b"\x89PNG\r\n\x1a\ncover")
+        cover_action = ensure_media_action(self.get_conn, cover_upload["upload_id"], 1)
+        prepare_media_execution(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1)
+        record_telegram_upload(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1, "private-cover-reference")
+        cover_result = apply_media_upload(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1)
+        preview = create_lifecycle_preview(
+            self.get_conn, recipe["content_id"], 1, cover_result["content_version"], secret
+        )
+        payload_json = self.query_one("SELECT payload_json FROM admin_action_requests WHERE action_id=%s", (preview["action_id"],))[0]
+        self.assertNotIn("private-cover-reference", payload_json)
+        self.assertNotIn("ingredients", payload_json)
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["status"], "draft")
+        self.assertEqual(list_versions(self.get_conn, recipe["content_id"])["items"], [])
+        with self.assertRaisesRegex(ContentCmsError, "content_action_not_found"):
+            confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 2, secret)
+
+        stale = preview
+        changed = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": cover_result["content_version"],
+            "ingredients": [{"name":"Вода","amount":"600 мл","sort_order":0}],
+            "steps": [{"step_number":1,"instruction":"Вскипятить"}],
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, recipe["content_id"], stale["action_id"], 1, secret)
+
+        preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, changed["version"], secret)
+        published = confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 1, secret)
+        duplicate = confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 1, secret)
+        self.assertEqual(duplicate["version_id"], published["version_id"])
+        item = get_cms_content(self.get_conn, recipe["content_id"])
+        self.assertEqual(item["status"], "published")
+        self.assertIsNotNone(item["published_at"])
+        version = get_version(self.get_conn, recipe["content_id"], published["version_id"])
+        self.assertEqual(version["ingredients"], [{"name":"Вода","amount":"600 мл","sort_order":0}])
+        self.assertEqual(version["steps"], [{"step_number":1,"instruction":"Вскипятить"}])
+        self.assertEqual(version["media"][0]["media_id"], cover_result["media_id"])
+        self.assertNotIn("server_reference", json.dumps(version))
+
+        archive_preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, item["version"], secret, archive=True)
+        self.assertEqual(cancel_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, archive=True)["status"], "cancelled")
+        self.assertEqual(cancel_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, archive=True)["status"], "cancelled")
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["status"], "published")
+        archive_preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, item["version"], secret, archive=True)
+        archived = confirm_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, secret, archive=True)
+        self.assertEqual(confirm_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, secret, archive=True)["version_id"], archived["version_id"])
+        archived_item = get_cms_content(self.get_conn, recipe["content_id"])
+        self.assertEqual(archived_item["status"], "archived")
+        self.assertEqual(archived_item["published_at"], item["published_at"])
+        self.assertIsNotNone(archived_item["archived_at"])
+        self.assertEqual(len(list_versions(self.get_conn, recipe["content_id"])["items"]), 2)
+        self.assertIsNone(get_member_preview_content(self.get_conn, recipe["content_id"], content_type="recipe"))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.Error):
+                    cur.execute("UPDATE content_item_versions SET title='tampered' WHERE version_id=%s", (published["version_id"],))
+            conn.rollback()
+        finally:
+            conn.close()
+
+        rollback_recipe = create_content_draft(self.get_conn, 1, {"content_type":"recipe","title":"Rollback","duration_seconds":60})
+        rollback_structure = replace_recipe_structure(self.get_conn, rollback_recipe["content_id"], {
+            "expected_version":1,
+            "ingredients":[{"name":"A","amount":None,"sort_order":0}],
+            "steps":[{"step_number":1,"instruction":"B"}],
+        })
+        rollback_preview = create_lifecycle_preview(self.get_conn, rollback_recipe["content_id"], 1, rollback_structure["version"], secret)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE FUNCTION reject_publish_update() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rollback publish'; END; $$ LANGUAGE plpgsql")
+                cur.execute("CREATE TRIGGER reject_publish_update_trigger BEFORE UPDATE ON content_items FOR EACH ROW WHEN (NEW.status='published') EXECUTE FUNCTION reject_publish_update()")
+            conn.commit()
+        finally: conn.close()
+
+        with self.assertRaises(psycopg2.Error):
+            confirm_lifecycle(self.get_conn, rollback_recipe["content_id"], rollback_preview["action_id"], 1, secret)
+        self.assertEqual(get_cms_content(self.get_conn, rollback_recipe["content_id"])["status"], "draft")
+        self.assertEqual(list_versions(self.get_conn, rollback_recipe["content_id"])["items"], [])
+        self.assertEqual(self.query_one("SELECT status FROM admin_action_requests WHERE action_id=%s", (rollback_preview["action_id"],))[0], "pending")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_publish_update_trigger ON content_items")
+                cur.execute("DROP FUNCTION reject_publish_update()")
+            conn.commit()
+        finally: conn.close()
+
+        old_now = datetime.utcnow() - timedelta(minutes=11)
+        expiring = create_content_draft(self.get_conn, 1, {"content_type":"recipe","title":"TTL","duration_seconds":60})
+        expiring_structure = replace_recipe_structure(self.get_conn, expiring["content_id"], {"expected_version":1,"ingredients":[{"name":"A","amount":None,"sort_order":0}],"steps":[{"step_number":1,"instruction":"B"}]})
+        expired_preview = create_lifecycle_preview(self.get_conn, expiring["content_id"], 1, expiring_structure["version"], secret, now=old_now)
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_preview_expired"):
+            confirm_lifecycle(self.get_conn, expiring["content_id"], expired_preview["action_id"], 1, secret)
+
+        migration_sql = (MIGRATIONS_DIR / "0025_content_version_history.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur: cur.execute(migration_sql)
+            conn.commit()
+        finally: conn.close()
+
+    def test_content_publish_domain_fences_and_archive_rollback_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "publish-domain-fence-secret"
+
+        def attach(content_id, media_type, data, reference):
+            upload = create_media_upload(self.get_conn, 1, content_id, media_type, data)
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            prepare_media_execution(self.get_conn, upload["upload_id"], action["action_id"], 1)
+            record_telegram_upload(self.get_conn, upload["upload_id"], action["action_id"], 1, reference)
+            return apply_media_upload(self.get_conn, upload["upload_id"], action["action_id"], 1)
+
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type":"lesson", "title":"Сила", "description":"Урок",
+            "duration_seconds":600,
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_incomplete"):
+            create_lifecycle_preview(self.get_conn, lesson["content_id"], 1, 1, secret)
+        lesson_media = attach(lesson["content_id"], "video", b"\x00\x00\x00\x18ftypisomvideo", "private-lesson-video")
+        lesson_preview = create_lifecycle_preview(self.get_conn, lesson["content_id"], 1, lesson_media["content_version"], secret)
+        lesson_published = confirm_lifecycle(self.get_conn, lesson["content_id"], lesson_preview["action_id"], 1, secret)
+        lesson_version = get_version(self.get_conn, lesson["content_id"], lesson_published["version_id"])
+        self.assertEqual(lesson_version["content_type"], "lesson")
+        self.assertEqual(lesson_version["media"][0]["media_id"], lesson_media["media_id"])
+        self.assertNotIn("private-lesson-video", json.dumps(lesson_version))
+
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type":"meditation", "title":"Дыхание", "duration_seconds":300,
+        })
+        meditation_media = attach(meditation["content_id"], "audio", b"\xff\xfb\x90\x64audio-one", "private-audio-one")
+        meditation_preview = create_lifecycle_preview(self.get_conn, meditation["content_id"], 1, meditation_media["content_version"], secret)
+        replacement = attach(meditation["content_id"], "audio", b"\xff\xfb\x90\x64audio-two", "private-audio-two")
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, meditation["content_id"], meditation_preview["action_id"], 1, secret)
+        fresh_meditation = create_lifecycle_preview(self.get_conn, meditation["content_id"], 1, replacement["content_version"], secret)
+        meditation_published = confirm_lifecycle(self.get_conn, meditation["content_id"], fresh_meditation["action_id"], 1, secret)
+        meditation_version = get_version(self.get_conn, meditation["content_id"], meditation_published["version_id"])
+        self.assertEqual(meditation_version["media"][0]["media_id"], replacement["media_id"])
+
+        nutrition = create_nutrition_draft(self.get_conn, 1, {
+            "content_type":"nutrition_material", "title":"Вода",
+            "duration_seconds":None, "body":"Исходный текст",
+        })
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition["version"], secret)
+        nutrition_changed = update_nutrition_draft(self.get_conn, nutrition["content_id"], {
+            "expected_version":nutrition["version"], "description":"Обновлено",
+            "body":"Новый точный текст",
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1, secret)
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition_changed["version"], secret)
+        with self.assertRaisesRegex(ContentCmsError, "content_action_not_found"):
+            cancel_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 2)
+        self.assertEqual(cancel_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1)["status"], "cancelled")
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition_changed["version"], secret)
+        nutrition_published = confirm_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1, secret)
+        self.assertEqual(get_version(self.get_conn, nutrition["content_id"], nutrition_published["version_id"])["nutrition_body"], "Новый точный текст")
+
+        archive_preview = create_lifecycle_preview(
+            self.get_conn, lesson["content_id"], 1,
+            get_cms_content(self.get_conn, lesson["content_id"])["version"], secret,
+            archive=True,
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE FUNCTION reject_archive_update() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rollback archive'; END; $$ LANGUAGE plpgsql")
+                cur.execute("CREATE TRIGGER reject_archive_update_trigger BEFORE UPDATE ON content_items FOR EACH ROW WHEN (NEW.status='archived') EXECUTE FUNCTION reject_archive_update()")
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaises(psycopg2.Error):
+            confirm_lifecycle(self.get_conn, lesson["content_id"], archive_preview["action_id"], 1, secret, archive=True)
+        self.assertEqual(get_cms_content(self.get_conn, lesson["content_id"])["status"], "published")
+        self.assertEqual(len(list_versions(self.get_conn, lesson["content_id"])["items"]), 1)
+        self.assertEqual(self.query_one("SELECT status FROM admin_action_requests WHERE action_id=%s", (archive_preview["action_id"],))[0], "pending")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_archive_update_trigger ON content_items")
+                cur.execute("DROP FUNCTION reject_archive_update()")
+            conn.commit()
+        finally: conn.close()
 
     def test_nutrition_material_atomic_body_media_and_preview_real_postgres(self):
         run_migrations(self.get_conn)
@@ -9073,8 +9280,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 24)
-        self.assertEqual(system["migrations"]["latest"], "0024_meditation_audio")
+        self.assertEqual(system["migrations"]["count"], 25)
+        self.assertEqual(system["migrations"]["latest"], "0025_content_version_history")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

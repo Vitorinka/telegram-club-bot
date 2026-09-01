@@ -9641,6 +9641,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
             ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}"),
             ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-preview"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-confirm"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-cancel"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-preview"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-confirm"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-cancel"),
+            ("GET", "/api/admin/content/cms/{content_id}/versions"),
+            ("GET", "/api/admin/content/cms/{content_id}/versions/{version_id}"),
         )
         for method, resource in routes:
             handler = self.route_handler(app, method, resource)
@@ -9650,6 +9658,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     "content_id": "00000000-0000-0000-0000-000000000001",
                     "upload_id": "00000000-0000-0000-0000-000000000002",
                     "media_id": "00000000-0000-0000-0000-000000000003",
+                    "version_id": "00000000-0000-0000-0000-000000000004",
                 },
             )
             with self.subTest(resource=resource):
@@ -9877,6 +9886,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("memberAudioElement.pause()", javascript)
         self.assertNotIn("autoplay", javascript.lower())
         self.assertIn("media-src 'self' blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
+        self.assertIn("content-lifecycle-card", index)
+        self.assertIn("content-version-history", index)
+        self.assertIn("previewContentLifecycle", javascript)
+        self.assertIn("${mode}-preview", javascript)
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)
         self.assertIn("URL.revokeObjectURL(contentMedia", javascript)

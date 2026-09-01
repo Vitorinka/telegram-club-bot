@@ -178,6 +178,13 @@ from content_media import (
     record_telegram_upload,
     validate_media_bytes,
 )
+from content_publish import (
+    cancel_lifecycle,
+    confirm_lifecycle,
+    create_lifecycle_preview,
+    get_version,
+    list_versions,
+)
 from member_preview import (
     MemberPreviewError,
     get_member_preview_content,
@@ -21787,6 +21794,94 @@ async def miniapp_admin_nutrition_update(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+async def miniapp_admin_content_lifecycle_preview(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"expected_version"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = create_lifecycle_preview(
+            get_db_conn, request.match_info.get("content_id"),
+            request["miniapp_admin"].telegram_id, body["expected_version"],
+            WEBHOOK_SECRET, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_content_publish_preview(request):
+    return await miniapp_admin_content_lifecycle_preview(request)
+
+
+async def miniapp_admin_content_archive_preview(request):
+    return await miniapp_admin_content_lifecycle_preview(request, archive=True)
+
+
+async def miniapp_admin_content_lifecycle_confirm(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"action_id"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = confirm_lifecycle(
+            get_db_conn, request.match_info.get("content_id"), body["action_id"],
+            request["miniapp_admin"].telegram_id, WEBHOOK_SECRET, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_publish_confirm(request):
+    return await miniapp_admin_content_lifecycle_confirm(request)
+
+
+async def miniapp_admin_content_archive_confirm(request):
+    return await miniapp_admin_content_lifecycle_confirm(request, archive=True)
+
+
+async def miniapp_admin_content_lifecycle_cancel(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"action_id"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = cancel_lifecycle(
+            get_db_conn, request.match_info.get("content_id"), body["action_id"],
+            request["miniapp_admin"].telegram_id, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_publish_cancel(request):
+    return await miniapp_admin_content_lifecycle_cancel(request)
+
+
+async def miniapp_admin_content_archive_cancel(request):
+    return await miniapp_admin_content_lifecycle_cancel(request, archive=True)
+
+
+async def miniapp_admin_content_versions(request):
+    try:
+        result = list_versions(get_db_conn, request.match_info.get("content_id"))
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_version_details(request):
+    try:
+        result = get_version(
+            get_db_conn, request.match_info.get("content_id"),
+            request.match_info.get("version_id"),
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    if result is None:
+        return content_cms_error_response(ContentCmsError("content_version_not_found", 404))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 def content_media_error_response(error):
     return apply_miniapp_security_headers(web.json_response(
         {"error": error.category}, status=error.status
@@ -23307,6 +23402,20 @@ def create_app():
         app.router.add_get('/api/admin/content/cms/{content_id}/media/{media_id}', miniapp_admin_content_media_proxy)
     if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio"):
         app.router.add_get('/api/admin/content/cms/{content_id}/media/{media_id}/audio', miniapp_admin_content_audio_proxy)
+    for path, handler in (
+        ('/api/admin/content/cms/{content_id}/publish-preview', miniapp_admin_content_publish_preview),
+        ('/api/admin/content/cms/{content_id}/publish-confirm', miniapp_admin_content_publish_confirm),
+        ('/api/admin/content/cms/{content_id}/publish-cancel', miniapp_admin_content_publish_cancel),
+        ('/api/admin/content/cms/{content_id}/archive-preview', miniapp_admin_content_archive_preview),
+        ('/api/admin/content/cms/{content_id}/archive-confirm', miniapp_admin_content_archive_confirm),
+        ('/api/admin/content/cms/{content_id}/archive-cancel', miniapp_admin_content_archive_cancel),
+    ):
+        if not _route_exists(app, "POST", path):
+            app.router.add_post(path, handler)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/versions"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/versions', miniapp_admin_content_versions)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/versions/{version_id}"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/versions/{version_id}', miniapp_admin_content_version_details)
     if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}"):
         app.router.add_get(
             '/api/admin/content/cms/{content_id}',

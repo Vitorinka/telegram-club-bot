@@ -770,6 +770,27 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_media_uploads_size_check": {"table": "content_media_uploads", "definition_contains": ("audio", "20971520"), "validated": True},
         },
     },
+    "0025_content_version_history": {
+        "tables": (
+            "content_item_versions", "content_item_version_media",
+            "content_item_version_recipe_ingredients",
+            "content_item_version_recipe_steps", "content_item_version_nutrition",
+        ),
+        "columns": {
+            "content_item_versions": (
+                "version_id", "content_id", "content_version", "event_type",
+                "content_type", "status", "title", "action_id",
+                "created_by_telegram_id", "created_at",
+            ),
+        },
+        "indexes": ("content_item_versions_content_created_idx",),
+        "constraints": {
+            "content_item_versions_content_version_unique": {"table":"content_item_versions","definition_contains":("content_id","content_version","unique"),"validated":True},
+            "content_item_versions_event_check": {"table":"content_item_versions","definition_contains":("publish","archive"),"validated":True},
+            "content_item_versions_status_check": {"table":"content_item_versions","definition_contains":("published","archived"),"validated":True},
+            "content_item_version_media_type_check": {"table":"content_item_version_media","definition_contains":("cover","video","audio"),"validated":True},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

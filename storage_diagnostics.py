@@ -13,6 +13,9 @@ APPLICATION_TABLES = (
     "subscription_refund_events", "content_items", "content_media",
     "content_media_uploads", "recipe_ingredients", "recipe_steps",
     "nutrition_material_bodies",
+    "content_item_versions", "content_item_version_media",
+    "content_item_version_recipe_ingredients", "content_item_version_recipe_steps",
+    "content_item_version_nutrition",
     "schema_migrations",
 )
 

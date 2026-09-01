@@ -103,6 +103,15 @@
   const contentMediaMessage = document.getElementById("content-media-message");
   const contentMediaConfirm = document.getElementById("content-media-confirm");
   const contentMediaCancel = document.getElementById("content-media-cancel");
+  const contentLifecycleCard = document.getElementById("content-lifecycle-card");
+  const contentLifecycleTitle = document.getElementById("content-lifecycle-title");
+  const contentLifecycleMessage = document.getElementById("content-lifecycle-message");
+  const contentLifecyclePreview = document.getElementById("content-lifecycle-preview");
+  const contentLifecyclePreviewButton = document.getElementById("content-lifecycle-preview-button");
+  const contentLifecycleConfirm = document.getElementById("content-lifecycle-confirm");
+  const contentLifecycleCancel = document.getElementById("content-lifecycle-cancel");
+  const contentVersionHistory = document.getElementById("content-version-history");
+  const contentVersionHistoryEmpty = document.getElementById("content-version-history-empty");
   const memberHomeLessons = document.getElementById("member-home-lessons");
   const memberHomeEmpty = document.getElementById("member-home-empty");
   const memberHomeCategories = document.getElementById("member-home-categories");
@@ -157,6 +166,8 @@
   let contentMediaLocalUrl = null;
   let contentMediaServerUrl = null;
   let contentMediaAttachedCoverUrl = null;
+  let contentLifecycleActionId = null;
+  let contentLifecycleMode = null;
   let memberPreviewMode = false;
   let memberCoverGeneration = 0;
   let memberAudioGeneration = 0;
@@ -1444,6 +1455,81 @@
     article.append(button);
     return article;
   };
+  const renderVersionDetails = (version) => {
+    const domain = version.content_type === "recipe"
+      ? `${version.ingredients.length} ингредиентов · ${version.steps.length} шагов`
+      : version.content_type === "nutrition_material" ? version.nutrition_body : null;
+    contentVersionHistory.prepend(detailCard(`Версия ${version.version}`, [
+      ["Событие", version.event_type], ["Статус", version.status],
+      ["Название", version.title], ["Описание", version.description],
+      ["Длительность", version.duration_seconds ? `${version.duration_seconds} сек.` : null],
+      ["Медиа", version.media.map((entry) => `${entry.media_type} v${entry.version}`).join(", ") || "Нет"],
+      ["Данные", domain], ["Администратор", `ID ${version.admin_id}`],
+      ["Дата", formatDate(version.created_at)],
+    ]));
+  };
+  const loadContentVersions = (contentId) => api(`/api/admin/content/cms/${encodeURIComponent(contentId)}/versions`).then((data) => {
+    contentVersionHistory.replaceChildren();
+    contentVersionHistoryEmpty.hidden = data.items.length !== 0;
+    data.items.forEach((version) => {
+      const button = text("button", `v${version.version} · ${version.event_type} · ${formatDate(version.created_at)}`, "secondary");
+      button.type = "button";
+      button.addEventListener("click", () => api(`/api/admin/content/cms/${encodeURIComponent(contentId)}/versions/${encodeURIComponent(version.version_id)}`).then(renderVersionDetails).catch(showApiError));
+      contentVersionHistory.append(button);
+    });
+  });
+  const resetContentLifecycle = (item) => {
+    contentLifecycleActionId = null;
+    contentLifecycleMode = item.status === "published" ? "archive" : "publish";
+    contentLifecycleCard.hidden = item.status === "archived";
+    contentLifecycleTitle.textContent = item.status === "published" ? "Архивирование" : "Публикация";
+    contentLifecyclePreviewButton.textContent = item.status === "published" ? "Предпросмотр архивирования" : "Предпросмотр публикации";
+    contentLifecycleMessage.textContent = item.status === "published"
+      ? "Архивирование требует отдельного подтверждения. История и данные сохранятся."
+      : "Публикация требует финального server-side preview и подтверждения.";
+    contentLifecyclePreview.hidden = true;
+    contentLifecycleConfirm.hidden = true;
+    contentLifecycleCancel.hidden = true;
+    contentLifecyclePreviewButton.hidden = item.status === "archived";
+  };
+  const previewContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleMode) return Promise.resolve();
+    const mode = contentLifecycleMode;
+    contentLifecycleMessage.textContent = "Проверяем финальное состояние…";
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-preview`, {expected_version: currentCmsContent.version}).then((preview) => {
+      contentLifecycleActionId = preview.action_id;
+      contentLifecyclePreview.replaceChildren(
+        text("strong", preview.title),
+        text("span", cmsTypeLabel(preview.content_type)),
+        text("span", preview.description || "Без описания"),
+        text("span", `Медиа: ${preview.media.map((entry) => entry.media_type).join(", ") || "нет"}`),
+        text("span", `Действительно до ${formatDate(preview.preview_expires_at)}`)
+      );
+      contentLifecyclePreview.hidden = false;
+      contentLifecycleConfirm.textContent = mode === "archive" ? "Архивировать" : "Опубликовать";
+      contentLifecycleConfirm.hidden = false; contentLifecycleCancel.hidden = false;
+      contentLifecycleMessage.textContent = mode === "archive"
+        ? "Материал перестанет отображаться в будущей пользовательской библиотеке, но история и данные сохранятся."
+        : "Проверьте итоговые данные перед публикацией.";
+    }).catch((error) => { contentLifecycleMessage.textContent = `Проверка не пройдена: ${error.message}`; });
+  };
+  const confirmContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
+    contentLifecycleConfirm.disabled = true;
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-confirm`, {action_id: contentLifecycleActionId})
+      .then(() => loadCmsContentDetails(currentCmsContent.content_id))
+      .catch((error) => {
+        contentLifecycleMessage.textContent = error.message === "content_publish_preview_expired"
+          ? "Предварительный просмотр устарел. Обновите данные и повторите."
+          : error.message === "content_publish_state_changed" ? "Материал изменился после проверки. Обновите данные." : `Операция не выполнена: ${error.message}`;
+      }).finally(() => { contentLifecycleConfirm.disabled = false; });
+  };
+  const cancelContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-cancel`, {action_id: contentLifecycleActionId})
+      .then(() => { resetContentLifecycle(currentCmsContent); status.textContent = "Операция отменена"; })
+      .catch(showApiError);
+  };
   const loadCmsContentDetails = (contentId) => {
     clearContentMediaUrls();
     resetContentMediaDraft();
@@ -1475,6 +1561,8 @@
       contentNutritionBody.value = item.nutrition ? item.nutrition.body : "";
       renderRecipeEditor();
       renderContentMedia(item);
+      resetContentLifecycle(item);
+      loadContentVersions(item.content_id).catch(showApiError);
       showScreen("content-details");
       status.textContent = item.title;
     }).catch(showApiError);
@@ -1725,6 +1813,9 @@
   contentAudioFile.addEventListener("change", () => showLocalContentMedia("audio"));
   contentMediaConfirm.addEventListener("click", confirmContentMedia);
   contentMediaCancel.addEventListener("click", cancelContentMedia);
+  contentLifecyclePreviewButton.addEventListener("click", previewContentLifecycle);
+  contentLifecycleConfirm.addEventListener("click", confirmContentLifecycle);
+  contentLifecycleCancel.addEventListener("click", cancelContentLifecycle);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {
