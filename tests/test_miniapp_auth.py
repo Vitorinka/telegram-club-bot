@@ -53,6 +53,24 @@ class MiniAppAuthTests(unittest.TestCase):
         )
         self.assertEqual(error.status, 403)
 
+    def test_valid_member_identity_uses_same_signature_and_freshness_checks(self):
+        identity = miniapp_auth.validate_telegram_member_init_data(
+            signed_init_data({"id": 99, "first_name": "Member"}),
+            BOT_TOKEN,
+            now=NOW,
+        )
+        self.assertEqual(identity.telegram_id, 99)
+        self.assertEqual(identity.first_name, "Member")
+
+    def test_member_identity_cannot_be_forged(self):
+        raw = signed_init_data({"id": 99})
+        forged = raw.replace("%22id%22%3A99", "%22id%22%3A42")
+        with self.assertRaises(miniapp_auth.MiniAppAuthError) as ctx:
+            miniapp_auth.validate_telegram_member_init_data(
+                forged, BOT_TOKEN, now=NOW
+            )
+        self.assertEqual(ctx.exception.category, "hash_mismatch")
+
     def test_bad_hash_is_unauthorized(self):
         raw = signed_init_data({"id": 42})
         self.assert_auth_error("hash_mismatch", raw.replace("query_id=test-query", "query_id=other"))

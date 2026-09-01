@@ -144,6 +144,8 @@
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
   let sessionToken = null;
+  let realMemberMode = false;
+  let memberEntitled = false;
   let usersCursor = null;
   let searchTimer = null;
   let subscriptionsCursor = null;
@@ -245,6 +247,20 @@
     if (!response.ok) throw new Error("api_failed");
     return response.json();
   });
+  const memberPath = (adminPath, memberPathValue) => realMemberMode ? memberPathValue : adminPath;
+  const syncMemberAccess = (access) => {
+    if (!realMemberMode || !access) return;
+    memberEntitled = Boolean(access.has_active_access);
+    document.getElementById("member-continue").textContent = memberEntitled
+      ? "Выбрать тренировку"
+      : "Получить доступ";
+    const statusLabel = document.getElementById("member-profile-access");
+    if (statusLabel) {
+      statusLabel.textContent = memberEntitled
+        ? "Доступ активен"
+        : "Нет активного доступа";
+    }
+  };
   const showApiError = (error) => {
     if (error.message === "session_ended") status.textContent = "Сессия завершена. Закройте и снова откройте админ-платформу.";
     else if (error.message === "access_revoked") status.textContent = "У вас больше нет доступа к админ-платформе.";
@@ -287,7 +303,7 @@
     }
     container.append(text("span", "Загружаем обложку…", "member-cover-placeholder"));
     fetch(
-      `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`,
+      memberPath(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`, `/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`),
       {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
     ).then((response) => {
       if (!response.ok) throw new Error("cover_unavailable");
@@ -349,7 +365,8 @@
     });
   };
   const loadMemberHome = () => {
-    return api("/api/admin/member-preview/home").then((data) => {
+    return api(memberPath("/api/admin/member-preview/home", "/api/member/home")).then((data) => {
+      syncMemberAccess(data.access);
       clearMemberCoverUrls();
       memberHomeLessons.replaceChildren();
       data.latest_lessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
@@ -359,7 +376,7 @@
         const card = document.createElement("article");
         card.className = "member-category-card";
         card.append(
-          text("strong", memberCategoryLabel(entry.category)),
+          text("strong", entry.title || memberCategoryLabel(entry.slug || entry.category)),
           text("span", `${entry.count} ${entry.count === 1 ? "материал" : "материалов"}`)
         );
         memberHomeCategories.append(card);
@@ -399,7 +416,8 @@
       });
   };
   const loadMemberLibrary = (category = "all") => {
-    return api("/api/admin/member-preview/content?limit=50").then((data) => {
+    return api(memberPath("/api/admin/member-preview/content?limit=50", "/api/member/content?content_type=lesson&limit=50")).then((data) => {
+      syncMemberAccess(data.access);
       memberLibraryItems = data.items;
       memberLibraryCategory = memberLibraryItems.some(
         (item) => (item.categories || []).some((entry) => entry.slug === category)
@@ -410,7 +428,7 @@
     });
   };
   const loadMemberLesson = (contentId, contentType = "lesson") => {
-    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`).then((item) => {
+    return api(memberPath(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`, `/api/member/content/${encodeURIComponent(contentId)}`)).then((item) => {
       clearMemberCoverUrls();
       clearMemberAudio();
       memberDetailContentType = contentType;
@@ -430,7 +448,12 @@
       ));
       memberLessonContent.append(heading);
       if (item.description) memberLessonContent.append(text("p", item.description, "member-description"));
-      if (item.content_type === "recipe") {
+      if (realMemberMode && item.locked) {
+        const locked=document.createElement("section"); locked.className="member-card member-locked-content";
+        locked.append(text("h2","Доступно участникам клуба"),text("p","Получите доступ, чтобы открыть полный материал и медиаплеер."));
+        const action=text("button","Получить доступ","member-button"); action.type="button"; action.addEventListener("click",()=>webApp.close()); locked.append(action); memberLessonContent.append(locked);
+      }
+      if (item.content_type === "recipe" && !item.locked) {
         const ingredients = document.createElement("section");
         ingredients.className = "member-recipe-detail";
         ingredients.append(text("h2", "Ингредиенты"));
@@ -449,7 +472,7 @@
         preparation.append(stepList);
         memberLessonContent.append(ingredients, preparation);
       }
-      if (item.content_type === "nutrition_material") {
+      if (item.content_type === "nutrition_material" && !item.locked) {
         const body = document.createElement("section");
         body.className = "member-card member-nutrition-body";
         (item.body || "").split(/\n{2,}/).filter((paragraph) => paragraph.trim()).forEach((paragraph) => {
@@ -457,7 +480,7 @@
         });
         memberLessonContent.append(body);
       }
-      if (item.content_type === "meditation" && item.has_audio && item.audio_media_id) {
+      if (item.content_type === "meditation" && item.has_audio && item.audio_media_id && !item.locked) {
         const generation = memberAudioGeneration;
         const player = document.createElement("section");
         player.className = "member-card member-audio-player";
@@ -466,7 +489,7 @@
         const times = document.createElement("div"); times.className = "member-audio-time";
         const current = text("span", "0:00"); const total = text("span", "—"); times.append(current, total);
         player.append(toggle, progress, times); memberLessonContent.append(player);
-        fetch(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.audio_media_id)}/audio`, {
+        fetch(memberPath(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.audio_media_id)}/audio`, `/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.audio_media_id)}`), {
           headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
         }).then((response) => { if (!response.ok) throw new Error("audio_unavailable"); return response.blob(); }).then((blob) => {
           if (generation !== memberAudioGeneration) return;
@@ -481,7 +504,7 @@
           progress.addEventListener("input", () => { audio.currentTime = Number(progress.value); });
         }).catch(() => { if (generation === memberAudioGeneration) player.replaceChildren(text("p", "Аудио временно недоступно.")); });
       }
-      if (item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
+      if (!item.locked && item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
         const video = document.createElement("section");
         video.className = "member-video-shell";
         video.append(text("span", "▶", "member-play-icon"));
@@ -500,7 +523,8 @@
     items.forEach((item) => memberMeditationList.append(memberContentCard(item)));
     memberMeditationEmpty.hidden = items.length !== 0;
   };
-  const loadMemberMeditations = () => api("/api/admin/member-preview/content?content_type=meditation&limit=50").then((data) => {
+  const loadMemberMeditations = () => api(memberPath("/api/admin/member-preview/content?content_type=meditation&limit=50", "/api/member/content?content_type=meditation&limit=50")).then((data) => {
+    syncMemberAccess(data.access);
     memberMeditationItems = data.items;
     renderMemberMeditations();
     showMemberScreen("member-meditations");
@@ -531,7 +555,8 @@
       memberRecipeChips.append(chip);
     });
   };
-  const loadMemberRecipes = () => api("/api/admin/member-preview/content?content_type=recipe&limit=50").then((data) => {
+  const loadMemberRecipes = () => api(memberPath("/api/admin/member-preview/content?content_type=recipe&limit=50", "/api/member/content?content_type=recipe&limit=50")).then((data) => {
+    syncMemberAccess(data.access);
     memberRecipeItems = data.items;
     if (!memberRecipeItems.some((item) => (item.categories || []).some((entry) => entry.slug === memberRecipeCategory))) memberRecipeCategory = "all";
     configureMemberRecipeFilters();
@@ -546,7 +571,8 @@
     items.forEach((item) => memberNutritionList.append(memberContentCard(item)));
     memberNutritionEmpty.hidden = items.length !== 0;
   };
-  const loadMemberNutrition = () => api("/api/admin/member-preview/content?content_type=nutrition_material&limit=50").then((data) => {
+  const loadMemberNutrition = () => api(memberPath("/api/admin/member-preview/content?content_type=nutrition_material&limit=50", "/api/member/content?content_type=nutrition_material&limit=50")).then((data) => {
+    syncMemberAccess(data.access);
     memberNutritionItems = data.items;
     renderMemberNutrition();
     showMemberScreen("member-nutrition");
@@ -560,6 +586,17 @@
     memberScheduleContent.replaceChildren(empty);
   };
   const loadMemberSchedule = () => {
+    if (realMemberMode) {
+      return api("/api/member/schedule").then((data) => {
+        clearScheduleImages();
+        renderMemberScheduleEmpty();
+        if (data.has_schedule) {
+          memberScheduleContent.querySelector("p").textContent =
+            "Расписание на текущий месяц доступно в основном меню бота.";
+        }
+        showMemberScreen("member-schedule");
+      });
+    }
     const today = moscowDate();
     const params = new URLSearchParams({from: today, to: today, status: "all", limit: "1"});
     return api(`/api/admin/schedule?${params.toString()}`).then((data) => {
@@ -588,6 +625,7 @@
     });
   };
   const exitMemberPreview = () => {
+    if (realMemberMode) { webApp.close(); return Promise.resolve(); }
     memberPreviewMode = false;
     clearMemberCoverUrls();
     clearMemberAudio();
@@ -1774,7 +1812,10 @@
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.getElementById("member-home-all").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
-  document.getElementById("member-continue").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
+  document.getElementById("member-continue").addEventListener("click", () => {
+    if (realMemberMode && !memberEntitled) webApp.close();
+    else loadMemberLibrary().catch(showApiError);
+  });
   document.getElementById("member-lesson-back").addEventListener("click", () => {
     const target = memberDetailContentType === "meditation" ? loadMemberMeditations()
       : memberDetailContentType === "recipe" ? loadMemberRecipes()
@@ -1897,17 +1938,27 @@
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",
   }).then((response) => {
-    if (!response.ok) throw new Error("telegram_session_expired");
-    return response.json();
-  }).then((session) => {
-    sessionToken = session.token;
-    return api("/api/admin/me");
-  }).then((admin) => {
-    telegramId.textContent = String(admin.telegram_id);
-    identity.hidden = false;
-    bottomNav.hidden = false;
-    return loadDashboard();
+    if (response.ok) return response.json().then((session) => ({session,admin:true}));
+    if (response.status !== 403) throw new Error("telegram_session_expired");
+    return fetch("/api/member/auth", {method:"POST",headers:{Authorization:`tma ${webApp.initData}`},cache:"no-store",credentials:"omit"}).then((memberResponse) => {
+      if (memberResponse.status === 403) throw new Error("member_rollout_disabled");
+      if (!memberResponse.ok) throw new Error("telegram_session_expired");
+      return memberResponse.json().then((session) => ({session,admin:false}));
+    });
+  }).then(({session,admin}) => {
+    sessionToken=session.token;
+    if (admin) return api("/api/admin/me").then((identityData) => ({admin:true,identityData}));
+    realMemberMode=true; memberEntitled=Boolean(session.access && session.access.has_active_access);
+    document.getElementById("member-greeting").textContent=session.profile && session.profile.first_name ? `Здравствуйте, ${session.profile.first_name}!` : "Здравствуйте!";
+    const profileName=document.getElementById("member-profile-name");
+    if (profileName) profileName.textContent=session.profile && session.profile.first_name ? session.profile.first_name : "Профиль";
+    syncMemberAccess(session.access);
+    return {admin:false,identityData:null};
+  }).then(({admin,identityData}) => {
+    if (!admin) return loadMemberHome();
+    telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false; return loadDashboard();
   }).catch((error) => {
+    if (error.message === "member_rollout_disabled") { status.textContent="Новая платформа пока доступна только участникам тестирования."; identity.hidden=true; return; }
     if (error.message === "telegram_session_expired") {
       status.textContent = "Сессия Telegram устарела. Закройте и откройте мини-приложение снова.";
       identity.hidden = true;

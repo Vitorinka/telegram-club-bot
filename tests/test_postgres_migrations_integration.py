@@ -120,6 +120,13 @@ from miniapp_sessions import (
     load_miniapp_admin_session,
     revoke_miniapp_admin_session,
 )
+from member_catalog import (
+    get_member_content,
+    list_member_catalog,
+    list_member_categories,
+    member_access,
+)
+from member_sessions import create_member_session, load_member_session
 from admin_dashboard import collect_admin_dashboard
 from admin_users import get_admin_user_details, list_admin_users
 
@@ -364,6 +371,145 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             0,
         )
 
+    def test_member_sessions_and_entitlement_aware_catalog_real_postgres(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0027_miniapp_member_sessions", first["applied"])
+        self.assertIn("0027_miniapp_member_sessions", second["applied"])
+        self.assertEqual(
+            self.query_one(
+                "SELECT to_regclass('public.miniapp_member_sessions')"
+            )[0],
+            "miniapp_member_sessions",
+        )
+
+        token, session = create_member_session(self.get_conn, 88001)
+        self.assertEqual(load_member_session(self.get_conn, token).session_id, session.session_id)
+        self.assertNotEqual(
+            self.query_one(
+                "SELECT token_hash FROM miniapp_member_sessions WHERE session_id=%s",
+                (session.session_id,),
+            )[0],
+            token,
+        )
+
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Опубликованный урок",
+            "category": "strength", "duration_seconds": 600,
+        })
+        hidden = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Черновик скрыт",
+            "category": "strength", "duration_seconds": 600,
+        })
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Рецепт клуба",
+            "category": "breakfast", "duration_seconds": 900,
+        })
+        replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [{"name": "Вода", "amount": "1 стакан", "sort_order": 0}],
+            "steps": [{"step_number": 1, "instruction": "Смешать"}],
+        })
+        nutrition = create_nutrition_draft(self.get_conn, 1, {
+            "content_type": "nutrition_material", "title": "Гайд по питанию",
+            "category": None, "description": "Безопасное описание",
+            "duration_seconds": None, "body": "Полный премиальный текст",
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, paid, expiry_date, first_name) "
+                    "VALUES (88001,FALSE,NOW()-INTERVAL '1 day','Без доступа'), "
+                    "(88002,TRUE,NOW()+INTERVAL '30 days','Участник'), "
+                    "(88003,TRUE,NOW()-INTERVAL '1 day','Истёк'), "
+                    "(88004,TRUE,NOW()-INTERVAL '1 day','Grace'), "
+                    "(88005,TRUE,NOW()+INTERVAL '7 days','Trial'), "
+                    "(88006,TRUE,NOW()+INTERVAL '7 days','Manual'), "
+                    "(88007,TRUE,NOW()+INTERVAL '7 days','Gift')"
+                )
+                cur.execute(
+                    "UPDATE users SET payment_failed=TRUE, grace_period_end=NOW()+INTERVAL '2 hours' "
+                    "WHERE telegram_id=88004"
+                )
+                cur.execute(
+                    "UPDATE content_items SET status='published',published_at=NOW() "
+                    "WHERE content_id=ANY(%s::uuid[])",
+                    ([lesson["content_id"], recipe["content_id"], nutrition["content_id"]],),
+                )
+                cur.execute(
+                    "INSERT INTO content_item_categories (content_id,category_id) "
+                    "SELECT %s,category_id FROM content_categories "
+                    "WHERE content_type='lesson' AND slug='strength'",
+                    (lesson["content_id"],),
+                )
+                cur.execute(
+                    "INSERT INTO content_item_categories (content_id,category_id) "
+                    "SELECT %s,category_id FROM content_categories "
+                    "WHERE content_type='recipe' AND slug='breakfast'",
+                    (recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        unpaid = list_member_catalog(self.get_conn, 88001, content_type="lesson")
+        self.assertEqual([item["content_id"] for item in unpaid["items"]], [lesson["content_id"]])
+        self.assertTrue(unpaid["items"][0]["locked"])
+        filtered = list_member_catalog(
+            self.get_conn, 88001, content_type="lesson", category="strength"
+        )
+        self.assertEqual([item["content_id"] for item in filtered["items"]], [lesson["content_id"]])
+        self.assertNotIn(hidden["content_id"], json.dumps(unpaid))
+        self.assertFalse(member_access(self.get_conn, 88001)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88002)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88003)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88004)["has_active_access"])
+        for telegram_id in (88005, 88006, 88007):
+            self.assertTrue(member_access(self.get_conn, telegram_id)["has_active_access"])
+
+        locked_recipe = get_member_content(self.get_conn, 88001, recipe["content_id"])
+        self.assertTrue(locked_recipe["locked"])
+        self.assertNotIn("ingredients", locked_recipe)
+        self.assertNotIn("steps", locked_recipe)
+        open_recipe = get_member_content(self.get_conn, 88002, recipe["content_id"])
+        self.assertFalse(open_recipe["locked"])
+        self.assertEqual(open_recipe["ingredients"][0]["name"], "Вода")
+        self.assertEqual(open_recipe["steps"][0]["instruction"], "Смешать")
+        recipe_filtered = list_member_catalog(
+            self.get_conn, 88001, content_type="recipe", category="breakfast"
+        )
+        self.assertEqual(
+            [item["content_id"] for item in recipe_filtered["items"]],
+            [recipe["content_id"]],
+        )
+        locked_nutrition = get_member_content(
+            self.get_conn, 88001, nutrition["content_id"]
+        )
+        self.assertNotIn("body", locked_nutrition)
+        open_nutrition = get_member_content(
+            self.get_conn, 88004, nutrition["content_id"]
+        )
+        self.assertEqual(open_nutrition["body"], "Полный премиальный текст")
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET expiry_date=NOW()-INTERVAL '1 second' WHERE telegram_id=88002")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertTrue(get_member_content(self.get_conn, 88002, recipe["content_id"])["locked"])
+        categories = list_member_categories(self.get_conn, "lesson")["items"]
+        self.assertIn("strength", {item["slug"] for item in categories})
+
+        serialized = json.dumps({"list": unpaid, "details": locked_recipe})
+        for forbidden in (
+            "telegram_file_id", "server_reference", "stripe_customer_id",
+            "stripe_subscription_id", "BOT_TOKEN",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
     def test_miniapp_dashboard_aggregates_synthetic_records_real_postgres(self):
         run_migrations(self.get_conn)
         conn = self.get_conn()
@@ -454,8 +600,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 26,
-            "latest": "0026_content_taxonomy",
+            "count": 27,
+            "latest": "0027_miniapp_member_sessions",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1939,7 +2085,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 26)
+        self.assertEqual(len(migrations), 27)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -9346,8 +9492,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 26)
-        self.assertEqual(system["migrations"]["latest"], "0026_content_taxonomy")
+        self.assertEqual(system["migrations"]["count"], 27)
+        self.assertEqual(system["migrations"]["latest"], "0027_miniapp_member_sessions")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

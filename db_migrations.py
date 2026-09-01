@@ -804,6 +804,15 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_categories_slug_check": {"table":"content_categories","definition_contains":("slug","a-z"),"validated":True},
         },
     },
+    "0027_miniapp_member_sessions": {
+        "tables": ("miniapp_member_sessions",),
+        "columns": {"miniapp_member_sessions": ("session_id","token_hash","telegram_id","first_name","created_at","expires_at","revoked_at")},
+        "indexes": ("miniapp_member_sessions_expires_at_idx","miniapp_member_sessions_telegram_id_idx"),
+        "constraints": {
+            "miniapp_member_sessions_expiry_check":{"table":"miniapp_member_sessions","definition_contains":("expires_at","created_at"),"validated":True},
+            "miniapp_member_sessions_first_name_check":{"table":"miniapp_member_sessions","definition_contains":("first_name","128"),"validated":True},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

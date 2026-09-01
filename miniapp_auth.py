@@ -106,7 +106,7 @@ def validate_telegram_init_data(
     telegram_id = user.get("id")
     if isinstance(telegram_id, bool) or not isinstance(telegram_id, int):
         raise MiniAppAuthError("user_id_invalid")
-    if telegram_id not in {int(admin_id) for admin_id in admin_ids or ()}:
+    if admin_ids is not None and telegram_id not in {int(admin_id) for admin_id in admin_ids or ()}:
         raise MiniAppAuthError("admin_forbidden", status=403)
 
     username = user.get("username")
@@ -115,6 +115,12 @@ def validate_telegram_init_data(
         telegram_id=telegram_id,
         username=username if isinstance(username, str) else None,
         first_name=first_name if isinstance(first_name, str) else None,
+    )
+
+
+def validate_telegram_member_init_data(raw_init_data, bot_token, *, now=None):
+    return validate_telegram_init_data(
+        raw_init_data, bot_token, None, now=now,
     )
 
 
