@@ -162,6 +162,7 @@ from content_cms import (
     update_content_draft,
 )
 from content_media import (
+    AUDIO_MAX_BYTES,
     COVER_MAX_BYTES,
     VIDEO_MAX_BYTES,
     ContentMediaError,
@@ -175,12 +176,26 @@ from content_media import (
     list_content_media,
     prepare_media_execution,
     record_telegram_upload,
+    validate_media_bytes,
+)
+from content_publish import (
+    cancel_lifecycle,
+    confirm_lifecycle,
+    create_lifecycle_preview,
+    get_version,
+    list_versions,
 )
 from member_preview import (
     MemberPreviewError,
     get_member_preview_content,
     get_member_preview_home,
     list_member_preview_content,
+)
+from recipe_cms import get_recipe_structure, replace_recipe_structure
+from nutrition_cms import (
+    create_nutrition_draft,
+    get_nutrition_body,
+    update_nutrition_draft,
 )
 from schedule_uploads import (
     SCHEDULE_UPLOAD_ACTION_TYPE,
@@ -353,6 +368,7 @@ MINIAPP_SECURITY_HEADERS = {
         "style-src 'self'; "
         "connect-src 'self'; "
         "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
         "base-uri 'none'; form-action 'none'; "
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     ),
@@ -21704,9 +21720,8 @@ async def read_content_cms_json(request):
 async def miniapp_admin_content_draft_create(request):
     try:
         body = await read_content_cms_json(request)
-        result = create_content_draft(
-            get_db_conn, request["miniapp_admin"].telegram_id, body
-        )
+        creator = create_nutrition_draft if body.get("content_type") == "nutrition_material" else create_content_draft
+        result = creator(get_db_conn, request["miniapp_admin"].telegram_id, body)
     except ContentCmsError as error:
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result, status=201))
@@ -21736,6 +21751,13 @@ async def miniapp_admin_cms_content_details(request):
     result["media"] = list_content_media(
         get_db_conn, request.match_info.get("content_id")
     )
+    if result["content_type"] == "recipe":
+        result["recipe"] = get_recipe_structure(
+            get_db_conn, request.match_info.get("content_id")
+        ) or {"ingredients": [], "steps": []}
+    if result["content_type"] == "nutrition_material":
+        body = get_nutrition_body(get_db_conn, request.match_info.get("content_id"))
+        result["nutrition"] = body or {"body": ""}
     return apply_miniapp_security_headers(web.json_response(result))
 
 
@@ -21747,6 +21769,116 @@ async def miniapp_admin_cms_content_update(request):
         )
     except ContentCmsError as error:
         return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_recipe_update(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = replace_recipe_structure(
+            get_db_conn, request.match_info.get("content_id"), body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_nutrition_update(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = update_nutrition_draft(
+            get_db_conn, request.match_info.get("content_id"), body
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_lifecycle_preview(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"expected_version"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = create_lifecycle_preview(
+            get_db_conn, request.match_info.get("content_id"),
+            request["miniapp_admin"].telegram_id, body["expected_version"],
+            WEBHOOK_SECRET, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_content_publish_preview(request):
+    return await miniapp_admin_content_lifecycle_preview(request)
+
+
+async def miniapp_admin_content_archive_preview(request):
+    return await miniapp_admin_content_lifecycle_preview(request, archive=True)
+
+
+async def miniapp_admin_content_lifecycle_confirm(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"action_id"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = confirm_lifecycle(
+            get_db_conn, request.match_info.get("content_id"), body["action_id"],
+            request["miniapp_admin"].telegram_id, WEBHOOK_SECRET, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_publish_confirm(request):
+    return await miniapp_admin_content_lifecycle_confirm(request)
+
+
+async def miniapp_admin_content_archive_confirm(request):
+    return await miniapp_admin_content_lifecycle_confirm(request, archive=True)
+
+
+async def miniapp_admin_content_lifecycle_cancel(request, *, archive=False):
+    try:
+        body = await read_content_cms_json(request)
+        if set(body) != {"action_id"}:
+            raise ContentCmsError("invalid_content_payload")
+        result = cancel_lifecycle(
+            get_db_conn, request.match_info.get("content_id"), body["action_id"],
+            request["miniapp_admin"].telegram_id, archive=archive,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_publish_cancel(request):
+    return await miniapp_admin_content_lifecycle_cancel(request)
+
+
+async def miniapp_admin_content_archive_cancel(request):
+    return await miniapp_admin_content_lifecycle_cancel(request, archive=True)
+
+
+async def miniapp_admin_content_versions(request):
+    try:
+        result = list_versions(get_db_conn, request.match_info.get("content_id"))
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_version_details(request):
+    try:
+        result = get_version(
+            get_db_conn, request.match_info.get("content_id"),
+            request.match_info.get("version_id"),
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    if result is None:
+        return content_cms_error_response(ContentCmsError("content_version_not_found", 404))
     return apply_miniapp_security_headers(web.json_response(result))
 
 
@@ -21839,6 +21971,7 @@ async def execute_content_media_upload(upload_id, action_id, admin_id):
         extension = {
             "image/jpeg": "jpg", "image/png": "png",
             "image/webp": "webp", "video/mp4": "mp4",
+            "audio/mpeg": "mp3",
         }[state["mime_type"]]
         media = BufferedInputFile(
             state["media_bytes"], filename=f"cms_media.{extension}"
@@ -21850,13 +21983,19 @@ async def execute_content_media_upload(upload_id, action_id, admin_id):
                     caption="CMS: загружена обложка черновика",
                 )
                 file_id = message.photo[-1].file_id
-            else:
+            elif state["media_type"] == "video":
                 message = await bot.send_video(
                     int(admin_id), media,
                     caption="CMS: загружено видео черновика",
                     supports_streaming=True,
                 )
                 file_id = message.video.file_id
+            else:
+                message = await bot.send_audio(
+                    int(admin_id), media,
+                    caption="CMS: загружено аудио медитации",
+                )
+                file_id = message.audio.file_id
         except Exception:
             fail_media_upload(
                 get_db_conn, upload_id, action_id, admin_id,
@@ -21963,6 +22102,93 @@ async def miniapp_admin_content_media_proxy(request):
     return response
 
 
+def parse_http_byte_range(value, total_size):
+    if not value:
+        return None
+    if not isinstance(value, str) or not value.startswith("bytes=") or "," in value:
+        raise ContentMediaError("invalid_audio_range", 416)
+    spec = value[6:].strip()
+    if "-" not in spec:
+        raise ContentMediaError("invalid_audio_range", 416)
+    start_text, end_text = spec.split("-", 1)
+    try:
+        if not start_text:
+            suffix = int(end_text)
+            if suffix <= 0:
+                raise ValueError
+            start = max(0, total_size - suffix)
+            end = total_size - 1
+        else:
+            start = int(start_text)
+            end = total_size - 1 if not end_text else int(end_text)
+            if start < 0 or end < start:
+                raise ValueError
+    except (TypeError, ValueError):
+        raise ContentMediaError("invalid_audio_range", 416) from None
+    if start >= total_size:
+        raise ContentMediaError("invalid_audio_range", 416)
+    return start, min(end, total_size - 1)
+
+
+async def miniapp_admin_content_audio_proxy(request):
+    try:
+        media = get_media_reference(
+            get_db_conn, request.match_info.get("content_id"),
+            request.match_info.get("media_id"),
+        )
+        if media is None:
+            raise ContentMediaError("content_media_not_found", 404)
+        if media["media_type"] != "audio" or media["content_type"] != "meditation":
+            raise ContentMediaError("content_media_not_found", 404)
+        if media["mime_type"] != "audio/mpeg" or media["size_bytes"] > AUDIO_MAX_BYTES:
+            raise ContentMediaError("content_media_unavailable", 502)
+        telegram_file = await bot.get_file(media["server_reference"])
+        file_path = getattr(telegram_file, "file_path", None)
+        file_size = getattr(telegram_file, "file_size", None)
+        if not file_path or (file_size is not None and int(file_size) > AUDIO_MAX_BYTES):
+            raise ContentMediaError("content_media_unavailable", 502)
+        destination = BoundedContentMediaBuffer(AUDIO_MAX_BYTES)
+        await bot.download_file(
+            file_path, destination=destination, timeout=30,
+            chunk_size=64 * 1024,
+        )
+        data = destination.getvalue()
+        try:
+            detected_mime = validate_media_bytes("audio", data)
+        except ContentMediaError:
+            raise ContentMediaError("content_media_unavailable", 502) from None
+        if detected_mime != "audio/mpeg":
+            raise ContentMediaError("content_media_unavailable", 502)
+        selected = parse_http_byte_range(request.headers.get("Range"), len(data))
+    except ContentMediaError as error:
+        if error.status == 416:
+            response = web.Response(status=416)
+            response.headers["Content-Range"] = f"bytes */{len(data)}" if "data" in locals() else "bytes */*"
+            apply_miniapp_security_headers(response)
+            response.headers["Cache-Control"] = "private, no-store"
+            return response
+        return content_media_error_response(error)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return content_media_error_response(ContentMediaError("content_media_unavailable", 502))
+    except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, ScheduleImageTooLarge):
+        return content_media_error_response(ContentMediaError("content_media_unavailable", 503))
+    headers = {
+        "Accept-Ranges": "bytes", "Cache-Control": "private, no-store",
+        "Content-Disposition": "inline",
+    }
+    status = 200
+    body = data
+    if selected is not None:
+        start, end = selected
+        status = 206
+        body = data[start:end + 1]
+        headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+    response = web.Response(body=body, status=status, content_type="audio/mpeg", headers=headers)
+    apply_miniapp_security_headers(response)
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
 def member_preview_error_response(error):
     return apply_miniapp_security_headers(web.json_response(
         {"error": error.category}, status=error.status
@@ -21980,7 +22206,8 @@ async def miniapp_admin_member_preview_home(request):
 async def miniapp_admin_member_preview_content(request):
     try:
         result = list_member_preview_content(
-            get_db_conn, limit=request.query.get("limit", "50")
+            get_db_conn, limit=request.query.get("limit", "50"),
+            content_type=request.query.get("content_type", "lesson"),
         )
     except MemberPreviewError as error:
         return member_preview_error_response(error)
@@ -21990,7 +22217,8 @@ async def miniapp_admin_member_preview_content(request):
 async def miniapp_admin_member_preview_content_details(request):
     try:
         result = get_member_preview_content(
-            get_db_conn, request.match_info.get("content_id")
+            get_db_conn, request.match_info.get("content_id"),
+            content_type=request.query.get("content_type"),
         )
     except MemberPreviewError as error:
         return member_preview_error_response(error)
@@ -23172,6 +23400,22 @@ def create_app():
         app.router.add_post('/api/admin/content/media/uploads/{upload_id}/cancel', miniapp_admin_content_media_cancel)
     if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}"):
         app.router.add_get('/api/admin/content/cms/{content_id}/media/{media_id}', miniapp_admin_content_media_proxy)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/media/{media_id}/audio', miniapp_admin_content_audio_proxy)
+    for path, handler in (
+        ('/api/admin/content/cms/{content_id}/publish-preview', miniapp_admin_content_publish_preview),
+        ('/api/admin/content/cms/{content_id}/publish-confirm', miniapp_admin_content_publish_confirm),
+        ('/api/admin/content/cms/{content_id}/publish-cancel', miniapp_admin_content_publish_cancel),
+        ('/api/admin/content/cms/{content_id}/archive-preview', miniapp_admin_content_archive_preview),
+        ('/api/admin/content/cms/{content_id}/archive-confirm', miniapp_admin_content_archive_confirm),
+        ('/api/admin/content/cms/{content_id}/archive-cancel', miniapp_admin_content_archive_cancel),
+    ):
+        if not _route_exists(app, "POST", path):
+            app.router.add_post(path, handler)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/versions"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/versions', miniapp_admin_content_versions)
+    if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}/versions/{version_id}"):
+        app.router.add_get('/api/admin/content/cms/{content_id}/versions/{version_id}', miniapp_admin_content_version_details)
     if not _route_exists(app, "GET", "/api/admin/content/cms/{content_id}"):
         app.router.add_get(
             '/api/admin/content/cms/{content_id}',
@@ -23181,6 +23425,16 @@ def create_app():
         app.router.add_patch(
             '/api/admin/content/cms/{content_id}',
             miniapp_admin_cms_content_update,
+        )
+    if not _route_exists(app, "PUT", "/api/admin/content/cms/{content_id}/recipe"):
+        app.router.add_put(
+            '/api/admin/content/cms/{content_id}/recipe',
+            miniapp_admin_recipe_update,
+        )
+    if not _route_exists(app, "PUT", "/api/admin/content/cms/{content_id}/nutrition"):
+        app.router.add_put(
+            '/api/admin/content/cms/{content_id}/nutrition',
+            miniapp_admin_nutrition_update,
         )
     if not _route_exists(app, "GET", "/api/admin/content/{content_id}"):
         app.router.add_get(

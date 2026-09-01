@@ -685,6 +685,112 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0021_content_types_meditation": {
+        "tables": ("content_items",),
+        "columns": {},
+        "indexes": (),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("content_type", "lesson", "meditation"),
+                "validated": True,
+            },
+        },
+    },
+    "0022_recipe_cms": {
+        "tables": ("content_items", "recipe_ingredients", "recipe_steps"),
+        "columns": {
+            "recipe_ingredients": (
+                "ingredient_id", "content_id", "name", "amount",
+                "sort_order", "created_at", "updated_at",
+            ),
+            "recipe_steps": (
+                "step_id", "content_id", "step_number", "instruction",
+                "created_at", "updated_at",
+            ),
+        },
+        "indexes": (
+            "recipe_ingredients_content_order_idx",
+            "recipe_steps_content_number_idx",
+        ),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("content_type", "lesson", "meditation", "recipe"),
+                "validated": True,
+            },
+            "recipe_ingredients_order_unique": {
+                "table": "recipe_ingredients",
+                "definition_contains": ("content_id", "sort_order", "unique"),
+                "validated": True,
+            },
+            "recipe_steps_number_unique": {
+                "table": "recipe_steps",
+                "definition_contains": ("content_id", "step_number", "unique"),
+                "validated": True,
+            },
+        },
+    },
+    "0023_nutrition_materials": {
+        "tables": ("content_items", "nutrition_material_bodies"),
+        "columns": {
+            "nutrition_material_bodies": (
+                "content_id", "body", "created_at", "updated_at",
+            ),
+        },
+        "indexes": (),
+        "constraints": {
+            "content_items_type_check": {
+                "table": "content_items",
+                "definition_contains": ("lesson", "meditation", "recipe", "nutrition_material"),
+                "validated": True,
+            },
+            "content_items_nutrition_duration_check": {
+                "table": "content_items",
+                "definition_contains": ("nutrition_material", "duration_seconds"),
+                "validated": True,
+            },
+            "nutrition_material_bodies_length_check": {
+                "table": "nutrition_material_bodies",
+                "definition_contains": ("body", "30000"),
+                "validated": True,
+            },
+        },
+    },
+    "0024_meditation_audio": {
+        "tables": ("content_media", "content_media_uploads"),
+        "columns": {},
+        "indexes": ("content_media_one_active_type_idx",),
+        "constraints": {
+            "content_media_type_check": {"table": "content_media", "definition_contains": ("cover", "video", "audio"), "validated": True},
+            "content_media_mime_check": {"table": "content_media", "definition_contains": ("audio", "audio/mpeg"), "validated": True},
+            "content_media_size_check": {"table": "content_media", "definition_contains": ("audio", "20971520"), "validated": True},
+            "content_media_uploads_type_check": {"table": "content_media_uploads", "definition_contains": ("cover", "video", "audio"), "validated": True},
+            "content_media_uploads_mime_check": {"table": "content_media_uploads", "definition_contains": ("audio", "audio/mpeg"), "validated": True},
+            "content_media_uploads_size_check": {"table": "content_media_uploads", "definition_contains": ("audio", "20971520"), "validated": True},
+        },
+    },
+    "0025_content_version_history": {
+        "tables": (
+            "content_item_versions", "content_item_version_media",
+            "content_item_version_recipe_ingredients",
+            "content_item_version_recipe_steps", "content_item_version_nutrition",
+        ),
+        "columns": {
+            "content_item_versions": (
+                "version_id", "content_id", "content_version", "event_type",
+                "content_type", "status", "title", "action_id",
+                "created_by_telegram_id", "created_at",
+            ),
+        },
+        "indexes": ("content_item_versions_content_created_idx",),
+        "constraints": {
+            "content_item_versions_content_version_unique": {"table":"content_item_versions","definition_contains":("content_id","content_version","unique"),"validated":True},
+            "content_item_versions_event_check": {"table":"content_item_versions","definition_contains":("publish","archive"),"validated":True},
+            "content_item_versions_status_check": {"table":"content_item_versions","definition_contains":("published","archived"),"validated":True},
+            "content_item_version_media_type_check": {"table":"content_item_version_media","definition_contains":("cover","video","audio"),"validated":True},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

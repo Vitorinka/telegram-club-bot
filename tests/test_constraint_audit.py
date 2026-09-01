@@ -70,7 +70,7 @@ class ConstraintAuditTests(unittest.TestCase):
             *audit.OPEN_DOMAIN_QUERIES.values(),
         ]
         forbidden = ("INSERT ", "UPDATE ", "DELETE ", "ALTER ", "CREATE ", "DROP ", "VACUUM", "ANALYZE")
-        self.assertEqual(len(audit.GROUPED_QUERIES), 14)
+        self.assertEqual(len(audit.GROUPED_QUERIES), 18)
         for sql in sql_texts:
             text = normalized(sql).upper()
             self.assertTrue(text.startswith("SELECT"), text)

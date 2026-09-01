@@ -11,7 +11,12 @@ APPLICATION_TABLES = (
     "aiogram_fsm_states", "gift_access_grants", "gift_certificate_templates",
     "gift_access_events", "subscription_refund_reconciliations",
     "subscription_refund_events", "content_items", "content_media",
-    "content_media_uploads", "schema_migrations",
+    "content_media_uploads", "recipe_ingredients", "recipe_steps",
+    "nutrition_material_bodies",
+    "content_item_versions", "content_item_version_media",
+    "content_item_version_recipe_ingredients", "content_item_version_recipe_steps",
+    "content_item_version_nutrition",
+    "schema_migrations",
 )
 
 CATALOG_SQL = """

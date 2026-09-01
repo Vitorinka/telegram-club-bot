@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timedelta
 
 from admin_security import claim_admin_action, complete_admin_action, fail_admin_action, make_action_request
+from content_cms import CONTENT_TYPES
 from schedule_uploads import schedule_upload_content_type
 
 
@@ -11,7 +12,16 @@ CONTENT_MEDIA_UPLOAD_TTL_MINUTES = 30
 CONTENT_MEDIA_INFLIGHT_SECONDS = 120
 COVER_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 20 * 1024 * 1024
-MEDIA_TYPES = frozenset({"cover", "video"})
+AUDIO_MAX_BYTES = 20 * 1024 * 1024
+MEDIA_TYPES = frozenset({"cover", "video", "audio"})
+
+
+def media_allowed_for_content(content_type, media_type):
+    if content_type not in CONTENT_TYPES:
+        return False
+    if media_type == "audio":
+        return content_type == "meditation"
+    return not (content_type in {"recipe", "nutrition_material"} and media_type != "cover")
 
 
 class ContentMediaError(ValueError):
@@ -38,6 +48,23 @@ def detect_media_mime(media_type, data):
         if brand not in {b"isom", b"iso2", b"mp41", b"mp42", b"avc1", b"M4V ", b"dash"}:
             return None
         return "video/mp4"
+    if media_type == "audio":
+        offset = 0
+        if len(data) >= 10 and data[:3] == b"ID3":
+            size_bytes = data[6:10]
+            if any(value & 0x80 for value in size_bytes):
+                return None
+            offset = 10 + sum(value << shift for value, shift in zip(size_bytes, (21, 14, 7, 0)))
+        if offset + 4 > len(data):
+            return None
+        first, second, third = data[offset], data[offset + 1], data[offset + 2]
+        if first != 0xFF or second & 0xE0 != 0xE0:
+            return None
+        if second & 0x18 == 0x08 or second & 0x06 == 0:
+            return None
+        if third >> 4 in (0, 15) or (third >> 2) & 0x03 == 0x03:
+            return None
+        return "audio/mpeg"
     return None
 
 
@@ -46,7 +73,7 @@ def validate_media_bytes(media_type, data):
         raise ContentMediaError("invalid_content_media_type")
     if not isinstance(data, bytes) or not data:
         raise ContentMediaError("content_media_missing")
-    limit = COVER_MAX_BYTES if media_type == "cover" else VIDEO_MAX_BYTES
+    limit = COVER_MAX_BYTES if media_type == "cover" else (AUDIO_MAX_BYTES if media_type == "audio" else VIDEO_MAX_BYTES)
     if len(data) > limit:
         raise ContentMediaError("content_media_too_large", 413)
     mime = detect_media_mime(media_type, data)
@@ -125,8 +152,10 @@ def create_media_upload(get_connection, admin_id, content_id, media_type, data):
         content = cur.fetchone()
         if not content:
             raise ContentMediaError("content_not_found", 404)
-        if content[1] != "draft" or content[3] != "lesson":
+        if content[1] != "draft" or content[3] not in CONTENT_TYPES:
             raise ContentMediaError("content_not_editable", 409)
+        if not media_allowed_for_content(content[3], media_type):
+            raise ContentMediaError("invalid_content_media_type")
         cur.execute("SELECT media_id FROM content_media WHERE content_id=%s AND media_type=%s AND deleted_at IS NULL", (content_id, media_type))
         existing = cur.fetchone()
         now = datetime.utcnow()
@@ -253,7 +282,8 @@ def prepare_media_execution(get_connection, upload_id, action_id, admin_id):
         if status != 'confirmed': conn.commit(); return {"mode":status}
         cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
         content = cur.fetchone()
-        if not content or content[0] != 'draft' or content[1] != expected_version or content[2] != 'lesson':
+        if (not content or content[0] != 'draft' or content[1] != expected_version
+                or not media_allowed_for_content(content[2], media_type)):
             cur.execute("UPDATE content_media_uploads SET status='failed',media_bytes=''::bytea,byte_size=0,consumed_at=NOW(),updated_at=NOW(),failure_category='content_version_changed' WHERE upload_id=%s", (upload_id,))
             fail_admin_action(cur, action_id); conn.commit()
             return {"mode":"failed", "failure_category":"content_version_changed"}
@@ -312,7 +342,8 @@ def apply_media_upload(get_connection, upload_id, action_id, admin_id):
         current = cur.fetchone()
         current_id = current[0] if current else None
         if (not content or content[0] != 'draft' or content[1] != expected_version
-                or content[2] != 'lesson' or current_id != expected_existing):
+                or not media_allowed_for_content(content[2], media_type)
+                or current_id != expected_existing):
             cur.execute("UPDATE content_media_uploads SET status='failed',media_bytes=''::bytea,byte_size=0,telegram_file_id=NULL,consumed_at=NOW(),updated_at=NOW(),failure_category='content_version_changed' WHERE upload_id=%s", (upload_id,))
             fail_admin_action(cur, action_id); conn.commit()
             return {"status":"failed", "failure_category":"content_version_changed"}
@@ -354,10 +385,14 @@ def get_media_reference(get_connection, content_id, media_id):
     conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
-        cur.execute("SELECT media_type,mime_type,size_bytes,server_reference FROM content_media WHERE content_id=%s AND media_id=%s AND deleted_at IS NULL", (content_id, media_id))
+        cur.execute("""
+            SELECT m.media_type,m.mime_type,m.size_bytes,m.server_reference,c.content_type
+            FROM content_media m JOIN content_items c ON c.content_id=m.content_id
+            WHERE m.content_id=%s AND m.media_id=%s AND m.deleted_at IS NULL
+        """, (content_id, media_id))
         row=cur.fetchone(); conn.rollback()
         if not row: return None
-        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3]}
+        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3], "content_type":row[4]}
     except Exception:
         conn.rollback(); raise
     finally:

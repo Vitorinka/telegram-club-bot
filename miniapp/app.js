@@ -74,9 +74,12 @@
   const cmsContentList = document.getElementById("cms-content-list");
   const cmsContentEmpty = document.getElementById("cms-content-empty");
   const contentCreateTitle = document.getElementById("content-create-title");
+  const contentCreateType = document.getElementById("content-create-type");
   const contentCreateCategory = document.getElementById("content-create-category");
   const contentCreateDescription = document.getElementById("content-create-description");
   const contentCreateDuration = document.getElementById("content-create-duration");
+  const contentCreateBody = document.getElementById("content-create-body");
+  const contentCreateBodyLabel = document.getElementById("content-create-body-label");
   const contentCreateMessage = document.getElementById("content-create-message");
   const contentEditCard = document.getElementById("content-edit-card");
   const contentEditTitle = document.getElementById("content-edit-title");
@@ -88,14 +91,27 @@
   const contentMediaCard = document.getElementById("content-media-card");
   const contentCoverCurrent = document.getElementById("content-cover-current");
   const contentVideoCurrent = document.getElementById("content-video-current");
+  const contentVideoControl = document.getElementById("content-video-control");
+  const contentAudioControl = document.getElementById("content-audio-control");
+  const contentAudioCurrent = document.getElementById("content-audio-current");
   const contentCoverFile = document.getElementById("content-cover-file");
   const contentVideoFile = document.getElementById("content-video-file");
+  const contentAudioFile = document.getElementById("content-audio-file");
   const contentMediaConfirmation = document.getElementById("content-media-confirmation");
   const contentMediaPreview = document.getElementById("content-media-preview");
   const contentMediaSummary = document.getElementById("content-media-summary");
   const contentMediaMessage = document.getElementById("content-media-message");
   const contentMediaConfirm = document.getElementById("content-media-confirm");
   const contentMediaCancel = document.getElementById("content-media-cancel");
+  const contentLifecycleCard = document.getElementById("content-lifecycle-card");
+  const contentLifecycleTitle = document.getElementById("content-lifecycle-title");
+  const contentLifecycleMessage = document.getElementById("content-lifecycle-message");
+  const contentLifecyclePreview = document.getElementById("content-lifecycle-preview");
+  const contentLifecyclePreviewButton = document.getElementById("content-lifecycle-preview-button");
+  const contentLifecycleConfirm = document.getElementById("content-lifecycle-confirm");
+  const contentLifecycleCancel = document.getElementById("content-lifecycle-cancel");
+  const contentVersionHistory = document.getElementById("content-version-history");
+  const contentVersionHistoryEmpty = document.getElementById("content-version-history-empty");
   const memberHomeLessons = document.getElementById("member-home-lessons");
   const memberHomeEmpty = document.getElementById("member-home-empty");
   const memberHomeCategories = document.getElementById("member-home-categories");
@@ -105,6 +121,23 @@
   const memberLibrarySearch = document.getElementById("member-library-search");
   const memberLibraryChips = document.getElementById("member-library-chips");
   const memberScheduleContent = document.getElementById("member-schedule-content");
+  const memberMeditationList = document.getElementById("member-meditation-list");
+  const memberMeditationEmpty = document.getElementById("member-meditation-empty");
+  const memberMeditationSearch = document.getElementById("member-meditation-search");
+  const contentRecipeCard = document.getElementById("content-recipe-card");
+  const contentNutritionCard = document.getElementById("content-nutrition-card");
+  const contentNutritionBody = document.getElementById("content-nutrition-body");
+  const contentNutritionMessage = document.getElementById("content-nutrition-message");
+  const recipeIngredientsList = document.getElementById("recipe-ingredients-list");
+  const recipeStepsList = document.getElementById("recipe-steps-list");
+  const recipeEditMessage = document.getElementById("recipe-edit-message");
+  const memberRecipeList = document.getElementById("member-recipe-list");
+  const memberRecipeEmpty = document.getElementById("member-recipe-empty");
+  const memberRecipeSearch = document.getElementById("member-recipe-search");
+  const memberRecipeChips = document.getElementById("member-recipe-chips");
+  const memberNutritionList = document.getElementById("member-nutrition-list");
+  const memberNutritionEmpty = document.getElementById("member-nutrition-empty");
+  const memberNutritionSearch = document.getElementById("member-nutrition-search");
   const metricNodes = document.querySelectorAll("[data-metric]");
   const statusLabels = {active: "Активен", active_grace: "Grace", expired: "Просрочен", inactive: "Нет доступа"};
   const typeLabels = {trial: "Trial", paid: "Платная", gift: "Подарок", manual: "Ручной", unknown: "Не определено"};
@@ -133,10 +166,22 @@
   let contentMediaLocalUrl = null;
   let contentMediaServerUrl = null;
   let contentMediaAttachedCoverUrl = null;
+  let contentLifecycleActionId = null;
+  let contentLifecycleMode = null;
   let memberPreviewMode = false;
   let memberCoverGeneration = 0;
+  let memberAudioGeneration = 0;
+  let memberAudioElement = null;
+  let memberAudioUrl = null;
   const memberCoverUrls = new Map();
   let memberLibraryItems = [];
+  let memberMeditationItems = [];
+  let memberRecipeItems = [];
+  let memberNutritionItems = [];
+  let memberRecipeCategory = "all";
+  let memberDetailContentType = "lesson";
+  let recipeIngredients = [];
+  let recipeSteps = [];
   let memberLibraryCategory = "all";
 
   const text = (tag, value, className) => {
@@ -218,6 +263,17 @@
     memberCoverUrls.forEach((url) => URL.revokeObjectURL(url));
     memberCoverUrls.clear();
   };
+  const clearMemberAudio = () => {
+    memberAudioGeneration += 1;
+    if (memberAudioElement) {
+      memberAudioElement.pause();
+      memberAudioElement.removeAttribute("src");
+      memberAudioElement.load();
+      memberAudioElement = null;
+    }
+    if (memberAudioUrl) URL.revokeObjectURL(memberAudioUrl);
+    memberAudioUrl = null;
+  };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
     const container = document.createElement("div");
@@ -249,7 +305,7 @@
     });
     return container;
   };
-  const memberLessonCard = (item) => {
+  const memberContentCard = (item) => {
     const article = document.createElement("article");
     article.className = "member-card member-content-card member-lesson-card";
     const button = document.createElement("button");
@@ -268,11 +324,12 @@
     if (item.duration_seconds) meta.append(text("span", `${Math.ceil(item.duration_seconds / 60)} мин.`, "member-duration-badge"));
     if (item.description) copy.append(text("p", item.description, "member-description-excerpt"));
     button.append(copy);
-    button.addEventListener("click", () => loadMemberLesson(item.content_id).catch(showApiError));
+    button.addEventListener("click", () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
     article.append(button);
     return article;
   };
   const showMemberScreen = (name) => {
+    if (name !== "member-lesson") clearMemberAudio();
     memberPreviewMode = true;
     document.body.classList.add("member-preview-mode");
     adminHero.hidden = true;
@@ -282,7 +339,7 @@
     showScreen(name);
     const navigationName = (
       name === "member-lesson" || name === "member-meditations"
-      || name === "member-recipes"
+      || name === "member-recipes" || name === "member-nutrition"
     ) ? "member-library" : name;
     document.querySelectorAll("[data-member-nav]").forEach((button) => {
       button.classList.toggle("active", button.dataset.memberNav === navigationName);
@@ -292,7 +349,7 @@
     return api("/api/admin/member-preview/home").then((data) => {
       clearMemberCoverUrls();
       memberHomeLessons.replaceChildren();
-      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberLessonCard(item)));
+      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
       memberHomeEmpty.hidden = data.latest_lessons.length !== 0;
       memberHomeCategories.replaceChildren();
       data.categories.forEach((entry) => {
@@ -316,7 +373,7 @@
     });
     clearMemberCoverUrls();
     memberTrainingList.replaceChildren();
-    items.forEach((item) => memberTrainingList.append(memberLessonCard(item)));
+    items.forEach((item) => memberTrainingList.append(memberContentCard(item)));
     memberTrainingEmpty.hidden = items.length !== 0;
   };
   const configureMemberLibraryFilters = () => {
@@ -349,9 +406,11 @@
       showMemberScreen("member-library");
     });
   };
-  const loadMemberLesson = (contentId) => {
-    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}`).then((item) => {
+  const loadMemberLesson = (contentId, contentType = "lesson") => {
+    return api(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`).then((item) => {
       clearMemberCoverUrls();
+      clearMemberAudio();
+      memberDetailContentType = contentType;
       memberLessonContent.replaceChildren();
       memberLessonContent.append(memberCover(item, true));
       const heading = document.createElement("header");
@@ -360,18 +419,135 @@
       meta.append(text("span", memberCategoryLabel(item.category)));
       if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
       heading.append(meta, text("h1", item.title));
-      if (item.duration_seconds) heading.append(text("p", `${Math.ceil(item.duration_seconds / 60)} минут`));
+      if (item.duration_seconds) heading.append(text(
+        "p",
+        item.content_type === "recipe"
+          ? `Время приготовления: ${Math.ceil(item.duration_seconds / 60)} минут`
+          : `${Math.ceil(item.duration_seconds / 60)} минут`
+      ));
       memberLessonContent.append(heading);
       if (item.description) memberLessonContent.append(text("p", item.description, "member-description"));
-      const video = document.createElement("section");
-      video.className = "member-video-shell";
-      video.append(text("span", "▶", "member-play-icon"));
-      video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
-      video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
-      memberLessonContent.append(video);
+      if (item.content_type === "recipe") {
+        const ingredients = document.createElement("section");
+        ingredients.className = "member-recipe-detail";
+        ingredients.append(text("h2", "Ингредиенты"));
+        const ingredientList = document.createElement("ul");
+        (item.ingredients || []).forEach((entry) => {
+          ingredientList.append(text("li", entry.amount ? `${entry.name} — ${entry.amount}` : entry.name));
+        });
+        if (!item.ingredients || !item.ingredients.length) ingredientList.append(text("li", "Ингредиенты пока не добавлены"));
+        ingredients.append(ingredientList);
+        const preparation = document.createElement("section");
+        preparation.className = "member-recipe-detail";
+        preparation.append(text("h2", "Способ приготовления"));
+        const stepList = document.createElement("ol");
+        (item.steps || []).forEach((entry) => stepList.append(text("li", entry.instruction)));
+        if (!item.steps || !item.steps.length) stepList.append(text("li", "Шаги пока не добавлены"));
+        preparation.append(stepList);
+        memberLessonContent.append(ingredients, preparation);
+      }
+      if (item.content_type === "nutrition_material") {
+        const body = document.createElement("section");
+        body.className = "member-card member-nutrition-body";
+        (item.body || "").split(/\n{2,}/).filter((paragraph) => paragraph.trim()).forEach((paragraph) => {
+          body.append(text("p", paragraph));
+        });
+        memberLessonContent.append(body);
+      }
+      if (item.content_type === "meditation" && item.has_audio && item.audio_media_id) {
+        const generation = memberAudioGeneration;
+        const player = document.createElement("section");
+        player.className = "member-card member-audio-player";
+        const toggle = text("button", "▶"); toggle.type = "button"; toggle.disabled = true;
+        const progress = document.createElement("input"); progress.type = "range"; progress.min = "0"; progress.max = "0"; progress.value = "0"; progress.step = "0.1"; progress.setAttribute("aria-label", "Позиция аудио");
+        const times = document.createElement("div"); times.className = "member-audio-time";
+        const current = text("span", "0:00"); const total = text("span", "—"); times.append(current, total);
+        player.append(toggle, progress, times); memberLessonContent.append(player);
+        fetch(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.audio_media_id)}/audio`, {
+          headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+        }).then((response) => { if (!response.ok) throw new Error("audio_unavailable"); return response.blob(); }).then((blob) => {
+          if (generation !== memberAudioGeneration) return;
+          memberAudioUrl = URL.createObjectURL(blob);
+          const audio = document.createElement("audio"); audio.preload = "metadata"; audio.src = memberAudioUrl;
+          memberAudioElement = audio;
+          const clock = (seconds) => Number.isFinite(seconds) ? `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}` : "—";
+          audio.addEventListener("loadedmetadata", () => { progress.max = String(audio.duration || 0); total.textContent = clock(audio.duration); toggle.disabled = false; });
+          audio.addEventListener("timeupdate", () => { progress.value = String(audio.currentTime); current.textContent = clock(audio.currentTime); });
+          audio.addEventListener("ended", () => { toggle.textContent = "▶"; });
+          toggle.addEventListener("click", () => { if (audio.paused) audio.play().then(() => { toggle.textContent = "❚❚"; }).catch(() => null); else { audio.pause(); toggle.textContent = "▶"; } });
+          progress.addEventListener("input", () => { audio.currentTime = Number(progress.value); });
+        }).catch(() => { if (generation === memberAudioGeneration) player.replaceChildren(text("p", "Аудио временно недоступно.")); });
+      }
+      if (item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
+        const video = document.createElement("section");
+        video.className = "member-video-shell";
+        video.append(text("span", "▶", "member-play-icon"));
+        video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
+        video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
+        memberLessonContent.append(video);
+      }
       showMemberScreen("member-lesson");
     });
   };
+  const renderMemberMeditations = () => {
+    const query = memberMeditationSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberMeditationItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
+    clearMemberCoverUrls();
+    memberMeditationList.replaceChildren();
+    items.forEach((item) => memberMeditationList.append(memberContentCard(item)));
+    memberMeditationEmpty.hidden = items.length !== 0;
+  };
+  const loadMemberMeditations = () => api("/api/admin/member-preview/content?content_type=meditation&limit=50").then((data) => {
+    memberMeditationItems = data.items;
+    renderMemberMeditations();
+    showMemberScreen("member-meditations");
+  });
+  const renderMemberRecipes = () => {
+    const query = memberRecipeSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberRecipeItems.filter((item) => {
+      const categoryMatches = memberRecipeCategory === "all" || (item.category || "other") === memberRecipeCategory;
+      return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
+    });
+    clearMemberCoverUrls();
+    memberRecipeList.replaceChildren();
+    items.forEach((item) => memberRecipeList.append(memberContentCard(item)));
+    memberRecipeEmpty.hidden = items.length !== 0;
+  };
+  const configureMemberRecipeFilters = () => {
+    const categories = [...new Set(memberRecipeItems.map((item) => item.category || "other"))];
+    memberRecipeChips.replaceChildren();
+    [{key: "all", label: "Все"}, ...categories.map((key) => ({key, label: memberCategoryLabel(key)}))].forEach((entry) => {
+      const chip = text("button", entry.label, "member-chip");
+      chip.type = "button";
+      chip.classList.toggle("active", entry.key === memberRecipeCategory);
+      chip.addEventListener("click", () => {
+        memberRecipeCategory = entry.key;
+        configureMemberRecipeFilters();
+        renderMemberRecipes();
+      });
+      memberRecipeChips.append(chip);
+    });
+  };
+  const loadMemberRecipes = () => api("/api/admin/member-preview/content?content_type=recipe&limit=50").then((data) => {
+    memberRecipeItems = data.items;
+    if (!memberRecipeItems.some((item) => (item.category || "other") === memberRecipeCategory)) memberRecipeCategory = "all";
+    configureMemberRecipeFilters();
+    renderMemberRecipes();
+    showMemberScreen("member-recipes");
+  });
+  const renderMemberNutrition = () => {
+    const query = memberNutritionSearch.value.trim().toLocaleLowerCase("ru");
+    const items = memberNutritionItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
+    clearMemberCoverUrls();
+    memberNutritionList.replaceChildren();
+    items.forEach((item) => memberNutritionList.append(memberContentCard(item)));
+    memberNutritionEmpty.hidden = items.length !== 0;
+  };
+  const loadMemberNutrition = () => api("/api/admin/member-preview/content?content_type=nutrition_material&limit=50").then((data) => {
+    memberNutritionItems = data.items;
+    renderMemberNutrition();
+    showMemberScreen("member-nutrition");
+  });
   const renderMemberScheduleEmpty = () => {
     const empty = document.createElement("article");
     empty.className = "member-card member-empty-state member-empty-art member-schedule-empty";
@@ -411,6 +587,7 @@
   const exitMemberPreview = () => {
     memberPreviewMode = false;
     clearMemberCoverUrls();
+    clearMemberAudio();
     document.body.classList.remove("member-preview-mode");
     memberBottomNav.hidden = true;
     memberShellHeader.hidden = true;
@@ -445,6 +622,7 @@
     contentMediaUploadId = null;
     contentCoverFile.value = "";
     contentVideoFile.value = "";
+    contentAudioFile.value = "";
     contentMediaConfirmation.hidden = true;
     contentMediaPreview.replaceChildren(text("span", "Предварительный просмотр", "schedule-image-loading"));
     contentMediaSummary.replaceChildren();
@@ -1227,12 +1405,48 @@
     }).catch(showApiError);
   }
 
+  const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт", nutrition_material: "Материал нутрициолога"}[contentType] || contentType);
+  const recipeMove = (items, index, offset) => {
+    const target = index + offset;
+    if (target < 0 || target >= items.length) return;
+    [items[index], items[target]] = [items[target], items[index]];
+    renderRecipeEditor();
+  };
+  const recipeRowButton = (label, handler) => {
+    const button = text("button", label, "secondary");
+    button.type = "button";
+    button.addEventListener("click", handler);
+    return button;
+  };
+  const renderRecipeEditor = () => {
+    recipeIngredientsList.replaceChildren();
+    recipeIngredients.forEach((item, index) => {
+      const row = document.createElement("div"); row.className = "recipe-editor-row";
+      const name = document.createElement("input"); name.type = "text"; name.maxLength = 200; name.placeholder = "Ингредиент"; name.value = item.name;
+      const amount = document.createElement("input"); amount.type = "text"; amount.maxLength = 100; amount.placeholder = "Количество"; amount.value = item.amount || "";
+      name.addEventListener("input", () => { item.name = name.value; });
+      amount.addEventListener("input", () => { item.amount = amount.value; });
+      const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeIngredients, index, -1)), recipeRowButton("↓", () => recipeMove(recipeIngredients, index, 1)), recipeRowButton("Удалить", () => { recipeIngredients.splice(index, 1); renderRecipeEditor(); }));
+      row.append(name, amount, controls); recipeIngredientsList.append(row);
+    });
+    recipeStepsList.replaceChildren();
+    recipeSteps.forEach((item, index) => {
+      const row = document.createElement("div"); row.className = "recipe-editor-row";
+      const instruction = document.createElement("textarea"); instruction.maxLength = 2000; instruction.placeholder = `Шаг ${index + 1}`; instruction.value = item.instruction;
+      instruction.addEventListener("input", () => { item.instruction = instruction.value; });
+      const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeSteps, index, -1)), recipeRowButton("↓", () => recipeMove(recipeSteps, index, 1)), recipeRowButton("Удалить", () => { recipeSteps.splice(index, 1); renderRecipeEditor(); }));
+      row.append(instruction, controls); recipeStepsList.append(row);
+    });
+  };
   const cmsContentCard = (item) => {
     const article = document.createElement("article");
     article.className = "card user-card";
     const button = document.createElement("button");
     button.type = "button";
-    button.append(text("p", "CMS", "eyebrow"), text("h2", item.title));
+    const typeLabel = cmsTypeLabel(item.content_type);
+    button.append(text("p", `CMS · ${typeLabel}`, "eyebrow"), text("h2", item.title));
     const badges = document.createElement("div");
     badges.className = "badges";
     badges.append(text("span", item.status, "badge"), text("span", `v${item.version}`, "badge"));
@@ -1241,6 +1455,81 @@
     article.append(button);
     return article;
   };
+  const renderVersionDetails = (version) => {
+    const domain = version.content_type === "recipe"
+      ? `${version.ingredients.length} ингредиентов · ${version.steps.length} шагов`
+      : version.content_type === "nutrition_material" ? version.nutrition_body : null;
+    contentVersionHistory.prepend(detailCard(`Версия ${version.version}`, [
+      ["Событие", version.event_type], ["Статус", version.status],
+      ["Название", version.title], ["Описание", version.description],
+      ["Длительность", version.duration_seconds ? `${version.duration_seconds} сек.` : null],
+      ["Медиа", version.media.map((entry) => `${entry.media_type} v${entry.version}`).join(", ") || "Нет"],
+      ["Данные", domain], ["Администратор", `ID ${version.admin_id}`],
+      ["Дата", formatDate(version.created_at)],
+    ]));
+  };
+  const loadContentVersions = (contentId) => api(`/api/admin/content/cms/${encodeURIComponent(contentId)}/versions`).then((data) => {
+    contentVersionHistory.replaceChildren();
+    contentVersionHistoryEmpty.hidden = data.items.length !== 0;
+    data.items.forEach((version) => {
+      const button = text("button", `v${version.version} · ${version.event_type} · ${formatDate(version.created_at)}`, "secondary");
+      button.type = "button";
+      button.addEventListener("click", () => api(`/api/admin/content/cms/${encodeURIComponent(contentId)}/versions/${encodeURIComponent(version.version_id)}`).then(renderVersionDetails).catch(showApiError));
+      contentVersionHistory.append(button);
+    });
+  });
+  const resetContentLifecycle = (item) => {
+    contentLifecycleActionId = null;
+    contentLifecycleMode = item.status === "published" ? "archive" : "publish";
+    contentLifecycleCard.hidden = item.status === "archived";
+    contentLifecycleTitle.textContent = item.status === "published" ? "Архивирование" : "Публикация";
+    contentLifecyclePreviewButton.textContent = item.status === "published" ? "Предпросмотр архивирования" : "Предпросмотр публикации";
+    contentLifecycleMessage.textContent = item.status === "published"
+      ? "Архивирование требует отдельного подтверждения. История и данные сохранятся."
+      : "Публикация требует финального server-side preview и подтверждения.";
+    contentLifecyclePreview.hidden = true;
+    contentLifecycleConfirm.hidden = true;
+    contentLifecycleCancel.hidden = true;
+    contentLifecyclePreviewButton.hidden = item.status === "archived";
+  };
+  const previewContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleMode) return Promise.resolve();
+    const mode = contentLifecycleMode;
+    contentLifecycleMessage.textContent = "Проверяем финальное состояние…";
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-preview`, {expected_version: currentCmsContent.version}).then((preview) => {
+      contentLifecycleActionId = preview.action_id;
+      contentLifecyclePreview.replaceChildren(
+        text("strong", preview.title),
+        text("span", cmsTypeLabel(preview.content_type)),
+        text("span", preview.description || "Без описания"),
+        text("span", `Медиа: ${preview.media.map((entry) => entry.media_type).join(", ") || "нет"}`),
+        text("span", `Действительно до ${formatDate(preview.preview_expires_at)}`)
+      );
+      contentLifecyclePreview.hidden = false;
+      contentLifecycleConfirm.textContent = mode === "archive" ? "Архивировать" : "Опубликовать";
+      contentLifecycleConfirm.hidden = false; contentLifecycleCancel.hidden = false;
+      contentLifecycleMessage.textContent = mode === "archive"
+        ? "Материал перестанет отображаться в будущей пользовательской библиотеке, но история и данные сохранятся."
+        : "Проверьте итоговые данные перед публикацией.";
+    }).catch((error) => { contentLifecycleMessage.textContent = `Проверка не пройдена: ${error.message}`; });
+  };
+  const confirmContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
+    contentLifecycleConfirm.disabled = true;
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-confirm`, {action_id: contentLifecycleActionId})
+      .then(() => loadCmsContentDetails(currentCmsContent.content_id))
+      .catch((error) => {
+        contentLifecycleMessage.textContent = error.message === "content_publish_preview_expired"
+          ? "Предварительный просмотр устарел. Обновите данные и повторите."
+          : error.message === "content_publish_state_changed" ? "Материал изменился после проверки. Обновите данные." : `Операция не выполнена: ${error.message}`;
+      }).finally(() => { contentLifecycleConfirm.disabled = false; });
+  };
+  const cancelContentLifecycle = () => {
+    if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-cancel`, {action_id: contentLifecycleActionId})
+      .then(() => { resetContentLifecycle(currentCmsContent); status.textContent = "Операция отменена"; })
+      .catch(showApiError);
+  };
   const loadCmsContentDetails = (contentId) => {
     clearContentMediaUrls();
     resetContentMediaDraft();
@@ -1248,20 +1537,32 @@
     return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
       currentCmsContent = item;
       contentDetailsContent.replaceChildren(detailCard("CMS material", [
-        ["Название", item.title], ["Тип", item.content_type],
+        ["Название", item.title], ["Тип", cmsTypeLabel(item.content_type)],
         ["Категория", item.category], ["Описание", item.description],
         ["Длительность", item.duration_seconds ? `${item.duration_seconds} сек.` : null],
         ["Статус", item.status], ["Версия", item.version],
       ]));
       contentEditCard.hidden = item.status !== "draft";
       contentMediaCard.hidden = item.status !== "draft";
+      contentRecipeCard.hidden = item.status !== "draft" || item.content_type !== "recipe";
+      contentNutritionCard.hidden = item.status !== "draft" || item.content_type !== "nutrition_material";
+      contentVideoControl.hidden = item.content_type === "recipe" || item.content_type === "nutrition_material";
+      contentAudioControl.hidden = item.content_type !== "meditation";
       contentEditTitle.value = item.title;
       contentEditCategory.value = item.category || "";
       contentEditDescription.value = item.description || "";
       contentEditDuration.value = item.duration_seconds || "";
+      contentEditDuration.closest("label").hidden = item.content_type === "nutrition_material";
+      document.getElementById("content-edit-save").hidden = item.content_type === "nutrition_material";
       contentEditOrder.value = item.sort_order;
       contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
+      recipeIngredients = item.recipe ? item.recipe.ingredients.map((entry) => ({name: entry.name, amount: entry.amount || ""})) : [];
+      recipeSteps = item.recipe ? item.recipe.steps.map((entry) => ({instruction: entry.instruction})) : [];
+      contentNutritionBody.value = item.nutrition ? item.nutrition.body : "";
+      renderRecipeEditor();
       renderContentMedia(item);
+      resetContentLifecycle(item);
+      loadContentVersions(item.content_id).catch(showApiError);
       showScreen("content-details");
       status.textContent = item.title;
     }).catch(showApiError);
@@ -1289,24 +1590,28 @@
   function renderContentMedia(item) {
     const cover = (item.media || []).find((entry) => entry.media_type === "cover");
     const video = (item.media || []).find((entry) => entry.media_type === "video");
+    const audio = (item.media || []).find((entry) => entry.media_type === "audio");
     contentCoverCurrent.replaceChildren(text("span", cover ? "Загружаем обложку…" : "Обложка не прикреплена", "schedule-image-loading"));
     contentVideoCurrent.textContent = video
       ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
       : "Видео не прикреплено";
+    contentAudioCurrent.textContent = audio
+      ? `MP3 · ${Math.ceil(audio.size_bytes / 1024 / 1024)} МиБ · версия ${audio.version}`
+      : "Аудио не прикреплено";
     if (cover) fetchContentCover(item, cover);
   }
   const showLocalContentMedia = (mediaType) => {
-    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
     contentMediaPreview.replaceChildren();
     if (!file) contentMediaPreview.append(text("span", "Выберите файл", "schedule-image-loading"));
     else if (mediaType === "cover") contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки"));
-    else contentMediaPreview.append(text("span", `Локально выбрано видео: ${file.name}`, "schedule-image-loading"));
+    else contentMediaPreview.append(text("span", `Локально выбрано ${mediaType === "audio" ? "аудио" : "видео"}: ${file.name}`, "schedule-image-loading"));
   };
   const validateContentMedia = (mediaType) => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
-    const file = mediaType === "cover" ? contentCoverFile.files[0] : contentVideoFile.files[0];
+    const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (!file) {
       contentMediaMessage.textContent = "Выберите файл.";
       contentMediaConfirmation.hidden = false;
@@ -1322,7 +1627,7 @@
         contentMediaUploadId = draft.upload_id;
         contentMediaSummary.replaceChildren(
           text("strong", currentCmsContent.title),
-          text("span", mediaType === "cover" ? "Обложка" : "Видео"),
+          text("span", mediaType === "cover" ? "Обложка" : mediaType === "audio" ? "Аудио" : "Видео"),
           text("span", `${draft.mime_type} · ${Math.ceil(draft.size_bytes / 1024)} КиБ`)
         );
         contentMediaMessage.textContent = draft.existing_media
@@ -1369,14 +1674,17 @@
   const optionalNumber = (input) => input.value === "" ? null : Number(input.value);
   const createCmsDraft = () => {
     contentCreateMessage.textContent = "Создаём черновик…";
-    return writeAdminJson("POST", "/api/admin/content/drafts", {
-      content_type: "lesson", title: contentCreateTitle.value,
+    const payload = {
+      content_type: contentCreateType.value, title: contentCreateTitle.value,
       category: contentCreateCategory.value || null,
       description: contentCreateDescription.value || null,
-      duration_seconds: optionalNumber(contentCreateDuration),
-    }).then((item) => {
+      duration_seconds: contentCreateType.value === "nutrition_material" ? null : optionalNumber(contentCreateDuration),
+    };
+    if (contentCreateType.value === "nutrition_material") payload.body = contentCreateBody.value;
+    return writeAdminJson("POST", "/api/admin/content/drafts", payload).then((item) => {
       contentCreateTitle.value = ""; contentCreateCategory.value = "";
       contentCreateDescription.value = ""; contentCreateDuration.value = "";
+      contentCreateBody.value = "";
       return loadCmsContentDetails(item.content_id);
     }).catch((error) => {
       contentCreateMessage.textContent = `Не удалось создать черновик: ${error.message}`;
@@ -1396,6 +1704,36 @@
       contentEditMessage.textContent = error.message === "content_version_changed"
         ? "Материал уже изменился. Обновите данные и повторите."
         : `Не удалось сохранить: ${error.message}`;
+    });
+  };
+  const saveRecipe = () => {
+    if (!currentCmsContent || currentCmsContent.content_type !== "recipe") return Promise.resolve();
+    recipeEditMessage.textContent = "Сохраняем…";
+    return writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/recipe`, {
+      expected_version: currentCmsContent.version,
+      ingredients: recipeIngredients.map((item, index) => ({name: item.name, amount: item.amount || null, sort_order: index})),
+      steps: recipeSteps.map((item, index) => ({step_number: index + 1, instruction: item.instruction})),
+    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+      recipeEditMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить рецепт: ${error.message}`;
+    });
+  };
+  const saveNutrition = () => {
+    if (!currentCmsContent || currentCmsContent.content_type !== "nutrition_material") return Promise.resolve();
+    contentNutritionMessage.textContent = "Сохраняем…";
+    return writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/nutrition`, {
+      expected_version: currentCmsContent.version,
+      title: contentEditTitle.value,
+      category: contentEditCategory.value || null,
+      description: contentEditDescription.value || null,
+      duration_seconds: null,
+      sort_order: Number(contentEditOrder.value),
+      body: contentNutritionBody.value,
+    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+      contentNutritionMessage.textContent = error.message === "content_version_changed"
+        ? "Материал уже изменился. Обновите данные и повторите."
+        : `Не удалось сохранить материал: ${error.message}`;
     });
   };
 
@@ -1424,10 +1762,19 @@
   document.getElementById("member-home-all").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-continue").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
-  document.getElementById("member-lesson-back").addEventListener("click", () => loadMemberLibrary(memberLibraryCategory).catch(showApiError));
-  document.getElementById("member-open-meditations").addEventListener("click", () => showMemberScreen("member-meditations"));
-  document.getElementById("member-open-recipes").addEventListener("click", () => showMemberScreen("member-recipes"));
-  document.getElementById("member-open-nutrition").addEventListener("click", () => showMemberScreen("member-recipes"));
+  document.getElementById("member-lesson-back").addEventListener("click", () => {
+    const target = memberDetailContentType === "meditation" ? loadMemberMeditations()
+      : memberDetailContentType === "recipe" ? loadMemberRecipes()
+      : memberDetailContentType === "nutrition_material" ? loadMemberNutrition()
+      : loadMemberLibrary(memberLibraryCategory);
+    target.catch(showApiError);
+  });
+  document.getElementById("member-open-meditations").addEventListener("click", () => loadMemberMeditations().catch(showApiError));
+  memberMeditationSearch.addEventListener("input", renderMemberMeditations);
+  document.getElementById("member-open-recipes").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
+  document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberNutrition().catch(showApiError));
+  memberNutritionSearch.addEventListener("input", renderMemberNutrition);
+  memberRecipeSearch.addEventListener("input", renderMemberRecipes);
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
   document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
@@ -1449,12 +1796,26 @@
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
   document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
+  document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); renderRecipeEditor(); } });
+  document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); renderRecipeEditor(); } });
+  document.getElementById("recipe-save").addEventListener("click", saveRecipe);
+  document.getElementById("content-nutrition-save").addEventListener("click", saveNutrition);
+  contentCreateType.addEventListener("change", () => {
+    const nutrition = contentCreateType.value === "nutrition_material";
+    contentCreateBodyLabel.hidden = !nutrition;
+    contentCreateDuration.closest("label").hidden = nutrition;
+  });
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
+  document.getElementById("content-audio-validate").addEventListener("click", () => validateContentMedia("audio"));
   contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
   contentVideoFile.addEventListener("change", () => showLocalContentMedia("video"));
+  contentAudioFile.addEventListener("change", () => showLocalContentMedia("audio"));
   contentMediaConfirm.addEventListener("click", confirmContentMedia);
   contentMediaCancel.addEventListener("click", cancelContentMedia);
+  contentLifecyclePreviewButton.addEventListener("click", previewContentLifecycle);
+  contentLifecycleConfirm.addEventListener("click", confirmContentLifecycle);
+  contentLifecycleCancel.addEventListener("click", cancelContentLifecycle);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
   usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
   usersSearch.addEventListener("input", () => {

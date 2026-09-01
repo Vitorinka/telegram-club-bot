@@ -69,10 +69,23 @@ from content_media import (
     prepare_media_execution,
     record_telegram_upload,
 )
+from content_publish import (
+    cancel_lifecycle,
+    confirm_lifecycle,
+    create_lifecycle_preview,
+    get_version,
+    list_versions,
+)
 from member_preview import (
     get_member_preview_content,
     get_member_preview_home,
     list_member_preview_content,
+)
+from recipe_cms import get_recipe_structure, replace_recipe_structure
+from nutrition_cms import (
+    create_nutrition_draft,
+    get_nutrition_body,
+    update_nutrition_draft,
 )
 from schedule_uploads import (
     apply_schedule_upload,
@@ -440,8 +453,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 20,
-            "latest": "0020_content_media",
+            "count": 25,
+            "latest": "0025_content_version_history",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1925,7 +1938,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 20)
+        self.assertEqual(len(migrations), 25)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2065,7 +2078,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         }.issubset(constraint_names))
 
         invalid_rows = (
-            ("recipe", "Valid", None, None, 1, 0, "draft", 1, None, None),
+            ("nutrition", "Valid", None, None, 1, 0, "draft", 1, None, None),
             ("lesson", "", None, None, 1, 0, "draft", 1, None, None),
             ("lesson", "Valid", "Bad category", None, 1, 0, "draft", 1, None, None),
             ("lesson", "Valid", None, None, 0, 0, "draft", 1, None, None),
@@ -2302,6 +2315,575 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.get_conn, 1, draft["content_id"], "cover", png
             )
 
+    def test_recipe_atomic_structure_media_and_preview_real_postgres(self):
+        run_migrations(self.get_conn)
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Овощной суп",
+            "category": "soups", "description": "Домашний рецепт",
+            "duration_seconds": 1800,
+        })
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Урок остаётся валиден",
+            "category": "warmup", "duration_seconds": 300,
+        })
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Медитация остаётся валидна",
+            "category": "breathing", "duration_seconds": 300,
+        })
+        first = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [
+                {"name": "Вода", "amount": "1 л", "sort_order": 0},
+                {"name": "Овощи", "amount": "500 г", "sort_order": 1},
+            ],
+            "steps": [
+                {"step_number": 1, "instruction": "Нарезать овощи."},
+                {"step_number": 2, "instruction": "Варить до готовности."},
+            ],
+        })
+        self.assertEqual(first["version"], 2)
+        self.assertEqual([item["name"] for item in first["ingredients"]], ["Вода", "Овощи"])
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 1, "ingredients": [], "steps": [],
+            })
+        reordered = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 2,
+            "ingredients": [
+                {"name": "Овощи", "amount": "500 г", "sort_order": 0},
+                {"name": "Вода", "amount": "1 л", "sort_order": 1},
+            ],
+            "steps": [
+                {"step_number": 1, "instruction": "Варить до готовности."},
+                {"step_number": 2, "instruction": "Подать тёплым."},
+            ],
+        })
+        self.assertEqual(reordered["version"], 3)
+        self.assertEqual(reordered["ingredients"][0]["name"], "Овощи")
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_recipe_test_step() RETURNS trigger AS $$
+                    BEGIN
+                        IF NEW.instruction = 'ROLLBACK_TEST' THEN
+                            RAISE EXCEPTION 'recipe rollback injection';
+                        END IF;
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_recipe_test_step_trigger
+                    BEFORE INSERT ON recipe_steps FOR EACH ROW
+                    EXECUTE FUNCTION reject_recipe_test_step()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.Error):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 3,
+                "ingredients": [{"name": "Не сохранять", "amount": None, "sort_order": 0}],
+                "steps": [{"step_number": 1, "instruction": "ROLLBACK_TEST"}],
+            })
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["version"], 3)
+        self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"]), {
+            "ingredients": reordered["ingredients"], "steps": reordered["steps"],
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_recipe_test_step_trigger ON recipe_steps")
+                cur.execute("DROP FUNCTION reject_recipe_test_step()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        cover = create_media_upload(
+            self.get_conn, 1, recipe["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nrecipe-cover",
+        )
+        action = ensure_media_action(self.get_conn, cover["upload_id"], 1)
+        self.assertEqual(prepare_media_execution(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+        )["mode"], "upload")
+        record_telegram_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+            "private-recipe-cover-ref",
+        )
+        self.assertEqual(apply_media_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+        )["status"], "completed")
+        with self.assertRaises(ContentMediaError):
+            create_media_upload(
+                self.get_conn, 1, recipe["content_id"], "video",
+                b"\x00\x00\x00\x18ftypisomrecipe-video",
+            )
+        preview = get_member_preview_content(
+            self.get_conn, recipe["content_id"], content_type="recipe"
+        )
+        self.assertTrue(preview["has_cover"])
+        self.assertFalse(preview["has_video"])
+        self.assertEqual(preview["ingredients"][0]["name"], "Овощи")
+        serialized = json.dumps(preview)
+        self.assertNotIn("private-recipe-cover-ref", serialized)
+        self.assertNotIn("telegram_file_id", serialized)
+        self.assertEqual(
+            get_member_preview_home(self.get_conn)["latest_recipes"][0]["content_id"],
+            recipe["content_id"],
+        )
+
+        published_recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Опубликованный рецепт",
+            "category": "soups", "duration_seconds": 900,
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published',published_at=NOW() WHERE content_id=%s",
+                    (published_recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            replace_recipe_structure(self.get_conn, published_recipe["content_id"], {
+                "expected_version": 1, "ingredients": [], "steps": [],
+            })
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s",
+                    (recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            [item["content_id"] for item in list_member_preview_content(
+                self.get_conn, content_type="recipe"
+            )["items"]],
+            [published_recipe["content_id"]],
+        )
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            replace_recipe_structure(self.get_conn, recipe["content_id"], {
+                "expected_version": 4, "ingredients": [], "steps": [],
+            })
+        self.assertEqual(get_cms_content(self.get_conn, lesson["content_id"])["content_type"], "lesson")
+        self.assertEqual(get_cms_content(self.get_conn, meditation["content_id"])["content_type"], "meditation")
+
+        migration_sql = (MIGRATIONS_DIR / "0022_recipe_cms.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(get_recipe_structure(self.get_conn, recipe["content_id"])["steps"], reordered["steps"])
+
+    def test_meditation_audio_attach_replace_and_fencing_real_postgres(self):
+        run_migrations(self.get_conn)
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Тихое дыхание",
+            "category": "breathing", "duration_seconds": 600,
+        })
+        audio_bytes = b"\xff\xfb\x90\x64meditation-audio"
+
+        def upload_and_apply(data, reference):
+            upload = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", data)
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            state = prepare_media_execution(self.get_conn, upload["upload_id"], action["action_id"], 1)
+            self.assertEqual(state["mode"], "upload")
+            record_telegram_upload(self.get_conn, upload["upload_id"], action["action_id"], 1, reference)
+            return upload, action, apply_media_upload(self.get_conn, upload["upload_id"], action["action_id"], 1)
+
+        first_upload, first_action, first = upload_and_apply(audio_bytes, "private-audio-v1")
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(apply_media_upload(self.get_conn, first_upload["upload_id"], first_action["action_id"], 1)["media_id"], first["media_id"])
+        second_upload, second_action, second = upload_and_apply(audio_bytes + b"2", "private-audio-v2")
+        active = list_content_media(self.get_conn, meditation["content_id"])
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["media_type"], "audio")
+        self.assertEqual(active[0]["media_id"], second["media_id"])
+        history = self.query_all("SELECT media_id,deleted_at IS NOT NULL FROM content_media WHERE content_id=%s AND media_type='audio' ORDER BY version", (meditation["content_id"],))
+        self.assertEqual(history, [(first["media_id"], True), (second["media_id"], False)])
+
+        cancelled = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"cancel")
+        self.assertEqual(cancel_media_upload(self.get_conn, cancelled["upload_id"], 1)["status"], "cancelled")
+        self.assertEqual(len(list_content_media(self.get_conn, meditation["content_id"])), 1)
+
+        rollback_upload = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"rollback")
+        rollback_action = ensure_media_action(self.get_conn, rollback_upload["upload_id"], 1)
+        prepare_media_execution(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1)
+        record_telegram_upload(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1, "private-audio-rollback")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_audio_replacement() RETURNS trigger AS $$
+                    BEGIN RAISE EXCEPTION 'audio replacement rollback'; END;
+                    $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_audio_replacement_trigger
+                    BEFORE INSERT ON content_media FOR EACH ROW
+                    WHEN (NEW.media_type = 'audio')
+                    EXECUTE FUNCTION reject_audio_replacement()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaises(psycopg2.Error):
+            apply_media_upload(self.get_conn, rollback_upload["upload_id"], rollback_action["action_id"], 1)
+        self.assertEqual(list_content_media(self.get_conn, meditation["content_id"])[0]["media_id"], second["media_id"])
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_audio_replacement_trigger ON content_media")
+                cur.execute("DROP FUNCTION reject_audio_replacement()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        stale = create_media_upload(self.get_conn, 1, meditation["content_id"], "audio", audio_bytes + b"stale")
+        update_content_draft(self.get_conn, meditation["content_id"], {"expected_version": 3, "title": "Новая версия"})
+        stale_action = ensure_media_action(self.get_conn, stale["upload_id"], 1)
+        self.assertEqual(prepare_media_execution(self.get_conn, stale["upload_id"], stale_action["action_id"], 1)["failure_category"], "content_version_changed")
+
+        for content_type in ("lesson", "recipe", "nutrition_material"):
+            other = create_content_draft(self.get_conn, 1, {"content_type": content_type, "title": content_type, "duration_seconds": None}) if content_type != "nutrition_material" else create_nutrition_draft(self.get_conn, 1, {"content_type": content_type, "title": content_type, "duration_seconds": None, "body": "body"})
+            with self.subTest(content_type=content_type), self.assertRaisesRegex(ContentMediaError, "invalid_content_media_type"):
+                create_media_upload(self.get_conn, 1, other["content_id"], "audio", audio_bytes)
+
+        preview = get_member_preview_content(self.get_conn, meditation["content_id"], content_type="meditation")
+        self.assertTrue(preview["has_audio"])
+        self.assertEqual(preview["audio_media_id"], second["media_id"])
+        self.assertNotIn("private-audio", json.dumps(preview))
+        migration_sql = (MIGRATIONS_DIR / "0024_meditation_audio.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_content_publish_archive_history_and_atomicity_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "publish-fingerprint-test-secret"
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Суп", "category": "nutrition",
+            "description": "Тёплый суп", "duration_seconds": 900,
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_incomplete"):
+            create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, 1, secret)
+        structure = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [{"name":"Вода","amount":"500 мл","sort_order":0}],
+            "steps": [{"step_number":1,"instruction":"Нагреть"}],
+        })
+        cover_upload = create_media_upload(self.get_conn, 1, recipe["content_id"], "cover", b"\x89PNG\r\n\x1a\ncover")
+        cover_action = ensure_media_action(self.get_conn, cover_upload["upload_id"], 1)
+        prepare_media_execution(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1)
+        record_telegram_upload(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1, "private-cover-reference")
+        cover_result = apply_media_upload(self.get_conn, cover_upload["upload_id"], cover_action["action_id"], 1)
+        preview = create_lifecycle_preview(
+            self.get_conn, recipe["content_id"], 1, cover_result["content_version"], secret
+        )
+        payload_json = self.query_one("SELECT payload_json FROM admin_action_requests WHERE action_id=%s", (preview["action_id"],))[0]
+        self.assertNotIn("private-cover-reference", payload_json)
+        self.assertNotIn("ingredients", payload_json)
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["status"], "draft")
+        self.assertEqual(list_versions(self.get_conn, recipe["content_id"])["items"], [])
+        with self.assertRaisesRegex(ContentCmsError, "content_action_not_found"):
+            confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 2, secret)
+
+        stale = preview
+        changed = replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": cover_result["content_version"],
+            "ingredients": [{"name":"Вода","amount":"600 мл","sort_order":0}],
+            "steps": [{"step_number":1,"instruction":"Вскипятить"}],
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, recipe["content_id"], stale["action_id"], 1, secret)
+
+        preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, changed["version"], secret)
+        published = confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 1, secret)
+        duplicate = confirm_lifecycle(self.get_conn, recipe["content_id"], preview["action_id"], 1, secret)
+        self.assertEqual(duplicate["version_id"], published["version_id"])
+        item = get_cms_content(self.get_conn, recipe["content_id"])
+        self.assertEqual(item["status"], "published")
+        self.assertIsNotNone(item["published_at"])
+        version = get_version(self.get_conn, recipe["content_id"], published["version_id"])
+        self.assertEqual(version["ingredients"], [{"name":"Вода","amount":"600 мл","sort_order":0}])
+        self.assertEqual(version["steps"], [{"step_number":1,"instruction":"Вскипятить"}])
+        self.assertEqual(version["media"][0]["media_id"], cover_result["media_id"])
+        self.assertNotIn("server_reference", json.dumps(version))
+
+        archive_preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, item["version"], secret, archive=True)
+        self.assertEqual(cancel_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, archive=True)["status"], "cancelled")
+        self.assertEqual(cancel_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, archive=True)["status"], "cancelled")
+        self.assertEqual(get_cms_content(self.get_conn, recipe["content_id"])["status"], "published")
+        archive_preview = create_lifecycle_preview(self.get_conn, recipe["content_id"], 1, item["version"], secret, archive=True)
+        archived = confirm_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, secret, archive=True)
+        self.assertEqual(confirm_lifecycle(self.get_conn, recipe["content_id"], archive_preview["action_id"], 1, secret, archive=True)["version_id"], archived["version_id"])
+        archived_item = get_cms_content(self.get_conn, recipe["content_id"])
+        self.assertEqual(archived_item["status"], "archived")
+        self.assertEqual(archived_item["published_at"], item["published_at"])
+        self.assertIsNotNone(archived_item["archived_at"])
+        self.assertEqual(len(list_versions(self.get_conn, recipe["content_id"])["items"]), 2)
+        self.assertIsNone(get_member_preview_content(self.get_conn, recipe["content_id"], content_type="recipe"))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.Error):
+                    cur.execute("UPDATE content_item_versions SET title='tampered' WHERE version_id=%s", (published["version_id"],))
+            conn.rollback()
+        finally:
+            conn.close()
+
+        rollback_recipe = create_content_draft(self.get_conn, 1, {"content_type":"recipe","title":"Rollback","duration_seconds":60})
+        rollback_structure = replace_recipe_structure(self.get_conn, rollback_recipe["content_id"], {
+            "expected_version":1,
+            "ingredients":[{"name":"A","amount":None,"sort_order":0}],
+            "steps":[{"step_number":1,"instruction":"B"}],
+        })
+        rollback_preview = create_lifecycle_preview(self.get_conn, rollback_recipe["content_id"], 1, rollback_structure["version"], secret)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE FUNCTION reject_publish_update() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rollback publish'; END; $$ LANGUAGE plpgsql")
+                cur.execute("CREATE TRIGGER reject_publish_update_trigger BEFORE UPDATE ON content_items FOR EACH ROW WHEN (NEW.status='published') EXECUTE FUNCTION reject_publish_update()")
+            conn.commit()
+        finally: conn.close()
+
+        with self.assertRaises(psycopg2.Error):
+            confirm_lifecycle(self.get_conn, rollback_recipe["content_id"], rollback_preview["action_id"], 1, secret)
+        self.assertEqual(get_cms_content(self.get_conn, rollback_recipe["content_id"])["status"], "draft")
+        self.assertEqual(list_versions(self.get_conn, rollback_recipe["content_id"])["items"], [])
+        self.assertEqual(self.query_one("SELECT status FROM admin_action_requests WHERE action_id=%s", (rollback_preview["action_id"],))[0], "pending")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_publish_update_trigger ON content_items")
+                cur.execute("DROP FUNCTION reject_publish_update()")
+            conn.commit()
+        finally: conn.close()
+
+        old_now = datetime.utcnow() - timedelta(minutes=11)
+        expiring = create_content_draft(self.get_conn, 1, {"content_type":"recipe","title":"TTL","duration_seconds":60})
+        expiring_structure = replace_recipe_structure(self.get_conn, expiring["content_id"], {"expected_version":1,"ingredients":[{"name":"A","amount":None,"sort_order":0}],"steps":[{"step_number":1,"instruction":"B"}]})
+        expired_preview = create_lifecycle_preview(self.get_conn, expiring["content_id"], 1, expiring_structure["version"], secret, now=old_now)
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_preview_expired"):
+            confirm_lifecycle(self.get_conn, expiring["content_id"], expired_preview["action_id"], 1, secret)
+
+        migration_sql = (MIGRATIONS_DIR / "0025_content_version_history.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur: cur.execute(migration_sql)
+            conn.commit()
+        finally: conn.close()
+
+    def test_content_publish_domain_fences_and_archive_rollback_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "publish-domain-fence-secret"
+
+        def attach(content_id, media_type, data, reference):
+            upload = create_media_upload(self.get_conn, 1, content_id, media_type, data)
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            prepare_media_execution(self.get_conn, upload["upload_id"], action["action_id"], 1)
+            record_telegram_upload(self.get_conn, upload["upload_id"], action["action_id"], 1, reference)
+            return apply_media_upload(self.get_conn, upload["upload_id"], action["action_id"], 1)
+
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type":"lesson", "title":"Сила", "description":"Урок",
+            "duration_seconds":600,
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_incomplete"):
+            create_lifecycle_preview(self.get_conn, lesson["content_id"], 1, 1, secret)
+        lesson_media = attach(lesson["content_id"], "video", b"\x00\x00\x00\x18ftypisomvideo", "private-lesson-video")
+        lesson_preview = create_lifecycle_preview(self.get_conn, lesson["content_id"], 1, lesson_media["content_version"], secret)
+        lesson_published = confirm_lifecycle(self.get_conn, lesson["content_id"], lesson_preview["action_id"], 1, secret)
+        lesson_version = get_version(self.get_conn, lesson["content_id"], lesson_published["version_id"])
+        self.assertEqual(lesson_version["content_type"], "lesson")
+        self.assertEqual(lesson_version["media"][0]["media_id"], lesson_media["media_id"])
+        self.assertNotIn("private-lesson-video", json.dumps(lesson_version))
+
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type":"meditation", "title":"Дыхание", "duration_seconds":300,
+        })
+        meditation_media = attach(meditation["content_id"], "audio", b"\xff\xfb\x90\x64audio-one", "private-audio-one")
+        meditation_preview = create_lifecycle_preview(self.get_conn, meditation["content_id"], 1, meditation_media["content_version"], secret)
+        replacement = attach(meditation["content_id"], "audio", b"\xff\xfb\x90\x64audio-two", "private-audio-two")
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, meditation["content_id"], meditation_preview["action_id"], 1, secret)
+        fresh_meditation = create_lifecycle_preview(self.get_conn, meditation["content_id"], 1, replacement["content_version"], secret)
+        meditation_published = confirm_lifecycle(self.get_conn, meditation["content_id"], fresh_meditation["action_id"], 1, secret)
+        meditation_version = get_version(self.get_conn, meditation["content_id"], meditation_published["version_id"])
+        self.assertEqual(meditation_version["media"][0]["media_id"], replacement["media_id"])
+
+        nutrition = create_nutrition_draft(self.get_conn, 1, {
+            "content_type":"nutrition_material", "title":"Вода",
+            "duration_seconds":None, "body":"Исходный текст",
+        })
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition["version"], secret)
+        nutrition_changed = update_nutrition_draft(self.get_conn, nutrition["content_id"], {
+            "expected_version":nutrition["version"], "description":"Обновлено",
+            "body":"Новый точный текст",
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_publish_state_changed"):
+            confirm_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1, secret)
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition_changed["version"], secret)
+        with self.assertRaisesRegex(ContentCmsError, "content_action_not_found"):
+            cancel_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 2)
+        self.assertEqual(cancel_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1)["status"], "cancelled")
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition_changed["version"], secret)
+        nutrition_published = confirm_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1, secret)
+        self.assertEqual(get_version(self.get_conn, nutrition["content_id"], nutrition_published["version_id"])["nutrition_body"], "Новый точный текст")
+
+        archive_preview = create_lifecycle_preview(
+            self.get_conn, lesson["content_id"], 1,
+            get_cms_content(self.get_conn, lesson["content_id"])["version"], secret,
+            archive=True,
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("CREATE FUNCTION reject_archive_update() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'rollback archive'; END; $$ LANGUAGE plpgsql")
+                cur.execute("CREATE TRIGGER reject_archive_update_trigger BEFORE UPDATE ON content_items FOR EACH ROW WHEN (NEW.status='archived') EXECUTE FUNCTION reject_archive_update()")
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaises(psycopg2.Error):
+            confirm_lifecycle(self.get_conn, lesson["content_id"], archive_preview["action_id"], 1, secret, archive=True)
+        self.assertEqual(get_cms_content(self.get_conn, lesson["content_id"])["status"], "published")
+        self.assertEqual(len(list_versions(self.get_conn, lesson["content_id"])["items"]), 1)
+        self.assertEqual(self.query_one("SELECT status FROM admin_action_requests WHERE action_id=%s", (archive_preview["action_id"],))[0], "pending")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_archive_update_trigger ON content_items")
+                cur.execute("DROP FUNCTION reject_archive_update()")
+            conn.commit()
+        finally: conn.close()
+
+    def test_nutrition_material_atomic_body_media_and_preview_real_postgres(self):
+        run_migrations(self.get_conn)
+        material = create_nutrition_draft(self.get_conn, 1, {
+            "content_type": "nutrition_material", "title": "Водный баланс",
+            "category": "habits", "description": "Краткая рекомендация",
+            "duration_seconds": None,
+            "body": "Первый абзац.\n\n<script>alert('plain')</script>",
+        })
+        self.assertEqual(material["version"], 1)
+        self.assertIn("<script>", get_nutrition_body(
+            self.get_conn, material["content_id"]
+        )["body"])
+        updated = update_nutrition_draft(self.get_conn, material["content_id"], {
+            "expected_version": 1, "title": "Водный баланс каждый день",
+            "category": "guides", "description": "Обновлённое введение",
+            "duration_seconds": None, "sort_order": 4,
+            "body": "Абзац один.\r\n\r\nАбзац два.  ",
+        })
+        self.assertEqual(updated["version"], 2)
+        self.assertEqual(updated["body"], "Абзац один.\n\nАбзац два.")
+        with self.assertRaisesRegex(ContentCmsError, "content_version_changed"):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 1, "title": "Устарело", "body": "Не применять",
+            })
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE FUNCTION reject_nutrition_body_update() RETURNS trigger AS $$
+                    BEGIN
+                        IF NEW.body = 'ROLLBACK_TEST' THEN
+                            RAISE EXCEPTION 'nutrition rollback injection';
+                        END IF;
+                        RETURN NEW;
+                    END; $$ LANGUAGE plpgsql
+                """)
+                cur.execute("""
+                    CREATE TRIGGER reject_nutrition_body_update_trigger
+                    BEFORE UPDATE ON nutrition_material_bodies FOR EACH ROW
+                    EXECUTE FUNCTION reject_nutrition_body_update()
+                """)
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaises(psycopg2.Error):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 2, "title": "Не сохранять",
+                "body": "ROLLBACK_TEST",
+            })
+        self.assertEqual(get_cms_content(self.get_conn, material["content_id"])["version"], 2)
+        self.assertEqual(get_cms_content(self.get_conn, material["content_id"])["title"], "Водный баланс каждый день")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DROP TRIGGER reject_nutrition_body_update_trigger ON nutrition_material_bodies")
+                cur.execute("DROP FUNCTION reject_nutrition_body_update()")
+            conn.commit()
+        finally:
+            conn.close()
+
+        cover = create_media_upload(
+            self.get_conn, 1, material["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nnutrition-cover",
+        )
+        action = ensure_media_action(self.get_conn, cover["upload_id"], 1)
+        prepare_media_execution(self.get_conn, cover["upload_id"], action["action_id"], 1)
+        record_telegram_upload(
+            self.get_conn, cover["upload_id"], action["action_id"], 1,
+            "private-nutrition-cover-ref",
+        )
+        apply_media_upload(self.get_conn, cover["upload_id"], action["action_id"], 1)
+        with self.assertRaisesRegex(ContentMediaError, "invalid_content_media_type"):
+            create_media_upload(
+                self.get_conn, 1, material["content_id"], "video",
+                b"\x00\x00\x00\x18ftypisomnutrition-video",
+            )
+        preview = get_member_preview_content(
+            self.get_conn, material["content_id"], content_type="nutrition_material"
+        )
+        self.assertTrue(preview["has_cover"])
+        self.assertFalse(preview["has_video"])
+        self.assertEqual(preview["body"], "Абзац один.\n\nАбзац два.")
+        self.assertNotIn("private-nutrition-cover-ref", json.dumps(preview))
+        self.assertEqual(
+            get_member_preview_home(self.get_conn)["latest_nutrition_materials"][0]["content_id"],
+            material["content_id"],
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s", (material["content_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(list_member_preview_content(
+            self.get_conn, content_type="nutrition_material"
+        )["items"], [])
+        with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
+            update_nutrition_draft(self.get_conn, material["content_id"], {
+                "expected_version": 3, "title": "Нельзя", "body": "Нельзя",
+            })
+        migration_sql = (MIGRATIONS_DIR / "0023_nutrition_materials.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
+
     def test_member_preview_safe_read_only_projection_real_postgres(self):
         run_migrations(self.get_conn)
         draft = create_content_draft(self.get_conn, 1, {
@@ -2319,6 +2901,36 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "category": "main_workout", "description": None,
             "duration_seconds": None,
         })
+        meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Тихое дыхание",
+            "category": "breathing", "description": "Практика покоя",
+            "duration_seconds": 600,
+        })
+        archived_meditation = create_content_draft(self.get_conn, 1, {
+            "content_type": "meditation", "title": "Старая медитация",
+            "category": "breathing", "description": None,
+            "duration_seconds": 300,
+        })
+        meditation_cover = create_media_upload(
+            self.get_conn, 1, meditation["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nmeditation-cover",
+        )
+        meditation_action = ensure_media_action(
+            self.get_conn, meditation_cover["upload_id"], 1
+        )
+        self.assertEqual(prepare_media_execution(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+        )["mode"], "upload")
+        record_telegram_upload(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+            "private-meditation-cover-ref",
+        )
+        self.assertEqual(apply_media_upload(
+            self.get_conn, meditation_cover["upload_id"],
+            meditation_action["action_id"], 1,
+        )["status"], "completed")
         for media_type, data, reference in (
             ("cover", b"\x89PNG\r\n\x1a\npreview-cover", "private-cover-ref"),
             ("video", b"\x00\x00\x00\x18ftypisompreview-video", "private-video-ref"),
@@ -2356,6 +2968,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     "archived_at=NOW() WHERE content_id=%s",
                     (archived["content_id"],),
                 )
+                cur.execute(
+                    "UPDATE content_items SET status='archived', "
+                    "archived_at=NOW() WHERE content_id=%s",
+                    (archived_meditation["content_id"],),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -2367,6 +2984,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             {draft["content_id"], published["content_id"]},
         )
         lesson = get_member_preview_content(self.get_conn, draft["content_id"])
+        self.assertEqual(lesson["content_type"], "lesson")
         self.assertEqual(lesson["status"], "draft")
         self.assertTrue(lesson["has_cover"])
         self.assertTrue(lesson["has_video"])
@@ -2379,6 +2997,31 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.assertNotIn(forbidden, serialized)
         home = get_member_preview_home(self.get_conn)
         self.assertEqual(home["total_lessons"], 2)
+        self.assertEqual(
+            [item["content_id"] for item in home["latest_meditations"]],
+            [meditation["content_id"]],
+        )
+        meditation_catalog = list_member_preview_content(
+            self.get_conn, content_type="meditation"
+        )
+        self.assertEqual(
+            [item["content_id"] for item in meditation_catalog["items"]],
+            [meditation["content_id"]],
+        )
+        self.assertEqual(
+            get_member_preview_content(
+                self.get_conn, meditation["content_id"],
+                content_type="meditation",
+            )["content_type"],
+            "meditation",
+        )
+        self.assertTrue(get_member_preview_content(
+            self.get_conn, meditation["content_id"],
+            content_type="meditation",
+        )["has_cover"])
+        self.assertIsNone(get_member_preview_content(
+            self.get_conn, meditation["content_id"], content_type="lesson"
+        ))
         self.assertTrue(home["read_only"])
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM content_items")[0], before
@@ -8637,8 +9280,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 20)
-        self.assertEqual(system["migrations"]["latest"], "0020_content_media")
+        self.assertEqual(system["migrations"]["count"], 25)
+        self.assertEqual(system["migrations"]["latest"], "0025_content_version_history")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

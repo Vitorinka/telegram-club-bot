@@ -9505,6 +9505,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         patch_handler = self.route_handler(
             app, "PATCH", "/api/admin/content/cms/{content_id}"
         )
+        recipe_handler = self.route_handler(
+            app, "PUT", "/api/admin/content/cms/{content_id}/recipe"
+        )
+        nutrition_handler = self.route_handler(
+            app, "PUT", "/api/admin/content/cms/{content_id}/nutrition"
+        )
         missing = await self.main.miniapp_admin_auth_middleware(
             FakeMiniAppRequest(
                 app, path="/api/admin/content/drafts", method="POST",
@@ -9541,6 +9547,22 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             {"content_type": "lesson", "title": "Урок"},
         )
         self.assertIsNotNone(patch_handler)
+        recipe_missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path="/api/admin/content/cms/item/recipe", method="PUT",
+                match_info={"content_id": "item"},
+                json_data={"expected_version": 1, "ingredients": [], "steps": []},
+            ), recipe_handler,
+        )
+        self.assertEqual(recipe_missing.status, 401)
+        nutrition_missing = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(
+                app, path="/api/admin/content/cms/item/nutrition", method="PUT",
+                match_info={"content_id": "item"},
+                json_data={"expected_version": 1, "title": "X", "body": "Text"},
+            ), nutrition_handler,
+        )
+        self.assertEqual(nutrition_missing.status, 401)
 
     async def test_member_preview_routes_are_admin_only_and_safely_projected(self):
         app = self.main.create_app()
@@ -9618,6 +9640,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
             ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}"),
+            ("GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-preview"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-confirm"),
+            ("POST", "/api/admin/content/cms/{content_id}/publish-cancel"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-preview"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-confirm"),
+            ("POST", "/api/admin/content/cms/{content_id}/archive-cancel"),
+            ("GET", "/api/admin/content/cms/{content_id}/versions"),
+            ("GET", "/api/admin/content/cms/{content_id}/versions/{version_id}"),
         )
         for method, resource in routes:
             handler = self.route_handler(app, method, resource)
@@ -9627,6 +9658,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     "content_id": "00000000-0000-0000-0000-000000000001",
                     "upload_id": "00000000-0000-0000-0000-000000000002",
                     "media_id": "00000000-0000-0000-0000-000000000003",
+                    "version_id": "00000000-0000-0000-0000-000000000004",
                 },
             )
             with self.subTest(resource=resource):
@@ -9650,6 +9682,54 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ), handler,
             )
         self.assertEqual(response.status, 403)
+
+    async def test_admin_audio_proxy_range_and_relationship_are_safe(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/content/cms/{content_id}/media/{media_id}/audio")
+        media = {"media_type": "audio", "content_type": "meditation", "mime_type": "audio/mpeg", "size_bytes": 12, "server_reference": "private-ref"}
+        data = b"\xff\xfb\x90\x64abcdefgh"
+        async def download(_path, destination, **_kwargs):
+            destination.write(data)
+        request = FakeMiniAppRequest(app, path="/api/admin/content/cms/c/media/m/audio", match_info={"content_id": "c", "media_id": "m"})
+        request.headers["Range"] = "bytes=4-7"
+        with patch.object(self.main, "get_media_reference", return_value=media), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="private-path", file_size=len(data)))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)):
+            response = await handler(request)
+        self.assertEqual(response.status, 206)
+        self.assertEqual(response.body, data[4:8])
+        self.assertEqual(response.headers["Content-Range"], f"bytes 4-7/{len(data)}")
+        self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+        self.assertNotIn("private-ref", str(response.headers))
+
+        request.headers["Range"] = "bytes=999-1000"
+        with patch.object(self.main, "get_media_reference", return_value=media), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="private-path", file_size=len(data)))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)):
+            invalid = await handler(request)
+        self.assertEqual(invalid.status, 416)
+        self.assertEqual(invalid.headers["Content-Range"], f"bytes */{len(data)}")
+
+        with patch.object(self.main, "get_media_reference", return_value={**media, "content_type": "lesson"}), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock()) as get_file:
+            wrong = await handler(FakeMiniAppRequest(app, match_info={"content_id": "c", "media_id": "m"}))
+        self.assertEqual(wrong.status, 404)
+        get_file.assert_not_awaited()
+
+    async def test_audio_upload_uses_send_audio_and_is_idempotent(self):
+        state = {"mode": "upload", "media_bytes": b"\xff\xfb\x90\x64audio", "mime_type": "audio/mpeg", "media_type": "audio"}
+        message = SimpleNamespace(audio=SimpleNamespace(file_id="private-audio-id"))
+        with patch.object(self.main, "prepare_media_execution", side_effect=[state, {"mode": "completed", "media_id": "media-id"}]), \
+             patch.object(self.main.bot, "send_audio", new=AsyncMock(return_value=message)) as send, \
+             patch.object(self.main, "record_telegram_upload") as recorded, \
+             patch.object(self.main, "apply_media_upload", return_value={"status": "completed", "media_id": "media-id"}):
+            first = await self.main.execute_content_media_upload("upload", "action", 1)
+            second = await self.main.execute_content_media_upload("upload", "action", 1)
+        self.assertEqual(first["status"], "completed")
+        self.assertEqual(second["status"], "completed")
+        send.assert_awaited_once()
+        recorded.assert_called_once_with(self.main.get_db_conn, "upload", "action", 1, "private-audio-id")
 
     async def test_content_media_storage_failure_is_safe_and_does_not_attach(self):
         raw_reference = "private-telegram-reference"
@@ -9800,6 +9880,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/media/uploads/", javascript)
         self.assertIn("content-media-card", index)
         self.assertIn('accept="video/mp4"', index)
+        self.assertIn('accept="audio/mpeg,.mp3"', index)
+        self.assertIn("content-audio-control", index)
+        self.assertIn("has_audio", javascript)
+        self.assertIn("memberAudioElement.pause()", javascript)
+        self.assertNotIn("autoplay", javascript.lower())
+        self.assertIn("media-src 'self' blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
+        self.assertIn("content-lifecycle-card", index)
+        self.assertIn("content-version-history", index)
+        self.assertIn("previewContentLifecycle", javascript)
+        self.assertIn("${mode}-preview", javascript)
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)
         self.assertIn("URL.revokeObjectURL(contentMedia", javascript)
@@ -9838,6 +9928,23 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="open-member-preview"', index)
         self.assertIn("/api/admin/member-preview/home", javascript)
         self.assertIn("/api/admin/member-preview/content", javascript)
+        self.assertIn('value="meditation">Новая медитация', index)
+        self.assertIn('value="recipe">Новый рецепт', index)
+        self.assertIn('value="nutrition_material">Материал нутрициолога', index)
+        self.assertIn("content_type=meditation", javascript)
+        self.assertIn("content_type=recipe", javascript)
+        self.assertIn("content_type=nutrition_material", javascript)
+        self.assertIn('id="member-meditation-list"', index)
+        self.assertIn('id="member-recipe-list"', index)
+        self.assertIn('id="member-nutrition-list"', index)
+        self.assertIn('id="content-recipe-card"', index)
+        self.assertIn("loadMemberMeditations", javascript)
+        self.assertIn("loadMemberRecipes", javascript)
+        self.assertIn('item.content_type === "recipe" || item.content_type === "nutrition_material"', javascript)
+        self.assertIn("/nutrition`,", javascript)
+        self.assertNotIn("innerHTML", javascript)
+        for invented in ("calories", "protein", "carbs", "difficulty", "servings"):
+            self.assertNotIn(invented, javascript.lower())
         self.assertIn('id="member-bottom-nav"', index)
         self.assertIn("Режим предпросмотра", index)
         self.assertIn("Медитации появятся здесь", index)

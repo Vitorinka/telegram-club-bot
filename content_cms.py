@@ -10,7 +10,7 @@ MAX_DESCRIPTION_LENGTH = 5000
 MAX_DURATION_SECONDS = 86400
 MAX_SORT_ORDER = 100000
 CATEGORY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
-CONTENT_TYPES = frozenset({"lesson"})
+CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe", "nutrition_material"})
 CONTENT_STATUSES = frozenset({"draft", "published", "archived"})
 CREATE_FIELDS = frozenset({
     "content_type", "title", "category", "description", "duration_seconds",
@@ -119,7 +119,7 @@ def validate_create_payload(payload):
         raise ContentCmsError("invalid_content_payload")
     if payload.get("content_type") not in CONTENT_TYPES:
         raise ContentCmsError("invalid_content_type")
-    return {
+    values = {
         "content_type": payload["content_type"],
         "title": _normalize_title(payload.get("title")),
         "category": _normalize_category(payload.get("category")),
@@ -129,6 +129,9 @@ def validate_create_payload(payload):
         ),
         "duration_seconds": _normalize_duration(payload.get("duration_seconds")),
     }
+    if values["content_type"] == "nutrition_material" and values["duration_seconds"] is not None:
+        raise ContentCmsError("invalid_nutrition_material")
+    return values
 
 
 def validate_update_payload(payload):
@@ -261,15 +264,17 @@ def update_content_draft(get_connection, content_id, payload):
     try:
         _begin_write(cur)
         cur.execute(
-            "SELECT status, version FROM content_items WHERE content_id = %s FOR UPDATE",
+            "SELECT content_type, status, version FROM content_items WHERE content_id = %s FOR UPDATE",
             (content_id,),
         )
         current = cur.fetchone()
         if not current:
             raise ContentCmsError("content_not_found", 404)
-        if current[0] != "draft":
+        if current[0] == "nutrition_material":
             raise ContentCmsError("content_not_editable", 409)
-        if current[1] != expected_version:
+        if current[1] != "draft":
+            raise ContentCmsError("content_not_editable", 409)
+        if current[2] != expected_version:
             raise ContentCmsError("content_version_changed", 409)
         assignments = [f"{field} = %s" for field in values]
         params = list(values.values())
