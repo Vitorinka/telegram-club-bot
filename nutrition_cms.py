@@ -51,10 +51,11 @@ def create_nutrition_draft(get_connection, admin_id, payload):
         cur.execute("""
             INSERT INTO content_items (
                 content_id,content_type,category,title,description,duration_seconds,
-                sort_order,status,version,created_by_telegram_id,created_at,updated_at
-            ) VALUES (%s,'nutrition_material',%s,%s,%s,NULL,0,'draft',1,%s,NOW(),NOW())
+                sort_order,status,version,created_by_telegram_id,logical_content_id,
+                revision_number,created_at,updated_at
+            ) VALUES (%s,'nutrition_material',%s,%s,%s,NULL,0,'draft',1,%s,%s,1,NOW(),NOW())
             RETURNING version
-        """, (content_id, metadata["category"], metadata["title"], metadata["description"], int(admin_id)))
+        """, (content_id, metadata["category"], metadata["title"], metadata["description"], int(admin_id), content_id))
         version = int(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO nutrition_material_bodies (content_id,body,created_at,updated_at)

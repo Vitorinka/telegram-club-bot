@@ -9766,6 +9766,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_miniapp_content_media_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         routes = (
+            ("POST", "/api/admin/content/cms/{content_id}/revision"),
             ("POST", "/api/admin/content/cms/{content_id}/media-preview"),
             ("GET", "/api/admin/content/media/uploads/{upload_id}/preview"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
@@ -10020,6 +10021,17 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("content-lifecycle-card", index)
         self.assertIn("content-version-history", index)
         self.assertIn("previewContentLifecycle", javascript)
+        self.assertIn("content-create-publish", index)
+        self.assertIn("content-authoring-publish", index)
+        self.assertIn("content-create-revision", index)
+        self.assertIn("/revision`, {}", javascript)
+        self.assertIn("appendRestrictedText", javascript)
+        self.assertIn("document.createTextNode", javascript)
+        self.assertIn("authoring-textarea", index)
+        self.assertIn("MP3 · до 20 МБ", index)
+        self.assertIn("Этот формат пока не поддерживается. Загрузите MP3.", javascript)
+        self.assertIn("formatDuration", javascript)
+        self.assertIn("Материал изменился. Обновите данные и повторите.", javascript)
         self.assertIn("${mode}-preview", javascript)
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)

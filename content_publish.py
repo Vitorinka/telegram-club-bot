@@ -27,7 +27,8 @@ def _iso(value):
 def _load_state(cur, content_id, *, lock=False):
     cur.execute("""
         SELECT content_id,content_type,category,title,description,duration_seconds,
-               sort_order,status,version,published_at,archived_at
+               sort_order,status,version,published_at,archived_at,
+               logical_content_id,revision_of,revision_number
         FROM content_items WHERE content_id=%s
     """ + (" FOR UPDATE" if lock else ""), (content_id,))
     row = cur.fetchone()
@@ -38,6 +39,9 @@ def _load_state(cur, content_id, *, lock=False):
         "title": row[3], "description": row[4], "duration_seconds": row[5],
         "sort_order": int(row[6]), "status": row[7], "version": int(row[8]),
         "published_at": row[9], "archived_at": row[10],
+        "logical_content_id": str(row[11]),
+        "revision_of": str(row[12]) if row[12] else None,
+        "revision_number": int(row[13]),
     }
     cur.execute("""
         SELECT media_id,media_type,version,sort_order,mime_type,size_bytes,sha256
@@ -83,6 +87,9 @@ def _fingerprint(state, secret):
         "ingredients": state["ingredients"], "steps": state["steps"],
         "nutrition_body": state["nutrition_body"],
         "categories": state["categories"],
+        "logical_content_id": state["logical_content_id"],
+        "revision_of": state["revision_of"],
+        "revision_number": state["revision_number"],
     }
     encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hmac.new(secret.encode(), encoded, hashlib.sha256).hexdigest()
@@ -177,7 +184,17 @@ def _parse_action(row, expected_type, content_id, now):
 
 def _insert_snapshot(cur, state, action_id, admin_id, event_type, now):
     version_id = str(uuid.uuid4())
-    result_version = state["version"] + 1
+    cur.execute(
+        """SELECT MAX(v.content_version)
+           FROM content_item_versions v
+           JOIN content_items i ON i.content_id=v.content_id
+           WHERE i.logical_content_id=%s""",
+        (state["logical_content_id"],),
+    )
+    previous = cur.fetchone()[0]
+    # Publication history is a logical editorial sequence.  Draft mutation
+    # versions are concurrency fences and must not leak into v1/v2 history.
+    result_version = int(previous) + 1 if previous is not None else 1
     snapshot_status = "published" if event_type == "publish" else "archived"
     published_at = now if event_type == "publish" else state["published_at"]
     archived_at = now if event_type == "archive" else None
@@ -241,6 +258,16 @@ def confirm_lifecycle(get_connection, content_id, action_id, admin_id, secret, *
             raise ContentCmsError("content_publish_state_changed", 409)
         if not archive:
             _validate_complete(state)
+        if not archive and state["revision_of"]:
+            cur.execute(
+                """SELECT content_id FROM content_items
+                   WHERE logical_content_id=%s AND status='published'
+                   FOR UPDATE""",
+                (state["logical_content_id"],),
+            )
+            current = cur.fetchone()
+            if not current or str(current[0]) != state["revision_of"]:
+                raise ContentCmsError("content_publish_state_changed", 409)
         version_id, result_version, published_at, archived_at = _insert_snapshot(
             cur, state, action_id, admin_id, "archive" if archive else "publish", now
         )
@@ -248,8 +275,17 @@ def confirm_lifecycle(get_connection, content_id, action_id, admin_id, secret, *
             cur.execute("UPDATE content_items SET status='archived',archived_at=%s,version=%s,updated_at=%s WHERE content_id=%s AND status='published' AND version=%s",
                         (archived_at,result_version,now,content_id,state["version"]))
         else:
+            if state["revision_of"]:
+                cur.execute(
+                    """UPDATE content_items
+                       SET status='archived',archived_at=%s,updated_at=%s
+                       WHERE content_id=%s AND status='published'""",
+                    (now, now, state["revision_of"]),
+                )
+                if cur.rowcount != 1:
+                    raise ContentCmsError("content_publish_state_changed", 409)
             cur.execute("UPDATE content_items SET status='published',published_at=%s,version=%s,updated_at=%s WHERE content_id=%s AND status='draft' AND version=%s",
-                        (published_at,result_version,now,content_id,state["version"]))
+                        (published_at,state["version"] + 1,now,content_id,state["version"]))
         if cur.rowcount != 1:
             raise ContentCmsError("content_publish_state_changed", 409)
         cur.execute("UPDATE admin_action_requests SET status='processing' WHERE action_id=%s AND admin_id=%s AND status='pending'", (action_id,int(admin_id)))
@@ -292,7 +328,14 @@ def list_versions(get_connection, content_id):
     content_id = _uuid(content_id); conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
-        cur.execute("SELECT version_id,content_version,event_type,status,created_by_telegram_id,created_at FROM content_item_versions WHERE content_id=%s ORDER BY content_version DESC", (content_id,))
+        cur.execute("SELECT logical_content_id FROM content_items WHERE content_id=%s", (content_id,))
+        logical = cur.fetchone()
+        if not logical:
+            conn.rollback(); raise ContentCmsError("content_not_found", 404)
+        cur.execute("""SELECT v.version_id,v.content_version,v.event_type,v.status,
+                       v.created_by_telegram_id,v.created_at
+                       FROM content_item_versions v JOIN content_items i ON i.content_id=v.content_id
+                       WHERE i.logical_content_id=%s ORDER BY v.content_version DESC""", (logical[0],))
         items = [{"version_id":str(r[0]),"version":int(r[1]),"event_type":r[2],"status":r[3],"admin_id":int(r[4]),"created_at":_iso(r[5])} for r in cur.fetchall()]
         conn.rollback(); return {"items":items,"read_only":True}
     except Exception:
@@ -306,10 +349,13 @@ def get_version(get_connection, content_id, version_id):
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
         cur.execute("""
-            SELECT version_id,content_version,event_type,content_type,status,title,description,
-                   category,duration_seconds,sort_order,published_at,archived_at,
-                   created_by_telegram_id,created_at
-            FROM content_item_versions WHERE content_id=%s AND version_id=%s
+            SELECT v.version_id,v.content_version,v.event_type,v.content_type,v.status,
+                   v.title,v.description,v.category,v.duration_seconds,v.sort_order,
+                   v.published_at,v.archived_at,v.created_by_telegram_id,v.created_at
+            FROM content_item_versions v
+            JOIN content_items vi ON vi.content_id=v.content_id
+            JOIN content_items requested ON requested.content_id=%s
+            WHERE vi.logical_content_id=requested.logical_content_id AND v.version_id=%s
         """, (content_id,version_id)); row=cur.fetchone()
         if not row: conn.rollback(); return None
         result={"version_id":str(row[0]),"version":int(row[1]),"event_type":row[2],"content_type":row[3],"status":row[4],"title":row[5],"description":row[6],"category":row[7],"duration_seconds":row[8],"sort_order":int(row[9]),"published_at":_iso(row[10]),"archived_at":_iso(row[11]),"admin_id":int(row[12]),"created_at":_iso(row[13])}

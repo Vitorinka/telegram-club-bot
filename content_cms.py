@@ -38,7 +38,7 @@ def _projection(row):
         content_id, content_type, category, title, description,
         duration_seconds, sort_order, status, version,
         created_by_telegram_id, created_at, updated_at, published_at,
-        archived_at,
+        archived_at, logical_content_id, revision_of, revision_number,
     ) = row
     return {
         "content_id": str(content_id),
@@ -57,6 +57,9 @@ def _projection(row):
         "archived_at": _iso(archived_at),
         "has_media": False,
         "source": "cms",
+        "logical_content_id": str(logical_content_id),
+        "revision_of": str(revision_of) if revision_of else None,
+        "revision_number": int(revision_number),
     }
 
 
@@ -64,7 +67,8 @@ CONTENT_SELECT = """
     SELECT content_id, content_type, category, title, description,
            duration_seconds, sort_order, status, version,
            created_by_telegram_id, created_at, updated_at,
-           published_at, archived_at
+           published_at, archived_at, logical_content_id, revision_of,
+           revision_number
     FROM content_items
 """
 
@@ -199,16 +203,18 @@ def create_content_draft(get_connection, admin_id, payload):
             INSERT INTO content_items (
                 content_id, content_type, category, title, description,
                 duration_seconds, sort_order, status, version,
-                created_by_telegram_id, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, 0, 'draft', 1, %s, NOW(), NOW())
+                created_by_telegram_id, logical_content_id, revision_number,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, 0, 'draft', 1, %s, %s, 1, NOW(), NOW())
             RETURNING content_id, content_type, category, title, description,
                       duration_seconds, sort_order, status, version,
                       created_by_telegram_id, created_at, updated_at,
-                      published_at, archived_at
+                      published_at, archived_at, logical_content_id,
+                      revision_of, revision_number
             """,
             (content_id, values["content_type"], values["category"],
              values["title"], values["description"],
-             values["duration_seconds"], int(admin_id)),
+             values["duration_seconds"], int(admin_id), content_id),
         )
         result = _projection(cur.fetchone())
         from content_taxonomy import replace_categories_cur

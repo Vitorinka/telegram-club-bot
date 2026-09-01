@@ -188,6 +188,7 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_revisions import create_published_revision
 from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
     MemberPreviewError,
@@ -21881,6 +21882,17 @@ async def miniapp_admin_cms_content_update(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+async def miniapp_admin_content_revision_create(request):
+    try:
+        result = create_published_revision(
+            get_db_conn, request.match_info.get("content_id"),
+            request["miniapp_admin"].telegram_id,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
 async def miniapp_admin_recipe_update(request):
     try:
         body = await read_content_cms_json(request)
@@ -23548,6 +23560,11 @@ def create_app():
         app.router.add_get(
             '/api/admin/content/cms/{content_id}',
             miniapp_admin_cms_content_details,
+        )
+    if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/revision"):
+        app.router.add_post(
+            '/api/admin/content/cms/{content_id}/revision',
+            miniapp_admin_content_revision_create,
         )
     if not _route_exists(app, "PATCH", "/api/admin/content/cms/{content_id}"):
         app.router.add_patch(
