@@ -87,11 +87,23 @@
         <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
         <input id="content-create-category" type="hidden">
         <fieldset id="content-create-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
-        <label>Описание <textarea id="content-create-description" maxlength="5000"></textarea></label>
-        <label>Длительность, секунд <input id="content-create-duration" type="number" min="1" max="86400"></label>
-        <label id="content-create-body-label" hidden>Основной текст <textarea id="content-create-body" maxlength="30000" rows="12"></textarea></label>
+        <label class="authoring-field">Описание <textarea id="content-create-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
+        <label class="authoring-field">Длительность <input id="content-create-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04" pattern="[0-9]{1,3}:[0-9]{2}"></label>
+        <section id="content-create-recipe-fields" class="authoring-section" hidden>
+          <h3>Рецепт</h3>
+          <label class="authoring-field">Ингредиенты <textarea id="content-create-ingredients" class="authoring-textarea" maxlength="12000" placeholder="Один ингредиент на строку: Название | количество"></textarea></label>
+          <label class="authoring-field">Шаги <textarea id="content-create-steps" class="authoring-textarea" maxlength="20000" placeholder="Один шаг приготовления на строку"></textarea></label>
+        </section>
+        <label id="content-create-body-label" class="authoring-field" hidden>Основной текст <textarea id="content-create-body" class="authoring-textarea" maxlength="30000"></textarea></label>
+        <section class="authoring-section">
+          <h3>Медиа</h3>
+          <label>Обложка <input id="content-create-cover-file" type="file" accept="image/jpeg,image/png,image/webp"></label>
+          <label id="content-create-video-label">Видео · MP4 до 20 МБ <input id="content-create-video-file" type="file" accept="video/mp4,.mp4"></label>
+          <label id="content-create-audio-label" hidden>Аудио · MP3 до 20 МБ <input id="content-create-audio-file" type="file" accept="audio/mpeg,.mp3"></label>
+          <p class="hint">Файл проходит server-side validation и прикрепляется только при успешном сохранении черновика.</p>
+        </section>
         <p id="content-create-message" class="hint">Материал будет создан только в статусе draft.</p>
-        <button id="content-create-submit" type="button">Создать черновик</button>
+        <div class="authoring-actions"><button id="content-create-submit" type="button">Сохранить черновик</button><button id="content-create-publish" type="button">Опубликовать</button></div>
       </article>
     </section>
     <section id="content-details" class="screen page" data-screen="content-details" hidden>
@@ -102,12 +114,13 @@
         <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
         <input id="content-edit-category" type="hidden">
         <fieldset id="content-edit-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
-        <label>Описание <textarea id="content-edit-description" maxlength="5000"></textarea></label>
-        <label>Длительность, секунд <input id="content-edit-duration" type="number" min="1" max="86400"></label>
+        <label class="authoring-field">Описание <textarea id="content-edit-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
+        <label class="authoring-field">Длительность <input id="content-edit-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04"></label>
         <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
         <p id="content-edit-message" class="hint"></p>
-        <button id="content-edit-save" type="button">Сохранить</button>
+        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить черновик</button><button id="content-authoring-publish" type="button">Опубликовать</button></div>
       </article>
+      <button id="content-create-revision" type="button" hidden>Редактировать</button>
       <article id="content-recipe-card" class="card" hidden>
         <h2>Рецепт</h2>
         <section class="recipe-editor-section">
@@ -147,7 +160,7 @@
           <button id="content-video-validate" type="button">Проверить видео</button>
         </section>
         <section id="content-audio-control" class="content-media-control" hidden>
-          <h3>Аудио</h3>
+          <h3>Аудио</h3><p class="hint">MP3 · до 20 МБ</p>
           <div id="content-audio-current" class="hint">Аудио не прикреплено</div>
           <label>Загрузить или заменить
             <input id="content-audio-file" type="file" accept="audio/mpeg,.mp3">
@@ -385,7 +398,7 @@
     </div>
     <section id="member-home" class="screen member-page" data-screen="member-home" hidden>
       <article class="member-hero member-card">
-        <div><p class="member-kicker">Здравствуйте!</p><h1>Рады видеть вас<br>в клубе Natalia_SoulFit</h1><button id="member-continue" class="member-button" type="button">Продолжить тренировку</button></div>
+        <div><p id="member-greeting" class="member-kicker">Здравствуйте!</p><h1>Рады видеть вас<br>в клубе Natalia_SoulFit</h1><button id="member-continue" class="member-button" type="button">Выбрать тренировку</button></div>
         <div class="member-hero-media" role="img" aria-label="Wellness-практика"></div>
       </article>
       <section class="member-section">
@@ -416,7 +429,6 @@
       </section>
       <section class="member-section"><div class="member-section-title"><h2>Новые материалы</h2><button id="member-home-library" type="button">Библиотека</button></div><div id="member-home-lessons" class="member-grid member-content-grid"></div><p id="member-home-empty" class="member-empty-state" hidden>Материалы клуба появятся здесь.</p></section>
       <section class="member-section"><article class="member-card member-zoom-card"><span class="member-zoom-icon" data-member-icon="calendar" aria-hidden="true"></span><div><p class="member-kicker">Zoom</p><h2>Расписание клуба</h2><p>Актуальное месячное расписание встреч и занятий.</p></div><button id="member-open-schedule" class="member-button" type="button">Открыть расписание</button></article></section>
-      <section class="member-section"><div class="member-section-title"><h2>Моё</h2></div><div class="member-my-grid"><button type="button"><i data-member-icon="heart" aria-hidden="true"></i><span>Избранное</span></button><button type="button"><i data-member-icon="completed" aria-hidden="true"></i><span>Пройденные</span></button><button type="button"><i data-member-icon="history" aria-hidden="true"></i><span>История</span></button><button type="button"><i data-member-icon="subscription" aria-hidden="true"></i><span>Подписка</span></button></div></section>
     </section>
     <section id="member-library" class="screen member-page" data-screen="member-library" hidden>
       <header class="member-page-heading"><p class="member-kicker">Библиотека</p><h1>Тренировки</h1><p>Эффективные занятия для тела и души</p></header>
@@ -429,7 +441,7 @@
     <section id="member-recipes" class="screen member-page" data-screen="member-recipes" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Рецепты</h1><p>Полезные и вкусные блюда для вашего баланса и энергии</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-recipe-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск рецептов"></label><div id="member-recipe-chips" class="member-chip-row"></div><div id="member-recipe-list" class="member-grid member-content-grid"></div><div id="member-recipe-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Рецепты появятся здесь</h2><p>Раздел пока не содержит реальных рецептов.</p></div></section>
     <section id="member-nutrition" class="screen member-page" data-screen="member-nutrition" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Материалы нутрициолога</h1><p>Статьи, гайды, рекомендации и чек-листы</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-nutrition-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск материалов"></label><div id="member-nutrition-list" class="member-grid member-content-grid"></div><div id="member-nutrition-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Материалы появятся здесь</h2><p>Раздел пока не содержит реальных материалов нутрициолога.</p></div></section>
     <section id="member-schedule" class="screen member-page" data-screen="member-schedule" hidden><header class="member-page-heading"><p class="member-kicker">Zoom и встречи</p><h1>Расписание</h1><p>Актуальное расписание клуба</p></header><div id="member-schedule-content" class="member-schedule-shell"><article class="member-card member-empty-state member-empty-art"><span data-member-icon="calendar" aria-hidden="true"></span><h2>Расписание клуба</h2><p>Информация о ближайших встречах появится здесь.</p></article></div></section>
-    <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1>Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span data-member-icon="subscription" aria-hidden="true"></span><div><small>Подписка</small><strong>Статус подписки будет отображаться здесь</strong></div></article><div class="member-profile-links"><button type="button"><i data-member-icon="heart" aria-hidden="true"></i><span>Избранное</span><b>›</b></button><button type="button"><i data-member-icon="history" aria-hidden="true"></i><span>История</span><b>›</b></button><button type="button"><i data-member-icon="calendar" aria-hidden="true"></i><span>Записи на Zoom</span><b>›</b></button><button type="button"><i data-member-icon="settings" aria-hidden="true"></i><span>Настройки</span><b>›</b></button></div><button class="member-exit member-button" type="button">Вернуться в админку</button></section>
+    <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1 id="member-profile-name">Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span data-member-icon="subscription" aria-hidden="true"></span><div><small>Доступ</small><strong id="member-profile-access">Статус доступа будет отображаться здесь</strong></div></article><button class="member-exit member-button" type="button">Вернуться в бота</button></section>
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>

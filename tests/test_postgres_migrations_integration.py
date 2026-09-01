@@ -76,6 +76,7 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_revisions import create_published_revision
 from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
     get_member_preview_content,
@@ -120,6 +121,13 @@ from miniapp_sessions import (
     load_miniapp_admin_session,
     revoke_miniapp_admin_session,
 )
+from member_catalog import (
+    get_member_content,
+    list_member_catalog,
+    list_member_categories,
+    member_access,
+)
+from member_sessions import create_member_session, load_member_session
 from admin_dashboard import collect_admin_dashboard
 from admin_users import get_admin_user_details, list_admin_users
 
@@ -364,6 +372,147 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             0,
         )
 
+    def test_member_sessions_and_entitlement_aware_catalog_real_postgres(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0027_miniapp_member_sessions", first["applied"])
+        self.assertIn("0027_miniapp_member_sessions", second["applied"])
+        self.assertIn("0028_content_revisions", first["applied"])
+        self.assertIn("0028_content_revisions", second["applied"])
+        self.assertEqual(
+            self.query_one(
+                "SELECT to_regclass('public.miniapp_member_sessions')"
+            )[0],
+            "miniapp_member_sessions",
+        )
+
+        token, session = create_member_session(self.get_conn, 88001)
+        self.assertEqual(load_member_session(self.get_conn, token).session_id, session.session_id)
+        self.assertNotEqual(
+            self.query_one(
+                "SELECT token_hash FROM miniapp_member_sessions WHERE session_id=%s",
+                (session.session_id,),
+            )[0],
+            token,
+        )
+
+        lesson = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Опубликованный урок",
+            "category": "strength", "duration_seconds": 600,
+        })
+        hidden = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Черновик скрыт",
+            "category": "strength", "duration_seconds": 600,
+        })
+        recipe = create_content_draft(self.get_conn, 1, {
+            "content_type": "recipe", "title": "Рецепт клуба",
+            "category": "breakfast", "duration_seconds": 900,
+        })
+        replace_recipe_structure(self.get_conn, recipe["content_id"], {
+            "expected_version": 1,
+            "ingredients": [{"name": "Вода", "amount": "1 стакан", "sort_order": 0}],
+            "steps": [{"step_number": 1, "instruction": "Смешать"}],
+        })
+        nutrition = create_nutrition_draft(self.get_conn, 1, {
+            "content_type": "nutrition_material", "title": "Гайд по питанию",
+            "category": None, "description": "Безопасное описание",
+            "duration_seconds": None, "body": "Полный премиальный текст",
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, paid, expiry_date, first_name) "
+                    "VALUES (88001,FALSE,NOW()-INTERVAL '1 day','Без доступа'), "
+                    "(88002,TRUE,NOW()+INTERVAL '30 days','Участник'), "
+                    "(88003,TRUE,NOW()-INTERVAL '1 day','Истёк'), "
+                    "(88004,TRUE,NOW()-INTERVAL '1 day','Grace'), "
+                    "(88005,TRUE,NOW()+INTERVAL '7 days','Trial'), "
+                    "(88006,TRUE,NOW()+INTERVAL '7 days','Manual'), "
+                    "(88007,TRUE,NOW()+INTERVAL '7 days','Gift')"
+                )
+                cur.execute(
+                    "UPDATE users SET payment_failed=TRUE, grace_period_end=NOW()+INTERVAL '2 hours' "
+                    "WHERE telegram_id=88004"
+                )
+                cur.execute(
+                    "UPDATE content_items SET status='published',published_at=NOW() "
+                    "WHERE content_id=ANY(%s::uuid[])",
+                    ([lesson["content_id"], recipe["content_id"], nutrition["content_id"]],),
+                )
+                cur.execute(
+                    "INSERT INTO content_item_categories (content_id,category_id) "
+                    "SELECT %s,category_id FROM content_categories "
+                    "WHERE content_type='lesson' AND slug='strength'",
+                    (lesson["content_id"],),
+                )
+                cur.execute(
+                    "INSERT INTO content_item_categories (content_id,category_id) "
+                    "SELECT %s,category_id FROM content_categories "
+                    "WHERE content_type='recipe' AND slug='breakfast'",
+                    (recipe["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        unpaid = list_member_catalog(self.get_conn, 88001, content_type="lesson")
+        self.assertEqual([item["content_id"] for item in unpaid["items"]], [lesson["content_id"]])
+        self.assertTrue(unpaid["items"][0]["locked"])
+        filtered = list_member_catalog(
+            self.get_conn, 88001, content_type="lesson", category="strength"
+        )
+        self.assertEqual([item["content_id"] for item in filtered["items"]], [lesson["content_id"]])
+        self.assertNotIn(hidden["content_id"], json.dumps(unpaid))
+        self.assertFalse(member_access(self.get_conn, 88001)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88002)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88003)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88004)["has_active_access"])
+        for telegram_id in (88005, 88006, 88007):
+            self.assertTrue(member_access(self.get_conn, telegram_id)["has_active_access"])
+
+        locked_recipe = get_member_content(self.get_conn, 88001, recipe["content_id"])
+        self.assertTrue(locked_recipe["locked"])
+        self.assertNotIn("ingredients", locked_recipe)
+        self.assertNotIn("steps", locked_recipe)
+        open_recipe = get_member_content(self.get_conn, 88002, recipe["content_id"])
+        self.assertFalse(open_recipe["locked"])
+        self.assertEqual(open_recipe["ingredients"][0]["name"], "Вода")
+        self.assertEqual(open_recipe["steps"][0]["instruction"], "Смешать")
+        recipe_filtered = list_member_catalog(
+            self.get_conn, 88001, content_type="recipe", category="breakfast"
+        )
+        self.assertEqual(
+            [item["content_id"] for item in recipe_filtered["items"]],
+            [recipe["content_id"]],
+        )
+        locked_nutrition = get_member_content(
+            self.get_conn, 88001, nutrition["content_id"]
+        )
+        self.assertNotIn("body", locked_nutrition)
+        open_nutrition = get_member_content(
+            self.get_conn, 88004, nutrition["content_id"]
+        )
+        self.assertEqual(open_nutrition["body"], "Полный премиальный текст")
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET expiry_date=NOW()-INTERVAL '1 second' WHERE telegram_id=88002")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertTrue(get_member_content(self.get_conn, 88002, recipe["content_id"])["locked"])
+        categories = list_member_categories(self.get_conn, "lesson")["items"]
+        self.assertIn("strength", {item["slug"] for item in categories})
+
+        serialized = json.dumps({"list": unpaid, "details": locked_recipe})
+        for forbidden in (
+            "telegram_file_id", "server_reference", "stripe_customer_id",
+            "stripe_subscription_id", "BOT_TOKEN",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
     def test_miniapp_dashboard_aggregates_synthetic_records_real_postgres(self):
         run_migrations(self.get_conn)
         conn = self.get_conn()
@@ -454,8 +603,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 26,
-            "latest": "0026_content_taxonomy",
+            "count": 28,
+            "latest": "0028_content_revisions",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -1939,7 +2088,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 26)
+        self.assertEqual(len(migrations), 28)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2756,6 +2905,86 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             with conn.cursor() as cur: cur.execute(migration_sql)
             conn.commit()
         finally: conn.close()
+
+    def test_content_revision_copy_publish_and_history_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "content-revision-secret"
+
+        def attach(content_id, media_type, data, reference):
+            upload = create_media_upload(self.get_conn, 1, content_id, media_type, data)
+            action = ensure_media_action(self.get_conn, upload["upload_id"], 1)
+            prepare_media_execution(self.get_conn, upload["upload_id"], action["action_id"], 1)
+            record_telegram_upload(self.get_conn, upload["upload_id"], action["action_id"], 1, reference)
+            return apply_media_upload(self.get_conn, upload["upload_id"], action["action_id"], 1)
+
+        categories = list_categories(self.get_conn, "lesson")["items"]
+        selected = [categories[0]["id"]]
+        original = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Версия один",
+            "description": "### Заголовок\n\n- пункт", "duration_seconds": 600,
+            "category_ids": selected,
+        })
+        media = attach(original["content_id"], "video", b"\x00\x00\x00\x18ftypisomrevision", "private-revision-video")
+        preview = create_lifecycle_preview(self.get_conn, original["content_id"], 1, media["content_version"], secret)
+        published = confirm_lifecycle(self.get_conn, original["content_id"], preview["action_id"], 1, secret)
+
+        revision = create_published_revision(self.get_conn, original["content_id"], 2)
+        duplicate = create_published_revision(self.get_conn, original["content_id"], 2)
+        self.assertEqual(revision["content_id"], duplicate["content_id"])
+        self.assertEqual(revision["revision_of"], original["content_id"])
+        self.assertEqual(revision["logical_content_id"], original["content_id"])
+        self.assertEqual(revision["revision_number"], 2)
+        self.assertEqual([item["id"] for item in get_content_categories(self.get_conn, revision["content_id"])], selected)
+        revision_media = list_content_media(self.get_conn, revision["content_id"])
+        self.assertEqual(revision_media[0]["media_type"], "video")
+        self.assertNotIn("private-revision-video", json.dumps(revision_media))
+
+        updated = update_content_draft(self.get_conn, revision["content_id"], {
+            "expected_version": revision["version"], "title": "Версия два",
+            "description": revision["description"], "duration_seconds": 600,
+            "category_ids": selected,
+        })
+        second_preview = create_lifecycle_preview(self.get_conn, revision["content_id"], 2, updated["version"], secret)
+        second = confirm_lifecycle(self.get_conn, revision["content_id"], second_preview["action_id"], 2, secret)
+        self.assertEqual(second["version"], 2)
+        self.assertEqual(self.query_one("SELECT status,title FROM content_items WHERE content_id=%s", (original["content_id"],)), ("archived", "Версия один"))
+        self.assertEqual(self.query_one("SELECT status,title FROM content_items WHERE content_id=%s", (revision["content_id"],)), ("published", "Версия два"))
+        versions = list_versions(self.get_conn, revision["content_id"])["items"]
+        self.assertEqual([entry["version"] for entry in versions], [2, 1])
+        old_snapshot = get_version(self.get_conn, revision["content_id"], published["version_id"])
+        self.assertEqual(old_snapshot["title"], "Версия один")
+
+        recipe = create_content_draft(self.get_conn, 1, {"content_type":"recipe", "title":"Рецепт"})
+        recipe_id = recipe["content_id"]
+        recipe_structure_version = replace_recipe_structure(self.get_conn, recipe_id, {
+            "expected_version":1,
+            "ingredients":[{"name":"Вода","amount":"1 л","sort_order":0}],
+            "steps":[{"step_number":1,"instruction":"Смешать"}],
+        })
+        recipe_preview = create_lifecycle_preview(self.get_conn, recipe_id, 1, recipe_structure_version["version"], secret)
+        confirm_lifecycle(self.get_conn, recipe_id, recipe_preview["action_id"], 1, secret)
+        recipe_revision = create_published_revision(self.get_conn, recipe_id, 2)
+        recipe_structure = get_recipe_structure(self.get_conn, recipe_revision["content_id"])
+        self.assertEqual(recipe_structure["ingredients"][0]["name"], "Вода")
+        self.assertEqual(recipe_structure["steps"][0]["instruction"], "Смешать")
+
+        nutrition = create_nutrition_draft(self.get_conn, 1, {
+            "content_type":"nutrition_material", "title":"Питание",
+            "category":"nutrition", "body":"Полный текст",
+        })
+        nutrition_preview = create_lifecycle_preview(self.get_conn, nutrition["content_id"], 1, nutrition["version"], secret)
+        confirm_lifecycle(self.get_conn, nutrition["content_id"], nutrition_preview["action_id"], 1, secret)
+        nutrition_revision = create_published_revision(self.get_conn, nutrition["content_id"], 2)
+        self.assertEqual(get_nutrition_body(self.get_conn, nutrition_revision["content_id"])["body"], "Полный текст")
+
+        migration_sql = (MIGRATIONS_DIR / "0028_content_revisions.sql").read_text(encoding="utf-8")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(migration_sql)
+            conn.commit()
+        finally:
+            conn.close()
 
     def test_content_publish_domain_fences_and_archive_rollback_real_postgres(self):
         run_migrations(self.get_conn)
@@ -9346,8 +9575,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 26)
-        self.assertEqual(system["migrations"]["latest"], "0026_content_taxonomy")
+        self.assertEqual(system["migrations"]["count"], 28)
+        self.assertEqual(system["migrations"]["latest"], "0028_content_revisions")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

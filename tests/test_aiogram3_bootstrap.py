@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import importlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -1425,7 +1426,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_access_restore_worker_sends_exact_text_button_and_persists_invite(self):
         key = "access-restore:act1:123"
-        expiry = datetime(2026, 9, 1, 12, 0)
+        expiry = datetime.utcnow() + timedelta(days=5)
         payload = json.dumps({"effective_expiry": expiry.isoformat(), "source": self.main.ACCESS_RESTORE_SOURCE_ADMIN, "admin_action_id": "act1"})
         claim_conn = FakeConnection(fetches=[[(key, 123, self.main.ACCESS_RESTORE_DELIVERY_TYPE, payload, 1, None, 1)]])
         recheck_conn = FakeConnection(fetches=[(True, expiry, False, None)])
@@ -9564,6 +9565,136 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(nutrition_missing.status, 401)
 
+    async def test_real_member_routes_use_separate_bearer_auth_and_rollout_gate(self):
+        app = self.main.create_app()
+        member_routes = (
+            ("GET", "/api/member/me"),
+            ("GET", "/api/member/home"),
+            ("GET", "/api/member/content"),
+            ("GET", "/api/member/categories"),
+            ("GET", "/api/member/schedule"),
+            ("GET", "/api/member/content/{content_id}"),
+            ("GET", "/api/member/content/{content_id}/media/{media_id}"),
+        )
+        for method, resource in member_routes:
+            handler = self.route_handler(app, method, resource)
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, path=resource), handler
+            )
+            self.assertEqual(response.status, 401)
+
+        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "false", "MEMBER_APP_TEST_IDS": "42"}, clear=False):
+            self.assertTrue(self.main.member_rollout_allowed(42))
+            self.assertFalse(self.main.member_rollout_allowed(43))
+        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "true", "MEMBER_APP_TEST_IDS": ""}, clear=False):
+            self.assertTrue(self.main.member_rollout_allowed(43))
+
+        member_session = SimpleNamespace(
+            telegram_id=42, first_name="Проверенное имя", session_id="member-session"
+        )
+        handler = self.route_handler(app, "GET", "/api/member/me")
+        with patch.object(
+            self.main, "load_member_session", return_value=member_session
+        ), patch.object(
+            self.main, "member_access",
+            return_value={"has_active_access": True, "expires_at": "2026-10-01", "first_name": "DB name", "username": None},
+        ):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer member-token", path="/api/member/me"),
+                handler,
+            )
+        self.assertEqual(response.status, 200)
+        payload = json.loads(response.text)
+        self.assertEqual(payload["profile"]["first_name"], "Проверенное имя")
+        self.assertNotIn("telegram_id", response.text)
+
+    async def test_member_auth_uses_validated_identity_and_does_not_reuse_admin_session(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "POST", "/api/member/auth")
+        request = FakeMiniAppRequest(
+            app, "tma signed-init-data", path="/api/member/auth", method="POST"
+        )
+        identity = SimpleNamespace(
+            telegram_id=77, first_name="Telegram Name", username="member"
+        )
+        session = SimpleNamespace(
+            telegram_id=77, first_name="Telegram Name", session_id="member-session",
+            expires_at=datetime.utcnow() + timedelta(hours=2),
+        )
+        with patch.object(
+            self.main, "validate_telegram_member_init_data", return_value=identity
+        ), patch.object(
+            self.main, "member_rollout_allowed", return_value=True
+        ), patch.object(
+            self.main, "create_member_session", return_value=("member-token", session)
+        ) as create_session, patch.object(
+            self.main, "member_access",
+            return_value={"has_active_access": False, "expires_at": None},
+        ), patch.object(
+            self.main, "create_miniapp_admin_session",
+            side_effect=AssertionError("admin session must not be used"),
+        ):
+            response = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(response.status, 201)
+        payload = json.loads(response.text)
+        self.assertEqual(payload["profile"]["first_name"], "Telegram Name")
+        self.assertFalse(payload["access"]["has_active_access"])
+        create_session.assert_called_once_with(
+            self.main.get_db_conn, 77, "Telegram Name"
+        )
+
+    async def test_member_media_rechecks_access_and_video_remains_unsupported(self):
+        app = self.main.create_app()
+        path = "/api/member/content/{content_id}/media/{media_id}"
+        handler = self.route_handler(app, "GET", path)
+        request = FakeMiniAppRequest(
+            app, "Bearer member-token", path=path,
+            match_info={"content_id": "content-id", "media_id": "media-id"},
+        )
+        session = SimpleNamespace(telegram_id=42, first_name="Member", session_id="member")
+        content = {"content_id": "content-id", "locked": True}
+        audio = {
+            "media_type": "audio", "mime_type": "audio/mpeg", "size_bytes": 10,
+            "server_reference": "private-ref", "content_type": "meditation",
+        }
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_content", return_value=content), \
+             patch.object(self.main, "get_media_reference", return_value=audio), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            denied = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(denied.status, 403)
+        get_file.assert_not_awaited()
+
+        video = dict(audio, media_type="video", mime_type="video/mp4")
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_content", return_value={"locked": False}), \
+             patch.object(self.main, "get_media_reference", return_value=video), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            unsupported = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(unsupported.status, 409)
+        get_file.assert_not_awaited()
+
+        async def download_audio(_path, destination, **_kwargs):
+            destination.write(b"safe-mp3")
+
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_content", return_value={"locked": False}), \
+             patch.object(self.main, "get_media_reference", return_value=audio), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(
+                 self.main.bot, "get_file", new_callable=AsyncMock,
+                 return_value=SimpleNamespace(file_path="private/path"),
+             ), patch.object(
+                 self.main.bot, "download_file", new_callable=AsyncMock,
+                 side_effect=download_audio,
+             ):
+            allowed = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(allowed.status, 200)
+        self.assertEqual(allowed.body, b"safe-mp3")
+        self.assertEqual(allowed.headers["Cache-Control"], "private, no-store")
+
     async def test_member_preview_routes_are_admin_only_and_safely_projected(self):
         app = self.main.create_app()
         routes = (
@@ -9635,6 +9766,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_miniapp_content_media_routes_require_admin_bearer_auth(self):
         app = self.main.create_app()
         routes = (
+            ("POST", "/api/admin/content/cms/{content_id}/revision"),
             ("POST", "/api/admin/content/cms/{content_id}/media-preview"),
             ("GET", "/api/admin/content/media/uploads/{upload_id}/preview"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
@@ -9889,6 +10021,17 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("content-lifecycle-card", index)
         self.assertIn("content-version-history", index)
         self.assertIn("previewContentLifecycle", javascript)
+        self.assertIn("content-create-publish", index)
+        self.assertIn("content-authoring-publish", index)
+        self.assertIn("content-create-revision", index)
+        self.assertIn("/revision`, {}", javascript)
+        self.assertIn("appendRestrictedText", javascript)
+        self.assertIn("document.createTextNode", javascript)
+        self.assertIn("authoring-textarea", index)
+        self.assertIn("MP3 · до 20 МБ", index)
+        self.assertIn("Этот формат пока не поддерживается. Загрузите MP3.", javascript)
+        self.assertIn("formatDuration", javascript)
+        self.assertIn("Материал изменился. Обновите данные и повторите.", javascript)
         self.assertIn("${mode}-preview", javascript)
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)
@@ -9971,7 +10114,12 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("member-content-card", javascript)
         self.assertIn("Медитации появятся здесь", index)
         self.assertIn("Рецепты появятся здесь", index)
-        self.assertIn("Статус подписки будет отображаться здесь", index)
+        self.assertIn("Статус доступа будет отображаться здесь", index)
+        self.assertIn("/api/member/auth", javascript)
+        self.assertIn("/api/member/content", javascript)
+        self.assertIn("/api/member/schedule", javascript)
+        self.assertIn("member_rollout_disabled", javascript)
+        self.assertIn("video_streaming_not_available", inspect.getsource(self.main))
         self.assertNotIn("member-training-group", javascript)
         self.assertNotIn("member-trainings", index)
         self.assertNotIn("innerHTML", javascript)

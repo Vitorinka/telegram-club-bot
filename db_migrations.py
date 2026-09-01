@@ -804,6 +804,30 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_categories_slug_check": {"table":"content_categories","definition_contains":("slug","a-z"),"validated":True},
         },
     },
+    "0027_miniapp_member_sessions": {
+        "tables": ("miniapp_member_sessions",),
+        "columns": {"miniapp_member_sessions": ("session_id","token_hash","telegram_id","first_name","created_at","expires_at","revoked_at")},
+        "indexes": ("miniapp_member_sessions_expires_at_idx","miniapp_member_sessions_telegram_id_idx"),
+        "constraints": {
+            "miniapp_member_sessions_expiry_check":{"table":"miniapp_member_sessions","definition_contains":("expires_at","created_at"),"validated":True},
+            "miniapp_member_sessions_first_name_check":{"table":"miniapp_member_sessions","definition_contains":("first_name","128"),"validated":True},
+        },
+    },
+    "0028_content_revisions": {
+        "tables": ("content_items",),
+        "columns": {"content_items": ("logical_content_id", "revision_of", "revision_number")},
+        "indexes": (
+            "content_items_logical_history_idx",
+            "content_items_one_draft_revision_idx",
+            "content_items_one_published_revision_idx",
+        ),
+        "constraints": {
+            "content_items_logical_content_fk": {"table":"content_items","definition_contains":("logical_content_id","content_items"),"validated":True},
+            "content_items_revision_of_fk": {"table":"content_items","definition_contains":("revision_of","content_items"),"validated":True},
+            "content_items_revision_number_check": {"table":"content_items","definition_contains":("revision_number","1"),"validated":True},
+            "content_items_revision_shape_check": {"table":"content_items","definition_contains":("revision_of","logical_content_id"),"validated":True},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

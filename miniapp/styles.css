@@ -494,3 +494,11 @@ body.member-preview-mode { background: #fbfaf7; }
   .bottom-nav button { font-size: 9.4px; letter-spacing: -.015em; }
 }
 .taxonomy-fieldset{border:1px solid var(--line);border-radius:14px;padding:12px;margin:10px 0}.taxonomy-fieldset legend{font-weight:700;padding:0 6px}.taxonomy-group{margin:8px 0}.taxonomy-group>strong{display:block;margin-bottom:5px}.taxonomy-options{display:grid;gap:6px}.taxonomy-option{min-height:44px;display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:11px;background:var(--surface-soft)}.taxonomy-option input{width:20px;height:20px;flex:none}
+.authoring-field { display: grid; gap: 7px; width: 100%; }
+.authoring-textarea { width: 100%; min-height: 160px; resize: vertical; line-height: 1.55; }
+.duration-input { width: min(100%, 150px); font-variant-numeric: tabular-nums; }
+.authoring-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.authoring-actions > button { min-height: 44px; flex: 1 1 180px; }
+.formatted-content { width: 100%; white-space: normal; line-height: 1.6; }
+.formatted-content p, .formatted-content ul, .formatted-content ol, .formatted-content h3 { margin: 0 0 10px; }
+@media (max-width: 430px) { .authoring-actions { display: grid; } .duration-input { width: 100%; } }

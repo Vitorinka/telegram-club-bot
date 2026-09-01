@@ -104,7 +104,10 @@ from miniapp_auth import (
     miniapp_auth_error_reference,
     parse_miniapp_authorization,
     validate_telegram_init_data,
+    validate_telegram_member_init_data,
 )
+from member_sessions import MemberSessionError, create_member_session, load_member_session
+from member_catalog import MemberCatalogError, get_member_content, list_member_catalog, list_member_categories, member_access
 from miniapp_sessions import (
     MiniAppSessionError,
     create_miniapp_admin_session,
@@ -185,6 +188,7 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_revisions import create_published_revision
 from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
     MemberPreviewError,
@@ -21606,10 +21610,30 @@ def authenticate_miniapp_session(request):
         raise MiniAppSessionError(category, status=403)
     return session
 
+def _member_test_ids():
+    result=set()
+    for value in os.getenv("MEMBER_APP_TEST_IDS", "").split(","):
+        value=value.strip()
+        if value:
+            try: result.add(int(value))
+            except ValueError: continue
+    return result
+
+def member_rollout_allowed(telegram_id):
+    return os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true" or int(telegram_id) in _member_test_ids()
+
+def authenticate_member_session(request):
+    try:
+        raw=parse_bearer_authorization(request.headers.get("Authorization"))
+        return load_member_session(get_db_conn,raw)
+    except (MiniAppSessionError,MemberSessionError) as error:
+        raise MemberSessionError("member_unauthorized",401) from error
+
 
 @web.middleware
 async def miniapp_admin_auth_middleware(request, handler):
     is_admin_api = request.path.startswith("/api/admin/")
+    is_member_api = request.path.startswith("/api/member/")
     if is_admin_api and not (
         request.path == "/api/admin/session" and request.method == "POST"
     ):
@@ -21617,10 +21641,15 @@ async def miniapp_admin_auth_middleware(request, handler):
             request["miniapp_admin"] = authenticate_miniapp_session(request)
         except MiniAppSessionError as error:
             return miniapp_auth_error_response(error.status)
+    if is_member_api and not (request.path == "/api/member/auth" and request.method == "POST"):
+        try:
+            request["miniapp_member"] = authenticate_member_session(request)
+        except MemberSessionError as error:
+            return miniapp_auth_error_response(error.status)
     try:
         response = await handler(request)
     except Exception:
-        if not is_admin_api:
+        if not is_admin_api and not is_member_api:
             raise
         category = "admin_api_internal_error"
         logging.error(
@@ -21629,7 +21658,77 @@ async def miniapp_admin_auth_middleware(request, handler):
             miniapp_auth_error_reference(category),
         )
         response = web.json_response({"error": "internal_error"}, status=500)
-    return apply_miniapp_security_headers(response) if is_admin_api else response
+    return apply_miniapp_security_headers(response) if (is_admin_api or is_member_api) else response
+
+def member_error(error):
+    return apply_miniapp_security_headers(web.json_response({"error":error.category},status=error.status))
+
+async def miniapp_member_auth(request):
+    try:
+        raw=parse_miniapp_authorization(request.headers.get("Authorization"))
+        identity=validate_telegram_member_init_data(raw,BOT_TOKEN)
+        if not member_rollout_allowed(identity.telegram_id):
+            raise MemberSessionError("member_rollout_disabled",403)
+        token,session=create_member_session(
+            get_db_conn, identity.telegram_id, identity.first_name
+        )
+        access=member_access(get_db_conn,identity.telegram_id)
+    except MiniAppAuthError as error: return miniapp_auth_error_response(error.status)
+    except MemberSessionError as error: return member_error(error)
+    return apply_miniapp_security_headers(web.json_response({"token":token,"expires_at":session.expires_at.isoformat(),"authenticated":True,"profile":{"first_name":identity.first_name,"username":identity.username},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}},status=201))
+
+async def miniapp_member_me(request):
+    access=member_access(get_db_conn,request["miniapp_member"].telegram_id)
+    return apply_miniapp_security_headers(web.json_response({"profile":{"first_name":request["miniapp_member"].first_name},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}}))
+
+async def miniapp_member_content_list(request):
+    try:
+        result=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"))
+    except MemberCatalogError as error: return member_error(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+async def miniapp_member_content_details(request):
+    try: result=get_member_content(get_db_conn,request["miniapp_member"].telegram_id,request.match_info.get("content_id"))
+    except MemberCatalogError as error: return member_error(error)
+    if result is None: return member_error(MemberCatalogError("content_not_found",404))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+async def miniapp_member_categories(request):
+    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"))
+    except MemberCatalogError as error: return member_error(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+async def miniapp_member_home(request):
+    lessons=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6)
+    categories=list_member_categories(get_db_conn,"lesson")
+    return apply_miniapp_security_headers(web.json_response({"latest_lessons":lessons["items"],"categories":categories["items"],"access":lessons["access"],"published_only":True}))
+
+async def miniapp_member_schedule(request):
+    month=datetime.now(MOSCOW_TZ).strftime("%Y-%m")
+    conn=get_db_conn(); cur=conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SELECT EXISTS(SELECT 1 FROM club_schedules WHERE schedule_month=%s)",(month,)); exists=bool(cur.fetchone()[0]); conn.rollback()
+    finally: cur.close(); conn.close()
+    return apply_miniapp_security_headers(web.json_response({"schedule_month":month,"has_schedule":exists,"join_url":None}))
+
+async def miniapp_member_media(request):
+    session=request["miniapp_member"]
+    content=get_member_content(get_db_conn,session.telegram_id,request.match_info.get("content_id"))
+    if content is None: return member_error(MemberCatalogError("content_not_found",404))
+    media=get_media_reference(get_db_conn,request.match_info.get("content_id"),request.match_info.get("media_id"))
+    if media is None: return member_error(MemberCatalogError("media_not_found",404))
+    premium=media["media_type"] in {"audio","video"}
+    if premium and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
+        return member_error(MemberCatalogError("active_access_required",403))
+    if media["media_type"] == "video": return member_error(MemberCatalogError("video_streaming_not_available",409))
+    limit=AUDIO_MAX_BYTES if media["media_type"]=="audio" else COVER_MAX_BYTES
+    try:
+        telegram_file=await bot.get_file(media["server_reference"]); file_path=getattr(telegram_file,"file_path",None)
+        if not file_path: raise MemberCatalogError("media_unavailable",502)
+        destination=BoundedContentMediaBuffer(limit); await bot.download_file(file_path,destination=destination,timeout=30,chunk_size=64*1024); data=destination.getvalue()
+    except MemberCatalogError as error: return member_error(error)
+    except Exception: return member_error(MemberCatalogError("media_unavailable",503))
+    response=web.Response(body=data,content_type=media["mime_type"]); response.headers["Cache-Control"]="private, no-store"; return apply_miniapp_security_headers(response)
 
 
 async def miniapp_admin_session_create(request):
@@ -21781,6 +21880,17 @@ async def miniapp_admin_cms_content_update(request):
     except ContentCmsError as error:
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_revision_create(request):
+    try:
+        result = create_published_revision(
+            get_db_conn, request.match_info.get("content_id"),
+            request["miniapp_admin"].telegram_id,
+        )
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
 
 
 async def miniapp_admin_recipe_update(request):
@@ -23369,6 +23479,22 @@ def create_app():
         app.router.add_get('/miniapp/app.js', miniapp_javascript)
     if not _route_exists(app, "GET", "/miniapp/styles.css"):
         app.router.add_get('/miniapp/styles.css', miniapp_stylesheet)
+    if not _route_exists(app,"POST","/api/member/auth"):
+        app.router.add_post('/api/member/auth',miniapp_member_auth)
+    if not _route_exists(app,"GET","/api/member/me"):
+        app.router.add_get('/api/member/me',miniapp_member_me)
+    if not _route_exists(app,"GET","/api/member/home"):
+        app.router.add_get('/api/member/home',miniapp_member_home)
+    if not _route_exists(app,"GET","/api/member/categories"):
+        app.router.add_get('/api/member/categories',miniapp_member_categories)
+    if not _route_exists(app,"GET","/api/member/schedule"):
+        app.router.add_get('/api/member/schedule',miniapp_member_schedule)
+    if not _route_exists(app,"GET","/api/member/content"):
+        app.router.add_get('/api/member/content',miniapp_member_content_list)
+    if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
+        app.router.add_get('/api/member/content/{content_id}/media/{media_id}',miniapp_member_media)
+    if not _route_exists(app,"GET","/api/member/content/{content_id}"):
+        app.router.add_get('/api/member/content/{content_id}',miniapp_member_content_details)
     if not _route_exists(app, "GET", "/api/admin/me"):
         app.router.add_get('/api/admin/me', miniapp_admin_me)
     if not _route_exists(app, "POST", "/api/admin/session"):
@@ -23434,6 +23560,11 @@ def create_app():
         app.router.add_get(
             '/api/admin/content/cms/{content_id}',
             miniapp_admin_cms_content_details,
+        )
+    if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/revision"):
+        app.router.add_post(
+            '/api/admin/content/cms/{content_id}/revision',
+            miniapp_admin_content_revision_create,
         )
     if not _route_exists(app, "PATCH", "/api/admin/content/cms/{content_id}"):
         app.router.add_patch(
