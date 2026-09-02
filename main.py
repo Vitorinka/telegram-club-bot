@@ -75,6 +75,11 @@ from checkout_safety import (
     subscription_status_action,
 )
 from db_migrations import run_migrations
+from failed_subscription_termination import (
+    claim_termination as claim_failed_subscription_termination,
+    fenced_failure as fail_failed_subscription_termination,
+    fenced_phase as mark_failed_subscription_termination_phase,
+)
 from group_access import (
     group_join_decision,
     invite_link_options,
@@ -1060,8 +1065,27 @@ def get_cancel_subscription_keyboard():
     ]])
 
 
+def get_failed_subscription_actions_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="💳 Оплатить / сменить карту", callback_data="failed_subscription_payment_action")],
+        [InlineKeyboardButton(text="❌ Отписаться и закрыть доступ", callback_data="cancel_failed_subscription")],
+    ])
+
+
+def get_failed_subscription_cancel_confirmation_keyboard():
+    return inline_keyboard([
+        [InlineKeyboardButton(text="❌ Отписаться и закрыть доступ", callback_data="confirm_cancel_failed_subscription")],
+        [InlineKeyboardButton(text="Назад", callback_data="failed_subscription_payment_action")],
+    ])
+
+
 def stripe_delivery_key(event_id, purpose):
     return f"stripe:{event_id}:{purpose}"
+
+
+def failed_subscription_cycle_delivery_key(subscription_id, grace_until):
+    deadline = int(grace_until.timestamp()) if grace_until else 0
+    return f"failed-subscription-payment:{safe_delivery_hash(subscription_id)}:{deadline}"
 
 
 def stripe_delivery_payload(text, keyboard_kind=None, parse_mode=None, **extra):
@@ -1444,10 +1468,11 @@ def enqueue_user_payment_success_message(cur, event_id, telegram_id, purpose, ex
     )
 
 
-def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keyboard_kind=None, parse_mode=None, delivery_type=None, **extra):
+def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keyboard_kind=None, parse_mode=None,
+                                delivery_type=None, delivery_key_override=None, **extra):
     return enqueue_message_delivery(
         cur,
-        stripe_delivery_key(event_id, purpose),
+        delivery_key_override or stripe_delivery_key(event_id, purpose),
         int(telegram_id),
         delivery_type or "stripe_user_message",
         stripe_delivery_payload(text, keyboard_kind=keyboard_kind, parse_mode=parse_mode, **extra),
@@ -1962,6 +1987,8 @@ def stripe_delivery_reply_markup(payload):
         ]])
     if keyboard_kind == "cancel_subscription":
         return get_cancel_subscription_keyboard()
+    if keyboard_kind == "payment_failed_actions":
+        return get_failed_subscription_actions_keyboard()
     if keyboard_kind == "tariffs":
         return get_tariffs_keyboard(show_trial=bool(payload.get("show_trial", False)))
     return None
@@ -3035,10 +3062,10 @@ async def get_open_invoice_url_for_subscription(stripe_subscription_id):
                 return hosted_invoice_url, getattr(invoice, "id", None)
     except Exception as e:
         logging.error(
-            "OPEN_INVOICE_LOOKUP_FAILED: stripe_subscription_id=%s, error=%s",
+            "OPEN_INVOICE_LOOKUP_FAILED: stripe_subscription_id=%s, error_class=%s, error_ref=%s",
             safe_log_id(stripe_subscription_id),
-            str(e),
-            exc_info=True,
+            type(e).__name__,
+            safe_admin_error_reference("open_invoice_lookup", e),
         )
 
     return None, None
@@ -3057,10 +3084,10 @@ async def create_billing_portal_url(stripe_customer_id):
         return getattr(portal, "url", None)
     except Exception as e:
         logging.error(
-            "BILLING_PORTAL_CREATE_FAILED: stripe_customer_id=%s, error=%s",
+            "BILLING_PORTAL_CREATE_FAILED: stripe_customer_id=%s, error_class=%s, error_ref=%s",
             safe_log_id(stripe_customer_id),
-            str(e),
-            exc_info=True,
+            type(e).__name__,
+            safe_admin_error_reference("billing_portal_create", e),
         )
         return None
 
@@ -3519,6 +3546,316 @@ async def refresh_active_stripe_subscription(telegram_id, stripe_subscription_id
 
     return False
 
+
+def failed_termination_phase(operation_id, owner_id, generation, status, timestamp_column=None):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        changed = mark_failed_subscription_termination_phase(
+            cur, operation_id, owner_id, generation, status, timestamp_column,
+        )
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def failed_termination_failure(operation_id, owner_id, generation, category, terminal=False):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        changed = fail_failed_subscription_termination(
+            cur, operation_id, owner_id, generation, category, terminal=terminal,
+        )
+        conn.commit()
+        return changed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def enqueue_failed_termination_admin_alert(operation_id, telegram_id, category):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        for admin_id in ADMIN_IDS:
+            enqueue_message_delivery(
+                cur,
+                f"failed-subscription-admin:{operation_id}:{category}:{int(admin_id)}",
+                int(admin_id),
+                "stripe_admin_message",
+                {
+                    "text": (
+                        "Failed-subscription termination требует внимания.\n\n"
+                        f"telegram_id: {int(telegram_id)}\n"
+                        f"operation_ref: {safe_log_id(operation_id)}\n"
+                        f"category: {category}"
+                    )
+                },
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def terminate_failed_subscription(telegram_id, reason, invoice_id=None):
+    """Crash-resumable immediate termination for one failed Stripe subscription."""
+    claim_conn = get_db_conn()
+    claim_cur = claim_conn.cursor()
+    try:
+        claim_cur.execute(
+            """
+            SELECT stripe_subscription_id, stripe_customer_id, expiry_date,
+                   payment_failed, grace_period_end
+            FROM users WHERE telegram_id = %s FOR UPDATE
+            """,
+            (int(telegram_id),),
+        )
+        user = claim_cur.fetchone()
+        if not user:
+            claim_conn.rollback()
+            return "missing_user"
+        current_subscription_id, customer_id, access_expiry, payment_failed, grace_period_end = user
+        claim_cur.execute(
+            """
+            SELECT stripe_subscription_id, failed_invoice_id, access_expiry, status
+            FROM failed_subscription_terminations
+            WHERE telegram_id = %s
+              AND (stripe_subscription_id = %s OR %s IS NULL)
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (int(telegram_id), current_subscription_id, current_subscription_id),
+        )
+        existing_operation = claim_cur.fetchone()
+        if existing_operation and existing_operation[3] in ("completed", "superseded", "manual_review"):
+            claim_conn.rollback()
+            return "already_processing_or_completed"
+        subscription_id = existing_operation[0] if existing_operation else current_subscription_id
+        if existing_operation:
+            invoice_id = invoice_id or existing_operation[1]
+            access_expiry = existing_operation[2]
+        if not has_valid_stripe_subscription_id(subscription_id):
+            claim_conn.rollback()
+            return "missing_subscription"
+        if not existing_operation and reason == "grace_period_expired" and (
+            not payment_failed or not grace_period_end or grace_period_end > datetime.utcnow()
+        ):
+            claim_conn.rollback()
+            return "not_due"
+        claim = claim_failed_subscription_termination(
+            claim_cur, int(telegram_id), subscription_id, reason, invoice_id,
+            OWNER_ID, access_expiry,
+        )
+        claim_conn.commit()
+    except Exception:
+        claim_conn.rollback()
+        raise
+    finally:
+        claim_cur.close()
+        claim_conn.close()
+    if not claim:
+        return "already_processing_or_completed"
+
+    (operation_id, generation, _status, stripe_cancelled_at, collection_stopped_at,
+     telegram_banned_at, telegram_removed_at, db_finalized_at, captured_expiry) = claim
+    logging.warning(
+        "FAILED_SUBSCRIPTION_CANCEL_REQUESTED: telegram_id=%s operation_ref=%s reason=%s",
+        int(telegram_id), safe_log_id(operation_id), reason,
+    )
+
+    if not stripe_cancelled_at:
+        try:
+            subscription = await asyncio.to_thread(
+                stripe.Subscription.retrieve, subscription_id, expand=["latest_invoice"],
+            )
+            live_status = stripe_value(subscription, "status")
+            latest_invoice_status = stripe_value(subscription, "latest_invoice", "status")
+            if live_status in ("active", "trialing") and latest_invoice_status in (None, "paid"):
+                failed_termination_phase(operation_id, OWNER_ID, generation, "superseded", "completed_at")
+                await refresh_active_stripe_subscription(telegram_id, subscription_id)
+                return "payment_recovered"
+            if live_status not in ("canceled", "incomplete_expired"):
+                cancelled_subscription = await asyncio.to_thread(subscription.cancel)
+                cancelled_status = stripe_value(cancelled_subscription, "status")
+                if cancelled_status not in ("canceled", "incomplete_expired"):
+                    confirmation = await asyncio.to_thread(stripe.Subscription.retrieve, subscription_id)
+                    cancelled_status = stripe_value(confirmation, "status")
+                if cancelled_status not in ("canceled", "incomplete_expired"):
+                    raise RuntimeError("stripe_cancellation_not_confirmed")
+            if not failed_termination_phase(
+                operation_id, OWNER_ID, generation, "processing", "stripe_cancelled_at",
+            ):
+                return "ownership_lost"
+            stripe_cancelled_at = datetime.utcnow()
+            logging.warning(
+                "FAILED_SUBSCRIPTION_STRIPE_CANCELLED: telegram_id=%s operation_ref=%s",
+                int(telegram_id), safe_log_id(operation_id),
+            )
+        except Exception as exc:
+            failed_termination_failure(operation_id, OWNER_ID, generation, "stripe_cancel_failed")
+            enqueue_failed_termination_admin_alert(operation_id, telegram_id, "stripe_cancel_failed")
+            logging.error(
+                "FAILED_SUBSCRIPTION_CANCEL_FAILED: telegram_id=%s operation_ref=%s error_class=%s error_ref=%s",
+                int(telegram_id), safe_log_id(operation_id),
+                type(exc).__name__,
+                safe_admin_error_reference("failed_subscription_cancel", exc),
+            )
+            return "stripe_retryable"
+
+    if not collection_stopped_at:
+        # stripe-python 15 Subscription.cancel documents that immediate cancellation
+        # stops automatic collection of finalized invoices. No invoice history is mutated.
+        if not failed_termination_phase(
+            operation_id, OWNER_ID, generation, "processing", "collection_stopped_at",
+        ):
+            return "ownership_lost"
+        logging.warning(
+            "FAILED_SUBSCRIPTION_COLLECTION_STOPPED: telegram_id=%s operation_ref=%s",
+            int(telegram_id), safe_log_id(operation_id),
+        )
+
+    if not telegram_removed_at:
+        try:
+            member = await bot.get_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+            if getattr(member, "status", None) in ("administrator", "creator"):
+                failed_termination_failure(operation_id, OWNER_ID, generation, "telegram_admin", terminal=True)
+                enqueue_failed_termination_admin_alert(operation_id, telegram_id, "telegram_admin")
+                return "telegram_admin"
+            if telegram_banned_at:
+                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+            else:
+                if not failed_termination_phase(operation_id, OWNER_ID, generation, "processing"):
+                    return "ownership_lost"
+                await bot.ban_chat_member(
+                    chat_id=int(GROUP_ID), user_id=int(telegram_id),
+                    until_date=datetime.utcnow() + timedelta(minutes=10),
+                )
+                if not failed_termination_phase(
+                    operation_id, OWNER_ID, generation, "processing", "telegram_banned_at",
+                ):
+                    try:
+                        await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+                    finally:
+                        return "ownership_lost_after_ban"
+                await bot.unban_chat_member(chat_id=int(GROUP_ID), user_id=int(telegram_id))
+            if not failed_termination_phase(
+                operation_id, OWNER_ID, generation, "processing", "telegram_removed_at",
+            ):
+                return "ownership_lost"
+        except Exception as exc:
+            failed_termination_failure(operation_id, OWNER_ID, generation, "telegram_removal_failed")
+            enqueue_failed_termination_admin_alert(operation_id, telegram_id, "telegram_removal_failed")
+            logging.warning(
+                "FAILED_SUBSCRIPTION_TELEGRAM_REMOVAL_PENDING: telegram_id=%s operation_ref=%s error_ref=%s",
+                int(telegram_id), safe_log_id(operation_id),
+                safe_admin_error_reference("failed_subscription_telegram", exc),
+            )
+            return "telegram_retryable"
+
+    finalize_conn = get_db_conn()
+    finalize_cur = finalize_conn.cursor()
+    try:
+        finalize_cur.execute(
+            """
+            SELECT stripe_subscription_id, expiry_date, paid, payment_failed, grace_period_end
+            FROM users WHERE telegram_id = %s FOR UPDATE
+            """,
+            (int(telegram_id),),
+        )
+        current = finalize_cur.fetchone()
+        if not current or current[0] not in (None, subscription_id) or (
+            current[1] and captured_expiry and current[1] > captured_expiry
+        ):
+            mark_failed_subscription_termination_phase(
+                finalize_cur, operation_id, OWNER_ID, generation, "superseded", "completed_at",
+            )
+            if current and has_active_access(
+                current[2], current[1], current[3], current[4], now=datetime.utcnow(),
+            ):
+                enqueue_message_delivery(
+                    finalize_cur,
+                    f"failed-subscription-access-restore:{operation_id}",
+                    int(telegram_id),
+                    "stripe_rejoin_check",
+                    stripe_delivery_payload(
+                        "✅ У вас появился новый действующий доступ.\n\n{invite_link}",
+                        source="failed_subscription_new_access_fence",
+                        new_expiry=current[1].isoformat() if current[1] else None,
+                    ),
+                )
+            finalize_conn.commit()
+            return "new_access_protected"
+        finalize_cur.execute(
+            """
+            UPDATE users
+            SET paid = FALSE, auto_renew = FALSE, payment_failed = FALSE,
+                payment_failed_at = NULL, grace_period_end = NULL, reminder_sent = FALSE
+            WHERE telegram_id = %s
+              AND (stripe_subscription_id = %s OR stripe_subscription_id IS NULL)
+            """,
+            (int(telegram_id), subscription_id),
+        )
+        finalize_cur.execute(
+            """
+            INSERT INTO access_events (
+                telegram_id, event_type, source, old_expiry, stripe_subscription_id, notes
+            )
+            SELECT %s, %s, 'failed_subscription_termination', %s, %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM access_events
+                WHERE telegram_id = %s AND source = 'failed_subscription_termination'
+                  AND stripe_subscription_id = %s AND event_type = %s
+            )
+            """,
+            (
+                int(telegram_id),
+                "failed_subscription_cancelled_by_user" if reason == "user_cancelled_after_payment_failure"
+                else "failed_subscription_cancelled_after_grace",
+                captured_expiry, subscription_id, operation_id, int(telegram_id), subscription_id,
+                "failed_subscription_cancelled_by_user" if reason == "user_cancelled_after_payment_failure"
+                else "failed_subscription_cancelled_after_grace",
+            ),
+        )
+        mark_stripe_link_subscription_terminal(finalize_cur, subscription_id, "canceled")
+        if not mark_failed_subscription_termination_phase(
+            finalize_cur, operation_id, OWNER_ID, generation, "processing", "db_finalized_at",
+        ):
+            raise RuntimeError("termination_fence_lost_before_finalization")
+        mark_failed_subscription_termination_phase(
+            finalize_cur, operation_id, OWNER_ID, generation, "completed", "completed_at",
+        )
+        enqueue_message_delivery(
+            finalize_cur,
+            f"failed-subscription-final:{operation_id}", int(telegram_id), "stripe_user_message",
+            stripe_delivery_payload(
+                "✅ Подписка отменена.\n\n"
+                "Доступ в клуб закрыт. Повторных автоматических списаний по этой подписке больше не будет."
+            ),
+        )
+        finalize_conn.commit()
+    except Exception:
+        finalize_conn.rollback()
+        raise
+    finally:
+        finalize_cur.close()
+        finalize_conn.close()
+    logging.warning(
+        "FAILED_SUBSCRIPTION_ACCESS_CLOSED: telegram_id=%s operation_ref=%s",
+        int(telegram_id), safe_log_id(operation_id),
+    )
+    return "completed"
+
 async def ban_user_logic(telegram_id, cur=None):
     claim_conn = get_db_conn()
     claim_cur = claim_conn.cursor()
@@ -3797,6 +4134,7 @@ async def check_subscriptions_and_reminders():
         WHERE paid = TRUE
           AND expiry_date IS NOT NULL
           AND expiry_date < NOW()
+          AND payment_failed IS NOT TRUE
           AND NOT (
               payment_failed = TRUE
               AND grace_period_end IS NOT NULL
@@ -6160,6 +6498,86 @@ async def cancel_subscription(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Ошибка отмены подписки {safe_log_id(sub_id)}: {e}")
         await callback.answer("Ошибка при отмене. Напишите администратору.", show_alert=True)
+
+
+@router.callback_query(F.data == "failed_subscription_payment_action", StateFilter('*'))
+async def failed_subscription_payment_action(callback: types.CallbackQuery):
+    user_id = int(callback.from_user.id)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT stripe_subscription_id, stripe_customer_id, payment_failed
+            FROM users
+            WHERE telegram_id = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM failed_subscription_terminations fst
+                  WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                    AND fst.status <> 'superseded'
+              )
+            """,
+            (user_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not row or not row[2] or not has_valid_stripe_subscription_id(row[0]):
+        await callback.answer("Не найдена ожидающая оплаты подписка.", show_alert=True)
+        return
+    invoice_url, _invoice_id = await get_open_invoice_url_for_subscription(row[0])
+    action_url = invoice_url or await create_billing_portal_url(row[1])
+    if not action_url:
+        await callback.answer("Ссылка временно недоступна. Попробуйте позже.", show_alert=True)
+        return
+    await callback.message.answer(
+        "По кнопке ниже можно оплатить текущий счёт или обновить способ оплаты.",
+        reply_markup=inline_keyboard([[
+            InlineKeyboardButton(text="💳 Оплатить / сменить карту", url=action_url)
+        ]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_failed_subscription", StateFilter('*'))
+async def cancel_failed_subscription_preview(callback: types.CallbackQuery):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT payment_failed, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (int(callback.from_user.id),),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not row or not row[0] or not has_valid_stripe_subscription_id(row[1]):
+        await callback.answer("Не найдена ожидающая оплаты подписка.", show_alert=True)
+        return
+    await callback.message.answer(
+        "Отменить подписку немедленно и закрыть доступ в клуб?\n\n"
+        "Это действие остановит автоматические попытки списания по этой подписке.",
+        reply_markup=get_failed_subscription_cancel_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm_cancel_failed_subscription", StateFilter('*'))
+async def confirm_cancel_failed_subscription(callback: types.CallbackQuery):
+    await callback.answer("Отменяю подписку…")
+    result = await terminate_failed_subscription(
+        int(callback.from_user.id), "user_cancelled_after_payment_failure",
+    )
+    if result == "completed":
+        await callback.message.edit_text("Отмена подтверждена. Итоговое сообщение поставлено в доставку.")
+    elif result in ("already_processing_or_completed", "payment_recovered", "new_access_protected"):
+        await callback.message.edit_text("Подписка уже обработана или оплата восстановлена.")
+    else:
+        await callback.message.edit_text(
+            "Не удалось подтвердить окончательную отмену. Доступ не закрыт; повторите позже или напишите администратору."
+        )
 
 @router.message(Command('profile'), StateFilter('*'))
 async def profile(message: types.Message):
@@ -9082,6 +9500,11 @@ async def stripe_webhook(request):
                             SELECT telegram_id, expiry_date AS old_expiry
                             FROM users
                             WHERE telegram_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations
+                                  WHERE stripe_subscription_id = %s
+                                    AND status <> 'superseded'
+                              )
                         )
                         UPDATE users
                         SET expiry_date = CASE
@@ -9100,7 +9523,7 @@ async def stripe_webhook(request):
                         FROM target
                         WHERE users.telegram_id = target.telegram_id
                         RETURNING users.telegram_id, target.old_expiry, users.expiry_date
-                    """, (int(linked_telegram_id), trial_expiry, trial_expiry, sub_id, customer_id))
+                    """, (int(linked_telegram_id), sub_id, trial_expiry, trial_expiry, sub_id, customer_id))
                     trial_row = cur.fetchone()
                     if trial_row:
                         upsert_stripe_link(
@@ -9212,6 +9635,11 @@ async def stripe_webhook(request):
                             SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
                             FROM users
                             WHERE telegram_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations
+                                  WHERE stripe_subscription_id = %s
+                                    AND status <> 'superseded'
+                              )
                         )
                         UPDATE users
                         SET expiry_date = CASE
@@ -9238,6 +9666,7 @@ async def stripe_webhook(request):
                         RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         metadata_telegram_id,
+                        sub_id,
                         stripe_period_expiry,
                         stripe_period_expiry,
                         sub_id,
@@ -9259,6 +9688,11 @@ async def stripe_webhook(request):
                             SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
                             FROM users
                             WHERE stripe_subscription_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations
+                                  WHERE stripe_subscription_id = %s
+                                    AND status <> 'superseded'
+                              )
                         )
                         UPDATE users
                         SET expiry_date = CASE
@@ -9286,6 +9720,7 @@ async def stripe_webhook(request):
                         RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         sub_id,
+                        sub_id,
                         stripe_period_expiry,
                         stripe_period_expiry,
                         sub_id,
@@ -9307,6 +9742,11 @@ async def stripe_webhook(request):
                             SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
                             FROM users
                             WHERE stripe_customer_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations
+                                  WHERE stripe_subscription_id = %s
+                                    AND status <> 'superseded'
+                              )
                         )
                         UPDATE users
                         SET expiry_date = CASE
@@ -9334,6 +9774,7 @@ async def stripe_webhook(request):
                         RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                     """, (
                         customer_id,
+                        sub_id,
                         stripe_period_expiry,
                         stripe_period_expiry,
                         sub_id,
@@ -9361,6 +9802,11 @@ async def stripe_webhook(request):
                                 SELECT telegram_id, expiry_date AS old_expiry, payment_failed AS was_payment_failed
                                 FROM users
                                 WHERE telegram_id = %s
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM failed_subscription_terminations
+                                      WHERE stripe_subscription_id = %s
+                                        AND status <> 'superseded'
+                                  )
                             )
                             UPDATE users
                             SET expiry_date = CASE
@@ -9388,6 +9834,7 @@ async def stripe_webhook(request):
                             RETURNING users.telegram_id, target.old_expiry, target.was_payment_failed, users.expiry_date AS effective_expiry
                         """, (
                             linked_telegram_id,
+                            sub_id,
                             stripe_period_expiry,
                             stripe_period_expiry,
                             sub_id,
@@ -10009,12 +10456,17 @@ async def stripe_webhook(request):
                     UPDATE users
                     SET payment_failed = TRUE,
                         payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                        grace_period_end = GREATEST(
-                            COALESCE(grace_period_end, NOW()),
-                            NOW() + (%s * INTERVAL '1 hour')
+                        grace_period_end = COALESCE(
+                            grace_period_end,
+                            COALESCE(payment_failed_at, NOW()) + (%s * INTERVAL '1 hour')
                         ),
                         stripe_customer_id = COALESCE(%s, stripe_customer_id)
                     WHERE stripe_subscription_id = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM failed_subscription_terminations fst
+                          WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                            AND fst.status <> 'superseded'
+                      )
                     RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
                 """, (PAYMENT_RETRY_GRACE_HOURS, customer_id_for_db, sub_id))
                 row = cur.fetchone()
@@ -10032,20 +10484,26 @@ async def stripe_webhook(request):
                             UPDATE users
                             SET payment_failed = TRUE,
                                 payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                                grace_period_end = GREATEST(
-                                    COALESCE(grace_period_end, NOW()),
-                                    NOW() + (%s * INTERVAL '1 hour')
+                                grace_period_end = COALESCE(
+                                    grace_period_end,
+                                    COALESCE(payment_failed_at, NOW()) + (%s * INTERVAL '1 hour')
                                 ),
                                 stripe_subscription_id = COALESCE(%s, stripe_subscription_id),
                                 stripe_customer_id = COALESCE(%s, stripe_customer_id)
                             WHERE stripe_customer_id = %s
                               AND (stripe_subscription_id IS NULL OR stripe_subscription_id = %s)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations fst
+                                  WHERE fst.stripe_subscription_id = %s
+                                    AND fst.status <> 'superseded'
+                              )
                             RETURNING telegram_id, paid, expiry_date, payment_failed_at, grace_period_end
                         """, (
                             PAYMENT_RETRY_GRACE_HOURS,
                             sub_id,
                             customer_id_for_db,
                             customer_id_for_db,
+                            sub_id,
                             sub_id,
                         ))
                         row = cur.fetchone()
@@ -10148,10 +10606,14 @@ async def stripe_webhook(request):
                     enqueue_stripe_user_message(
                         cur,
                         event_id,
-                        telegram_id,
+                        int(telegram_id),
                         "payment_failed",
-                        f"⚠️ Не удалось списать оплату за подписку. У вас есть {PAYMENT_RETRY_GRACE_HOURS} часов, чтобы пополнить карту или связаться с администратором.\n"
-                        "После устранения проблемы доступ восстановится автоматически.",
+                        "⚠️ Не удалось списать оплату за подписку.\n\n"
+                        f"У вас есть {PAYMENT_RETRY_GRACE_HOURS} часов, чтобы пополнить карту или изменить способ оплаты. "
+                        "Если платеж пройдет успешно, доступ продолжится автоматически.\n\n"
+                        "Если вы не хотите продолжать подписку, вы можете отменить ее сразу.",
+                        keyboard_kind="payment_failed_actions",
+                        delivery_key_override=failed_subscription_cycle_delivery_key(sub_id, grace_until),
                     )
                     enqueue_admin_payment_problem_safely(
                         cur,
@@ -10241,6 +10703,18 @@ async def stripe_webhook(request):
                         RETURNING telegram_id, paid, expiry_date
                     """, (customer_id, sub_id))
                     row = cur.fetchone()
+                    cur.execute(
+                        """
+                        UPDATE failed_subscription_terminations
+                        SET stripe_cancelled_at = COALESCE(stripe_cancelled_at, NOW()),
+                            collection_stopped_at = COALESCE(collection_stopped_at, NOW()),
+                            status = CASE WHEN status = 'processing' THEN 'stripe_cancelled' ELSE status END,
+                            updated_at = NOW()
+                        WHERE stripe_subscription_id = %s
+                          AND status NOT IN ('completed', 'superseded', 'manual_review')
+                        """,
+                        (sub_id,),
+                    )
                     mark_stripe_link_subscription_terminal(cur, sub_id, status or "canceled")
                     conn.commit()
                 except Exception:
@@ -10359,6 +10833,11 @@ async def stripe_webhook(request):
                                 ),
                                 stripe_customer_id = COALESCE(%s, stripe_customer_id)
                             WHERE stripe_subscription_id = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM failed_subscription_terminations fst
+                                  WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                                    AND fst.status <> 'superseded'
+                              )
                         """, (event_created_at, event_created_at, customer_id, sub_id))
                         row = None
                     else:
@@ -10367,9 +10846,9 @@ async def stripe_webhook(request):
                             SET auto_renew = %s,
                                 payment_failed = TRUE,
                                 payment_failed_at = COALESCE(payment_failed_at, NOW()),
-                                grace_period_end = GREATEST(
-                                    COALESCE(grace_period_end, NOW()),
-                                    NOW() + (%s * INTERVAL '1 hour')
+                                grace_period_end = COALESCE(
+                                    grace_period_end,
+                                    COALESCE(payment_failed_at, NOW()) + (%s * INTERVAL '1 hour')
                                 ),
                                 stripe_customer_id = COALESCE(%s, stripe_customer_id),
                                 last_subscription_state_event_created_at = GREATEST(
@@ -10377,6 +10856,11 @@ async def stripe_webhook(request):
                                     %s
                                 )
                             WHERE stripe_subscription_id = %s
+                              AND NOT EXISTS (
+                                    SELECT 1 FROM failed_subscription_terminations fst
+                                    WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                                      AND fst.status <> 'superseded'
+                              )
                               AND (
                                     %s IS NULL
                                     OR last_subscription_state_event_created_at IS NULL
@@ -10438,6 +10922,11 @@ async def stripe_webhook(request):
                                     %s
                                 )
                             WHERE stripe_subscription_id = %s
+                              AND NOT EXISTS (
+                                    SELECT 1 FROM failed_subscription_terminations fst
+                                    WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                                      AND fst.status <> 'superseded'
+                              )
                               AND (
                                     %s IS NULL
                                     OR last_subscription_state_event_created_at IS NULL
@@ -10465,6 +10954,11 @@ async def stripe_webhook(request):
                                     %s
                                 )
                             WHERE stripe_subscription_id = %s
+                              AND NOT EXISTS (
+                                    SELECT 1 FROM failed_subscription_terminations fst
+                                    WHERE fst.stripe_subscription_id = users.stripe_subscription_id
+                                      AND fst.status <> 'superseded'
+                              )
                               AND (
                                     %s IS NULL
                                     OR last_subscription_state_event_created_at IS NULL
@@ -12055,6 +12549,64 @@ async def scheduled_check_subscriptions_and_reminders():
     )
 
 
+async def process_expired_failed_subscription_grace(limit=100):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT telegram_id
+            FROM users
+            WHERE payment_failed = TRUE
+              AND grace_period_end IS NOT NULL
+              AND grace_period_end <= NOW()
+            UNION
+            SELECT telegram_id
+            FROM failed_subscription_terminations
+            WHERE status IN (
+                'pending', 'retryable_failed', 'stripe_cancelled',
+                'collection_stopped', 'telegram_failed', 'telegram_removed'
+            )
+            ORDER BY telegram_id
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
+        candidates = [int(row[0]) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        conn.close()
+    results = {
+        "candidates": len(candidates), "completed": 0, "recovered": 0,
+        "retryable": 0, "skipped": 0,
+    }
+    for telegram_id in candidates:
+        result = await terminate_failed_subscription(telegram_id, "grace_period_expired")
+        if result == "completed":
+            results["completed"] += 1
+        elif result in ("payment_recovered", "new_access_protected"):
+            results["recovered"] += 1
+        elif result in ("stripe_retryable", "telegram_retryable"):
+            results["retryable"] += 1
+        else:
+            results["skipped"] += 1
+    logging.info(
+        "EXPIRED_FAILED_SUBSCRIPTION_GRACE_PROCESSED: candidates=%s completed=%s recovered=%s retryable=%s skipped=%s",
+        results["candidates"], results["completed"], results["recovered"],
+        results["retryable"], results["skipped"],
+    )
+    return results
+
+
+async def scheduled_process_expired_failed_subscription_grace():
+    return await run_scheduled_with_lock(
+        "process_expired_failed_subscription_grace",
+        hourly_schedule_slot(),
+        process_expired_failed_subscription_grace,
+        lease_minutes=50,
+    )
+
+
 def five_minute_schedule_slot(now=None):
     now = now or datetime.utcnow()
     minute = now.minute - (now.minute % 5)
@@ -12489,6 +13041,15 @@ def register_scheduler_jobs_once():
         'cron',
         hour=10,
         minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_process_expired_failed_subscription_grace,
+        'cron',
+        minute=5,
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1

@@ -982,7 +982,6 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
     def test_postgres_fsm_storage_migration_shape_and_idempotency(self):
         run_migrations(self.get_conn)
-
         columns = {
             row[0]: row[1]
             for row in self.query_all(
@@ -1003,6 +1002,174 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         run_migrations(self.get_conn)
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states")[0], 0)
+
+    def test_failed_subscription_termination_migration_and_full_flow_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9750
+        expiry = datetime.utcnow() - timedelta(hours=3)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            stripe_customer_id="cus_failed_9750",
+            stripe_subscription_id="sub_failed_9750",
+            payment_failed=True,
+            payment_failed_at=datetime.utcnow() - timedelta(hours=49),
+            grace_period_end=datetime.utcnow() - timedelta(hours=1),
+            auto_renew=True,
+        )
+
+        subscription = mock.Mock()
+        subscription.status = "past_due"
+        subscription.latest_invoice = mock.Mock(status="open")
+        subscription.cancel = mock.Mock(return_value=mock.Mock(status="canceled"))
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            result = asyncio.run(main.terminate_failed_subscription(user_id, "grace_period_expired"))
+
+        self.assertEqual(result, "completed")
+        subscription.cancel.assert_called_once_with()
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        user = self.query_one(
+            """
+            SELECT paid, auto_renew, payment_failed, payment_failed_at, grace_period_end,
+                   stripe_subscription_id
+            FROM users WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )
+        self.assertEqual(user[:5], (False, False, False, None, None))
+        self.assertEqual(user[5], "sub_failed_9750")
+        operation = self.query_one(
+            """
+            SELECT status, stripe_cancelled_at, collection_stopped_at,
+                   telegram_removed_at, db_finalized_at, completed_at
+            FROM failed_subscription_terminations WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )
+        self.assertEqual(operation[0], "completed")
+        self.assertTrue(all(operation[1:]))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM access_events WHERE telegram_id = %s AND event_type = 'failed_subscription_cancelled_after_grace'",
+            (user_id,),
+        )[0], 1)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'stripe_user_message'",
+            (user_id,),
+        )[0], 1)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve") as retrieve_again:
+            duplicate = asyncio.run(main.terminate_failed_subscription(user_id, "grace_period_expired"))
+        self.assertEqual(duplicate, "already_processing_or_completed")
+        retrieve_again.assert_not_called()
+
+    def test_failed_subscription_stripe_and_telegram_failures_remain_retryable_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        self.insert_recovery_user(
+            9751, paid=True, expiry_date=now - timedelta(hours=2),
+            stripe_customer_id="cus_failed_9751", stripe_subscription_id="sub_failed_9751",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=50),
+            grace_period_end=now - timedelta(hours=2), auto_renew=True,
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", side_effect=RuntimeError("temporary")), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            result = asyncio.run(main.terminate_failed_subscription(9751, "grace_period_expired"))
+        self.assertEqual(result, "stripe_retryable")
+        ban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT paid, stripe_subscription_id FROM users WHERE telegram_id = 9751"
+        ), (True, "sub_failed_9751"))
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_cancelled_at FROM failed_subscription_terminations WHERE telegram_id = 9751"
+        ), ("retryable_failed", None))
+
+        self.insert_recovery_user(
+            9752, paid=True, expiry_date=now - timedelta(hours=2),
+            stripe_customer_id="cus_failed_9752", stripe_subscription_id="sub_failed_9752",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=50),
+            grace_period_end=now - timedelta(hours=2), auto_renew=True,
+        )
+        subscription = mock.Mock(status="past_due", latest_invoice=mock.Mock(status="open"))
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock(side_effect=RuntimeError("telegram down"))):
+            result = asyncio.run(main.terminate_failed_subscription(9752, "grace_period_expired"))
+        self.assertEqual(result, "telegram_retryable")
+        self.assertTrue(self.query_one(
+            "SELECT stripe_cancelled_at IS NOT NULL FROM failed_subscription_terminations WHERE telegram_id = 9752"
+        )[0])
+        self.assertTrue(self.query_one("SELECT paid FROM users WHERE telegram_id = 9752")[0])
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve") as retrieve_again, \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()):
+            retry = asyncio.run(main.terminate_failed_subscription(9752, "grace_period_expired"))
+        self.assertEqual(retry, "completed")
+        retrieve_again.assert_not_called()
+
+    def test_terminated_old_subscription_cannot_overwrite_new_access_real_postgres(self):
+        run_migrations(self.get_conn)
+        user_id = 9753
+        future = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=future,
+            stripe_customer_id="cus_shared_9753", stripe_subscription_id="sub_new_9753",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id, reason, status,
+                    stripe_cancelled_at, completed_at
+                ) VALUES ('fst-old-9753', %s, 'sub_old_9753', 'grace_period_expired',
+                          'completed', NOW(), NOW())
+                """,
+                (user_id,),
+            )
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id FROM users
+                    WHERE telegram_id = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM failed_subscription_terminations
+                          WHERE stripe_subscription_id = %s
+                            AND stripe_cancelled_at IS NOT NULL AND status <> 'superseded'
+                      )
+                )
+                UPDATE users SET paid = TRUE, stripe_subscription_id = 'sub_old_9753'
+                FROM target WHERE users.telegram_id = target.telegram_id
+                RETURNING users.telegram_id
+                """,
+                (user_id, "sub_old_9753"),
+            )
+            self.assertIsNone(cur.fetchone())
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, future, "sub_new_9753"))
 
     def test_postgres_fsm_storage_roundtrip_isolation_concurrent_update_and_cleanup(self):
         run_migrations(self.get_conn)
