@@ -67,10 +67,10 @@ class SchedulerTimezoneTests(unittest.TestCase):
             main.register_scheduler_jobs_once()
         return scheduler
 
-    def test_scheduler_and_all_cron_timezones_are_explicit_and_job_count_is_nine(self):
+    def test_scheduler_and_all_cron_timezones_are_explicit_and_job_count_is_ten(self):
         scheduler = self.registered_scheduler()
         jobs = scheduler.get_jobs()
-        self.assertEqual(len(jobs), 9)
+        self.assertEqual(len(jobs), 10)
         self.assertEqual(str(scheduler.timezone), "UTC")
         by_func = {job.func: job for job in jobs}
         self.assertEqual(str(by_func[main.send_weekly_admin_report].trigger.timezone), "Europe/Moscow")
@@ -118,12 +118,13 @@ class SchedulerTimezoneTests(unittest.TestCase):
         self.assertEqual(observed[0], observed[1])
         self.assertEqual(observed[1], observed[2])
 
-    def test_job_cadence_configuration_is_unchanged(self):
+    def test_job_cadence_configuration_includes_hourly_failed_subscription_termination(self):
         scheduler = self.registered_scheduler()
         by_func = {job.func: str(job.trigger) for job in scheduler.get_jobs()}
         expected_fragments = {
             main.scheduled_check_subscriptions_and_reminders: "hour='10', minute='0'",
             main.scheduled_process_expired_access: "minute='5'",
+            main.scheduled_process_expired_failed_subscription_grace: "minute='5'",
             main.scheduled_check_auto_free_lessons: "minute='15'",
             main.scheduled_check_free_lesson_followups: "minute='30'",
             main.scheduled_send_db_backup: "day_of_week='mon', hour='3', minute='0'",

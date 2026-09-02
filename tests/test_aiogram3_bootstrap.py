@@ -2907,7 +2907,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 78)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 37)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 41)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -2939,7 +2939,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_filters.append(text)
 
         self.assertEqual(len(message_handlers), 78)
-        self.assertEqual(len(callback_handlers), 37)
+        self.assertEqual(len(callback_handlers), 41)
         self.assertEqual(
             commands,
             [
@@ -7299,7 +7299,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for call in set_webhook.await_args_list:
             self.assertEqual(call.kwargs["secret_token"], TEST_ENV["WEBHOOK_SECRET"])
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 9)
+        self.assertEqual(len(fake_scheduler.jobs), 10)
         self.assertFalse(hasattr(self.main, "scheduled_apply_reserved_gifts"))
         self.assertEqual(fake_scheduler.start_calls, 1)
 

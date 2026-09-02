@@ -603,7 +603,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 28,
+            "count": 29,
             "latest": "0028_content_revisions",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
@@ -2088,7 +2088,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 28)
+        self.assertEqual(len(migrations), 29)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -4023,7 +4023,6 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
     def test_postgres_fsm_storage_migration_shape_and_idempotency(self):
         run_migrations(self.get_conn)
-
         columns = {
             row[0]: row[1]
             for row in self.query_all(
@@ -4044,6 +4043,424 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         run_migrations(self.get_conn)
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states")[0], 0)
+
+    def test_failed_subscription_termination_migration_and_full_flow_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9750
+        expiry = datetime.utcnow() - timedelta(hours=3)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            stripe_customer_id="cus_failed_9750",
+            stripe_subscription_id="sub_failed_9750",
+            payment_failed=True,
+            payment_failed_at=datetime.utcnow() - timedelta(hours=49),
+            grace_period_end=datetime.utcnow() - timedelta(hours=1),
+            auto_renew=True,
+        )
+
+        failed_invoice = mock.Mock(
+            id="in_failed_9750", subscription="sub_failed_9750", status="open",
+        )
+        failed_invoice.void_invoice.return_value = mock.Mock(status="void")
+        voided_invoice = mock.Mock(
+            id="in_failed_9750", subscription="sub_failed_9750", status="void",
+        )
+        subscription = mock.Mock()
+        subscription.status = "past_due"
+        subscription.latest_invoice = failed_invoice
+        subscription.cancel = mock.Mock(return_value=mock.Mock(status="canceled"))
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[failed_invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            result = asyncio.run(main.terminate_failed_subscription(user_id, "grace_period_expired"))
+
+        self.assertEqual(result, "completed")
+        subscription.cancel.assert_called_once_with()
+        failed_invoice.void_invoice.assert_called_once_with()
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        user = self.query_one(
+            """
+            SELECT paid, auto_renew, payment_failed, payment_failed_at, grace_period_end,
+                   stripe_subscription_id
+            FROM users WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )
+        self.assertEqual(user[:5], (False, False, False, None, None))
+        self.assertEqual(user[5], "sub_failed_9750")
+        operation = self.query_one(
+            """
+            SELECT status, stripe_cancelled_at, collection_stopped_at,
+                   telegram_removed_at, db_finalized_at, completed_at
+            FROM failed_subscription_terminations WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )
+        self.assertEqual(operation[0], "completed")
+        self.assertTrue(all(operation[1:]))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM access_events WHERE telegram_id = %s AND event_type = 'failed_subscription_cancelled_after_grace'",
+            (user_id,),
+        )[0], 1)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM message_delivery_events WHERE telegram_id = %s AND delivery_type = 'stripe_user_message'",
+            (user_id,),
+        )[0], 1)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve") as retrieve_again:
+            duplicate = asyncio.run(main.terminate_failed_subscription(user_id, "grace_period_expired"))
+        self.assertEqual(duplicate, "already_processing_or_completed")
+        retrieve_again.assert_not_called()
+
+    def test_failed_subscription_stripe_and_telegram_failures_remain_retryable_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        self.insert_recovery_user(
+            9751, paid=True, expiry_date=now - timedelta(hours=2),
+            stripe_customer_id="cus_failed_9751", stripe_subscription_id="sub_failed_9751",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=50),
+            grace_period_end=now - timedelta(hours=2), auto_renew=True,
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", side_effect=RuntimeError("temporary")), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            result = asyncio.run(main.terminate_failed_subscription(9751, "grace_period_expired"))
+        self.assertEqual(result, "stripe_retryable")
+        ban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT paid, stripe_subscription_id FROM users WHERE telegram_id = 9751"
+        ), (True, "sub_failed_9751"))
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_cancelled_at FROM failed_subscription_terminations WHERE telegram_id = 9751"
+        ), ("retryable_failed", None))
+
+        self.insert_recovery_user(
+            9752, paid=True, expiry_date=now - timedelta(hours=2),
+            stripe_customer_id="cus_failed_9752", stripe_subscription_id="sub_failed_9752",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=50),
+            grace_period_end=now - timedelta(hours=2), auto_renew=True,
+        )
+        failed_invoice = mock.Mock(
+            id="in_failed_9752", subscription="sub_failed_9752", status="open",
+        )
+        failed_invoice.void_invoice.return_value = mock.Mock(status="void")
+        voided_invoice = mock.Mock(
+            id="in_failed_9752", subscription="sub_failed_9752", status="void",
+        )
+        subscription = mock.Mock(status="past_due", latest_invoice=failed_invoice)
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[failed_invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock(side_effect=RuntimeError("telegram down"))):
+            result = asyncio.run(main.terminate_failed_subscription(9752, "grace_period_expired"))
+        self.assertEqual(result, "telegram_retryable")
+        self.assertTrue(self.query_one(
+            "SELECT stripe_cancelled_at IS NOT NULL FROM failed_subscription_terminations WHERE telegram_id = 9752"
+        )[0])
+        self.assertTrue(self.query_one("SELECT paid FROM users WHERE telegram_id = 9752")[0])
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve") as retrieve_again, \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()):
+            retry = asyncio.run(main.terminate_failed_subscription(9752, "grace_period_expired"))
+        self.assertEqual(retry, "completed")
+        retrieve_again.assert_not_called()
+
+    def test_expired_processing_lease_retries_user_cancel_before_grace_deadline_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9754
+        now = datetime.utcnow()
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=now + timedelta(days=2),
+            stripe_customer_id="cus_failed_9754", stripe_subscription_id="sub_failed_9754",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=1),
+            grace_period_end=now + timedelta(hours=47), auto_renew=True,
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id, failed_invoice_id,
+                    reason, status, owner_id, claim_generation, lease_until, access_expiry,
+                    attempt_count, created_at, updated_at
+                ) VALUES (
+                    'fst-crashed-user-cancel', %s, 'sub_failed_9754', 'in_failed_9754',
+                    'user_cancelled_after_payment_failure', 'processing', 'crashed-worker', 1,
+                    %s, %s, 1, %s, %s
+                )
+                """,
+                (user_id, now - timedelta(minutes=1), now + timedelta(days=2), now, now),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        invoice = mock.Mock(id="in_failed_9754", subscription="sub_failed_9754", status="open")
+        invoice.void_invoice.return_value = mock.Mock(status="void")
+        voided_invoice = mock.Mock(id="in_failed_9754", subscription="sub_failed_9754", status="void")
+        subscription = mock.Mock(status="past_due", latest_invoice=invoice)
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()):
+            result = asyncio.run(main.process_expired_failed_subscription_grace())
+
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(self.query_one(
+            "SELECT status, reason, claim_generation FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (user_id,),
+        ), ("completed", "user_cancelled_after_payment_failure", 2))
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE telegram_id = %s AND event_type = 'failed_subscription_cancelled_by_user'
+            """,
+            (user_id,),
+        )[0], 1)
+
+    def test_scheduler_retry_preserves_user_cancel_reason_after_telegram_failure_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9755
+        now = datetime.utcnow()
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=now + timedelta(days=2),
+            stripe_customer_id="cus_failed_9755", stripe_subscription_id="sub_failed_9755",
+            payment_failed=True, payment_failed_at=now - timedelta(hours=1),
+            grace_period_end=now + timedelta(hours=47), auto_renew=True,
+        )
+        invoice = mock.Mock(id="in_failed_9755", subscription="sub_failed_9755", status="open")
+        invoice.void_invoice.return_value = mock.Mock(status="void")
+        voided_invoice = mock.Mock(id="in_failed_9755", subscription="sub_failed_9755", status="void")
+        subscription = mock.Mock(status="past_due", latest_invoice=invoice)
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+        member = mock.Mock(status="member")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock(side_effect=RuntimeError("temporary"))):
+            first = asyncio.run(main.terminate_failed_subscription(
+                user_id, "user_cancelled_after_payment_failure",
+            ))
+        self.assertEqual(first, "telegram_retryable")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve") as retrieve_again, \
+             mock.patch.object(main.stripe.Invoice, "retrieve") as invoice_again, \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=member)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()):
+            retry = asyncio.run(main.process_expired_failed_subscription_grace())
+        self.assertEqual(retry["completed"], 1)
+        retrieve_again.assert_not_called()
+        invoice_again.assert_not_called()
+        self.assertEqual(self.query_one(
+            "SELECT reason FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (user_id,),
+        )[0], "user_cancelled_after_payment_failure")
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM access_events
+            WHERE telegram_id = %s AND event_type = 'failed_subscription_cancelled_by_user'
+            """,
+            (user_id,),
+        )[0], 1)
+
+    def test_terminated_old_subscription_cannot_overwrite_new_access_real_postgres(self):
+        run_migrations(self.get_conn)
+        user_id = 9753
+        future = datetime.utcnow() + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=future,
+            stripe_customer_id="cus_shared_9753", stripe_subscription_id="sub_new_9753",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id, reason, status,
+                    stripe_cancelled_at, completed_at
+                ) VALUES ('fst-old-9753', %s, 'sub_old_9753', 'grace_period_expired',
+                          'completed', NOW(), NOW())
+                """,
+                (user_id,),
+            )
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT telegram_id FROM users
+                    WHERE telegram_id = %s
+                      AND NOT EXISTS (
+                          SELECT 1 FROM failed_subscription_terminations
+                          WHERE stripe_subscription_id = %s
+                            AND stripe_cancelled_at IS NOT NULL AND status <> 'superseded'
+                      )
+                )
+                UPDATE users SET paid = TRUE, stripe_subscription_id = 'sub_old_9753'
+                FROM target WHERE users.telegram_id = target.telegram_id
+                RETURNING users.telegram_id
+                """,
+                (user_id, "sub_old_9753"),
+            )
+            self.assertIsNone(cur.fetchone())
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, future, "sub_new_9753"))
+
+    def test_hourly_retry_targets_old_operation_and_protects_new_subscription_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9756
+        now = datetime.utcnow()
+        new_expiry = now + timedelta(days=30)
+        old_expiry = now - timedelta(hours=2)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=new_expiry,
+            stripe_customer_id="cus_shared_9756", stripe_subscription_id="sub_new_9756",
+            payment_failed=False, auto_renew=True,
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id, failed_invoice_id,
+                    reason, status, access_expiry, attempt_count, created_at, updated_at
+                ) VALUES (
+                    'fst-old-retry-9756', %s, 'sub_old_9756', 'in_old_9756',
+                    'grace_period_expired', 'retryable_failed', %s, 1, NOW(), NOW()
+                )
+                """,
+                (user_id, old_expiry),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        invoice = mock.Mock(id="in_old_9756", subscription="sub_old_9756", status="open")
+        invoice.void_invoice.return_value = mock.Mock(status="void")
+        voided_invoice = mock.Mock(id="in_old_9756", subscription="sub_old_9756", status="void")
+        old_subscription = mock.Mock(status="past_due", latest_invoice=invoice)
+        old_subscription.cancel.return_value = mock.Mock(status="canceled")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.stripe.Subscription, "retrieve", return_value=old_subscription,
+             ) as retrieve, \
+             mock.patch.object(
+                 main.stripe.Invoice, "retrieve", side_effect=[invoice, voided_invoice],
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+            result = asyncio.run(main.process_expired_failed_subscription_grace())
+
+        self.assertEqual(result["recovered"], 1)
+        retrieve.assert_called_once_with("sub_old_9756", expand=["latest_invoice"])
+        old_subscription.cancel.assert_called_once_with()
+        invoice.void_invoice.assert_called_once_with()
+        ban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status FROM failed_subscription_terminations WHERE operation_id = 'fst-old-retry-9756'"
+        )[0], "superseded")
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, new_expiry, "sub_new_9756"))
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM failed_subscription_terminations
+            WHERE operation_id = 'fst-old-retry-9756'
+              AND status IN ('pending', 'processing', 'stripe_cancelled', 'collection_stopped',
+                             'telegram_failed', 'telegram_removed', 'retryable_failed')
+            """
+        )[0], 0)
+
+    def test_removed_old_operation_with_new_access_enqueues_one_restore_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9757
+        now = datetime.utcnow()
+        new_expiry = now + timedelta(days=30)
+        old_expiry = now - timedelta(hours=2)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=new_expiry,
+            stripe_customer_id="cus_shared_9757", stripe_subscription_id="sub_new_9757",
+            payment_failed=False, auto_renew=True,
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id, failed_invoice_id,
+                    reason, status, stripe_cancelled_at, collection_stopped_at,
+                    telegram_banned_at, telegram_removed_at, access_expiry,
+                    attempt_count, created_at, updated_at
+                ) VALUES (
+                    'fst-old-removed-9757', %s, 'sub_old_9757', 'in_old_9757',
+                    'grace_period_expired', 'telegram_removed', NOW(), NOW(), NOW(), NOW(),
+                    %s, 1, NOW(), NOW()
+                )
+                """,
+                (user_id, old_expiry),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        for _ in range(2):
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+                asyncio.run(main.process_expired_failed_subscription_grace())
+            ban.assert_not_awaited()
+
+        self.assertEqual(self.query_one(
+            "SELECT status FROM failed_subscription_terminations WHERE operation_id = 'fst-old-removed-9757'"
+        )[0], "superseded")
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM message_delivery_events
+            WHERE delivery_key = 'failed-subscription-access-restore:fst-old-removed-9757'
+              AND delivery_type = 'stripe_rejoin_check'
+            """
+        )[0], 1)
+        self.assertEqual(self.query_one(
+            "SELECT paid, expiry_date, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, new_expiry, "sub_new_9757"))
 
     def test_postgres_fsm_storage_roundtrip_isolation_concurrent_update_and_cleanup(self):
         run_migrations(self.get_conn)
@@ -6998,7 +7415,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(delivery[0], 1)
         self.assertEqual(delivery[1], "pending")
         self.assertEqual(delivery[2], main.failed_renewal_message_text())
-        self.assertEqual(delivery[3], "billing_portal")
+        self.assertEqual(delivery[3], "payment_failed_actions")
 
     def test_hourly_expired_access_selector_excludes_future_and_processes_ordinary_trial_once_real_postgres(self):
         run_migrations(self.get_conn)
@@ -9575,7 +9992,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 28)
+        self.assertEqual(system["migrations"]["count"], 29)
         self.assertEqual(system["migrations"]["latest"], "0028_content_revisions")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)

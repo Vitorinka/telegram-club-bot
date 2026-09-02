@@ -1246,7 +1246,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END", block)
         cur = FakeCursor()
         query = block[block.index('cur.execute("""') + len('cur.execute("""'):block.index('""", (')]
-        params = (1, datetime.utcnow(), datetime.utcnow(), "sub_1", "cus_1", 123, 123, True)
+        params = (1, "sub_1", datetime.utcnow(), datetime.utcnow(), "sub_1", "cus_1", 123, 123, True)
         cur.execute(query, params)
         self.assertEqual(query.count("%s"), len(params))
 
