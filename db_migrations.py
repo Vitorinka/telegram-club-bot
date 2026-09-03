@@ -273,6 +273,23 @@ MIGRATION_BASELINE_REQUIREMENTS = {
         },
         "indexes": ("aiogram_fsm_states_updated_at_idx",),
     },
+    "0005_failed_subscription_terminations": {
+        "tables": ("failed_subscription_terminations",),
+        "columns": {
+            "failed_subscription_terminations": (
+                "operation_id", "telegram_id", "stripe_subscription_id", "failed_invoice_id",
+                "reason", "status", "owner_id", "claim_generation", "lease_until",
+                "access_expiry", "stripe_cancelled_at", "collection_stopped_at", "telegram_banned_at",
+                "telegram_removed_at", "db_finalized_at", "completed_at", "attempt_count",
+                "last_error_category", "created_at", "updated_at",
+            ),
+        },
+        "indexes": (
+            "failed_subscription_terminations_due_idx",
+            "failed_subscription_terminations_subscription_uidx",
+            "failed_subscription_terminations_user_idx",
+        ),
+    },
     "0005_gift_access": {
         "tables": ("gift_access_grants", "gift_certificate_templates", "gift_access_events"),
         "columns": {
@@ -836,6 +853,7 @@ BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_ha
     "gift_access_grants",
     "gift_certificate_templates",
     "gift_access_events",
+    "failed_subscription_terminations",
 )
 
 BASELINE_REQUIRED_COLUMNS = {
