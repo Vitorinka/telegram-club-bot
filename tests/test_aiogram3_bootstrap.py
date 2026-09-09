@@ -9643,6 +9643,68 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             self.main.get_db_conn, 77, "Telegram Name"
         )
 
+    async def test_member_media_requires_member_session_and_does_not_authorize_admin_media(self):
+        app = self.main.create_app()
+        member_path = "/api/member/content/{content_id}/media/{media_id}"
+        member_handler = self.route_handler(app, "GET", member_path)
+        member_request = FakeMiniAppRequest(
+            app, path=member_path,
+            match_info={"content_id": "content-id", "media_id": "media-id"},
+        )
+        with patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file, \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock) as download:
+            missing = await self.main.miniapp_admin_auth_middleware(
+                member_request, member_handler
+            )
+        self.assertEqual(missing.status, 401)
+        get_file.assert_not_awaited()
+        download.assert_not_awaited()
+
+        member_request.headers["Authorization"] = "Bearer expired-member-token"
+        with patch.object(
+            self.main, "load_member_session",
+            side_effect=self.main.MemberSessionError("member_session_inactive"),
+        ), patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            expired = await self.main.miniapp_admin_auth_middleware(
+                member_request, member_handler
+            )
+        self.assertEqual(expired.status, 401)
+        get_file.assert_not_awaited()
+
+        member_request.headers["Authorization"] = "Bearer valid-admin-token"
+        with patch.object(
+            self.main, "load_member_session",
+            side_effect=self.main.MemberSessionError("member_session_unknown"),
+        ), patch.object(
+            self.main, "load_miniapp_admin_session"
+        ) as load_admin, patch.object(
+            self.main.bot, "get_file", new_callable=AsyncMock
+        ) as get_file:
+            admin_token_rejected = await self.main.miniapp_admin_auth_middleware(
+                member_request, member_handler
+            )
+        self.assertEqual(admin_token_rejected.status, 401)
+        load_admin.assert_not_called()
+        get_file.assert_not_awaited()
+
+        admin_path = "/api/admin/content/cms/{content_id}/media/{media_id}"
+        admin_handler = self.route_handler(app, "GET", admin_path)
+        admin_request = FakeMiniAppRequest(
+            app, "Bearer member-token", path=admin_path,
+            match_info={"content_id": "content-id", "media_id": "media-id"},
+        )
+        with patch.object(
+            self.main, "load_miniapp_admin_session",
+            side_effect=self.main.MiniAppSessionError("admin_session_unknown"),
+        ), patch.object(self.main, "load_member_session") as load_member, \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            rejected = await self.main.miniapp_admin_auth_middleware(
+                admin_request, admin_handler
+            )
+        self.assertEqual(rejected.status, 401)
+        load_member.assert_not_called()
+        get_file.assert_not_awaited()
+
     async def test_member_media_rechecks_access_and_video_remains_unsupported(self):
         app = self.main.create_app()
         path = "/api/member/content/{content_id}/media/{media_id}"
@@ -9652,14 +9714,13 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             match_info={"content_id": "content-id", "media_id": "media-id"},
         )
         session = SimpleNamespace(telegram_id=42, first_name="Member", session_id="member")
-        content = {"content_id": "content-id", "locked": True}
         audio = {
             "media_type": "audio", "mime_type": "audio/mpeg", "size_bytes": 10,
             "server_reference": "private-ref", "content_type": "meditation",
+            "access_level": "premium",
         }
         with patch.object(self.main, "load_member_session", return_value=session), \
-             patch.object(self.main, "get_member_content", return_value=content), \
-             patch.object(self.main, "get_media_reference", return_value=audio), \
+             patch.object(self.main, "get_member_media_reference", return_value=audio), \
              patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
              patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
             denied = await self.main.miniapp_admin_auth_middleware(request, handler)
@@ -9668,8 +9729,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         video = dict(audio, media_type="video", mime_type="video/mp4")
         with patch.object(self.main, "load_member_session", return_value=session), \
-             patch.object(self.main, "get_member_content", return_value={"locked": False}), \
-             patch.object(self.main, "get_media_reference", return_value=video), \
+             patch.object(self.main, "get_member_media_reference", return_value=video), \
              patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
              patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
             unsupported = await self.main.miniapp_admin_auth_middleware(request, handler)
@@ -9680,8 +9740,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             destination.write(b"safe-mp3")
 
         with patch.object(self.main, "load_member_session", return_value=session), \
-             patch.object(self.main, "get_member_content", return_value={"locked": False}), \
-             patch.object(self.main, "get_media_reference", return_value=audio), \
+             patch.object(self.main, "get_member_media_reference", return_value=audio), \
              patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
              patch.object(
                  self.main.bot, "get_file", new_callable=AsyncMock,
@@ -9694,6 +9753,38 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(allowed.status, 200)
         self.assertEqual(allowed.body, b"safe-mp3")
         self.assertEqual(allowed.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(allowed.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("Content-Security-Policy", allowed.headers)
+
+        # The same authenticated session must lose premium delivery immediately
+        # when request-time entitlement no longer permits access.
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=audio), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            lost_access = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(lost_access.status, 403)
+        get_file.assert_not_awaited()
+
+        cover = dict(
+            audio, media_type="cover", mime_type="image/png",
+            access_level="preview",
+        )
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=cover), \
+             patch.object(self.main, "member_access", side_effect=AssertionError("cover must not require entitlement")), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/path")), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_audio):
+            preview = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(preview.status, 200)
+
+        unknown = dict(audio, media_type="future_media", access_level=None)
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=unknown), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
+            rejected = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(rejected.status, 404)
+        get_file.assert_not_awaited()
 
     async def test_member_preview_routes_are_admin_only_and_safely_projected(self):
         app = self.main.create_app()

@@ -14,6 +14,45 @@ COVER_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 20 * 1024 * 1024
 AUDIO_MAX_BYTES = 20 * 1024 * 1024
 MEDIA_TYPES = frozenset({"cover", "video", "audio"})
+MEMBER_MEDIA_CONTENT_TYPES = frozenset({
+    "lesson", "meditation", "recipe", "nutrition_material",
+})
+MEMBER_PUBLIC_PREVIEW_MEDIA_TYPES = frozenset({"cover"})
+MEMBER_PREMIUM_MEDIA_TYPES = frozenset({"audio", "video"})
+MEMBER_MEDIA_MIME_TYPES = {
+    "cover": frozenset({"image/jpeg", "image/png", "image/webp"}),
+    "audio": frozenset({"audio/mpeg"}),
+    "video": frozenset({"video/mp4"}),
+}
+
+
+def member_media_access_level(media_type):
+    if media_type in MEMBER_PUBLIC_PREVIEW_MEDIA_TYPES:
+        return "preview"
+    if media_type in MEMBER_PREMIUM_MEDIA_TYPES:
+        return "premium"
+    return None
+
+
+def member_media_metadata_valid(content_type, media_type, mime_type, size_bytes):
+    if content_type not in MEMBER_MEDIA_CONTENT_TYPES:
+        return False
+    if member_media_access_level(media_type) is None:
+        return False
+    if not media_allowed_for_content(content_type, media_type):
+        return False
+    if mime_type not in MEMBER_MEDIA_MIME_TYPES[media_type]:
+        return False
+    try:
+        size_bytes = int(size_bytes)
+    except (TypeError, ValueError):
+        return False
+    limit = {
+        "cover": COVER_MAX_BYTES,
+        "audio": AUDIO_MAX_BYTES,
+        "video": VIDEO_MAX_BYTES,
+    }[media_type]
+    return 0 < size_bytes <= limit
 
 
 def media_allowed_for_content(content_type, media_type):
@@ -395,5 +434,48 @@ def get_media_reference(get_connection, content_id, media_id):
         return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3], "content_type":row[4]}
     except Exception:
         conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+def get_member_media_reference(get_connection, content_id, media_id):
+    """Resolve a published member-media relationship without exposing it to clients."""
+    content_id = validate_uuid(content_id, "invalid_content_id")
+    media_id = validate_uuid(media_id, "invalid_media_id")
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("SET LOCAL statement_timeout=5000")
+        cur.execute(
+            """
+            SELECT m.media_type, m.mime_type, m.size_bytes,
+                   m.server_reference, c.content_type
+            FROM content_items c
+            JOIN content_media m ON m.content_id = c.content_id
+            WHERE c.content_id = %s
+              AND c.status = 'published'
+              AND m.media_id = %s
+              AND m.deleted_at IS NULL
+              AND m.storage_kind = 'telegram_file_id'
+            """,
+            (content_id, media_id),
+        )
+        row = cur.fetchone()
+        conn.rollback()
+        if not row or not row[3]:
+            return None
+        if not member_media_metadata_valid(row[4], row[0], row[1], row[2]):
+            return None
+        return {
+            "media_type": row[0],
+            "mime_type": row[1],
+            "size_bytes": int(row[2]),
+            "server_reference": row[3],
+            "content_type": row[4],
+            "access_level": member_media_access_level(row[0]),
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cur.close(); conn.close()

@@ -64,6 +64,7 @@ from content_media import (
     cancel_media_upload,
     create_media_upload,
     ensure_media_action,
+    get_member_media_reference,
     get_media_upload,
     list_content_media,
     prepare_media_execution,
@@ -2562,6 +2563,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
+
         with self.assertRaises(psycopg2.DatabaseError):
             apply_media_upload(
                 self.get_conn, faulted["upload_id"],
@@ -2626,6 +2628,91 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             create_media_upload(
                 self.get_conn, 1, draft["content_id"], "cover", png
             )
+
+    def test_member_media_lookup_requires_published_live_relationship_real_postgres(self):
+        run_migrations(self.get_conn)
+        first = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Member media one",
+            "category": "main_workout", "duration_seconds": 600,
+        })
+        second = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Member media two",
+            "category": "main_workout", "duration_seconds": 600,
+        })
+        staged = create_media_upload(
+            self.get_conn, 1, first["content_id"], "cover",
+            b"\x89PNG\r\n\x1a\nmember-cover",
+        )
+        action = ensure_media_action(self.get_conn, staged["upload_id"], 1)
+        prepare_media_execution(
+            self.get_conn, staged["upload_id"], action["action_id"], 1
+        )
+        record_telegram_upload(
+            self.get_conn, staged["upload_id"], action["action_id"], 1,
+            "telegram-private-member-cover",
+        )
+        applied = apply_media_upload(
+            self.get_conn, staged["upload_id"], action["action_id"], 1
+        )
+        media_id = applied["media_id"]
+
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], media_id
+        ))
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published', published_at=NOW() "
+                    "WHERE content_id=%s",
+                    (first["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resolved = get_member_media_reference(
+            self.get_conn, first["content_id"], media_id
+        )
+        self.assertEqual(resolved["access_level"], "preview")
+        self.assertEqual(resolved["media_type"], "cover")
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, second["content_id"], media_id
+        ))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='archived', archived_at=NOW() "
+                    "WHERE content_id=%s",
+                    (first["content_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], media_id
+        ))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE content_items SET status='published', archived_at=NULL "
+                    "WHERE content_id=%s",
+                    (first["content_id"],),
+                )
+                cur.execute(
+                    "UPDATE content_media SET deleted_at=NOW() WHERE media_id=%s",
+                    (media_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], media_id
+        ))
 
     def test_recipe_atomic_structure_media_and_preview_real_postgres(self):
         run_migrations(self.get_conn)
