@@ -513,6 +513,103 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
+    def test_member_entitlement_rechecks_failed_termination_state_real_postgres(self):
+        run_migrations(self.get_conn)
+        now = datetime.utcnow()
+        expired = now - timedelta(hours=1)
+        future = now + timedelta(hours=2)
+        later_access = now + timedelta(days=30)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (
+                        telegram_id, paid, expiry_date, payment_failed,
+                        grace_period_end, stripe_subscription_id
+                    ) VALUES
+                        (88101, TRUE, %s, FALSE, NULL, 'sub_active'),
+                        (88102, TRUE, %s, FALSE, NULL, 'sub_expired'),
+                        (88103, TRUE, %s, TRUE, %s, 'sub_grace'),
+                        (88104, TRUE, %s, TRUE, %s, 'sub_grace_expired'),
+                        (88105, TRUE, %s, TRUE, %s, 'sub_not_cancelled'),
+                        (88106, TRUE, %s, TRUE, %s, 'sub_not_closed'),
+                        (88107, TRUE, %s, TRUE, %s, 'sub_shutdown'),
+                        (88108, TRUE, %s, TRUE, %s, 'sub_new'),
+                        (88109, TRUE, %s, TRUE, %s, 'sub_old_later_access'),
+                        (88110, TRUE, %s, TRUE, %s, 'sub_superseded'),
+                        (88111, TRUE, %s, TRUE, %s, NULL),
+                        (88112, TRUE, %s, TRUE, %s, NULL),
+                        (88113, TRUE, %s, TRUE, %s, 'sub_newer_after_grace'),
+                        (88114, TRUE, %s, TRUE, %s, 'sub_manual_review_open'),
+                        (88115, TRUE, %s, TRUE, %s, NULL),
+                        (88116, TRUE, %s, FALSE, NULL, NULL)
+                    """,
+                    (
+                        future, expired, expired, future, expired, expired,
+                        expired, future, expired, future, expired, future,
+                        expired, future, later_access, future, expired, future,
+                        expired, future, later_access, future,
+                        later_access, expired,
+                        expired, future, expired, future, later_access,
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry,
+                        stripe_cancelled_at, collection_stopped_at
+                    ) VALUES
+                        ('member-fst-5', 88105, 'sub_not_cancelled',
+                         'user_cancelled_after_payment_failure', 'processing', %s, NULL, NULL),
+                        ('member-fst-6', 88106, 'sub_not_closed',
+                         'user_cancelled_after_payment_failure', 'stripe_cancelled', %s, NOW(), NULL),
+                        ('member-fst-7', 88107, 'sub_shutdown',
+                         'user_cancelled_after_payment_failure', 'telegram_failed', %s, NOW(), NOW()),
+                        ('member-fst-8', 88108, 'sub_old',
+                         'user_cancelled_after_payment_failure', 'telegram_failed', %s, NOW(), NOW()),
+                        ('member-fst-9', 88109, 'sub_old_later_access',
+                         'user_cancelled_after_payment_failure', 'telegram_failed', %s, NOW(), NOW()),
+                        ('member-fst-10', 88110, 'sub_superseded',
+                         'user_cancelled_after_payment_failure', 'superseded', %s, NOW(), NOW()),
+                        ('member-fst-11', 88111, 'sub_identity_cleared',
+                         'user_cancelled_after_payment_failure', 'telegram_failed', %s, NOW(), NOW()),
+                        ('member-fst-12', 88112, 'sub_identity_cleared_later_access',
+                         'user_cancelled_after_payment_failure', 'telegram_failed', %s, NOW(), NOW()),
+                        ('member-fst-14', 88114, 'sub_manual_review_open',
+                         'user_cancelled_after_payment_failure', 'manual_review', %s, NOW(), NULL),
+                        ('member-fst-15', 88115, 'sub_manual_review_closed',
+                         'user_cancelled_after_payment_failure', 'manual_review', %s, NOW(), NOW()),
+                        ('member-fst-16', 88116, 'sub_completed_old',
+                         'grace_period_expired', 'completed', %s, NOW(), NOW())
+                    """,
+                    (
+                        expired, expired, expired, expired, expired, expired,
+                        expired, expired, expired, expired, expired,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertTrue(member_access(self.get_conn, 88101, now)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88102, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88103, now)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88104, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88105, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88106, now)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88107, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88108, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88109, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88110, now)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88111, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88112, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88113, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88114, now)["has_active_access"])
+        self.assertFalse(member_access(self.get_conn, 88115, now)["has_active_access"])
+        self.assertTrue(member_access(self.get_conn, 88116, now)["has_active_access"])
+
     def test_miniapp_dashboard_aggregates_synthetic_records_real_postgres(self):
         run_migrations(self.get_conn)
         conn = self.get_conn()
