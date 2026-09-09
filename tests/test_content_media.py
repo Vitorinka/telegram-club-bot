@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from content_media import (
     AUDIO_MAX_BYTES,
@@ -6,6 +7,8 @@ from content_media import (
     VIDEO_MAX_BYTES,
     ContentMediaError,
     detect_media_mime,
+    member_media_access_level,
+    member_media_metadata_valid,
     validate_media_bytes,
 )
 
@@ -58,6 +61,48 @@ class ContentMediaValidationTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ContentMediaError, "content_media_too_large"):
             validate_media_bytes("audio", b"\xff\xfb\x90\x64" + b"x" * AUDIO_MAX_BYTES)
+
+    def test_member_media_policy_is_explicit_and_fail_closed(self):
+        self.assertEqual(member_media_access_level("cover"), "preview")
+        self.assertEqual(member_media_access_level("audio"), "premium")
+        self.assertEqual(member_media_access_level("video"), "premium")
+        self.assertIsNone(member_media_access_level("future_media"))
+        self.assertTrue(member_media_metadata_valid(
+            "lesson", "cover", "image/png", 100
+        ))
+        self.assertTrue(member_media_metadata_valid(
+            "meditation", "audio", "audio/mpeg", 100
+        ))
+        self.assertTrue(member_media_metadata_valid(
+            "recipe", "cover", "image/webp", 100
+        ))
+        self.assertTrue(member_media_metadata_valid(
+            "nutrition_material", "cover", "image/jpeg", 100
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "recipe", "audio", "audio/mpeg", 100
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "nutrition_material", "video", "video/mp4", 100
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "lesson", "future_media", "application/octet-stream", 100
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "lesson", "cover", "image/svg+xml", 100
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "lesson", "cover", "image/png", COVER_MAX_BYTES + 1
+        ))
+
+    def test_future_cms_content_type_is_not_implicitly_member_facing(self):
+        with patch("content_media.CONTENT_TYPES", frozenset({
+            "lesson", "meditation", "recipe", "nutrition_material",
+            "future_cms_type",
+        })):
+            self.assertFalse(member_media_metadata_valid(
+                "future_cms_type", "cover", "image/png", 100
+            ))
 
 
 if __name__ == "__main__":

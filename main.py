@@ -181,9 +181,11 @@ from content_media import (
     create_media_upload,
     ensure_media_action,
     fail_media_upload,
+    get_member_media_reference,
     get_media_reference,
     get_media_upload,
     list_content_media,
+    member_media_access_level,
     prepare_media_execution,
     record_telegram_upload,
     validate_media_bytes,
@@ -22432,12 +22434,19 @@ async def miniapp_member_schedule(request):
 
 async def miniapp_member_media(request):
     session=request["miniapp_member"]
-    content=get_member_content(get_db_conn,session.telegram_id,request.match_info.get("content_id"))
-    if content is None: return member_error(MemberCatalogError("content_not_found",404))
-    media=get_media_reference(get_db_conn,request.match_info.get("content_id"),request.match_info.get("media_id"))
+    try:
+        media=get_member_media_reference(
+            get_db_conn,
+            request.match_info.get("content_id"),
+            request.match_info.get("media_id"),
+        )
+    except ContentMediaError:
+        return member_error(MemberCatalogError("media_not_found",404))
     if media is None: return member_error(MemberCatalogError("media_not_found",404))
-    premium=media["media_type"] in {"audio","video"}
-    if premium and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
+    access_level=member_media_access_level(media["media_type"])
+    if access_level is None:
+        return member_error(MemberCatalogError("media_not_found",404))
+    if access_level == "premium" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
         return member_error(MemberCatalogError("active_access_required",403))
     if media["media_type"] == "video": return member_error(MemberCatalogError("video_streaming_not_available",409))
     limit=AUDIO_MAX_BYTES if media["media_type"]=="audio" else COVER_MAX_BYTES
