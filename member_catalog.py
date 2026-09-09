@@ -12,8 +12,21 @@ class MemberCatalogError(Exception):
 
 def _access(row, now=None):
     if not row: return {"has_active_access":False,"expires_at":None}
-    active=has_active_access(row[0],row[1],payment_failed=row[2],grace_period_end=row[3],now=now)
-    effective=row[3] if row[2] and row[3] and row[3]>(now or datetime.utcnow()) else row[1]
+    now = now or datetime.utcnow()
+    paid, expiry_date, payment_failed, grace_period_end = row[:4]
+    billing_shutdown_confirmed = bool(row[4]) if len(row) > 4 else False
+    if billing_shutdown_confirmed:
+        active = False
+    elif payment_failed and grace_period_end and grace_period_end <= now:
+        # A failed-renewal grace is a hard entitlement deadline.  A genuinely
+        # newer access grant remains valid if it extends beyond that deadline.
+        active = bool(paid and expiry_date and expiry_date > now and expiry_date > grace_period_end)
+    else:
+        active=has_active_access(
+            paid, expiry_date, payment_failed=payment_failed,
+            grace_period_end=grace_period_end, now=now,
+        )
+    effective=grace_period_end if payment_failed and grace_period_end and grace_period_end>now else expiry_date
     return {"has_active_access":bool(active),"expires_at":effective.isoformat() if active and effective else None}
 
 def member_access(get_connection, telegram_id, now=None):
@@ -21,8 +34,28 @@ def member_access(get_connection, telegram_id, now=None):
     try:
         cur.execute("SET TRANSACTION READ ONLY")
         cur.execute(
-            "SELECT paid,expiry_date,payment_failed,grace_period_end "
-            "FROM users WHERE telegram_id=%s",
+            """
+            SELECT u.paid, u.expiry_date, u.payment_failed, u.grace_period_end,
+                   EXISTS (
+                       SELECT 1
+                       FROM failed_subscription_terminations fst
+                       WHERE fst.telegram_id = u.telegram_id
+                         AND fst.stripe_cancelled_at IS NOT NULL
+                         AND fst.collection_stopped_at IS NOT NULL
+                         AND fst.status <> 'superseded'
+                         AND fst.access_expiry IS NOT NULL
+                         AND (
+                             u.stripe_subscription_id IS NULL
+                             OR u.stripe_subscription_id = fst.stripe_subscription_id
+                         )
+                         AND (
+                             u.expiry_date IS NULL
+                             OR u.expiry_date <= fst.access_expiry
+                         )
+                   ) AS billing_shutdown_confirmed
+            FROM users u
+            WHERE u.telegram_id = %s
+            """,
             (int(telegram_id),),
         )
         row=cur.fetchone(); conn.rollback()
