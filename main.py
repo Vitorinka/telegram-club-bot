@@ -135,6 +135,15 @@ from admin_subscriptions import (
     list_admin_subscriptions,
     parse_subscriptions_limit,
 )
+from admin_failed_subscriptions import (
+    AdminFailedSubscriptionsError,
+    cancel_retry_action,
+    claim_retry_action,
+    create_retry_preview,
+    finish_retry_action,
+    get_failed_subscription,
+    list_failed_subscriptions,
+)
 from admin_system import (
     AdminSystemQueryError,
     collect_admin_system,
@@ -23495,6 +23504,107 @@ async def miniapp_admin_subscriptions(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+def failed_subscription_admin_error(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status,
+    ))
+
+
+async def miniapp_admin_failed_subscriptions(request):
+    try:
+        result = list_failed_subscriptions(
+            get_db_conn, state=request.query.get("state", "all"),
+            limit=request.query.get("limit", "25"),
+            cursor=request.query.get("cursor"),
+        )
+    except AdminFailedSubscriptionsError as error:
+        return failed_subscription_admin_error(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_failed_subscription_details(request):
+    try:
+        result = get_failed_subscription(
+            get_db_conn, request.match_info.get("operation_id")
+        )
+    except AdminFailedSubscriptionsError as error:
+        return failed_subscription_admin_error(error)
+    if result is None:
+        return failed_subscription_admin_error(
+            AdminFailedSubscriptionsError("operation_not_found", 404)
+        )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_failed_subscription_retry_preview(request):
+    try:
+        result = create_retry_preview(
+            get_db_conn, request["miniapp_admin"].telegram_id,
+            request.match_info.get("operation_id"),
+        )
+    except AdminFailedSubscriptionsError as error:
+        return failed_subscription_admin_error(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_failed_subscription_retry_confirm(request):
+    try:
+        expected_operation_id = request.match_info.get("operation_id")
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
+        action_id = str(uuid.UUID(str(body.get("action_id"))))
+        claimed = claim_retry_action(
+            get_db_conn, request["miniapp_admin"].telegram_id, action_id,
+            expected_operation_id,
+        )
+    except AdminFailedSubscriptionsError as error:
+        return failed_subscription_admin_error(error)
+    except (TypeError, ValueError):
+        return failed_subscription_admin_error(
+            AdminFailedSubscriptionsError("invalid_retry_confirmation")
+        )
+    try:
+        lifecycle_result = await terminate_failed_subscription(
+            claimed["telegram_id"], claimed["reason"],
+            target_operation_id=claimed["operation_id"],
+            target_subscription_id=claimed["subscription_id"],
+        )
+    except Exception:
+        finish_retry_action(get_db_conn, action_id, False)
+        raise
+    finish_retry_action(get_db_conn, action_id, True)
+    return apply_miniapp_security_headers(web.json_response({
+        "action_id": action_id, "status": "completed",
+        "lifecycle_result": lifecycle_result,
+    }))
+
+
+async def miniapp_admin_failed_subscription_retry_cancel(request):
+    try:
+        expected_operation_id = request.match_info.get("operation_id")
+        body = await request.json()
+        if not isinstance(body, dict): raise ValueError
+        action_id = str(uuid.UUID(str(body.get("action_id"))))
+        cancelled = cancel_retry_action(
+            get_db_conn, request["miniapp_admin"].telegram_id, action_id,
+            expected_operation_id,
+        )
+    except AdminFailedSubscriptionsError as error:
+        return failed_subscription_admin_error(error)
+    except (TypeError, ValueError):
+        return failed_subscription_admin_error(
+            AdminFailedSubscriptionsError("invalid_retry_cancellation")
+        )
+    if not cancelled:
+        return failed_subscription_admin_error(
+            AdminFailedSubscriptionsError("action_not_pending", 409)
+        )
+    return apply_miniapp_security_headers(web.json_response({
+        "action_id": action_id, "status": "cancelled",
+    }))
+
+
 async def miniapp_admin_subscription_details(request):
     try:
         details = get_admin_subscription_details(
@@ -24333,6 +24443,30 @@ def create_app():
         app.router.add_get(
             '/api/admin/subscriptions/{telegram_id}',
             miniapp_admin_subscription_details,
+        )
+    if not _route_exists(app, "GET", "/api/admin/failed-subscriptions"):
+        app.router.add_get(
+            '/api/admin/failed-subscriptions', miniapp_admin_failed_subscriptions,
+        )
+    if not _route_exists(app, "POST", "/api/admin/failed-subscriptions/{operation_id}/retry-preview"):
+        app.router.add_post(
+            '/api/admin/failed-subscriptions/{operation_id}/retry-preview',
+            miniapp_admin_failed_subscription_retry_preview,
+        )
+    if not _route_exists(app, "POST", "/api/admin/failed-subscriptions/{operation_id}/retry-confirm"):
+        app.router.add_post(
+            '/api/admin/failed-subscriptions/{operation_id}/retry-confirm',
+            miniapp_admin_failed_subscription_retry_confirm,
+        )
+    if not _route_exists(app, "POST", "/api/admin/failed-subscriptions/{operation_id}/retry-cancel"):
+        app.router.add_post(
+            '/api/admin/failed-subscriptions/{operation_id}/retry-cancel',
+            miniapp_admin_failed_subscription_retry_cancel,
+        )
+    if not _route_exists(app, "GET", "/api/admin/failed-subscriptions/{operation_id}"):
+        app.router.add_get(
+            '/api/admin/failed-subscriptions/{operation_id}',
+            miniapp_admin_failed_subscription_details,
         )
     if not _route_exists(app, "GET", "/api/admin/system"):
         app.router.add_get('/api/admin/system', miniapp_admin_system)

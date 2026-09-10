@@ -39,6 +39,14 @@ from admin_subscriptions import (
     get_admin_subscription_details,
     list_admin_subscriptions,
 )
+from admin_failed_subscriptions import (
+    AdminFailedSubscriptionsError,
+    cancel_retry_action,
+    claim_retry_action,
+    create_retry_preview,
+    get_failed_subscription,
+    list_failed_subscriptions,
+)
 from admin_system import (
     collect_admin_system,
     get_admin_delivery_details,
@@ -4227,6 +4235,124 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         run_migrations(self.get_conn)
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM aiogram_fsm_states")[0], 0)
+
+    def test_failed_subscription_admin_queue_and_retry_fencing_real_postgres(self):
+        run_migrations(self.get_conn)
+        now=datetime.utcnow(); user_id=9740
+        self.insert_recovery_user(user_id,paid=True,expiry_date=now-timedelta(days=1),stripe_subscription_id="sub_queue_secret_9740")
+        operations=(
+            ("fst-queue-manual-9740","manual_review",None,"unsafe reason <script>"),
+            ("fst-queue-retry-9740","retryable_failed",None,"grace_period_expired"),
+            ("fst-queue-active-9740","processing",now+timedelta(minutes=10),"grace_period_expired"),
+            ("fst-queue-stale-9740","processing",now-timedelta(minutes=1),"user_cancelled_after_payment_failure"),
+            ("fst-queue-completed-9740","completed",None,"grace_period_expired"),
+            ("fst-queue-superseded-9740","superseded",None,"grace_period_expired"),
+        )
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                for index,(operation_id,status,lease,reason) in enumerate(operations):
+                    cur.execute("""INSERT INTO failed_subscription_terminations
+                      (operation_id,telegram_id,stripe_subscription_id,failed_invoice_id,reason,status,lease_until,attempt_count,last_error_category,access_expiry,created_at,updated_at)
+                      VALUES (%s,%s,%s,%s,%s,%s,%s,2,%s,%s,%s,%s)""",
+                      (operation_id,user_id,f"sub_queue_secret_{index}",f"in_queue_secret_{index}",reason,status,lease,"unsafe error: raw",now-timedelta(days=1),now-timedelta(minutes=index+1),now-timedelta(minutes=index+1)))
+            conn.commit()
+        finally: conn.close()
+
+        result=list_failed_subscriptions(self.get_conn,state="all",limit=10)
+        by_status={item["operation_id"]:item for item in result["items"]}
+        self.assertTrue(by_status["fst-queue-retry-9740"]["needs_attention"])
+        self.assertFalse(by_status["fst-queue-active-9740"]["stale"])
+        self.assertFalse(by_status["fst-queue-active-9740"]["retry_allowed"])
+        self.assertTrue(by_status["fst-queue-stale-9740"]["stale"])
+        self.assertTrue(by_status["fst-queue-stale-9740"]["retry_allowed"])
+        self.assertFalse(by_status["fst-queue-completed-9740"]["retry_allowed"])
+        self.assertTrue(by_status["fst-queue-completed-9740"]["needs_attention"])
+        self.assertNotEqual(by_status["fst-queue-completed-9740"]["current_phase"],"completed")
+        self.assertFalse(by_status["fst-queue-superseded-9740"]["retry_allowed"])
+        serialized=json.dumps(result,ensure_ascii=False)
+        self.assertNotIn("sub_queue_secret_",serialized); self.assertNotIn("in_queue_secret_",serialized)
+        self.assertNotIn("unsafe reason",serialized); self.assertNotIn("unsafe error",serialized)
+        self.assertNotIn("owner_id",serialized)
+        first_page=list_failed_subscriptions(self.get_conn,state="all",limit=2)
+        second_page=list_failed_subscriptions(self.get_conn,state="all",limit=2,cursor=first_page["next_cursor"])
+        self.assertTrue(set(item["operation_id"] for item in first_page["items"]).isdisjoint(
+            item["operation_id"] for item in second_page["items"]
+        ))
+        manual=list_failed_subscriptions(self.get_conn,state="manual_review",limit=10)
+        self.assertEqual([item["operation_id"] for item in manual["items"]],["fst-queue-manual-9740"])
+        attention=list_failed_subscriptions(self.get_conn,state="attention",limit=10)
+        self.assertIn("fst-queue-completed-9740",[item["operation_id"] for item in attention["items"]])
+
+        detail=get_failed_subscription(self.get_conn,"fst-queue-stale-9740")
+        self.assertEqual(detail["reason_label"],"Пользователь отменил после ошибки оплаты")
+        preview=create_retry_preview(self.get_conn,1,"fst-queue-stale-9740")
+        stored_payload=self.query_one("SELECT payload_json FROM admin_action_requests WHERE action_id=%s",(preview["action_id"],))[0]
+        self.assertNotIn("sub_queue_secret_",stored_payload)
+        claimed=claim_retry_action(self.get_conn,1,preview["action_id"],"fst-queue-stale-9740")
+        self.assertEqual(claimed["operation_id"],"fst-queue-stale-9740")
+        self.assertEqual(claimed["subscription_id"],"sub_queue_secret_3")
+        self.assertEqual(claimed["reason"],"user_cancelled_after_payment_failure")
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"action_not_pending"):
+            claim_retry_action(self.get_conn,1,preview["action_id"],"fst-queue-stale-9740")
+
+        # A stuck processing admin action must not prevent a fresh preview for
+        # the still-stale durable lifecycle operation.
+        replacement=create_retry_preview(self.get_conn,1,"fst-queue-stale-9740")
+        self.assertNotEqual(replacement["action_id"],preview["action_id"])
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_action_mismatch"):
+            claim_retry_action(self.get_conn,1,replacement["action_id"],"fst-queue-retry-9740")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id=%s",
+            (replacement["action_id"],),
+        )[0],"pending")
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_action_mismatch"):
+            cancel_retry_action(self.get_conn,1,replacement["action_id"],"fst-queue-retry-9740")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id=%s",
+            (replacement["action_id"],),
+        )[0],"pending")
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_action_mismatch"):
+            cancel_retry_action(self.get_conn,2,replacement["action_id"],"fst-queue-stale-9740")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id=%s",
+            (replacement["action_id"],),
+        )[0],"pending")
+        self.assertTrue(cancel_retry_action(
+            self.get_conn,1,replacement["action_id"],"fst-queue-stale-9740"
+        ))
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id=%s",
+            (replacement["action_id"],),
+        )[0],"cancelled")
+
+        foreign_action_id=str(uuid.uuid4())
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO admin_action_requests
+                  (action_id,admin_id,action_type,payload_json,status,expires_at)
+                  VALUES (%s,1,'gift_cancel','{}','pending',%s)""",
+                  (foreign_action_id,now+timedelta(minutes=10)))
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_action_mismatch"):
+            cancel_retry_action(self.get_conn,1,foreign_action_id,"fst-queue-stale-9740")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM admin_action_requests WHERE action_id=%s",
+            (foreign_action_id,),
+        )[0],"pending")
+
+        changed=create_retry_preview(self.get_conn,1,"fst-queue-retry-9740")
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur: cur.execute("UPDATE failed_subscription_terminations SET attempt_count=attempt_count+1 WHERE operation_id='fst-queue-retry-9740'")
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_state_changed"):
+            claim_retry_action(self.get_conn,1,changed["action_id"],"fst-queue-retry-9740")
+        with self.assertRaisesRegex(AdminFailedSubscriptionsError,"operation_not_retryable"):
+            create_retry_preview(self.get_conn,1,"fst-queue-manual-9740")
 
     def test_failed_subscription_termination_migration_and_full_flow_real_postgres(self):
         run_migrations(self.get_conn)

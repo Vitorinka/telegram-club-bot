@@ -29,6 +29,12 @@
   const subscriptionsMore = document.getElementById("subscriptions-more");
   const subscriptionDetailsContent = document.getElementById("subscription-details-content");
   const subscriptionMetricNodes = document.querySelectorAll("[data-subscription-metric]");
+  const failedSubscriptionsFilter = document.getElementById("failed-subscriptions-filter");
+  const failedSubscriptionsList = document.getElementById("failed-subscriptions-list");
+  const failedSubscriptionsEmpty = document.getElementById("failed-subscriptions-empty");
+  const failedSubscriptionsMore = document.getElementById("failed-subscriptions-more");
+  const failedSubscriptionDetailsContent = document.getElementById("failed-subscription-details-content");
+  const failedSubscriptionMetricNodes = document.querySelectorAll("[data-failed-metric]");
   const systemMetricNodes = document.querySelectorAll("[data-system-metric]");
   const systemAttention = document.getElementById("system-attention");
   const systemDeliveryMetrics = document.getElementById("system-delivery-metrics");
@@ -158,6 +164,7 @@
   let usersCursor = null;
   let searchTimer = null;
   let subscriptionsCursor = null;
+  let failedSubscriptionsCursor = null;
   let subscriptionsSearchTimer = null;
   let deliveriesCursor = null;
   let scheduleCursor = null;
@@ -997,6 +1004,65 @@
       );
       showScreen("subscription-details");
       status.textContent = "Подписка пользователя";
+    }).catch(showApiError);
+  }
+
+  const failedStatusLabels = {
+    pending: "Ожидает", processing: "В обработке", stripe_cancelled: "Stripe отменена",
+    collection_stopped: "Invoice закрыт", telegram_failed: "Ошибка Telegram",
+    telegram_removed: "Удалён из Telegram", retryable_failed: "Нужен повтор",
+    manual_review: "Ручная проверка", completed: "Завершена", superseded: "Замещена",
+    unknown: "Неизвестно",
+  };
+  const failedSubscriptionCard = (operation) => {
+    const article = document.createElement("article");
+    article.className = `card user-card${operation.needs_attention ? " attention" : ""}`;
+    const button = document.createElement("button"); button.type = "button";
+    button.append(text("h2", operation.username ? `@${operation.username}` : (operation.first_name || `ID ${operation.telegram_id}`)));
+    button.append(text("p", operation.reason_label));
+    button.append(text("p", `Обновлено: ${formatDate(operation.updated_at)} · Попыток: ${operation.attempt_count}`));
+    const badges = document.createElement("div"); badges.className = "badges";
+    badges.append(text("span", failedStatusLabels[operation.status] || "Неизвестно", "badge"));
+    if (operation.stale) badges.append(text("span", "Stale", "badge attention-label"));
+    if (operation.needs_attention) badges.append(text("span", "⚠ Требует внимания", "badge attention-label"));
+    button.append(badges); button.addEventListener("click", () => loadFailedSubscriptionDetails(operation.operation_id));
+    article.append(button); return article;
+  };
+  const loadFailedSubscriptions = (append = false) => {
+    const params = new URLSearchParams({limit:"25", state:failedSubscriptionsFilter.value});
+    if (append && failedSubscriptionsCursor) params.set("cursor", failedSubscriptionsCursor);
+    return api(`/api/admin/failed-subscriptions?${params.toString()}`).then((data) => {
+      if (!append) failedSubscriptionsList.replaceChildren();
+      data.items.forEach((item) => failedSubscriptionsList.append(failedSubscriptionCard(item)));
+      failedSubscriptionsCursor = data.next_cursor; failedSubscriptionsMore.hidden = !data.has_more;
+      failedSubscriptionsEmpty.hidden = failedSubscriptionsList.children.length !== 0;
+      failedSubscriptionMetricNodes.forEach((node) => { node.textContent = String(data.summary[node.dataset.failedMetric] ?? "—"); });
+      showScreen("failed-subscriptions"); status.textContent = "Проблемы продления";
+    }).catch(showApiError);
+  };
+  const retryFailedSubscription = (operation) => postAdminJson(
+    `/api/admin/failed-subscriptions/${encodeURIComponent(operation.operation_id)}/retry-preview`, {}
+  ).then((preview) => {
+    if (!window.confirm(`Повторить безопасную обработку операции для Telegram ID ${preview.telegram_id}?`)) {
+      return postAdminJson(`/api/admin/failed-subscriptions/${encodeURIComponent(operation.operation_id)}/retry-cancel`, {action_id:preview.action_id});
+    }
+    return postAdminJson(`/api/admin/failed-subscriptions/${encodeURIComponent(operation.operation_id)}/retry-confirm`, {action_id:preview.action_id}).then((result) => {
+      status.textContent = `Результат: ${result.lifecycle_result}`;
+      return loadFailedSubscriptionDetails(operation.operation_id);
+    });
+  }).catch(showApiError);
+  function loadFailedSubscriptionDetails(operationId) {
+    return api(`/api/admin/failed-subscriptions/${encodeURIComponent(operationId)}`).then((operation) => {
+      failedSubscriptionDetailsContent.replaceChildren();
+      failedSubscriptionDetailsContent.append(
+        detailCard("Пользователь", [["Telegram ID",operation.telegram_id],["Username",operation.username ? `@${operation.username}`:"—"],["Имя",operation.first_name||"—"]]),
+        detailCard("Состояние", [["Статус",failedStatusLabels[operation.status]||"Неизвестно"],["Фаза",operation.current_phase],["Причина",operation.reason_label],["Ошибка",operation.last_error_category||"—"],["Попытки",operation.attempt_count]]),
+        detailCard("Billing references", [["Subscription",operation.stripe.subscription_id||"—"],["Invoice",operation.stripe.failed_invoice_id||"—"]]),
+        detailCard("Прогресс фаз", [["Stripe cancellation",formatDate(operation.stripe_cancelled_at)],["Invoice closed",formatDate(operation.collection_stopped_at)],["Telegram ban",formatDate(operation.telegram_banned_at)],["Telegram removed",formatDate(operation.telegram_removed_at)],["DB finalized",formatDate(operation.db_finalized_at)]]),
+        detailCard("Timing", [["Access expiry",formatDate(operation.access_expiry)],["Lease",formatDate(operation.lease_until)],["Завершено",formatDate(operation.completed_at)],["Generation",operation.claim_generation],["Создано",formatDate(operation.created_at)],["Обновлено",formatDate(operation.updated_at)]])
+      );
+      if (operation.retry_allowed) { const retry=text("button","Повторить сейчас"); retry.type="button"; retry.addEventListener("click",()=>retryFailedSubscription(operation)); failedSubscriptionDetailsContent.append(retry); }
+      showScreen("failed-subscription-details"); status.textContent="Операция продления";
     }).catch(showApiError);
   }
 
@@ -1929,6 +1995,11 @@
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
+  document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
+  failedSubscriptionsFilter.addEventListener("change", () => { failedSubscriptionsCursor=null; loadFailedSubscriptions(false); });
+  failedSubscriptionsMore.addEventListener("click", () => loadFailedSubscriptions(true));
+  document.getElementById("failed-subscriptions-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
+  document.getElementById("failed-subscriptions-back").addEventListener("click", () => loadFailedSubscriptions(false));
   document.getElementById("member-home-all").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-home-library").addEventListener("click", () => loadMemberLibrary().catch(showApiError));
   document.getElementById("member-continue").addEventListener("click", () => {
