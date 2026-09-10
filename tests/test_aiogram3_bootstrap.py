@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -9117,6 +9118,60 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ):
                 response = await self.main.miniapp_admin_auth_middleware(request, handler)
             self.assertEqual(response.status, 400)
+
+    async def test_failed_subscription_queue_is_admin_protected_and_read_only(self):
+        app=self.main.create_app(); path="/api/admin/failed-subscriptions"
+        handler=self.route_handler(app,"GET",path)
+        missing=await self.main.miniapp_admin_auth_middleware(FakeMiniAppRequest(app,path=path),handler)
+        self.assertEqual(missing.status,401)
+        with patch.object(self.main,"load_miniapp_admin_session",side_effect=self.main.MiniAppSessionError("admin_session_unknown")), \
+             patch.object(self.main,"load_member_session") as load_member, \
+             patch.object(self.main,"list_failed_subscriptions") as listing:
+            member_rejected=await self.main.miniapp_admin_auth_middleware(FakeMiniAppRequest(app,"Bearer member-token",path=path),handler)
+        self.assertEqual(member_rejected.status,401); load_member.assert_not_called(); listing.assert_not_called()
+        session=SimpleNamespace(telegram_id=1,session_id="admin")
+        result={"items":[],"summary":{},"has_more":False,"next_cursor":None}
+        with patch.object(self.main,"load_miniapp_admin_session",return_value=session), \
+             patch.object(self.main,"list_failed_subscriptions",return_value=result) as listing, \
+             patch.object(self.main.stripe.Subscription,"retrieve",side_effect=AssertionError("no Stripe")), \
+             patch.object(self.main.bot,"send_message",side_effect=AssertionError("no Telegram")):
+            response=await self.main.miniapp_admin_auth_middleware(FakeMiniAppRequest(app,"Bearer admin",path=path,query={"state":"attention","limit":"25"}),handler)
+        self.assertEqual(response.status,200); self.assertEqual(json.loads(response.text),result)
+        listing.assert_called_once_with(self.main.get_db_conn,state="attention",limit="25",cursor=None)
+
+    async def test_failed_subscription_retry_uses_exact_durable_identity(self):
+        app=self.main.create_app(); operation_id="fst-01234567890123456789-abcdef123456"
+        path="/api/admin/failed-subscriptions/{operation_id}/retry-confirm"
+        handler=self.route_handler(app,"POST",path); action_id=str(uuid.uuid4())
+        request=FakeMiniAppRequest(app,"Bearer admin",path=path,method="POST",match_info={"operation_id":operation_id},json_data={"action_id":action_id})
+        session=SimpleNamespace(telegram_id=1,session_id="admin")
+        claim={"action_id":action_id,"operation_id":operation_id,"telegram_id":42,"subscription_id":"sub_old_exact","reason":"user_cancelled_after_payment_failure"}
+        with patch.object(self.main,"load_miniapp_admin_session",return_value=session), \
+             patch.object(self.main,"claim_retry_action",return_value=claim) as claim_action, \
+             patch.object(self.main,"terminate_failed_subscription",new_callable=AsyncMock,return_value="completed") as terminate, \
+             patch.object(self.main,"finish_retry_action") as finish:
+            response=await self.main.miniapp_admin_auth_middleware(request,handler)
+        self.assertEqual(response.status,200)
+        claim_action.assert_called_once_with(
+            self.main.get_db_conn, 1, action_id, operation_id
+        )
+        terminate.assert_awaited_once_with(42,"user_cancelled_after_payment_failure",target_operation_id=operation_id,target_subscription_id="sub_old_exact")
+        finish.assert_called_once_with(self.main.get_db_conn,action_id,True)
+
+    async def test_failed_subscription_retry_rejects_url_action_identity_mismatch(self):
+        app=self.main.create_app(); operation_id="fst-01234567890123456789-operation-b"
+        path="/api/admin/failed-subscriptions/{operation_id}/retry-confirm"
+        handler=self.route_handler(app,"POST",path); action_id=str(uuid.uuid4())
+        request=FakeMiniAppRequest(app,"Bearer admin",path=path,method="POST",match_info={"operation_id":operation_id},json_data={"action_id":action_id})
+        session=SimpleNamespace(telegram_id=1,session_id="admin")
+        with patch.object(self.main,"load_miniapp_admin_session",return_value=session), \
+             patch.object(self.main,"claim_retry_action",side_effect=self.main.AdminFailedSubscriptionsError("operation_action_mismatch",409)) as claim, \
+             patch.object(self.main,"terminate_failed_subscription",new_callable=AsyncMock) as terminate:
+            response=await self.main.miniapp_admin_auth_middleware(request,handler)
+        self.assertEqual(response.status,409)
+        self.assertEqual(json.loads(response.text)["error"],"operation_action_mismatch")
+        claim.assert_called_once_with(self.main.get_db_conn,1,action_id,operation_id)
+        terminate.assert_not_awaited()
 
     async def test_miniapp_system_and_deliveries_are_centrally_protected_and_read_only(self):
         app = self.main.create_app()

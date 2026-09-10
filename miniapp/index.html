@@ -48,6 +48,7 @@
         <button id="open-gifts" type="button">🎁 Подарки</button>
         <button id="open-content" type="button">📚 Контент</button>
         <button id="open-member-preview" type="button">✨ Предпросмотр клуба</button>
+        <button id="open-failed-subscriptions" type="button">⚠️ Проблемы продления</button>
       </article>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
@@ -261,6 +262,32 @@
     <section id="subscription-details" class="screen page" data-screen="subscription-details" hidden>
       <button id="subscriptions-back" class="secondary" type="button">← К подпискам</button>
       <div id="subscription-details-content" class="dashboard"></div>
+    </section>
+    <section id="failed-subscriptions-screen" class="screen page" data-screen="failed-subscriptions" hidden>
+      <article class="card subscriptions-toolbar">
+        <h2>Проблемы продления</h2>
+        <div id="failed-subscriptions-summary" class="summary-grid">
+          <div><span>Требуют внимания</span><strong data-failed-metric="attention">—</strong></div>
+          <div><span>Retryable</span><strong data-failed-metric="retryable">—</strong></div>
+          <div><span>Manual review</span><strong data-failed-metric="manual_review">—</strong></div>
+          <div><span>Stale</span><strong data-failed-metric="stale">—</strong></div>
+          <div><span>В обработке</span><strong data-failed-metric="processing">—</strong></div>
+        </div>
+        <select id="failed-subscriptions-filter" aria-label="Фильтр проблем продления">
+          <option value="all">Все</option><option value="attention">Требуют внимания</option>
+          <option value="retryable">Retryable</option><option value="processing">В обработке</option>
+          <option value="stale">Stale</option><option value="manual_review">Manual review</option>
+          <option value="completed">Завершённые</option><option value="superseded">Superseded</option>
+        </select>
+      </article>
+      <div id="failed-subscriptions-list" class="user-list"></div>
+      <p id="failed-subscriptions-empty" class="card" hidden>Операций нет.</p>
+      <button id="failed-subscriptions-more" type="button" hidden>Показать ещё</button>
+      <button id="failed-subscriptions-dashboard-back" class="secondary" type="button">← К обзору</button>
+    </section>
+    <section id="failed-subscription-details" class="screen page" data-screen="failed-subscription-details" hidden>
+      <button id="failed-subscriptions-back" class="secondary" type="button">← К проблемам продления</button>
+      <div id="failed-subscription-details-content" class="dashboard"></div>
     </section>
     <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
       <article class="card schedule-toolbar">
