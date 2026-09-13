@@ -22457,15 +22457,26 @@ async def miniapp_member_media(request):
         return member_error(MemberCatalogError("media_not_found",404))
     if access_level == "premium" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
         return member_error(MemberCatalogError("active_access_required",403))
-    if media["media_type"] == "video": return member_error(MemberCatalogError("video_streaming_not_available",409))
-    limit=AUDIO_MAX_BYTES if media["media_type"]=="audio" else COVER_MAX_BYTES
+    limit={"cover":COVER_MAX_BYTES,"audio":AUDIO_MAX_BYTES,"video":VIDEO_MAX_BYTES}[media["media_type"]]
     try:
         telegram_file=await bot.get_file(media["server_reference"]); file_path=getattr(telegram_file,"file_path",None)
-        if not file_path: raise MemberCatalogError("media_unavailable",502)
+        file_size=getattr(telegram_file,"file_size",None)
+        if not file_path or (file_size is not None and int(file_size)>limit):
+            raise MemberCatalogError("media_unavailable",502)
         destination=BoundedContentMediaBuffer(limit); await bot.download_file(file_path,destination=destination,timeout=30,chunk_size=64*1024); data=destination.getvalue()
+        if media["media_type"]=="video":
+            try: detected_mime=validate_media_bytes("video",data)
+            except ContentMediaError: raise MemberCatalogError("media_unavailable",502) from None
+            if detected_mime!="video/mp4" or media["mime_type"]!="video/mp4":
+                raise MemberCatalogError("media_unavailable",502)
     except MemberCatalogError as error: return member_error(error)
     except Exception: return member_error(MemberCatalogError("media_unavailable",503))
-    response=web.Response(body=data,content_type=media["mime_type"]); response.headers["Cache-Control"]="private, no-store"; return apply_miniapp_security_headers(response)
+    if access_level=="premium" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
+        return member_error(MemberCatalogError("active_access_required",403))
+    response=web.Response(body=data,content_type=media["mime_type"])
+    response.headers["Content-Disposition"]="inline"
+    response.headers["Cache-Control"]="private, no-store"
+    return apply_miniapp_security_headers(response)
 
 
 async def miniapp_admin_session_create(request):

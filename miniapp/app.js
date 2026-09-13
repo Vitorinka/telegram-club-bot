@@ -193,6 +193,9 @@
   let memberAudioGeneration = 0;
   let memberAudioElement = null;
   let memberAudioUrl = null;
+  let memberVideoGeneration = 0;
+  let memberVideoElement = null;
+  let memberVideoUrl = null;
   const memberCoverUrls = new Map();
   let memberLibraryItems = [];
   let memberMeditationItems = [];
@@ -358,6 +361,17 @@
     if (memberAudioUrl) URL.revokeObjectURL(memberAudioUrl);
     memberAudioUrl = null;
   };
+  const clearMemberVideo = () => {
+    memberVideoGeneration += 1;
+    if (memberVideoElement) {
+      memberVideoElement.pause();
+      memberVideoElement.removeAttribute("src");
+      memberVideoElement.load();
+    }
+    memberVideoElement = null;
+    if (memberVideoUrl) URL.revokeObjectURL(memberVideoUrl);
+    memberVideoUrl = null;
+  };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
     const container = document.createElement("div");
@@ -414,6 +428,7 @@
   };
   const showMemberScreen = (name) => {
     if (name !== "member-lesson") clearMemberAudio();
+    if (name !== "member-lesson") clearMemberVideo();
     memberPreviewMode = true;
     document.body.classList.add("member-preview-mode");
     adminHero.hidden = true;
@@ -496,6 +511,7 @@
     return api(memberPath(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`, `/api/member/content/${encodeURIComponent(contentId)}`)).then((item) => {
       clearMemberCoverUrls();
       clearMemberAudio();
+      clearMemberVideo();
       memberDetailContentType = contentType;
       memberLessonContent.replaceChildren();
       memberLessonContent.append(memberCover(item, true));
@@ -574,12 +590,53 @@
           progress.addEventListener("input", () => { audio.currentTime = Number(progress.value); });
         }).catch(() => { if (generation === memberAudioGeneration) player.replaceChildren(text("p", "Аудио временно недоступно.")); });
       }
-      if (!item.locked && item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
+      if (realMemberMode && !item.locked && item.content_type === "lesson" && item.has_video && item.video_media_id) {
+        const generation = memberVideoGeneration;
+        const player = document.createElement("section");
+        player.className = "member-card member-video-shell member-video-loading";
+        player.append(text("strong", "Загружаем видео…"), text("p", "Урок откроется после безопасной проверки доступа."));
+        memberLessonContent.append(player);
+        fetch(`/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.video_media_id)}`, {
+          headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+        }).then(async (response) => {
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            const error = new Error(payload.error || "video_unavailable");
+            error.category = payload.error;
+            error.status = response.status;
+            throw error;
+          }
+          return response.blob();
+        }).then((blob) => {
+          if (generation !== memberVideoGeneration) return;
+          if (blob.type !== "video/mp4") throw new Error("video_unavailable");
+          memberVideoUrl = URL.createObjectURL(blob);
+          const video = document.createElement("video");
+          video.className = "member-video-player";
+          video.controls = true;
+          video.playsInline = true;
+          video.preload = "metadata";
+          video.src = memberVideoUrl;
+          memberVideoElement = video;
+          player.classList.remove("member-video-loading");
+          player.replaceChildren(video);
+        }).catch((error) => {
+          if (generation !== memberVideoGeneration) return;
+          if (error.status === 403 || error.category === "active_access_required") {
+            memberEntitled = false;
+            player.className = "member-card member-locked-content";
+            player.replaceChildren(text("h2", "Доступ завершён"), text("p", "Обновите доступ, чтобы продолжить просмотр урока."));
+            return;
+          }
+          player.classList.remove("member-video-loading");
+          player.replaceChildren(text("strong", "Видео временно недоступно"), text("p", "Попробуйте открыть урок ещё раз позже."));
+        });
+      } else if (!item.locked && item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
         const video = document.createElement("section");
         video.className = "member-video-shell";
         video.append(text("span", "▶", "member-play-icon"));
-        video.append(text("strong", item.has_video ? "Видео готово" : "Видео появится позже"));
-        video.append(text("p", item.has_video ? "Воспроизведение будет доступно в следующей версии." : "К этому материалу видео пока не добавлено."));
+        video.append(text("strong", item.has_video ? "Видео загружено" : "Видео появится позже"));
+        video.append(text("p", item.has_video ? "Воспроизведение доступно в режиме участника." : "К этому материалу видео пока не добавлено."));
         memberLessonContent.append(video);
       }
       showMemberScreen("member-lesson");

@@ -9760,7 +9760,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         load_member.assert_not_called()
         get_file.assert_not_awaited()
 
-    async def test_member_media_rechecks_access_and_video_remains_unsupported(self):
+    async def test_member_media_rechecks_access_and_delivers_bounded_video(self):
         app = self.main.create_app()
         path = "/api/member/content/{content_id}/media/{media_id}"
         handler = self.route_handler(app, "GET", path)
@@ -9774,22 +9774,68 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "server_reference": "private-ref", "content_type": "meditation",
             "access_level": "premium",
         }
+        video = dict(audio, media_type="video", mime_type="video/mp4", size_bytes=21)
         with patch.object(self.main, "load_member_session", return_value=session), \
-             patch.object(self.main, "get_member_media_reference", return_value=audio), \
+             patch.object(self.main, "get_member_media_reference", return_value=video), \
              patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
              patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
             denied = await self.main.miniapp_admin_auth_middleware(request, handler)
         self.assertEqual(denied.status, 403)
         get_file.assert_not_awaited()
 
-        video = dict(audio, media_type="video", mime_type="video/mp4")
+        video_bytes = b"\x00\x00\x00\x18ftypisomvideo"
+        async def download_video(file_path, destination, **kwargs):
+            self.assertEqual(file_path, "private/video/path")
+            destination.write(video_bytes)
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=video), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}) as access_check, \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=len(video_bytes))) as get_file, \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_video) as download:
+            delivered = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(delivered.status, 200)
+        self.assertEqual(delivered.body, video_bytes)
+        self.assertEqual(delivered.content_type, "video/mp4")
+        self.assertEqual(delivered.headers["Cache-Control"], "private, no-store")
+        self.assertEqual(delivered.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(delivered.headers["Content-Disposition"], "inline")
+        self.assertNotIn("private/video/path", str(delivered.headers))
+        self.assertNotIn("private-ref", str(delivered.headers))
+        self.assertNotIn("api.telegram.org", str(delivered.headers))
+        get_file.assert_awaited_once_with("private-ref")
+        download.assert_awaited_once()
+        self.assertEqual(access_check.call_count, 2)
+
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=video), \
+             patch.object(self.main, "member_access", side_effect=[{"has_active_access": True},{"has_active_access": False}]), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=len(video_bytes))), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_video):
+            expired_during_download = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(expired_during_download.status, 403)
+        self.assertEqual(json.loads(expired_during_download.text)["error"],"active_access_required")
+
         with patch.object(self.main, "load_member_session", return_value=session), \
              patch.object(self.main, "get_member_media_reference", return_value=video), \
              patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
-             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as get_file:
-            unsupported = await self.main.miniapp_admin_auth_middleware(request, handler)
-        self.assertEqual(unsupported.status, 409)
-        get_file.assert_not_awaited()
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=self.main.VIDEO_MAX_BYTES + 1)), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock) as download:
+            oversized = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(oversized.status, 502)
+        self.assertEqual(json.loads(oversized.text)["error"], "media_unavailable")
+        download.assert_not_awaited()
+
+        async def download_invalid_video(file_path, destination, **kwargs):
+            self.assertEqual(file_path, "private/video/path")
+            destination.write(b"not-an-mp4")
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=video), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=10)), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_invalid_video):
+            invalid_video = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(invalid_video.status, 502)
+        self.assertEqual(json.loads(invalid_video.text)["error"], "media_unavailable")
 
         async def download_audio(_path, destination, **_kwargs):
             destination.write(b"safe-mp3")
@@ -10265,7 +10311,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/api/member/content", javascript)
         self.assertIn("/api/member/schedule", javascript)
         self.assertIn("member_rollout_disabled", javascript)
-        self.assertIn("video_streaming_not_available", inspect.getsource(self.main))
+        self.assertNotIn("video_streaming_not_available", inspect.getsource(self.main))
+        self.assertIn("memberVideoElement.pause()", javascript)
+        self.assertIn("memberVideoElement.removeAttribute(\"src\")", javascript)
+        self.assertIn("URL.revokeObjectURL(memberVideoUrl)", javascript)
+        self.assertIn("video.controls = true", javascript)
+        self.assertIn("video.playsInline = true", javascript)
+        self.assertIn('blob.type !== "video/mp4"', javascript)
+        self.assertIn('item.has_video ? "Видео загружено" : "Видео появится позже"', javascript)
+        self.assertIn('item.has_video ? "Воспроизведение доступно в режиме участника." : "К этому материалу видео пока не добавлено."', javascript)
         self.assertNotIn("member-training-group", javascript)
         self.assertNotIn("member-trainings", index)
         self.assertNotIn("innerHTML", javascript)
