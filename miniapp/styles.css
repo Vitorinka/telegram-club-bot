@@ -392,6 +392,9 @@ body.member-preview-mode { background: #fbfaf7; }
 .member-video-shell { min-height: 210px; display: grid; place-items: center; align-content: center; gap: 6px; padding: 22px; border-radius: 22px; background: linear-gradient(145deg, #063e43, #087b80); color: #fff; text-align: center; }
 .member-video-shell strong { color: #fff; }
 .member-video-shell p { max-width: 32ch; color: rgb(255 255 255 / 70%); font-size: 12px; }
+.member-video-shell:has(.member-video-player) { min-height: 0; padding: 0; overflow: hidden; background: #071719; }
+.member-video-player { display: block; width: 100%; max-height: min(62vh, 520px); background: #071719; }
+.member-video-loading { min-height: 210px; }
 .member-play-icon { width: 52px; height: 52px; display: grid; place-items: center; border: 1px solid rgb(255 255 255 / 28%); border-radius: 50%; background: rgb(255 255 255 / 12%); }
 .member-bottom-nav { position: fixed; z-index: 11; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 4px max(5px, env(safe-area-inset-left)) max(4px, env(safe-area-inset-bottom)) max(5px, env(safe-area-inset-right)); border-top: 1px solid rgb(6 79 85 / 10%); background: #fffdf9; }
 .member-bottom-nav[hidden] { display: none; }

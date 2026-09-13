@@ -2664,8 +2664,29 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         )
         media_id = applied["media_id"]
 
+        video_staged = create_media_upload(
+            self.get_conn, 1, first["content_id"], "video",
+            b"\x00\x00\x00\x18ftypisommember-video",
+        )
+        video_action = ensure_media_action(
+            self.get_conn, video_staged["upload_id"], 1
+        )
+        prepare_media_execution(
+            self.get_conn, video_staged["upload_id"], video_action["action_id"], 1
+        )
+        record_telegram_upload(
+            self.get_conn, video_staged["upload_id"], video_action["action_id"], 1,
+            "telegram-private-member-video",
+        )
+        video_id = apply_media_upload(
+            self.get_conn, video_staged["upload_id"], video_action["action_id"], 1
+        )["media_id"]
+
         self.assertIsNone(get_member_media_reference(
             self.get_conn, first["content_id"], media_id
+        ))
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], video_id
         ))
         conn = self.get_conn()
         try:
@@ -2684,8 +2705,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(resolved["access_level"], "preview")
         self.assertEqual(resolved["media_type"], "cover")
+        resolved_video = get_member_media_reference(
+            self.get_conn, first["content_id"], video_id
+        )
+        self.assertEqual(resolved_video["access_level"], "premium")
+        self.assertEqual(resolved_video["media_type"], "video")
+        self.assertEqual(resolved_video["mime_type"], "video/mp4")
         self.assertIsNone(get_member_media_reference(
             self.get_conn, second["content_id"], media_id
+        ))
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, second["content_id"], video_id
         ))
 
         conn = self.get_conn()
@@ -2702,6 +2732,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIsNone(get_member_media_reference(
             self.get_conn, first["content_id"], media_id
         ))
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], video_id
+        ))
 
         conn = self.get_conn()
         try:
@@ -2713,11 +2746,18 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 )
                 cur.execute(
                     "UPDATE content_media SET deleted_at=NOW() WHERE media_id=%s",
+                    (video_id,),
+                )
+                cur.execute(
+                    "UPDATE content_media SET deleted_at=NOW() WHERE media_id=%s",
                     (media_id,),
                 )
             conn.commit()
         finally:
             conn.close()
+        self.assertIsNone(get_member_media_reference(
+            self.get_conn, first["content_id"], video_id
+        ))
         self.assertIsNone(get_member_media_reference(
             self.get_conn, first["content_id"], media_id
         ))
