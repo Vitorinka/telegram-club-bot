@@ -853,6 +853,21 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_items_soft_delete_shape_check": {"table":"content_items","definition_contains":("deleted_at","deleted_by_telegram_id","draft"),"validated":False},
         },
     },
+    "0030_content_access_level": {
+        "tables": ("content_items", "content_item_versions"),
+        "columns": {
+            "content_items": ("access_level",),
+            "content_item_versions": ("access_level",),
+        },
+        "indexes": (
+            "content_items_one_draft_revision_idx",
+            "content_items_member_access_order_idx",
+        ),
+        "constraints": {
+            "content_items_access_level_check": {"table":"content_items","definition_contains":("access_level","paid","free"),"validated":False},
+            "content_item_versions_access_level_check": {"table":"content_item_versions","definition_contains":("access_level","paid","free"),"validated":False},
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

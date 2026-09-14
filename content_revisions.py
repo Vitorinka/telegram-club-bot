@@ -22,6 +22,7 @@ def create_published_revision(get_connection, content_id, admin_id):
             """
             SELECT content_type,category,title,description,duration_seconds,
                    sort_order,status,logical_content_id,revision_number
+                   ,access_level
             FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE
             """,
             (content_id,),
@@ -47,11 +48,12 @@ def create_published_revision(get_connection, content_id, admin_id):
             INSERT INTO content_items (
                 content_id,content_type,category,title,description,duration_seconds,
                 sort_order,status,version,created_by_telegram_id,logical_content_id,
-                revision_of,revision_number,created_at,updated_at
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,'draft',1,%s,%s,%s,%s,NOW(),NOW())
+                revision_of,revision_number,access_level,created_at,updated_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,'draft',1,%s,%s,%s,%s,%s,NOW(),NOW())
             """,
             (new_id, source[0], source[1], source[2], source[3], source[4],
-             source[5], int(admin_id), logical_id, content_id, revision_number),
+             source[5], int(admin_id), logical_id, content_id, revision_number,
+             source[9]),
         )
         cur.execute(
             """INSERT INTO content_item_categories(content_id,category_id,sort_order,created_at)

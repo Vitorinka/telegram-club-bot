@@ -450,7 +450,7 @@ def get_member_media_reference(get_connection, content_id, media_id):
         cur.execute(
             """
             SELECT m.media_type, m.mime_type, m.size_bytes,
-                   m.server_reference, c.content_type
+                   m.server_reference, c.content_type, c.access_level
             FROM content_items c
             JOIN content_media m ON m.content_id = c.content_id
             WHERE c.content_id = %s
@@ -473,6 +473,7 @@ def get_member_media_reference(get_connection, content_id, media_id):
             "size_bytes": int(row[2]),
             "server_reference": row[3],
             "content_type": row[4],
+            "content_access_level": row[5],
             "access_level": member_media_access_level(row[0]),
         }
     except Exception:

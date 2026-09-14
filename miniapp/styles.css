@@ -1014,3 +1014,22 @@ body:not(.member-preview-mode) button.secondary { border-color: rgb(8 115 111 / 
   .admin-page-heading > button { width: 100%; }
   .admin-summary-card { min-height: 0; }
 }
+.member-free-section {
+  padding: 14px;
+  border: 1px solid rgba(181, 139, 58, .3);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(255, 250, 238, .96), rgba(237, 248, 244, .96));
+}
+.member-free-section .member-content-card { margin: 0; }
+.member-free-badge {
+  color: #075f59;
+  background: #dff5ec;
+  border-color: rgba(7, 95, 89, .16);
+}
+.member-free-cta {
+  display: inline-flex;
+  width: fit-content;
+  margin-top: 8px;
+  color: #075f59;
+  font-weight: 700;
+}

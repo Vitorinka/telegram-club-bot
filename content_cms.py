@@ -12,13 +12,14 @@ MAX_SORT_ORDER = 100000
 CATEGORY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe", "nutrition_material"})
 CONTENT_STATUSES = frozenset({"draft", "published", "archived"})
+CONTENT_ACCESS_LEVELS = frozenset({"paid", "free"})
 CREATE_FIELDS = frozenset({
     "content_type", "title", "category", "description", "duration_seconds",
-    "category_ids",
+    "category_ids", "access_level",
 })
 EDITABLE_FIELDS = frozenset({
     "title", "category", "description", "duration_seconds", "sort_order",
-    "category_ids",
+    "category_ids", "access_level",
 })
 
 
@@ -39,6 +40,7 @@ def _projection(row):
         duration_seconds, sort_order, status, version,
         created_by_telegram_id, created_at, updated_at, published_at,
         archived_at, logical_content_id, revision_of, revision_number,
+        access_level,
     ) = row
     return {
         "content_id": str(content_id),
@@ -60,6 +62,7 @@ def _projection(row):
         "logical_content_id": str(logical_content_id),
         "revision_of": str(revision_of) if revision_of else None,
         "revision_number": int(revision_number),
+        "access_level": access_level,
     }
 
 
@@ -68,7 +71,7 @@ CONTENT_SELECT = """
            duration_seconds, sort_order, status, version,
            created_by_telegram_id, created_at, updated_at,
            published_at, archived_at, logical_content_id, revision_of,
-           revision_number
+           revision_number, access_level
     FROM content_items
 """
 
@@ -120,6 +123,12 @@ def _normalize_sort_order(value):
     return value
 
 
+def _normalize_access_level(value):
+    if value not in CONTENT_ACCESS_LEVELS:
+        raise ContentCmsError("invalid_access_level")
+    return value
+
+
 def validate_create_payload(payload):
     if not isinstance(payload, dict) or set(payload) - CREATE_FIELDS:
         raise ContentCmsError("invalid_content_payload")
@@ -135,6 +144,7 @@ def validate_create_payload(payload):
         ),
         "duration_seconds": _normalize_duration(payload.get("duration_seconds")),
         "category_ids": payload.get("category_ids", []),
+        "access_level": _normalize_access_level(payload.get("access_level", "paid")),
     }
     if values["content_type"] == "nutrition_material" and values["duration_seconds"] is not None:
         raise ContentCmsError("invalid_nutrition_material")
@@ -170,6 +180,8 @@ def validate_update_payload(payload):
         )
     if "sort_order" in payload:
         values["sort_order"] = _normalize_sort_order(payload["sort_order"])
+    if "access_level" in payload:
+        values["access_level"] = _normalize_access_level(payload["access_level"])
     if not values:
         raise ContentCmsError("no_content_changes")
     return version, values
@@ -203,18 +215,19 @@ def create_content_draft(get_connection, admin_id, payload):
             INSERT INTO content_items (
                 content_id, content_type, category, title, description,
                 duration_seconds, sort_order, status, version,
-                created_by_telegram_id, logical_content_id, revision_number,
+                created_by_telegram_id, logical_content_id, revision_number, access_level,
                 created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, 0, 'draft', 1, %s, %s, 1, NOW(), NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, 0, 'draft', 1, %s, %s, 1, %s, NOW(), NOW())
             RETURNING content_id, content_type, category, title, description,
                       duration_seconds, sort_order, status, version,
                       created_by_telegram_id, created_at, updated_at,
                       published_at, archived_at, logical_content_id,
-                      revision_of, revision_number
+                      revision_of, revision_number, access_level
             """,
             (content_id, values["content_type"], values["category"],
              values["title"], values["description"],
-             values["duration_seconds"], int(admin_id), content_id),
+             values["duration_seconds"], int(admin_id), content_id,
+             values["access_level"]),
         )
         result = _projection(cur.fetchone())
         from content_taxonomy import replace_categories_cur
