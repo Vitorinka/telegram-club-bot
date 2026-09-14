@@ -101,7 +101,7 @@ def get_recipe_structure(get_connection, content_id):
     try:
         cur.execute("SET TRANSACTION READ ONLY")
         cur.execute("SET LOCAL statement_timeout = 5000")
-        cur.execute("SELECT content_type FROM content_items WHERE content_id=%s", (content_id,))
+        cur.execute("SELECT content_type FROM content_items WHERE content_id=%s AND deleted_at IS NULL", (content_id,))
         row = cur.fetchone()
         if not row or row[0] != "recipe":
             conn.rollback(); return None
@@ -120,7 +120,7 @@ def replace_recipe_structure(get_connection, content_id, payload):
     try:
         cur.execute("SET LOCAL statement_timeout = 5000")
         cur.execute("SET LOCAL lock_timeout = '2s'")
-        cur.execute("SELECT content_type,status,version FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
+        cur.execute("SELECT content_type,status,version FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,))
         row = cur.fetchone()
         if not row:
             raise ContentCmsError("content_not_found", 404)
@@ -144,7 +144,7 @@ def replace_recipe_structure(get_connection, content_id, payload):
             """, (str(uuid.uuid4()), content_id, item["step_number"], item["instruction"]))
         cur.execute("""
             UPDATE content_items SET version=version+1,updated_at=NOW()
-            WHERE content_id=%s AND version=%s AND status='draft'
+            WHERE content_id=%s AND version=%s AND status='draft' AND deleted_at IS NULL
             RETURNING version
         """, (content_id, expected_version))
         updated = cur.fetchone()

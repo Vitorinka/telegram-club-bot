@@ -22,7 +22,7 @@ def create_published_revision(get_connection, content_id, admin_id):
             """
             SELECT content_type,category,title,description,duration_seconds,
                    sort_order,status,logical_content_id,revision_number
-            FROM content_items WHERE content_id=%s FOR UPDATE
+            FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE
             """,
             (content_id,),
         )
@@ -34,7 +34,7 @@ def create_published_revision(get_connection, content_id, admin_id):
         logical_id = str(source[7])
         cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (f"content-revision:{logical_id}",))
         cur.execute(
-            "SELECT content_id FROM content_items WHERE logical_content_id=%s AND status='draft' FOR UPDATE",
+            "SELECT content_id FROM content_items WHERE logical_content_id=%s AND status='draft' AND deleted_at IS NULL FOR UPDATE",
             (logical_id,),
         )
         existing = cur.fetchone()

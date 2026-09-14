@@ -187,7 +187,7 @@ def create_media_upload(get_connection, admin_id, content_id, media_type, data):
     try:
         cur.execute("SET LOCAL statement_timeout = 5000")
         _expire(cur)
-        cur.execute("SELECT title, status, version, content_type FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
+        cur.execute("SELECT title, status, version, content_type FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,))
         content = cur.fetchone()
         if not content:
             raise ContentMediaError("content_not_found", 404)
@@ -319,7 +319,7 @@ def prepare_media_execution(get_connection, upload_id, action_id, admin_id):
             fail_admin_action(cur, action_id); conn.commit()
             return {"mode":"failed", "failure_category":"telegram_upload_outcome_unknown"}
         if status != 'confirmed': conn.commit(); return {"mode":status}
-        cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
+        cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,))
         content = cur.fetchone()
         if (not content or content[0] != 'draft' or content[1] != expected_version
                 or not media_allowed_for_content(content[2], media_type)):
@@ -375,7 +375,7 @@ def apply_media_upload(get_connection, upload_id, action_id, admin_id):
             complete_admin_action(cur, action_id); conn.commit()
             return {"status":"completed", "media_id":str(applied_id)}
         if status != 'uploaded' or not file_id: raise ContentMediaError("content_media_upload_not_ready", 409)
-        cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
+        cur.execute("SELECT status,version,content_type FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,))
         content = cur.fetchone()
         cur.execute("SELECT media_id,version FROM content_media WHERE content_id=%s AND media_type=%s AND deleted_at IS NULL FOR UPDATE", (content_id, media_type))
         current = cur.fetchone()
@@ -428,6 +428,7 @@ def get_media_reference(get_connection, content_id, media_id):
             SELECT m.media_type,m.mime_type,m.size_bytes,m.server_reference,c.content_type
             FROM content_media m JOIN content_items c ON c.content_id=m.content_id
             WHERE m.content_id=%s AND m.media_id=%s AND m.deleted_at IS NULL
+              AND c.deleted_at IS NULL
         """, (content_id, media_id))
         row=cur.fetchone(); conn.rollback()
         if not row: return None
@@ -455,7 +456,7 @@ def get_member_media_reference(get_connection, content_id, media_id):
             WHERE c.content_id = %s
               AND c.status = 'published'
               AND m.media_id = %s
-              AND m.deleted_at IS NULL
+              AND m.deleted_at IS NULL AND c.deleted_at IS NULL
               AND m.storage_kind = 'telegram_file_id'
             """,
             (content_id, media_id),

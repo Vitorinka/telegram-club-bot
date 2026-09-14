@@ -88,7 +88,7 @@ def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",ca
     access=member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
-        cur.execute(SELECT+""" WHERE c.status='published' AND c.content_type=%s AND (%s IS NULL OR EXISTS
+        cur.execute(SELECT+""" WHERE c.status='published' AND c.deleted_at IS NULL AND c.content_type=%s AND (%s IS NULL OR EXISTS
           (SELECT 1 FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id AND cc.slug=%s))
           AND (%s='' OR c.title ILIKE '%%'||%s||'%%') ORDER BY c.sort_order,c.updated_at DESC,c.content_id LIMIT %s""",
           (content_type,category,category,query,query,limit))
@@ -101,7 +101,7 @@ def get_member_content(get_connection,telegram_id,content_id):
     except Exception: raise MemberCatalogError("invalid_content_id") from None
     access=member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
     try:
-        cur.execute("SET TRANSACTION READ ONLY"); cur.execute(SELECT+" WHERE c.content_id=%s AND c.status='published'",(content_id,)); row=cur.fetchone()
+        cur.execute("SET TRANSACTION READ ONLY"); cur.execute(SELECT+" WHERE c.content_id=%s AND c.status='published' AND c.deleted_at IS NULL",(content_id,)); row=cur.fetchone()
         if not row: conn.rollback(); return None
         result=_item(row,not access["has_active_access"])
         if access["has_active_access"] and result["content_type"]=='recipe':
@@ -118,7 +118,7 @@ def list_member_categories(get_connection,content_type):
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("""SELECT cc.slug,cc.title,cc.group_slug,COUNT(c.content_id)
           FROM content_categories cc LEFT JOIN content_item_categories cic ON cic.category_id=cc.category_id
-          LEFT JOIN content_items c ON c.content_id=cic.content_id AND c.status='published'
+          LEFT JOIN content_items c ON c.content_id=cic.content_id AND c.status='published' AND c.deleted_at IS NULL
           WHERE cc.content_type=%s AND cc.is_active=TRUE GROUP BY cc.slug,cc.title,cc.group_slug,cc.sort_order ORDER BY cc.sort_order""",(content_type,))
         rows=[{"slug":r[0],"title":r[1],"group":r[2],"count":int(r[3])} for r in cur.fetchall()]; conn.rollback(); return {"items":rows}
     finally: cur.close(); conn.close()

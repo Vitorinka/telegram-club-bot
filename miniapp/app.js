@@ -35,6 +35,7 @@
   };
   const contentStudioSaveRecipe = ({saveMetadata, saveRecipe, reload}) =>
     saveMetadata().then(saveRecipe).then(reload);
+  const adminScreenIsVisible = (activeScreen, candidateScreen) => activeScreen === candidateScreen;
   const contentStudioCreateDraft = ({files, createDraft, saveDomain, attachMedia, openDraft}) => {
     const preflightError = files.map(([mediaType, file]) => contentStudioMediaPreflightError(mediaType, file)).find(Boolean);
     if (preflightError) return Promise.resolve({status: "preflight_failed", error: preflightError, draft: null});
@@ -57,7 +58,7 @@
     });
   };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    module.exports = {adminScreenIsVisible, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
     return;
   }
   const webApp = window.Telegram && window.Telegram.WebApp;
@@ -80,6 +81,7 @@
   const dashboardScheduleList = document.getElementById("dashboard-schedule-list");
   const dashboardGiftsList = document.getElementById("dashboard-gifts-list");
   const dashboardFailedList = document.getElementById("dashboard-failed-list");
+  const attentionList = document.getElementById("attention-list");
   const detailsContent = document.getElementById("user-details-content");
   const manualAccessCard = document.getElementById("manual-access-card");
   const manualAccessControls = document.getElementById("manual-access-controls");
@@ -174,9 +176,14 @@
   const contentEditOrder = document.getElementById("content-edit-order");
   const contentEditMessage = document.getElementById("content-edit-message");
   const contentEditorState = document.getElementById("content-editor-state");
+  const contentEditorTitle = document.getElementById("content-editor-title");
+  const contentEditorStatus = document.getElementById("content-editor-status");
+  const contentEditorMore = document.getElementById("content-editor-more");
+  const contentEditorMenu = document.getElementById("content-editor-menu");
+  const contentEditorActions = document.getElementById("content-editor-actions");
+  const contentBottomSave = document.getElementById("content-bottom-save");
+  const contentBottomPublish = document.getElementById("content-bottom-publish");
   const contentLivePreview = document.getElementById("content-live-preview");
-  const contentToolbarPreview = document.getElementById("content-toolbar-preview");
-  const contentToolbarPublish = document.getElementById("content-toolbar-publish");
   const contentStudioWorkspace = document.getElementById("content-studio-workspace");
   const contentStudioTabs = document.getElementById("content-studio-tabs");
   const contentUnsavedDialog = document.getElementById("content-unsaved-dialog");
@@ -883,7 +890,16 @@
     memberShellHeader.hidden = true;
     adminHero.hidden = false;
     bottomNav.hidden = false;
-    return loadDashboard();
+    const destination = adminScreenBeforeClub;
+    if (destination === "content") return loadContent();
+    if (destination === "users") return loadUsers();
+    if (destination === "subscriptions") return loadSubscriptions();
+    if (destination === "schedule") return loadSchedule();
+    if (destination === "gifts") return loadGifts();
+    if (destination === "failed-subscriptions") return loadFailedSubscriptions(false);
+    if (destination === "system") return loadSystem();
+    showScreen(destination === "more" ? "more" : "overview");
+    return destination === "overview" ? loadDashboard() : Promise.resolve();
   };
   const clearScheduleImages = () => {
     scheduleImageGeneration += 1;
@@ -936,6 +952,19 @@
     scheduleUploadPreview.replaceChildren(text("span", "Выберите изображение", "schedule-image-loading"));
     scheduleUploadMessage.textContent = "Сначала проверьте локальное изображение, затем отправьте его на безопасную проверку.";
   };
+  let activeAdminScreen = "overview";
+  let adminScreenBeforeClub = "overview";
+  const adminRootScreen = (name) => ({
+    "user-details": "users", "subscription-details": "subscriptions",
+    "failed-subscription-details": "failed-subscriptions",
+    "schedule-details": "schedule", "schedule-upload": "schedule",
+    "gift-details": "gifts", "delivery-details": "system",
+    "content-details": "content", "content-create": "content",
+  }[name] || name);
+  const syncAdminShellActions = (name) => {
+    const root = adminRootScreen(name);
+    document.getElementById("topbar-create-content").hidden = root !== "overview";
+  };
   const showScreen = (name) => {
     if (name !== "schedule" && name !== "schedule-details" && name !== "member-schedule" && scheduleImageUrls.size) {
       clearScheduleImages();
@@ -947,8 +976,13 @@
       clearContentMediaUrls();
       contentMediaUploadId = null;
     }
-    document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = node.dataset.screen !== name; });
-    document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === name); });
+    document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = !adminScreenIsVisible(name, node.dataset.screen); });
+    if (!name.startsWith("member-")) {
+      activeAdminScreen = adminRootScreen(name);
+      document.body.dataset.adminScreen = activeAdminScreen;
+      syncAdminShellActions(name);
+    }
+    document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === adminRootScreen(name)); });
   };
   const postAdmin = (path, body) => fetch(path, {
     method: "POST", headers: {Authorization: `Bearer ${sessionToken}`}, body,
@@ -1023,14 +1057,31 @@
   };
   const renderDashboardGifts = (data) => {
     dashboardGiftsList.replaceChildren();
+    document.querySelector(".admin-gifts-overview").classList.toggle("no-actionable", !data.items.some((gift) => gift.requires_attention));
     if (!data.items.length) return dashboardEmpty(dashboardGiftsList, "Подарков пока нет.");
     data.items.slice(0, 4).forEach((gift) => dashboardGiftsList.append(dashboardRow(`Подарок на ${gift.duration_label}`, gift.recipient && gift.recipient.username ? `@${gift.recipient.username}` : gift.public_reference, gift.status_label)));
   };
   const renderDashboardFailures = (data) => {
     dashboardFailedList.replaceChildren();
+    document.querySelector(".admin-failed-overview").classList.toggle("no-attention", !data.items.length);
     if (!data.items.length) return dashboardEmpty(dashboardFailedList, "Проблем продления нет.");
     data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
   };
+  const setAttentionCount = (count) => {
+    document.getElementById("dashboard-attention-count").textContent=String(count);
+    document.getElementById("topbar-attention").textContent=String(count);
+    document.getElementById("sidebar-attention").textContent=String(count);
+    document.getElementById("more-attention").textContent=String(count);
+  };
+  const refreshAttentionCount = () => Promise.all([
+    api("/api/admin/failed-subscriptions?state=attention&limit=1"),
+    api("/api/admin/gifts?status=review_required&duration=all&limit=1"),
+    api("/api/admin/system"),
+  ]).then(([failed,gifts,system]) => setAttentionCount(
+    Number(failed.summary.attention || 0)+Number(gifts.summary.requires_attention || 0)
+    +Number(system.deliveries.permanently_failed || 0)+Number(system.scheduler.failed_last_24h || 0)
+    +Number(system.removals.retryable || 0)
+  ));
   const loadDashboard = () => {
     status.textContent = "Загружаем данные…";
     const today = new Date();
@@ -1038,9 +1089,7 @@
     return api("/api/admin/dashboard").then((data) => {
       metricNodes.forEach((node) => { node.textContent = String(valueAtPath(data, node.dataset.metric) ?? "—"); });
       const attention = Number(data.deliveries.failed || 0) + Number(data.deliveries.permanently_failed || 0) + Number(data.billing.failed_payments || 0);
-      document.getElementById("dashboard-attention-count").textContent = String(attention);
-      document.getElementById("topbar-attention").textContent = String(attention);
-      document.getElementById("sidebar-attention").textContent = String(attention);
+      setAttentionCount(attention);
       document.getElementById("dashboard-migration-count").textContent = String(data.system.migrations.count);
       document.getElementById("dashboard-scheduler-count").textContent = String(data.system.scheduler.known_jobs);
       document.getElementById("dashboard-job-errors").textContent = String(data.system.scheduler.failed_last_24h);
@@ -1054,6 +1103,7 @@
         api(`/api/admin/schedule?${scheduleQuery.toString()}`).then(renderDashboardSchedules),
         api("/api/admin/gifts?limit=4&status=all&duration=all").then(renderDashboardGifts),
         api("/api/admin/failed-subscriptions?limit=4&state=attention").then(renderDashboardFailures),
+        refreshAttentionCount(),
       ]);
     });
   };
@@ -1361,7 +1411,9 @@
     return Promise.all([api("/api/admin/system"), loadDeliveries(false)]).then(([data]) => {
       systemMetricNodes.forEach((node) => {
         if (node.dataset.systemMetric === "database") {
-          node.textContent = data.database.connection_errors ? "Проблема" : "OK";
+          node.textContent = data.database.connection_errors ? "Ошибка" : "Работает";
+        } else if (node.dataset.systemMetric === "schema") {
+          node.textContent = data.migrations.latest ? "Актуальна" : "Требует проверки";
         } else {
           node.textContent = String(valueAtPath(data, node.dataset.systemMetric) ?? "—");
         }
@@ -1391,6 +1443,30 @@
       });
       showScreen("system");
       status.textContent = "Состояние системы";
+    });
+  };
+  const attentionRow = (kind, title, description, severity, actionLabel, action) => {
+    const row=document.createElement("article"); row.className="card attention-row";
+    const copy=document.createElement("div"); copy.append(text("small",kind),text("strong",title),text("p",description || "Требуется безопасная проверка."));
+    const badge=text("span",severity,severity === "Критично" ? "badge attention-label" : "badge");
+    const button=text("button",actionLabel,"secondary"); button.type="button"; button.addEventListener("click",action);
+    row.append(copy,badge,button); return row;
+  };
+  const loadAttention = () => {
+    status.textContent="Загружаем очередь внимания…";
+    return Promise.all([
+      api("/api/admin/failed-subscriptions?state=attention&limit=25"),
+      api("/api/admin/deliveries?status=permanently_failed&limit=25"),
+      api("/api/admin/gifts?status=review_required&duration=all&limit=25"),
+    ]).then(([failed,deliveries,gifts]) => {
+      attentionList.replaceChildren();
+      failed.items.forEach((item)=>attentionList.append(attentionRow("Подписка",item.username ? `@${item.username}` : item.first_name || "Операция подписки",item.reason_label,"Критично","Открыть",()=>loadFailedSubscriptionDetails(item.operation_id))));
+      deliveries.items.forEach((item)=>attentionList.append(attentionRow("Доставка",item.delivery_label,item.explanation,"Критично","Открыть",()=>loadDeliveryDetails(item.delivery_id))));
+      gifts.items.forEach((item)=>attentionList.append(attentionRow("Подарок",item.public_reference,item.status_label,"Проверка","Открыть",()=>loadGiftDetails(item.gift_id))));
+      if(!attentionList.children.length) attentionList.append(text("p","Сейчас нет нерешённых событий.","card"));
+      const count=failed.items.length+deliveries.items.length+gifts.items.length;
+      refreshAttentionCount().catch(()=>null);
+      showScreen("attention"); status.textContent=`Требуют внимания: ${count}`;
     });
   };
   function loadDeliveryDetails(deliveryId) {
@@ -1852,6 +1928,8 @@
     contentEditorDirty = dirty;
     contentEditorState.textContent = dirty ? "Есть несохранённые изменения" : "Все изменения сохранены ✓";
     contentEditorState.classList.toggle("dirty", dirty);
+    if (contentBottomSave) contentBottomSave.disabled = !dirty;
+    if (contentBottomPublish) contentBottomPublish.disabled = dirty || !currentCmsContent || currentCmsContent.status !== "draft";
   };
   const runPendingContentNavigation = () => {
     const action = pendingContentNavigation;
@@ -1984,12 +2062,23 @@
     if(!item.media_ready && ["lesson","meditation"].includes(item.content_type)) button.append(text("p",item.content_type==="lesson" ? "Не добавлено видео" : "Не добавлено аудио или видео","studio-warning"));
     button.append(text("small",`Обновлено ${formatDate(item.updated_at)}`));
     button.addEventListener("click", () => loadCmsContentDetails(item.content_id));
-    const actions=document.createElement("div"); actions.className="studio-card-actions";
-    const edit=text("button",item.status==="draft" ? "Редактировать" : "Открыть","secondary"); edit.type="button";
-    edit.addEventListener("click",()=>loadCmsContentDetails(item.content_id));
-    const preview=text("button","Посмотреть в клубе","secondary"); preview.type="button";
-    preview.addEventListener("click",()=>loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
-    actions.append(edit,preview);
+    const actions=document.createElement("details"); actions.className="studio-card-actions studio-card-menu";
+    const summary=text("summary","⋯"); summary.setAttribute("aria-label",`Действия: ${item.title}`); actions.append(summary);
+    const menu=document.createElement("div"); menu.className="studio-card-menu-items";
+    const addAction=(label, handler) => { const action=text("button",label,"secondary"); action.type="button"; action.addEventListener("click",handler); menu.append(action); };
+    if(item.status==="draft") {
+      addAction("Редактировать",()=>loadCmsContentDetails(item.content_id));
+      addAction("Предпросмотр",()=>openCmsContentPreview(item.content_id));
+      addAction("Опубликовать",()=>loadCmsContentDetails(item.content_id).then(previewContentLifecycle).catch(showApiError));
+      addAction("Удалить черновик",()=>loadCmsContentDetails(item.content_id).then(() => { contentLifecycleMode="delete"; return previewContentLifecycle(); }).catch(showApiError));
+    } else if(item.status==="published") {
+      addAction("Редактировать новую версию",()=>loadCmsContentDetails(item.content_id).then(createContentRevision).catch(showApiError));
+      addAction("Посмотреть в клубе",()=>loadMemberLesson(item.content_id,item.content_type).catch(showApiError));
+      addAction("Архивировать",()=>loadCmsContentDetails(item.content_id).then(previewContentLifecycle).catch(showApiError));
+    } else {
+      addAction("Открыть",()=>loadCmsContentDetails(item.content_id));
+    }
+    actions.append(menu);
     article.append(button,actions);
     return article;
   };
@@ -2034,10 +2123,11 @@
     if (!currentCmsContent || !contentLifecycleMode) return Promise.resolve();
     const mode = contentLifecycleMode;
     contentLifecycleCard.hidden = false;
+    if (mode === "delete") contentLifecycleTitle.textContent = "Удалить черновик?";
     contentLifecycleMessage.textContent = "Проверяем финальное состояние…";
     return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-preview`, {expected_version: currentCmsContent.version}).then((preview) => {
       contentLifecycleActionId = preview.action_id;
-      const mediaTypes = new Set(preview.media.map((entry) => entry.media_type));
+      const mediaTypes = new Set((preview.media || []).map((entry) => entry.media_type));
       const checklist = document.createElement("ul"); checklist.className = "studio-publish-checklist";
       if (mode === "publish") {
         checklist.append(text("li", "Обязательно", "checklist-heading"));
@@ -2053,16 +2143,18 @@
       }
       contentLifecyclePreview.replaceChildren(
         text("strong", preview.title),
-        text("span", cmsTypeLabel(preview.content_type)),
-        text("span", preview.description || "Без описания"),
-        text("span", `Медиа: ${preview.media.map((entry) => entry.media_type).join(", ") || "нет"}`),
+        text("span", mode === "delete" ? "Черновик" : cmsTypeLabel(preview.content_type)),
+        text("span", mode === "delete" ? `Связанных медиа: ${preview.media_count}` : preview.description || "Без описания"),
+        text("span", mode === "delete" ? "История и связанные данные сохранятся для аудита." : `Медиа: ${(preview.media || []).map((entry) => entry.media_type).join(", ") || "нет"}`),
         checklist,
         text("span", `Действительно до ${formatDate(preview.preview_expires_at)}`)
       );
       contentLifecyclePreview.hidden = false;
-      contentLifecycleConfirm.textContent = mode === "archive" ? "Архивировать" : "Опубликовать";
+      contentLifecycleConfirm.textContent = mode === "archive" ? "Архивировать" : mode === "delete" ? "Удалить" : "Опубликовать";
       contentLifecycleConfirm.hidden = false; contentLifecycleCancel.hidden = false;
-      contentLifecycleMessage.textContent = mode === "archive"
+      contentLifecycleMessage.textContent = mode === "delete"
+        ? "Материал исчезнет из списка черновиков. Опубликованный контент эта операция не затрагивает."
+        : mode === "archive"
         ? "Материал перестанет отображаться в будущей пользовательской библиотеке, но история и данные сохранятся."
         : "Проверьте итоговые данные перед публикацией.";
       contentLifecycleCard.scrollIntoView({behavior: "smooth", block: "center"});
@@ -2071,8 +2163,9 @@
   const confirmContentLifecycle = () => {
     if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
     contentLifecycleConfirm.disabled = true;
-    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-confirm`, {action_id: contentLifecycleActionId})
-      .then(() => loadCmsContentDetails(currentCmsContent.content_id))
+    const mode = contentLifecycleMode;
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-confirm`, {action_id: contentLifecycleActionId})
+      .then(() => mode === "delete" ? loadContent().then(() => { status.textContent="Черновик удалён"; }) : loadCmsContentDetails(currentCmsContent.content_id))
       .catch((error) => {
         contentLifecycleMessage.textContent = contentErrorMessage(error);
       }).finally(() => { contentLifecycleConfirm.disabled = false; });
@@ -2089,11 +2182,17 @@
     status.textContent = "Загружаем черновик…";
     return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
       currentCmsContent = item;
-      const metadata = detailCard("Материал CMS", [
-        ["Название", item.title], ["Тип", cmsTypeLabel(item.content_type)],
-        ["Категории", (item.categories || []).map((entry) => entry.title).join(", ") || item.category],
-        ["Длительность", item.duration_seconds ? formatDuration(item.duration_seconds) : null],
-        ["Статус", item.status], ["Ревизия", item.revision_number], ["Версия данных", item.version],
+      contentEditorTitle.textContent = item.title;
+      contentEditorStatus.textContent = cmsStatusLabel(item.status);
+      contentEditorStatus.className = `badge studio-status ${item.status}`;
+      contentEditorMenu.hidden = true;
+      contentEditorMore.setAttribute("aria-expanded", "false");
+      contentEditorActions.hidden = item.status === "archived";
+      contentBottomSave.hidden = item.status !== "draft";
+      const metadata = detailCard("Состояние материала", [
+        ["Статус", cmsStatusLabel(item.status)],
+        ["Последнее изменение", formatDate(item.updated_at)],
+        ["Готовность", item.media_ready ? "Основное медиа добавлено" : "Требуется проверить медиа"],
       ]);
       const description = document.createElement("article"); description.className = "card authoring-readable";
       description.append(text("h2", "Описание"));
@@ -2128,8 +2227,8 @@
       contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((button) => button.classList.toggle("active", button.dataset.studioPanel === (previewOnly ? "preview" : "editor")));
       renderContentLivePreview(item);
       contentEditorState.textContent = item.status === "draft" ? "Все изменения сохранены ✓" : cmsStatusLabel(item.status);
-      contentToolbarPublish.textContent = item.status === "published" ? "Архивировать" : item.status === "archived" ? "В архиве" : "Опубликовать";
-      contentToolbarPublish.disabled = item.status === "archived";
+      contentBottomPublish.textContent = item.status === "published" ? "Архивировать" : "Опубликовать";
+      contentBottomPublish.disabled = item.status === "archived" || contentEditorDirty;
       loadContentVersions(item.content_id).catch(showApiError);
       showScreen("content-details");
       status.textContent = item.title;
@@ -2155,6 +2254,10 @@
     if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
     contentMediaAttachedCoverUrl = URL.createObjectURL(blob);
     contentCoverCurrent.replaceChildren(mediaImage(contentMediaAttachedCoverUrl, `Обложка ${item.title}`));
+    if (item.status === "draft") {
+      const remove=text("button","Удалить","secondary content-media-remove"); remove.type="button";
+      remove.addEventListener("click",()=>previewContentMediaRemove(media,"обложку")); contentCoverCurrent.append(remove);
+    }
     renderContentLivePreview(item);
   }).catch(() => {
     if (generation === contentMediaGeneration && currentCmsContent && currentCmsContent.content_id === item.content_id) {
@@ -2174,7 +2277,28 @@
       ? `MP3 · ${Math.ceil(audio.size_bytes / 1024 / 1024)} МиБ · версия ${audio.version}`
       : "Аудио не прикреплено";
     if (cover) fetchContentCover(item, cover);
+    const addRemove = (host, media, label) => {
+      if (!media || item.status !== "draft") return;
+      const remove = text("button", "Удалить", "secondary content-media-remove"); remove.type="button";
+      remove.addEventListener("click", () => previewContentMediaRemove(media, label)); host.append(remove);
+    };
+    addRemove(contentVideoCurrent, video, "видео");
+    addRemove(contentAudioCurrent, audio, "аудио");
   }
+  const previewContentMediaRemove = (media, label) => {
+    if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
+    const mode = `media/${encodeURIComponent(media.media_id)}/remove`;
+    contentLifecycleMode = mode;
+    contentLifecycleTitle.textContent = `Удалить ${label}?`;
+    contentLifecycleCard.hidden = false;
+    contentLifecycleMessage.textContent = "Связь с материалом будет отключена. Telegram-файл физически не удаляется.";
+    return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-preview`, {expected_version:currentCmsContent.version}).then((preview) => {
+      contentLifecycleActionId=preview.action_id;
+      contentLifecyclePreview.replaceChildren(text("strong",currentCmsContent.title),text("span",`Медиа: ${media.media_type}`),text("span","История публикаций не изменится."));
+      contentLifecyclePreview.hidden=false; contentLifecycleConfirm.textContent="Удалить";
+      contentLifecycleConfirm.hidden=false; contentLifecycleCancel.hidden=false; contentLifecyclePreviewButton.hidden=true;
+    }).catch((error)=>{ contentLifecycleMessage.textContent=contentErrorMessage(error); });
+  };
   const showLocalContentMedia = (mediaType) => {
     const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
@@ -2496,20 +2620,43 @@
         else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
         else if (button.dataset.nav === "schedule") loadSchedule().catch(showApiError);
         else if (button.dataset.nav === "content") loadContent().catch(showApiError);
+        else if (button.dataset.nav === "more") showScreen("more");
         else showScreen(button.dataset.nav);
       });
     });
   });
-  refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
+  refresh.addEventListener("click", () => {
+    const reload = activeAdminScreen === "content" ? loadContent
+      : activeAdminScreen === "users" ? loadUsers
+      : activeAdminScreen === "subscriptions" ? loadSubscriptions
+      : activeAdminScreen === "schedule" ? loadSchedule
+      : activeAdminScreen === "gifts" ? loadGifts
+      : activeAdminScreen === "failed-subscriptions" ? () => loadFailedSubscriptions(false)
+      : activeAdminScreen === "system" ? loadSystem : loadDashboard;
+    guardContentNavigation(() => reload().catch(showApiError));
+  });
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("open-subscriptions-mobile").addEventListener("click", () => loadSubscriptions().catch(showApiError));
   document.getElementById("open-schedule-mobile").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("open-content-legacy").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("topbar-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
-  document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
+  const openAdminClub = () => {
+    adminScreenBeforeClub = activeAdminScreen;
+    return loadMemberHome().catch(showApiError);
+  };
+  document.getElementById("open-member-preview").addEventListener("click", openAdminClub);
+  document.getElementById("open-club-global").addEventListener("click", () => guardContentNavigation(openAdminClub));
   document.getElementById("dashboard-open-users").addEventListener("click", () => loadUsers().catch(showApiError));
   document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
+  document.getElementById("dashboard-open-attention").addEventListener("click", () => loadAttention().catch(showApiError));
+  document.getElementById("more-subscriptions").addEventListener("click", () => loadSubscriptions().catch(showApiError));
+  document.getElementById("more-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
+  document.getElementById("more-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("more-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
+  document.getElementById("more-system").addEventListener("click", () => loadSystem().catch(showApiError));
+  document.getElementById("more-open-club").addEventListener("click", openAdminClub);
+  document.getElementById("attention-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
   document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("nav-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
@@ -2561,18 +2708,27 @@
   });
   contentCreateType.addEventListener("change", () => loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError));
   document.getElementById("content-edit-save").addEventListener("click", saveCurrentContent);
-  document.getElementById("content-authoring-publish").addEventListener("click", saveAndPreviewPublish);
-  contentToolbarPreview.addEventListener("click", () => {
+  const showContentPreviewPanel = () => {
     renderContentLivePreview();
     contentStudioWorkspace.classList.add("preview-active");
     contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((button) => button.classList.toggle("active", button.dataset.studioPanel === "preview"));
     contentLivePreview.scrollIntoView({behavior: "smooth", block: "start"});
-  });
-  contentToolbarPublish.addEventListener("click", () => {
+  };
+  const runContentPublishAction = () => {
     if (!currentCmsContent) return;
-    if (currentCmsContent.status === "draft") saveAndPreviewPublish();
+    if (currentCmsContent.status === "draft" && !contentEditorDirty) previewContentLifecycle();
     else if (currentCmsContent.status === "published") previewContentLifecycle();
+  };
+  contentBottomSave.addEventListener("click", saveCurrentContent);
+  contentBottomPublish.addEventListener("click", runContentPublishAction);
+  contentEditorMore.addEventListener("click", () => {
+    contentEditorMenu.hidden = !contentEditorMenu.hidden;
+    contentEditorMore.setAttribute("aria-expanded", String(!contentEditorMenu.hidden));
   });
+  document.getElementById("content-menu-preview").addEventListener("click", () => { contentEditorMenu.hidden = true; showContentPreviewPanel(); });
+  document.getElementById("content-menu-history").addEventListener("click", () => { contentEditorMenu.hidden = true; document.getElementById("content-version-history-card").open = true; document.getElementById("content-version-history-card").scrollIntoView({behavior:"smooth",block:"start"}); });
+  document.getElementById("content-history-close").addEventListener("click", () => { document.getElementById("content-version-history-card").open = false; });
+  document.getElementById("content-menu-technical").addEventListener("click", () => { contentEditorMenu.hidden = true; status.textContent = currentCmsContent ? `Версия данных ${currentCmsContent.version} · ревизия ${currentCmsContent.revision_number}` : "Технические сведения недоступны"; });
   contentCreateRevision.addEventListener("click", createContentRevision);
   document.querySelectorAll(".authoring-textarea").forEach((field) => {
     const grow = () => { field.style.height = "auto"; field.style.height = `${Math.max(160, field.scrollHeight)}px`; };

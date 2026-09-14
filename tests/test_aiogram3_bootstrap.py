@@ -10243,10 +10243,35 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("autoplay", javascript.lower())
         self.assertIn("media-src 'self' blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("content-lifecycle-card", index)
+        self.assertIn("dashboard-open-attention", index)
+        self.assertIn("attention-screen", index)
+        self.assertIn("loadAttention", javascript)
+        self.assertNotIn("Скрыть событие", index)
+        self.assertIn("system-technical-details", index)
+        for route in (
+            "/api/admin/content/cms/{content_id}/delete-preview",
+            "/api/admin/content/cms/{content_id}/delete-confirm",
+            "/api/admin/content/cms/{content_id}/delete-cancel",
+            "/api/admin/content/cms/{content_id}/media/{media_id}/remove-preview",
+            "/api/admin/content/cms/{content_id}/media/{media_id}/remove-confirm",
+            "/api/admin/content/cms/{content_id}/media/{media_id}/remove-cancel",
+        ):
+            self.assertIsNotNone(self.route_handler(app, "POST", route))
         self.assertIn("content-version-history", index)
         self.assertIn("previewContentLifecycle", javascript)
         self.assertIn("content-create-publish", index)
-        self.assertIn("content-authoring-publish", index)
+        self.assertNotIn("content-authoring-publish", index)
+        self.assertNotIn("Сохранить и опубликовать", index)
+        self.assertIn('id="content-bottom-save"', index)
+        self.assertIn('id="content-bottom-publish"', index)
+        self.assertIn('id="content-editor-more"', index)
+        self.assertIn('id="content-menu-history"', index)
+        self.assertIn('id="content-menu-technical"', index)
+        self.assertIn('id="open-club-global"', index)
+        self.assertIn('id="more-open-club"', index)
+        self.assertIn("adminScreenIsVisible", javascript)
+        self.assertIn('actions.className="studio-card-actions studio-card-menu"', javascript)
+        self.assertNotIn('["Статус", item.status], ["Ревизия"', javascript)
         self.assertIn("content-create-revision", index)
         self.assertIn("/revision`, {}", javascript)
         self.assertIn("appendRestrictedText", javascript)
@@ -10283,6 +10308,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('class="admin-kpi-row"', index)
         self.assertIn('class="admin-dashboard-grid"', index)
         self.assertIn('id="sidebar-attention"', index)
+        self.assertIn('id="admin-more-screen"', index)
+        for action_id in (
+            "more-subscriptions", "more-schedule", "more-gifts",
+            "more-failed-subscriptions", "more-system",
+        ):
+            self.assertIn(f'id="{action_id}"', index)
+        self.assertIn('data-nav="more"', index)
+        self.assertIn(".desktop-system-nav { display: none !important; }", stylesheet)
+        self.assertIn(".admin-system-overview", stylesheet)
+        self.assertIn(".admin-failed-overview.no-attention", stylesheet)
+        self.assertIn(".admin-gifts-overview.no-actionable", stylesheet)
+        self.assertIn(".overview-content-card:nth-child(n + 4)", stylesheet)
+        self.assertIn("#users-list .user-telegram-cell", stylesheet)
+        self.assertIn("body:not(.member-preview-mode) .admin-more-nav { display: none !important; }", stylesheet)
         self.assertIn("Promise.allSettled", javascript)
         self.assertIn("renderDashboardContent", javascript)
         self.assertIn("renderDashboardUsers", javascript)

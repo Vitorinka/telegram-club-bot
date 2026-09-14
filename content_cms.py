@@ -242,7 +242,7 @@ def list_cms_content(get_connection, *, status="all", limit=25):
     conn = get_connection(); cur = conn.cursor()
     try:
         _begin_read(cur)
-        where = "" if status == "all" else " WHERE status = %s"
+        where = " WHERE deleted_at IS NULL" if status == "all" else " WHERE deleted_at IS NULL AND status = %s"
         params = () if status == "all" else (status,)
         cur.execute(
             CONTENT_SELECT + where + " ORDER BY updated_at DESC, content_id DESC LIMIT %s",
@@ -272,7 +272,7 @@ def list_cms_content_studio(get_connection, *, status="all", limit=25):
     conn = get_connection(); cur = conn.cursor()
     try:
         _begin_read(cur)
-        where = "" if status == "all" else " WHERE status = %s"
+        where = " WHERE deleted_at IS NULL" if status == "all" else " WHERE deleted_at IS NULL AND status = %s"
         params = () if status == "all" else (status,)
         cur.execute(
             CONTENT_SELECT + where + " ORDER BY updated_at DESC, content_id DESC LIMIT %s",
@@ -340,7 +340,7 @@ def get_cms_content(get_connection, content_id):
     conn = get_connection(); cur = conn.cursor()
     try:
         _begin_read(cur)
-        cur.execute(CONTENT_SELECT + " WHERE content_id = %s", (content_id,))
+        cur.execute(CONTENT_SELECT + " WHERE content_id = %s AND deleted_at IS NULL", (content_id,))
         row = cur.fetchone()
         conn.rollback()
         return _projection(row) if row else None
@@ -357,7 +357,7 @@ def update_content_draft(get_connection, content_id, payload):
     try:
         _begin_write(cur)
         cur.execute(
-            "SELECT content_type, status, version FROM content_items WHERE content_id = %s FOR UPDATE",
+            "SELECT content_type, status, version FROM content_items WHERE content_id = %s AND deleted_at IS NULL FOR UPDATE",
             (content_id,),
         )
         current = cur.fetchone()
@@ -378,7 +378,7 @@ def update_content_draft(get_connection, content_id, payload):
         assignments.extend(["version = version + 1", "updated_at = NOW()"])
         cur.execute(
             "UPDATE content_items SET " + ", ".join(assignments)
-            + " WHERE content_id = %s AND status = 'draft' AND version = %s RETURNING "
+            + " WHERE content_id = %s AND status = 'draft' AND deleted_at IS NULL AND version = %s RETURNING "
             + CONTENT_SELECT.split("FROM content_items")[0].replace("SELECT", "", 1).strip(),
             tuple(params + [content_id, expected_version]),
         )

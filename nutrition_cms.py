@@ -79,7 +79,7 @@ def get_nutrition_body(get_connection, content_id):
             SELECT b.content_id,b.body,b.created_at,b.updated_at
             FROM nutrition_material_bodies b
             JOIN content_items c ON c.content_id=b.content_id
-            WHERE b.content_id=%s AND c.content_type='nutrition_material'
+            WHERE b.content_id=%s AND c.content_type='nutrition_material' AND c.deleted_at IS NULL
         """, (content_id,))
         result = _body_projection(cur.fetchone())
         conn.rollback(); return result
@@ -102,7 +102,7 @@ def update_nutrition_draft(get_connection, content_id, payload):
     try:
         cur.execute("SET LOCAL statement_timeout = 5000")
         cur.execute("SET LOCAL lock_timeout = '2s'")
-        cur.execute("SELECT content_type,status,version FROM content_items WHERE content_id=%s FOR UPDATE", (content_id,))
+        cur.execute("SELECT content_type,status,version FROM content_items WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,))
         row = cur.fetchone()
         if not row:
             raise ContentCmsError("content_not_found", 404)
@@ -113,7 +113,7 @@ def update_nutrition_draft(get_connection, content_id, payload):
         assignments = [f"{field}=%s" for field in values]
         cur.execute(
             "UPDATE content_items SET " + ",".join(assignments)
-            + ",version=version+1,updated_at=NOW() WHERE content_id=%s AND version=%s AND status='draft' RETURNING version",
+            + ",version=version+1,updated_at=NOW() WHERE content_id=%s AND version=%s AND status='draft' AND deleted_at IS NULL RETURNING version",
             tuple(list(values.values()) + [content_id, expected_version]),
         )
         updated = cur.fetchone()
