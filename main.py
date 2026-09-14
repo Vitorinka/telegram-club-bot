@@ -178,6 +178,7 @@ from content_cms import (
     create_content_draft,
     get_cms_content,
     list_cms_content,
+    list_cms_content_studio,
     update_content_draft,
 )
 from content_media import (
@@ -22577,7 +22578,7 @@ async def miniapp_admin_content_draft_create(request):
 
 async def miniapp_admin_cms_content(request):
     try:
-        result = list_cms_content(
+        result = list_cms_content_studio(
             get_db_conn,
             status=request.query.get("status", "all"),
             limit=request.query.get("limit", "25"),

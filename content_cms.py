@@ -257,6 +257,84 @@ def list_cms_content(get_connection, *, status="all", limit=25):
         cur.close(); conn.close()
 
 
+def list_cms_content_studio(get_connection, *, status="all", limit=25):
+    """Return the bounded admin library projection using one read transaction."""
+    if status != "all" and status not in CONTENT_STATUSES:
+        raise ContentCmsError("invalid_status")
+    if isinstance(limit, bool):
+        raise ContentCmsError("invalid_limit")
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise ContentCmsError("invalid_limit") from None
+    if limit < 1 or limit > MAX_CONTENT_LIMIT:
+        raise ContentCmsError("invalid_limit")
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        _begin_read(cur)
+        where = "" if status == "all" else " WHERE status = %s"
+        params = () if status == "all" else (status,)
+        cur.execute(
+            CONTENT_SELECT + where + " ORDER BY updated_at DESC, content_id DESC LIMIT %s",
+            params + (limit,),
+        )
+        items = [_projection(row) for row in cur.fetchall()]
+        by_id = {item["content_id"]: item for item in items}
+        for item in items:
+            item["media"] = []
+            item["categories"] = []
+        content_ids = list(by_id)
+        if content_ids:
+            cur.execute(
+                """
+                SELECT media_id,content_id,media_type,mime_type,size_bytes,
+                       sort_order,version,created_at,updated_at
+                FROM content_media
+                WHERE content_id=ANY(%s::uuid[]) AND deleted_at IS NULL
+                ORDER BY content_id,media_type,sort_order,media_id
+                """,
+                (content_ids,),
+            )
+            for row in cur.fetchall():
+                by_id[str(row[1])]["media"].append({
+                    "media_id": str(row[0]), "content_id": str(row[1]),
+                    "media_type": row[2], "mime_type": row[3],
+                    "size_bytes": int(row[4]), "sort_order": int(row[5]),
+                    "version": int(row[6]), "created_at": _iso(row[7]),
+                    "updated_at": _iso(row[8]), "has_media": True,
+                })
+            cur.execute(
+                """
+                SELECT cic.content_id,cc.category_id,cc.slug,cc.title,
+                       cc.group_slug,cc.sort_order
+                FROM content_item_categories cic
+                JOIN content_categories cc USING(category_id)
+                WHERE cic.content_id=ANY(%s::uuid[])
+                ORDER BY cic.content_id,COALESCE(cic.sort_order,cc.sort_order),cc.slug
+                """,
+                (content_ids,),
+            )
+            for row in cur.fetchall():
+                by_id[str(row[0])]["categories"].append({
+                    "id": str(row[1]), "slug": row[2], "title": row[3],
+                    "group": row[4], "sort_order": int(row[5]),
+                })
+        for item in items:
+            media_types = {entry["media_type"] for entry in item["media"]}
+            item["media_ready"] = (
+                "video" in media_types if item["content_type"] == "lesson"
+                else bool(media_types.intersection({"audio", "video"}))
+                if item["content_type"] == "meditation" else True
+            )
+        conn.rollback()
+        return {"items": items, "read_only": True}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close(); conn.close()
+
+
 def get_cms_content(get_connection, content_id):
     content_id = _parse_content_id(content_id)
     conn = get_connection(); cur = conn.cursor()

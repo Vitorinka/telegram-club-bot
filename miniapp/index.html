@@ -52,31 +52,25 @@
       </article>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
-      <article class="card">
-        <h2>Контент</h2>
-        <p class="hint">Legacy-материалы продолжают работать как раньше. CMS пока используется только для черновиков.</p>
-        <button id="content-create-open" type="button">+ Новый материал</button>
+      <header class="studio-heading"><div><p class="eyebrow">Режим администратора</p><h1>Контент</h1><p>Управляйте материалами прямо в интерфейсе клуба.</p></div><button id="content-create-open" type="button">+ Добавить</button></header>
+      <article class="card studio-filters">
+        <div id="content-status-filters" class="studio-chips" aria-label="Статус материалов">
+          <button class="active" data-content-status="all" type="button">Все</button><button data-content-status="draft" type="button">Черновики</button><button data-content-status="published" type="button">Опубликованные</button><button data-content-status="archived" type="button">Архив</button>
+        </div>
         <label class="search-label" for="content-search">Поиск по названию</label>
-        <input id="content-search" type="search" maxlength="80" autocomplete="off">
-        <select id="content-category" aria-label="Категория контента">
-          <option value="all">Все</option>
-          <option value="onboarding">Онбординг</option>
-          <option value="club_information">Информация клуба</option>
-          <option value="free_materials">Бесплатные материалы</option>
-        </select>
+        <input id="content-search" type="search" maxlength="80" autocomplete="off" placeholder="Название материала">
+        <div class="studio-filter-row"><select id="content-type" aria-label="Тип контента"><option value="all">Все типы</option><option value="lesson">Уроки</option><option value="meditation">Медитации</option><option value="recipe">Рецепты</option><option value="nutrition_material">Питание</option></select><select id="content-category" aria-label="Категория контента"><option value="all">Все категории</option></select></div>
       </article>
-      <h2>Legacy content</h2>
-      <div id="content-list" class="user-list"></div>
-      <p id="content-empty" class="card" hidden>Материалов по выбранному фильтру нет.</p>
-      <h2>CMS content</h2>
-      <div id="cms-content-list" class="user-list"></div>
-      <p id="cms-content-empty" class="card" hidden>Черновиков CMS пока нет.</p>
+      <div id="cms-content-list" class="studio-grid"></div>
+      <p id="cms-content-empty" class="card" hidden>Материалов по выбранным фильтрам нет.</p>
+      <details class="card studio-legacy"><summary>Ещё · служебные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Служебных материалов нет.</p></details>
       <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
     </section>
     <section id="content-create" class="screen page" data-screen="content-create" hidden>
       <button id="content-create-back" class="secondary" type="button">← К контенту</button>
-      <article class="card">
+      <article class="card studio-create-card">
         <h2>Новый материал</h2>
+        <p class="hint">Выберите тип и укажите название. Материал создастся как черновик и откроется в редакторе.</p>
         <label>Тип
           <select id="content-create-type">
             <option value="lesson">Новый урок</option>
@@ -86,6 +80,7 @@
           </select>
         </label>
         <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
+        <details class="studio-create-options"><summary>Заполнить дополнительные поля сразу</summary>
         <input id="content-create-category" type="hidden">
         <fieldset id="content-create-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
         <label class="authoring-field">Описание <textarea id="content-create-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
@@ -103,14 +98,16 @@
           <label id="content-create-audio-label" hidden>Аудио · MP3 до 20 МБ <input id="content-create-audio-file" type="file" accept="audio/mpeg,.mp3"></label>
           <p class="hint">Файл проходит server-side validation и прикрепляется только при успешном сохранении черновика.</p>
         </section>
+        </details>
         <p id="content-create-message" class="hint">Материал будет создан только в статусе draft.</p>
-        <div class="authoring-actions"><button id="content-create-submit" type="button">Сохранить черновик</button><button id="content-create-publish" type="button">Опубликовать</button></div>
+        <div class="authoring-actions"><button id="content-create-submit" type="button">Создать черновик</button><button id="content-create-publish" type="button">Создать и подготовить публикацию</button></div>
       </article>
     </section>
     <section id="content-details" class="screen page" data-screen="content-details" hidden>
-      <button id="content-back" class="secondary" type="button">← К контенту</button>
+      <header class="studio-toolbar"><button id="content-back" class="secondary" type="button">← Контент</button><span id="content-editor-state">Все изменения сохранены ✓</span><button id="content-toolbar-preview" class="secondary" type="button">Предпросмотр</button><button id="content-toolbar-publish" type="button">Опубликовать</button></header>
       <div id="content-details-content" class="dashboard"></div>
-      <article id="content-edit-card" class="card" hidden>
+      <div id="content-studio-tabs" class="studio-mobile-tabs"><button class="active" data-studio-panel="editor" type="button">Редактор</button><button data-studio-panel="preview" type="button">Предпросмотр</button></div>
+      <div id="content-studio-workspace" class="studio-workspace"><article id="content-edit-card" class="card studio-editor" hidden>
         <h2>Редактировать черновик</h2>
         <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
         <input id="content-edit-category" type="hidden">
@@ -119,8 +116,8 @@
         <label class="authoring-field">Длительность <input id="content-edit-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04"></label>
         <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
         <p id="content-edit-message" class="hint"></p>
-        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить черновик</button><button id="content-authoring-publish" type="button">Опубликовать</button></div>
-      </article>
+        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button><button id="content-authoring-publish" type="button">Сохранить и опубликовать</button></div>
+      </article><aside id="content-live-preview" class="card studio-preview"><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
       <button id="content-create-revision" type="button" hidden>Редактировать</button>
       <article id="content-recipe-card" class="card" hidden>
         <h2>Рецепт</h2>
@@ -150,7 +147,7 @@
           <label>Загрузить или заменить
             <input id="content-cover-file" type="file" accept="image/jpeg,image/png,image/webp">
           </label>
-          <button id="content-cover-validate" type="button">Проверить обложку</button>
+          <button id="content-cover-validate" type="button">Продолжить с обложкой</button>
         </section>
         <section id="content-video-control" class="content-media-control">
           <h3>Видео</h3>
@@ -158,7 +155,7 @@
           <label>Загрузить или заменить
             <input id="content-video-file" type="file" accept="video/mp4">
           </label>
-          <button id="content-video-validate" type="button">Проверить видео</button>
+          <button id="content-video-validate" type="button">Продолжить с видео</button>
         </section>
         <section id="content-audio-control" class="content-media-control" hidden>
           <h3>Аудио</h3><p class="hint">MP3 · до 20 МБ</p>
@@ -166,7 +163,7 @@
           <label>Загрузить или заменить
             <input id="content-audio-file" type="file" accept="audio/mpeg,.mp3">
           </label>
-          <button id="content-audio-validate" type="button">Проверить аудио</button>
+          <button id="content-audio-validate" type="button">Продолжить с аудио</button>
         </section>
         <section id="content-media-confirmation" hidden>
           <h3>Подтверждение</h3>
@@ -174,7 +171,7 @@
           <div id="content-media-summary" class="confirmation-summary"></div>
           <p id="content-media-message" class="hint"></p>
           <div class="confirmation-actions">
-            <button id="content-media-confirm" type="button">Прикрепить</button>
+            <button id="content-media-confirm" type="button">Сохранить медиа</button>
             <button id="content-media-cancel" class="secondary" type="button">Отмена</button>
           </div>
         </section>
@@ -189,12 +186,16 @@
           <button id="content-lifecycle-cancel" class="secondary" type="button" hidden>Отмена</button>
         </div>
       </article>
-      <article id="content-version-history-card" class="card">
+      <details id="content-version-history-card" class="card studio-history"><summary>⋯ Ещё · История изменений</summary>
         <h2>История версий</h2>
         <div id="content-version-history" class="dashboard"></div>
         <p id="content-version-history-empty" class="hint">История версий пока пуста.</p>
-      </article>
+      </details>
     </section>
+    <dialog id="content-unsaved-dialog" class="studio-dialog">
+      <h2>Есть несохранённые изменения</h2><p>Выйти без сохранения?</p>
+      <div class="confirmation-actions"><button id="content-unsaved-save" type="button">Сохранить</button><button id="content-unsaved-discard" class="secondary" type="button">Выйти без сохранения</button><button id="content-unsaved-cancel" class="secondary" type="button">Отмена</button></div>
+    </dialog>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
         <h2>Пользователи</h2>
@@ -473,6 +474,7 @@
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
     <button type="button" data-nav="overview">Обзор</button>
+    <button type="button" data-nav="content">Контент</button>
     <button type="button" data-nav="users">Пользователи</button>
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
