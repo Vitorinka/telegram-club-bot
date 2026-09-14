@@ -68,12 +68,18 @@
   const adminHero = document.getElementById("admin-hero");
   const bottomNav = document.getElementById("bottom-nav");
   const adminFullscreen = document.getElementById("admin-fullscreen");
+  const fullscreenMessage = document.getElementById("fullscreen-message");
   const memberBottomNav = document.getElementById("member-bottom-nav");
   const memberShellHeader = document.getElementById("member-shell-header");
   const usersSearch = document.getElementById("users-search");
   const usersStatus = document.getElementById("users-status");
   const usersList = document.getElementById("users-list");
   const usersMore = document.getElementById("users-more");
+  const dashboardContentList = document.getElementById("dashboard-content-list");
+  const dashboardUsersList = document.getElementById("dashboard-users-list");
+  const dashboardScheduleList = document.getElementById("dashboard-schedule-list");
+  const dashboardGiftsList = document.getElementById("dashboard-gifts-list");
+  const dashboardFailedList = document.getElementById("dashboard-failed-list");
   const detailsContent = document.getElementById("user-details-content");
   const manualAccessCard = document.getElementById("manual-access-card");
   const manualAccessControls = document.getElementById("manual-access-controls");
@@ -982,13 +988,73 @@
     return data;
   });
   const valueAtPath = (object, path) => path.split(".").reduce((value, key) => value && value[key], object);
+  const dashboardEmpty = (container, label) => container.replaceChildren(text("p", label, "overview-empty"));
+  const dashboardRow = (title, meta, badge) => {
+    const row = document.createElement("div"); row.className = "overview-row";
+    const copy = document.createElement("div"); copy.append(text("strong", title), text("small", meta || "—"));
+    row.append(copy); if (badge) row.append(text("span", badge, "overview-status"));
+    return row;
+  };
+  const renderDashboardContent = (data) => {
+    dashboardContentList.replaceChildren();
+    const published = data.items.filter((item) => item.status === "published").length;
+    document.getElementById("dashboard-published-count").textContent = `${data.items.length >= 50 ? "≥" : ""}${published}`;
+    if (!data.items.length) return dashboardEmpty(dashboardContentList, "Материалов пока нет.");
+    data.items.slice(0, 4).forEach((item) => {
+      const button = document.createElement("button"); button.type = "button"; button.className = "overview-content-card";
+      button.append(text("span", ({lesson:"Урок",meditation:"Медитация",recipe:"Рецепт",nutrition_material:"Питание"}[item.content_type] || item.content_type), "overview-type"), text("strong", item.title), text("small", ({draft:"Черновик",published:"Опубликован",archived:"Архив"}[item.status] || item.status)));
+      button.addEventListener("click", () => loadCmsContentDetails(item.content_id)); dashboardContentList.append(button);
+    });
+  };
+  const renderDashboardUsers = (data) => {
+    dashboardUsersList.replaceChildren();
+    if (!data.items.length) return dashboardEmpty(dashboardUsersList, "Пользователей пока нет.");
+    data.items.slice(0, 4).forEach((user) => {
+      const button = document.createElement("button"); button.type = "button"; button.className = "overview-user-row";
+      button.append(text("strong", user.username ? `@${user.username}` : "Без username"), text("small", String(user.telegram_id)), text("span", statusLabels[user.access_status] || user.access_status, "overview-status"), text("small", user.expiry_date ? new Date(user.expiry_date).toLocaleDateString("ru-RU") : "—"));
+      button.addEventListener("click", () => loadUserDetails(user.telegram_id)); dashboardUsersList.append(button);
+    });
+  };
+  const renderDashboardSchedules = (data) => {
+    dashboardScheduleList.replaceChildren();
+    document.getElementById("dashboard-schedule-count").textContent = String(data.summary && data.summary.total_future != null ? data.summary.total_future : data.items.length);
+    if (!data.items.length) return dashboardEmpty(dashboardScheduleList, "Ближайших расписаний нет.");
+    data.items.slice(0, 3).forEach((item) => dashboardScheduleList.append(dashboardRow(item.title, item.period_label, item.status === "upcoming" ? "Опубликовано" : null)));
+  };
+  const renderDashboardGifts = (data) => {
+    dashboardGiftsList.replaceChildren();
+    if (!data.items.length) return dashboardEmpty(dashboardGiftsList, "Подарков пока нет.");
+    data.items.slice(0, 4).forEach((gift) => dashboardGiftsList.append(dashboardRow(`Подарок на ${gift.duration_label}`, gift.recipient && gift.recipient.username ? `@${gift.recipient.username}` : gift.public_reference, gift.status_label)));
+  };
+  const renderDashboardFailures = (data) => {
+    dashboardFailedList.replaceChildren();
+    if (!data.items.length) return dashboardEmpty(dashboardFailedList, "Проблем продления нет.");
+    data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
+  };
   const loadDashboard = () => {
     status.textContent = "Загружаем данные…";
+    const today = new Date();
+    document.getElementById("dashboard-clock").textContent = today.toLocaleString("ru-RU", {weekday:"long",day:"numeric",month:"long",hour:"2-digit",minute:"2-digit"});
     return api("/api/admin/dashboard").then((data) => {
       metricNodes.forEach((node) => { node.textContent = String(valueAtPath(data, node.dataset.metric) ?? "—"); });
+      const attention = Number(data.deliveries.failed || 0) + Number(data.deliveries.permanently_failed || 0) + Number(data.billing.failed_payments || 0);
+      document.getElementById("dashboard-attention-count").textContent = String(attention);
+      document.getElementById("topbar-attention").textContent = String(attention);
+      document.getElementById("sidebar-attention").textContent = String(attention);
+      document.getElementById("dashboard-migration-count").textContent = String(data.system.migrations.count);
+      document.getElementById("dashboard-scheduler-count").textContent = String(data.system.scheduler.known_jobs);
+      document.getElementById("dashboard-job-errors").textContent = String(data.system.scheduler.failed_last_24h);
       showScreen("overview");
       refresh.hidden = false;
       status.textContent = "Доступ подтверждён";
+      const scheduleQuery = new URLSearchParams({limit:"3",status:"upcoming",from:moscowDate(),to:addDays(moscowDate(),730)});
+      return Promise.allSettled([
+        api("/api/admin/content/cms?status=all&limit=50").then(renderDashboardContent),
+        api("/api/admin/users?limit=4&status=all").then(renderDashboardUsers),
+        api(`/api/admin/schedule?${scheduleQuery.toString()}`).then(renderDashboardSchedules),
+        api("/api/admin/gifts?limit=4&status=all&duration=all").then(renderDashboardGifts),
+        api("/api/admin/failed-subscriptions?limit=4&state=attention").then(renderDashboardFailures),
+      ]);
     });
   };
   const addBadges = (container, user) => {
@@ -2390,20 +2456,36 @@
   }
   webApp.ready();
   webApp.expand();
+  let adminModeConfirmed = false;
+  const mobileTelegramPlatforms = new Set(["android", "android_x", "ios"]);
+  const showFullscreenFailure = (error) => {
+    if (!fullscreenMessage) return;
+    fullscreenMessage.textContent = "Полноэкранный режим недоступен в этой версии Telegram.";
+    fullscreenMessage.hidden = false;
+    const category = typeof error === "string" ? error : error && (error.error || error.error_type);
+    if (String(category || "").toUpperCase() === "UNSUPPORTED") adminFullscreen.hidden = true;
+  };
   const updateFullscreenControl = () => {
     if (!adminFullscreen) return;
-    adminFullscreen.hidden = window.innerWidth < 1024 || Boolean(webApp.isFullscreen)
-      || typeof webApp.requestFullscreen !== "function";
+    adminFullscreen.hidden = !adminModeConfirmed || Boolean(webApp.isFullscreen)
+      || typeof webApp.requestFullscreen !== "function"
+      || mobileTelegramPlatforms.has(String(webApp.platform || "").toLowerCase());
   };
-  updateFullscreenControl();
   window.addEventListener("resize", updateFullscreenControl);
-  if (webApp.onEvent) webApp.onEvent("fullscreenChanged", updateFullscreenControl);
+  if (webApp.onEvent) {
+    webApp.onEvent("fullscreenChanged", () => {
+      if (fullscreenMessage) fullscreenMessage.hidden = true;
+      updateFullscreenControl();
+      window.requestAnimationFrame(updateFullscreenControl);
+    });
+    webApp.onEvent("fullscreenFailed", showFullscreenFailure);
+  }
   adminFullscreen.addEventListener("click", () => {
     if (typeof webApp.requestFullscreen !== "function") { adminFullscreen.hidden = true; return; }
     try {
       const result = webApp.requestFullscreen();
-      if (result && typeof result.catch === "function") result.catch(() => {});
-    } catch (_error) { /* Telegram Desktop may not support fullscreen. */ }
+      if (result && typeof result.catch === "function") result.catch(showFullscreenFailure);
+    } catch (_error) { showFullscreenFailure(); }
   });
   document.querySelectorAll("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -2426,6 +2508,8 @@
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("topbar-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
+  document.getElementById("dashboard-open-users").addEventListener("click", () => loadUsers().catch(showApiError));
+  document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
   document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
   document.getElementById("nav-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
@@ -2630,6 +2714,17 @@
     return {admin:false,identityData:null};
   }).then(({admin,identityData}) => {
     if (!admin) return loadMemberHome();
+    adminModeConfirmed = true;
+    updateFullscreenControl();
+    console.info("MINIAPP_VIEWPORT_DIAGNOSTIC", {
+      platform: String(webApp.platform || "unknown"),
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      viewportWidth: typeof webApp.viewportWidth === "number" ? webApp.viewportWidth : null,
+      viewportHeight: typeof webApp.viewportHeight === "number" ? webApp.viewportHeight : null,
+      isFullscreen: Boolean(webApp.isFullscreen),
+      requestFullscreenSupported: typeof webApp.requestFullscreen === "function",
+    });
     telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false; return loadDashboard();
   }).catch((error) => {
     if (error.message === "member_rollout_disabled") { status.textContent="Новая платформа пока доступна только участникам тестирования."; identity.hidden=true; return; }

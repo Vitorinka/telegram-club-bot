@@ -11,40 +11,31 @@
 <body>
   <main class="shell" aria-live="polite">
     <section id="admin-hero" class="card hero-card">
-      <div class="admin-topbar-copy"><p class="eyebrow">Natalia_SoulFit</p><h1 id="title">Рабочее пространство</h1></div>
+      <label class="admin-global-search"><span aria-hidden="true">⌕</span><input type="search" disabled placeholder="Поиск по пользователям, материалам, подпискам, задачам..."><small>Поиск доступен внутри разделов</small></label>
+      <div class="admin-topbar-copy"><p class="eyebrow">Natalia_SoulFit</p><h1 id="title">Админ-панель</h1></div>
       <p class="admin-status-line">
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <div class="admin-topbar-actions"><button id="admin-fullscreen" class="secondary" type="button" hidden>Развернуть</button><button id="refresh" class="secondary" type="button" hidden>Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button></div>
+      <div class="admin-topbar-actions"><small id="fullscreen-message" class="fullscreen-message" role="status" hidden></small><button id="admin-fullscreen" class="secondary" type="button" hidden>Развернуть</button><button id="refresh" class="secondary" type="button" hidden>↻ Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button><span id="topbar-attention" class="topbar-attention" aria-label="Требуют внимания">0</span><span class="admin-topbar-avatar" aria-hidden="true">N</span></div>
     </section>
-    <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
-      <header class="admin-page-heading"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия</h1><p>Контент, участники и задачи, которым нужно внимание.</p></div></header>
-      <article class="card admin-summary-card admin-summary-members"><span class="admin-summary-icon" aria-hidden="true">○</span><h2>Участники</h2><dl>
-        <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
-        <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
-        <div><dt>Trial</dt><dd data-metric="users.trial"></dd></div>
-        <div><dt>Просроченные доступы</dt><dd data-metric="users.expired_paid"></dd></div>
-      </dl></article>
-      <article class="card admin-summary-card admin-summary-subscriptions"><span class="admin-summary-icon" aria-hidden="true">◇</span><h2>Подписки</h2><dl>
-        <div><dt>Неудачные оплаты</dt><dd data-metric="billing.failed_payments"></dd></div>
-        <div><dt>Активный grace</dt><dd data-metric="billing.active_grace"></dd></div>
-        <div><dt>Истёкший grace</dt><dd data-metric="billing.expired_grace"></dd></div>
-        <div><dt>Автопродление</dt><dd data-metric="billing.auto_renew"></dd></div>
-      </dl></article>
-      <article class="card dashboard-feature admin-summary-content"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, готовность и публикация в одном пространстве.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть студию</button><button id="open-member-preview" class="secondary" type="button">Посмотреть клуб</button></div></article>
-      <article class="card admin-summary-card admin-summary-attention"><span class="admin-summary-icon" aria-hidden="true">!</span><h2>Требуют внимания</h2><dl>
-        <div><dt>Ожидают отправки</dt><dd data-metric="deliveries.pending"></dd></div>
-        <div><dt>Ошибки доставки</dt><dd data-metric="deliveries.failed"></dd></div>
-        <div><dt>Не доставлено окончательно</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
-      </dl></article>
-      <article class="card secondary-navigation dashboard-more">
-        <h2>Ещё</h2>
-        <button id="open-subscriptions-mobile" type="button">Подписки</button>
-        <button id="open-schedule-mobile" type="button">Расписание</button>
-        <button id="open-gifts" type="button">🎁 Подарки</button>
-        <button id="open-failed-subscriptions" type="button">⚠️ Проблемы продления</button>
-      </article>
+    <section id="dashboard" class="dashboard screen admin-dashboard" data-screen="overview" hidden>
+      <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия!</h1><p>Вместе мы делаем людей счастливее и здоровее 🌿</p></div><time id="dashboard-clock"></time></header>
+      <div class="admin-kpi-row">
+        <article class="card admin-kpi"><span>○</span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
+        <article class="card admin-kpi"><span>▣</span><strong id="dashboard-published-count">—</strong><small>Опубликовано материалов</small></article>
+        <article class="card admin-kpi"><span>□</span><strong id="dashboard-schedule-count">—</strong><small>Ближайших расписаний</small></article>
+        <article class="card admin-kpi admin-kpi-danger"><span>!</span><strong id="dashboard-attention-count">—</strong><small>Требуют внимания</small></article>
+      </div>
+      <div class="admin-dashboard-grid">
+        <article class="card admin-overview-panel admin-content-overview"><header><div><h2>Контент</h2><small>Управление материалами клуба</small></div><button id="open-content" class="admin-text-action" type="button">Все материалы →</button></header><div id="dashboard-content-list" class="overview-content-grid"><p class="overview-empty">Загружаем материалы…</p></div><button id="open-member-preview" class="secondary admin-quiet-action" type="button">Посмотреть клуб</button></article>
+        <article class="card admin-overview-panel admin-users-overview"><header><div><h2>Пользователи</h2><small>Участники клуба</small></div><button id="dashboard-open-users" class="admin-text-action" type="button">Все пользователи →</button></header><div class="overview-table-head"><span>Пользователь</span><span>Telegram ID</span><span>Статус</span><span>Истекает</span></div><div id="dashboard-users-list" class="overview-table"><p class="overview-empty">Загружаем пользователей…</p></div></article>
+        <article class="card admin-overview-panel admin-subscriptions-overview"><header><div><h2>Подписки</h2><small>Оплаты и доступы</small></div><button id="open-subscriptions-mobile" class="admin-text-action" type="button">Все подписки →</button></header><div class="overview-metrics"><div><strong data-metric="users.active_access">—</strong><small>Активные</small></div><div><strong data-metric="billing.active_grace">—</strong><small>Льготный период</small></div><div><strong data-metric="billing.failed_payments">—</strong><small>Ошибки оплаты</small></div><div><strong data-metric="billing.auto_renew">—</strong><small>Автопродление</small></div></div></article>
+        <article class="card admin-overview-panel admin-schedule-overview"><header><div><h2>Расписание</h2><small>Месячные расписания клуба</small></div><button id="open-schedule-mobile" class="admin-text-action" type="button">Все расписания →</button></header><div id="dashboard-schedule-list" class="overview-compact-list"><p class="overview-empty">Загружаем расписание…</p></div></article>
+        <article class="card admin-overview-panel admin-gifts-overview"><header><div><h2>Подарки</h2><small>Подарочные доступы и сертификаты</small></div><button id="open-gifts" class="admin-text-action" type="button">Все подарки →</button></header><div id="dashboard-gifts-list" class="overview-compact-list"><p class="overview-empty">Загружаем подарки…</p></div></article>
+        <article class="card admin-overview-panel admin-failed-overview"><header><div><h2>⚠ Проблемы продления</h2><small>Неудачные попытки списания</small></div><button id="open-failed-subscriptions" class="admin-text-action" type="button">Все проблемы →</button></header><div id="dashboard-failed-list" class="overview-compact-list"><p class="overview-empty">Загружаем операции…</p></div></article>
+        <article class="card admin-overview-panel admin-system-overview"><header><div><h2>Система</h2><small>Состояние и техническая информация</small></div><button id="dashboard-open-system" class="admin-text-action" type="button">Подробнее →</button></header><div class="overview-metrics overview-system-metrics"><div><strong>Online</strong><small>База данных</small></div><div><strong id="dashboard-migration-count">—</strong><small>Миграции</small></div><div><strong id="dashboard-scheduler-count">—</strong><small>Задачи планировщика</small></div><div><strong id="dashboard-job-errors">—</strong><small>Ошибки за 24 часа</small></div></div></article>
+      </div>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
       <header class="studio-heading"><div><p class="eyebrow">Редакционная студия</p><h1>Контент</h1><p>Создавайте вдохновляющие материалы для клуба.</p></div><button id="content-create-open" type="button">+ Создать материал</button></header>
@@ -477,9 +468,10 @@
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
     <button id="nav-gifts" type="button">Подарки</button>
-    <button id="nav-failed-subscriptions" type="button">Проблемы продления</button>
+    <button id="nav-failed-subscriptions" type="button">Проблемы продления <span id="sidebar-attention" class="sidebar-attention">0</span></button>
     <span class="admin-nav-group">Управление</span>
     <button type="button" data-nav="system" class="admin-more-nav"><span aria-hidden="true">•••</span><small>Ещё</small></button>
+    <blockquote class="admin-nav-quote">«Забота о себе меняет мир»<small>— Natalia_SoulFit</small></blockquote>
     <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
