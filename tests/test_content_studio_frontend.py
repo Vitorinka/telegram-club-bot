@@ -8,6 +8,20 @@ APP_JS = Path(__file__).resolve().parents[1] / "miniapp" / "app.js"
 
 
 class ContentStudioFrontendTests(unittest.TestCase):
+    def test_admin_screen_model_has_exactly_one_visible_screen(self):
+        output = self.run_node("""
+          const core=require('./miniapp/app.js');
+          const screens=['overview','content','users','system'];
+          const result={};
+          for (const active of ['users','content','system']) {
+            result[active]=screens.filter((screen)=>core.adminScreenIsVisible(active,screen));
+          }
+          console.log(JSON.stringify(result));
+        """)
+        self.assertEqual(output, {
+            "users": ["users"], "content": ["content"], "system": ["system"],
+        })
+
     def run_node(self, source):
         completed = subprocess.run(
             ["node", "-e", source],

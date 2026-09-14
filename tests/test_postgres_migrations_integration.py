@@ -67,6 +67,12 @@ from content_cms import (
     list_cms_content_studio,
     update_content_draft,
 )
+from content_cleanup import (
+    confirm_draft_delete,
+    confirm_media_remove,
+    preview_draft_delete,
+    preview_media_remove,
+)
 from content_media import (
     ContentMediaError,
     apply_media_upload,
@@ -74,6 +80,7 @@ from content_media import (
     create_media_upload,
     ensure_media_action,
     get_member_media_reference,
+    get_media_reference,
     get_media_upload,
     list_content_media,
     prepare_media_execution,
@@ -388,7 +395,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn("0027_miniapp_member_sessions", first["applied"])
         self.assertIn("0027_miniapp_member_sessions", second["applied"])
         self.assertIn("0028_content_revisions", first["applied"])
-        self.assertIn("0028_content_revisions", second["applied"])
+        self.assertIn("0029_content_draft_soft_delete", first["applied"])
+        self.assertIn("0029_content_draft_soft_delete", second["applied"])
         self.assertEqual(
             self.query_one(
                 "SELECT to_regclass('public.miniapp_member_sessions')"
@@ -710,8 +718,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 29,
-            "latest": "0028_content_revisions",
+            "count": 30,
+            "latest": "0029_content_draft_soft_delete",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2195,7 +2203,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 29)
+        self.assertEqual(len(migrations), 30)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -10418,8 +10426,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 29)
-        self.assertEqual(system["migrations"]["latest"], "0028_content_revisions")
+        self.assertEqual(system["migrations"]["count"], 30)
+        self.assertEqual(system["migrations"]["latest"], "0029_content_draft_soft_delete")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (
@@ -11282,6 +11290,107 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.assertIn("preview_expires_at", parsed_payload)
         finally:
             verify.close()
+
+    def test_content_draft_soft_delete_and_media_detach_real_postgres(self):
+        run_migrations(self.get_conn)
+        secret = "content-cleanup-test-secret"
+        draft = create_content_draft(self.get_conn, 101, {
+            "content_type": "recipe", "title": "Удаляемый черновик",
+        })
+        draft_content_id = draft["content_id"]
+        recipe_result = replace_recipe_structure(self.get_conn, draft_content_id, {
+            "expected_version": draft["version"],
+            "ingredients": [{"name":"Вода","amount":"1 стакан","sort_order":0}],
+            "steps": [{"step_number":1,"instruction":"Смешать"}],
+        })
+        draft["version"] = recipe_result["version"]
+        deleted_draft_media=str(uuid.uuid4()); conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO content_media
+                  (media_id,content_id,media_type,storage_kind,server_reference,mime_type,size_bytes,sha256,created_by_telegram_id)
+                  VALUES (%s,%s,'cover','telegram_file_id','draft_cover','image/jpeg',100,%s,101)""",
+                  (deleted_draft_media,draft_content_id,"c"*64))
+            conn.commit()
+        finally: conn.close()
+        stale = preview_draft_delete(self.get_conn, draft["content_id"], 101, draft["version"], secret)
+        update_content_draft(self.get_conn, draft["content_id"], {
+            "expected_version": draft["version"], "title": "Изменённый черновик",
+        })
+        with self.assertRaisesRegex(ContentCmsError, "content_state_changed"):
+            confirm_draft_delete(self.get_conn, stale["action_id"], 101, secret)
+        current = get_cms_content(self.get_conn, draft["content_id"])
+        preview = preview_draft_delete(self.get_conn, draft["content_id"], 101, current["version"], secret)
+        with self.assertRaisesRegex(ContentCmsError, "content_action_not_found"):
+            confirm_draft_delete(self.get_conn, preview["action_id"], 202, secret)
+        result = confirm_draft_delete(self.get_conn, preview["action_id"], 101, secret)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(confirm_draft_delete(self.get_conn, preview["action_id"], 101, secret)["status"], "completed")
+        self.assertIsNone(get_cms_content(self.get_conn, draft["content_id"]))
+        self.assertNotIn(draft["content_id"], {item["content_id"] for item in list_cms_content(self.get_conn, status="all")["items"]})
+        self.assertIsNone(get_recipe_structure(self.get_conn, draft["content_id"]))
+        with self.assertRaisesRegex(ContentCmsError, "content_not_found"):
+            replace_recipe_structure(self.get_conn, draft["content_id"], {
+                "expected_version": current["version"],
+                "ingredients": [],
+                "steps": [],
+            })
+        self.assertIsNone(get_media_reference(self.get_conn,draft["content_id"],deleted_draft_media))
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM content_media WHERE media_id=%s",(deleted_draft_media,))[0],1)
+        self.assertEqual(self.query_one("SELECT COUNT(*) FROM recipe_steps WHERE content_id=%s",(draft["content_id"],))[0],1)
+
+        published = create_content_draft(self.get_conn, 101, {"content_type":"lesson","title":"Published","duration_seconds":60})
+        archived = create_content_draft(self.get_conn, 101, {"content_type":"lesson","title":"Archived","duration_seconds":60})
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE content_items SET status='published',published_at=NOW() WHERE content_id=%s",(published["content_id"],))
+                cur.execute("UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s",(archived["content_id"],))
+            conn.commit()
+        finally: conn.close()
+        for item in (published, archived):
+            with self.assertRaisesRegex(ContentCmsError, "content_not_deletable"):
+                preview_draft_delete(self.get_conn,item["content_id"],101,item["version"],secret)
+
+        media_draft=create_content_draft(self.get_conn,101,{"content_type":"meditation","title":"Media","duration_seconds":60})
+        media_ids={kind:str(uuid.uuid4()) for kind in ("cover","video","audio")}
+        conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                for kind,media_id in media_ids.items():
+                    mime={"cover":"image/jpeg","video":"video/mp4","audio":"audio/mpeg"}[kind]
+                    cur.execute("""INSERT INTO content_media
+                      (media_id,content_id,media_type,storage_kind,server_reference,mime_type,size_bytes,sha256,created_by_telegram_id)
+                      VALUES (%s,%s,%s,'telegram_file_id',%s,%s,100,%s,101)""",
+                      (media_id,media_draft["content_id"],kind,f"file_{kind}",mime,"a"*64))
+            conn.commit()
+        finally: conn.close()
+        version=media_draft["version"]
+        stale_media=preview_media_remove(self.get_conn,media_draft["content_id"],media_ids["audio"],101,version,secret)
+        for kind in ("cover","audio","video"):
+            action=preview_media_remove(self.get_conn,media_draft["content_id"],media_ids[kind],101,version,secret)
+            removed=confirm_media_remove(self.get_conn,action["action_id"],101,secret)
+            self.assertEqual(removed["media_type"],kind)
+            version += 1
+            if kind == "cover":
+                with self.assertRaisesRegex(ContentCmsError,"content_state_changed"):
+                    confirm_media_remove(self.get_conn,stale_media["action_id"],101,secret)
+        self.assertEqual(list_content_media(self.get_conn,media_draft["content_id"]),[])
+        for media_id in media_ids.values():
+            self.assertIsNone(get_media_reference(self.get_conn,media_draft["content_id"],media_id))
+        published_media=str(uuid.uuid4()); conn=self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO content_media
+                  (media_id,content_id,media_type,storage_kind,server_reference,mime_type,size_bytes,sha256,created_by_telegram_id)
+                  VALUES (%s,%s,'cover','telegram_file_id','published_cover','image/jpeg',100,%s,101)""",
+                  (published_media,published["content_id"],"b"*64))
+            conn.commit()
+        finally: conn.close()
+        with self.assertRaisesRegex(ContentCmsError,"content_media_not_removable"):
+            preview_media_remove(self.get_conn,published["content_id"],published_media,101,published["version"],secret)
+        with self.assertRaisesRegex(ContentCmsError,"content_media_not_found"):
+            preview_media_remove(self.get_conn,media_draft["content_id"],published_media,101,version,secret)
 
     def test_migration_runner_rejects_destructive_sql(self):
         with tempfile.TemporaryDirectory() as tmp:

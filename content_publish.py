@@ -29,7 +29,7 @@ def _load_state(cur, content_id, *, lock=False):
         SELECT content_id,content_type,category,title,description,duration_seconds,
                sort_order,status,version,published_at,archived_at,
                logical_content_id,revision_of,revision_number
-        FROM content_items WHERE content_id=%s
+        FROM content_items WHERE content_id=%s AND deleted_at IS NULL
     """ + (" FOR UPDATE" if lock else ""), (content_id,))
     row = cur.fetchone()
     if not row:

@@ -17,7 +17,7 @@
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <div class="admin-topbar-actions"><small id="fullscreen-message" class="fullscreen-message" role="status" hidden></small><button id="admin-fullscreen" class="secondary" type="button" hidden>Развернуть</button><button id="refresh" class="secondary" type="button" hidden>↻ Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button><span id="topbar-attention" class="topbar-attention" aria-label="Требуют внимания">0</span><span class="admin-topbar-avatar" aria-hidden="true">N</span></div>
+      <div class="admin-topbar-actions"><small id="fullscreen-message" class="fullscreen-message" role="status" hidden></small><button id="admin-fullscreen" class="secondary" type="button" hidden>Развернуть</button><button id="open-club-global" class="secondary" type="button">Открыть клуб</button><button id="refresh" class="secondary" type="button" hidden aria-label="Обновить">↻</button><button id="topbar-create-content" type="button"><span class="create-wide-label">+ Создать материал</span><span class="create-mobile-label">+ Материал</span></button><span id="topbar-attention" class="topbar-attention" aria-label="Требуют внимания">0</span><span class="admin-topbar-avatar" aria-hidden="true">N</span></div>
     </section>
     <section id="dashboard" class="dashboard screen admin-dashboard" data-screen="overview" hidden>
       <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия!</h1><p>Вместе мы делаем людей счастливее и здоровее 🌿</p></div><time id="dashboard-clock"></time></header>
@@ -25,7 +25,7 @@
         <article class="card admin-kpi"><span>○</span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
         <article class="card admin-kpi"><span>▣</span><strong id="dashboard-published-count">—</strong><small>Опубликовано материалов</small></article>
         <article class="card admin-kpi"><span>□</span><strong id="dashboard-schedule-count">—</strong><small>Ближайших расписаний</small></article>
-        <article class="card admin-kpi admin-kpi-danger"><span>!</span><strong id="dashboard-attention-count">—</strong><small>Требуют внимания</small></article>
+        <button id="dashboard-open-attention" class="card admin-kpi admin-kpi-danger" type="button"><span>!</span><strong id="dashboard-attention-count">—</strong><small>Требуют внимания</small></button>
       </div>
       <div class="admin-dashboard-grid">
         <article class="card admin-overview-panel admin-content-overview"><header><div><h2>Контент</h2><small>Управление материалами клуба</small></div><button id="open-content" class="admin-text-action" type="button">Все материалы →</button></header><div id="dashboard-content-list" class="overview-content-grid"><p class="overview-empty">Загружаем материалы…</p></div><button id="open-member-preview" class="secondary admin-quiet-action" type="button">Посмотреть клуб</button></article>
@@ -90,7 +90,8 @@
       </article>
     </section>
     <section id="content-details" class="screen page" data-screen="content-details" hidden>
-      <header class="studio-toolbar"><button id="content-back" class="secondary" type="button">← Контент</button><span id="content-editor-state">Все изменения сохранены ✓</span><button id="content-toolbar-preview" class="secondary" type="button">Предпросмотр</button><button id="content-toolbar-publish" type="button">Опубликовать</button></header>
+      <header class="studio-toolbar"><button id="content-back" class="secondary" type="button">← Контент</button><div class="studio-editor-title"><strong id="content-editor-title">Материал</strong><span id="content-editor-status" class="badge studio-status draft">Черновик</span></div><button id="content-editor-more" class="secondary" type="button" aria-expanded="false" aria-controls="content-editor-menu">⋯</button><span id="content-editor-state">Все изменения сохранены ✓</span></header>
+      <nav id="content-editor-menu" class="card studio-editor-menu" aria-label="Действия с материалом" hidden><button id="content-menu-preview" type="button">Предпросмотр</button><button id="content-menu-history" type="button">История изменений</button><button id="content-menu-technical" type="button">Техническая информация</button></nav>
       <div id="content-details-content" class="dashboard"></div>
       <div id="content-studio-tabs" class="studio-mobile-tabs"><button class="active" data-studio-panel="editor" type="button">Редактор</button><button data-studio-panel="preview" type="button">Предпросмотр</button></div>
       <div id="content-studio-workspace" class="studio-workspace"><article id="content-edit-card" class="card studio-editor" hidden>
@@ -102,7 +103,7 @@
         <label class="authoring-field">Длительность <input id="content-edit-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04"></label>
         <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
         <p id="content-edit-message" class="hint"></p>
-        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button><button id="content-authoring-publish" type="button">Сохранить и опубликовать</button></div>
+        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button></div>
       </article><aside id="content-live-preview" class="card studio-preview"><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
       <button id="content-create-revision" type="button" hidden>Редактировать</button>
       <article id="content-recipe-card" class="card" hidden>
@@ -172,7 +173,8 @@
           <button id="content-lifecycle-cancel" class="secondary" type="button" hidden>Отмена</button>
         </div>
       </article>
-      <details id="content-version-history-card" class="card studio-history"><summary>⋯ Ещё · История изменений</summary>
+      <footer id="content-editor-actions" class="studio-editor-actions" hidden><button id="content-bottom-save" class="secondary" type="button">Сохранить</button><button id="content-bottom-publish" type="button">Опубликовать</button></footer>
+      <details id="content-version-history-card" class="card studio-history"><summary>История изменений</summary><button id="content-history-close" class="secondary" type="button">Закрыть</button>
         <h2>История версий</h2>
         <div id="content-version-history" class="dashboard"></div>
         <p id="content-version-history-empty" class="hint">История версий пока пуста.</p>
@@ -380,7 +382,8 @@
       <article class="card">
         <h2>Система / Ошибки</h2>
         <div class="summary-grid">
-          <div><span>DB</span><strong data-system-metric="database">—</strong></div>
+          <div><span>База данных</span><strong data-system-metric="database">—</strong></div>
+          <div><span>Схема базы</span><strong data-system-metric="schema">—</strong></div>
           <div><span>Задачи планировщика</span><strong data-system-metric="scheduler.known_jobs">—</strong></div>
           <div><span>Ошибки за 24 часа</span><strong data-system-metric="scheduler.failed_last_24h">—</strong></div>
           <div><span>Не доставлено окончательно</span><strong data-system-metric="deliveries.permanently_failed">—</strong></div>
@@ -399,9 +402,26 @@
       </article>
       <div id="deliveries-list" class="user-list"></div>
       <button id="deliveries-more" type="button" hidden>Показать ещё</button>
-      <article class="card"><h2>Планировщик</h2><div id="scheduler-runs" class="compact-list"></div></article>
-      <article class="card"><h2>Миграции</h2><dl id="system-migrations"></dl></article>
+      <details class="card system-technical-details"><summary>Технические детали</summary><article><h2>Планировщик</h2><div id="scheduler-runs" class="compact-list"></div></article><article><h2>Миграции</h2><dl id="system-migrations"></dl></article></details>
       <article class="card secondary-navigation"><h2>Служебные инструменты</h2><button id="open-content-legacy" type="button">Content Studio</button></article>
+    </section>
+    <section id="attention-screen" class="screen page" data-screen="attention" hidden>
+      <header class="mobile-page-heading"><p class="eyebrow">Безопасная очередь</p><h1>Требуют внимания</h1></header>
+      <div class="studio-chips" aria-label="Фильтр внимания"><button class="active" type="button">Все</button><button type="button">Нужно действие</button><button type="button">Системные</button></div>
+      <div id="attention-list" class="attention-list"><p class="card">Загружаем…</p></div>
+      <button id="attention-back" class="secondary" type="button">← К обзору</button>
+    </section>
+    <section id="admin-more-screen" class="screen page admin-more-screen" data-screen="more" hidden>
+      <header class="mobile-page-heading"><p class="eyebrow">Управление</p><h1>Ещё</h1></header>
+      <nav class="card mobile-more-menu" aria-label="Дополнительные разделы">
+        <button id="more-subscriptions" type="button"><span aria-hidden="true">◇</span><strong>Подписки</strong><i>›</i></button>
+        <button id="more-schedule" type="button"><span aria-hidden="true">□</span><strong>Расписание</strong><i>›</i></button>
+        <button id="more-gifts" type="button"><span aria-hidden="true">♡</span><strong>Подарки</strong><i>›</i></button>
+        <button id="more-failed-subscriptions" type="button"><span aria-hidden="true">!</span><strong>Проблемы продления</strong><em id="more-attention">0</em><i>›</i></button>
+        <button id="more-system" type="button"><span aria-hidden="true">⚙</span><strong>Система</strong><i>›</i></button>
+        <button id="more-open-club" type="button"><span aria-hidden="true">⌂</span><strong>Открыть клуб</strong><i>›</i></button>
+      </nav>
+      <article class="card mobile-admin-profile"><span class="admin-topbar-avatar" aria-hidden="true">N</span><div><strong>Natalia_SoulFit</strong><small>Администратор · технические сведения доступны в разделе «Система»</small></div></article>
     </section>
     <section id="delivery-details" class="screen page" data-screen="delivery-details" hidden>
       <button id="deliveries-back" class="secondary" type="button">← К системе</button>
@@ -470,7 +490,8 @@
     <button id="nav-gifts" type="button">Подарки</button>
     <button id="nav-failed-subscriptions" type="button">Проблемы продления <span id="sidebar-attention" class="sidebar-attention">0</span></button>
     <span class="admin-nav-group">Управление</span>
-    <button type="button" data-nav="system" class="admin-more-nav"><span aria-hidden="true">•••</span><small>Ещё</small></button>
+    <button type="button" data-nav="system" class="desktop-system-nav">Система</button>
+    <button type="button" data-nav="more" class="admin-more-nav"><span aria-hidden="true">•••</span><small>Ещё</small></button>
     <blockquote class="admin-nav-quote">«Забота о себе меняет мир»<small>— Natalia_SoulFit</small></blockquote>
     <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>

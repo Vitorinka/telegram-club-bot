@@ -207,6 +207,15 @@ from content_publish import (
     get_version,
     list_versions,
 )
+from content_cleanup import (
+    DRAFT_DELETE_ACTION,
+    MEDIA_REMOVE_ACTION,
+    cancel_cleanup,
+    confirm_draft_delete,
+    confirm_media_remove,
+    preview_draft_delete,
+    preview_media_remove,
+)
 from content_revisions import create_published_revision
 from content_taxonomy import get_content_categories, list_categories
 from member_preview import (
@@ -22631,6 +22640,60 @@ async def miniapp_admin_cms_content_update(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+async def miniapp_admin_content_delete_preview(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = preview_draft_delete(get_db_conn, request.match_info.get("content_id"), request["miniapp_admin"].telegram_id, body.get("expected_version"), WEBHOOK_SECRET)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_delete_confirm(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = confirm_draft_delete(get_db_conn, body.get("action_id"), request["miniapp_admin"].telegram_id, WEBHOOK_SECRET)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_delete_cancel(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = cancel_cleanup(get_db_conn, body.get("action_id"), request["miniapp_admin"].telegram_id, DRAFT_DELETE_ACTION)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_media_remove_preview(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = preview_media_remove(get_db_conn, request.match_info.get("content_id"), request.match_info.get("media_id"), request["miniapp_admin"].telegram_id, body.get("expected_version"), WEBHOOK_SECRET)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_media_remove_confirm(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = confirm_media_remove(get_db_conn, body.get("action_id"), request["miniapp_admin"].telegram_id, WEBHOOK_SECRET)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_content_media_remove_cancel(request):
+    try:
+        body = await read_content_cms_json(request)
+        result = cancel_cleanup(get_db_conn, body.get("action_id"), request["miniapp_admin"].telegram_id, MEDIA_REMOVE_ACTION)
+    except ContentCmsError as error:
+        return content_cms_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_content_revision_create(request):
     try:
         result = create_published_revision(
@@ -24399,6 +24462,16 @@ def create_app():
         ('/api/admin/content/cms/{content_id}/archive-preview', miniapp_admin_content_archive_preview),
         ('/api/admin/content/cms/{content_id}/archive-confirm', miniapp_admin_content_archive_confirm),
         ('/api/admin/content/cms/{content_id}/archive-cancel', miniapp_admin_content_archive_cancel),
+    ):
+        if not _route_exists(app, "POST", path):
+            app.router.add_post(path, handler)
+    for path, handler in (
+        ('/api/admin/content/cms/{content_id}/delete-preview', miniapp_admin_content_delete_preview),
+        ('/api/admin/content/cms/{content_id}/delete-confirm', miniapp_admin_content_delete_confirm),
+        ('/api/admin/content/cms/{content_id}/delete-cancel', miniapp_admin_content_delete_cancel),
+        ('/api/admin/content/cms/{content_id}/media/{media_id}/remove-preview', miniapp_admin_content_media_remove_preview),
+        ('/api/admin/content/cms/{content_id}/media/{media_id}/remove-confirm', miniapp_admin_content_media_remove_confirm),
+        ('/api/admin/content/cms/{content_id}/media/{media_id}/remove-cancel', miniapp_admin_content_media_remove_cancel),
     ):
         if not _route_exists(app, "POST", path):
             app.router.add_post(path, handler)
