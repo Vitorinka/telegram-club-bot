@@ -16,10 +16,10 @@
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <div class="admin-topbar-actions"><button id="refresh" class="secondary" type="button" hidden>Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button></div>
+      <div class="admin-topbar-actions"><button id="admin-fullscreen" class="secondary" type="button" hidden>Развернуть</button><button id="refresh" class="secondary" type="button" hidden>Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button></div>
     </section>
     <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
-      <header class="admin-page-heading"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия</h1><p>Контент, участники и задачи, которым нужно внимание.</p></div><button id="dashboard-create-content" type="button">+ Создать материал</button></header>
+      <header class="admin-page-heading"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия</h1><p>Контент, участники и задачи, которым нужно внимание.</p></div></header>
       <article class="card admin-summary-card admin-summary-members"><span class="admin-summary-icon" aria-hidden="true">○</span><h2>Участники</h2><dl>
         <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
         <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
@@ -34,12 +34,12 @@
       </dl></article>
       <article class="card dashboard-feature admin-summary-content"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, готовность и публикация в одном пространстве.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть студию</button><button id="open-member-preview" class="secondary" type="button">Посмотреть клуб</button></div></article>
       <article class="card admin-summary-card admin-summary-attention"><span class="admin-summary-icon" aria-hidden="true">!</span><h2>Требуют внимания</h2><dl>
-        <div><dt>Pending</dt><dd data-metric="deliveries.pending"></dd></div>
-        <div><dt>Failed</dt><dd data-metric="deliveries.failed"></dd></div>
-        <div><dt>Permanently failed</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
+        <div><dt>Ожидают отправки</dt><dd data-metric="deliveries.pending"></dd></div>
+        <div><dt>Ошибки доставки</dt><dd data-metric="deliveries.failed"></dd></div>
+        <div><dt>Не доставлено окончательно</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
       </dl></article>
-      <article class="card secondary-navigation">
-        <h2>Дополнительные разделы</h2>
+      <article class="card secondary-navigation dashboard-more">
+        <h2>Ещё</h2>
         <button id="open-subscriptions-mobile" type="button">Подписки</button>
         <button id="open-schedule-mobile" type="button">Расписание</button>
         <button id="open-gifts" type="button">🎁 Подарки</button>
@@ -390,10 +390,10 @@
         <h2>Система / Ошибки</h2>
         <div class="summary-grid">
           <div><span>DB</span><strong data-system-metric="database">—</strong></div>
-          <div><span>Scheduler jobs</span><strong data-system-metric="scheduler.known_jobs">—</strong></div>
-          <div><span>Failed jobs 24h</span><strong data-system-metric="scheduler.failed_last_24h">—</strong></div>
-          <div><span>Permanently failed</span><strong data-system-metric="deliveries.permanently_failed">—</strong></div>
-          <div><span>Retryable removals</span><strong data-system-metric="removals.retryable">—</strong></div>
+          <div><span>Задачи планировщика</span><strong data-system-metric="scheduler.known_jobs">—</strong></div>
+          <div><span>Ошибки за 24 часа</span><strong data-system-metric="scheduler.failed_last_24h">—</strong></div>
+          <div><span>Не доставлено окончательно</span><strong data-system-metric="deliveries.permanently_failed">—</strong></div>
+          <div><span>Повторные удаления</span><strong data-system-metric="removals.retryable">—</strong></div>
         </div>
       </article>
       <article class="card system-compact-card"><h2>Требуют внимания</h2><dl id="system-attention"></dl></article>
@@ -401,9 +401,9 @@
       <article class="card">
         <h2>События доставки</h2>
         <select id="deliveries-status" aria-label="Статус доставки">
-          <option value="all">Все</option><option value="pending">Pending</option>
-          <option value="failed">Failed</option><option value="permanently_failed">Permanently failed</option>
-          <option value="sent">Sent</option>
+          <option value="all">Все</option><option value="pending">Ожидают</option>
+          <option value="failed">С ошибкой</option><option value="permanently_failed">Не доставлено окончательно</option>
+          <option value="sent">Доставлено</option>
         </select>
       </article>
       <div id="deliveries-list" class="user-list"></div>
@@ -471,15 +471,15 @@
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
     <div class="admin-nav-brand" aria-hidden="true"><span class="admin-brand-lotus">◇</span><strong>Natalia_SoulFit</strong><small>Больше, чем клуб</small></div>
     <span class="admin-nav-group">Рабочее пространство</span>
-    <button type="button" data-nav="overview">Обзор</button>
-    <button type="button" data-nav="content">Контент</button>
-    <button type="button" data-nav="users">Пользователи</button>
+    <button type="button" data-nav="overview"><span aria-hidden="true">⌂</span><small>Обзор</small></button>
+    <button type="button" data-nav="content"><span aria-hidden="true">▣</span><small>Контент</small></button>
+    <button type="button" data-nav="users"><span aria-hidden="true">○</span><small>Участники</small></button>
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
     <button id="nav-gifts" type="button">Подарки</button>
     <button id="nav-failed-subscriptions" type="button">Проблемы продления</button>
     <span class="admin-nav-group">Управление</span>
-    <button type="button" data-nav="system">Система</button>
+    <button type="button" data-nav="system" class="admin-more-nav"><span aria-hidden="true">•••</span><small>Ещё</small></button>
     <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>

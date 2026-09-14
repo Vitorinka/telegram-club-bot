@@ -67,6 +67,7 @@
   const refresh = document.getElementById("refresh");
   const adminHero = document.getElementById("admin-hero");
   const bottomNav = document.getElementById("bottom-nav");
+  const adminFullscreen = document.getElementById("admin-fullscreen");
   const memberBottomNav = document.getElementById("member-bottom-nav");
   const memberShellHeader = document.getElementById("member-shell-header");
   const usersSearch = document.getElementById("users-search");
@@ -1004,10 +1005,14 @@
     article.className = "card user-card";
     const button = document.createElement("button");
     button.type = "button";
-    button.append(text("h2", user.username ? `@${user.username}` : "Без username"));
-    button.append(text("p", `Telegram ID: ${user.telegram_id}`));
-    button.append(text("p", `Доступ до: ${user.expiry_date || "—"}`));
-    addBadges(button, user);
+    const identityCell = document.createElement("div"); identityCell.className = "user-identity-cell";
+    identityCell.append(text("span", (user.username || "?").slice(0, 1).toUpperCase(), "user-avatar"), text("h2", user.username ? `@${user.username}` : "Без username"));
+    const telegram = text("p", `ID ${user.telegram_id}`, "user-telegram-cell");
+    const access = document.createElement("div"); access.className = "user-access-cell"; addBadges(access, user);
+    const subscription = text("p", user.auto_renew ? "Автопродление" : "Без автопродления", "user-subscription-cell");
+    const expiry = text("p", user.expiry_date || "—", "user-expiry-cell");
+    const action = text("span", "Открыть →", "user-action-cell");
+    button.append(identityCell, telegram, access, subscription, expiry, action);
     button.addEventListener("click", () => loadUserDetails(user.telegram_id));
     article.append(button);
     return article;
@@ -1296,13 +1301,13 @@
         }
       });
       replaceDefinitionList(systemAttention, [
-        ["Permanently failed deliveries", data.deliveries.permanently_failed],
-        ["Failed scheduler jobs 24h", data.scheduler.failed_last_24h],
-        ["Retryable removals", data.removals.retryable],
+        ["Не доставлено окончательно", data.deliveries.permanently_failed],
+        ["Ошибки планировщика за 24 часа", data.scheduler.failed_last_24h],
+        ["Повторные удаления", data.removals.retryable],
       ]);
       replaceDefinitionList(systemDeliveryMetrics, [
-        ["Pending", data.deliveries.pending], ["Processing", data.deliveries.processing],
-        ["Failed", data.deliveries.failed], ["Permanently failed", data.deliveries.permanently_failed],
+        ["Ожидают", data.deliveries.pending], ["В обработке", data.deliveries.processing],
+        ["С ошибкой", data.deliveries.failed], ["Не доставлено окончательно", data.deliveries.permanently_failed],
         ["Sent 24h", data.deliveries.sent_last_24h],
       ]);
       replaceDefinitionList(systemMigrations, [
@@ -2385,6 +2390,21 @@
   }
   webApp.ready();
   webApp.expand();
+  const updateFullscreenControl = () => {
+    if (!adminFullscreen) return;
+    adminFullscreen.hidden = window.innerWidth < 1024 || Boolean(webApp.isFullscreen)
+      || typeof webApp.requestFullscreen !== "function";
+  };
+  updateFullscreenControl();
+  window.addEventListener("resize", updateFullscreenControl);
+  if (webApp.onEvent) webApp.onEvent("fullscreenChanged", updateFullscreenControl);
+  adminFullscreen.addEventListener("click", () => {
+    if (typeof webApp.requestFullscreen !== "function") { adminFullscreen.hidden = true; return; }
+    try {
+      const result = webApp.requestFullscreen();
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch (_error) { /* Telegram Desktop may not support fullscreen. */ }
+  });
   document.querySelectorAll("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => {
       guardContentNavigation(() => {
@@ -2405,7 +2425,6 @@
   document.getElementById("open-content-legacy").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("topbar-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
-  document.getElementById("dashboard-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
   document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
