@@ -20,7 +20,8 @@
       <button id="refresh" type="button" hidden>Обновить данные</button>
     </section>
     <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
-      <article class="card"><h2>Обзор</h2><dl>
+      <header class="admin-page-heading"><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день</h1><p>Контент, участники и задачи, которым нужно внимание.</p></header>
+      <article class="card"><h2>Участники</h2><dl>
         <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
         <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
         <div><dt>Trial</dt><dd data-metric="users.trial"></dd></div>
@@ -40,6 +41,8 @@
       </dl></article>
       <article class="card secondary-navigation">
         <h2>Дополнительные разделы</h2>
+        <button id="open-subscriptions-mobile" type="button">Подписки</button>
+        <button id="open-schedule-mobile" type="button">Расписание</button>
         <button id="open-gifts" type="button">🎁 Подарки</button>
         <button id="open-failed-subscriptions" type="button">⚠️ Проблемы продления</button>
       </article>
@@ -56,7 +59,7 @@
       </article>
       <div id="cms-content-list" class="studio-grid"></div>
       <p id="cms-content-empty" class="card" hidden>Материалов по выбранным фильтрам нет.</p>
-      <details class="card studio-legacy"><summary>Ещё · служебные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Служебных материалов нет.</p></details>
+      <details class="card studio-legacy"><summary>Дополнительные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Дополнительных материалов пока нет.</p></details>
       <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
     </section>
     <section id="content-create" class="screen page" data-screen="content-create" hidden>
@@ -467,12 +470,16 @@
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
+    <div class="admin-nav-brand" aria-hidden="true"><span>◇</span><strong>Natalia_SoulFit</strong><small>Управление клубом</small></div>
     <button type="button" data-nav="overview">Обзор</button>
     <button type="button" data-nav="content">Контент</button>
     <button type="button" data-nav="users">Пользователи</button>
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
+    <button id="nav-gifts" type="button">Подарки</button>
+    <button id="nav-failed-subscriptions" type="button">Проблемы продления</button>
     <button type="button" data-nav="system">Система</button>
+    <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
     <button type="button" data-member-nav="member-home"><span aria-hidden="true">⌂</span><small>Главная</small></button>

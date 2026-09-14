@@ -510,9 +510,8 @@
     if (!realMemberMode) {
       const actions = document.createElement("div");
       actions.className = "member-admin-card-actions";
-      const edit = text("button", item.status === "published" ? "Новая версия" : item.status === "archived" ? "Только просмотр" : "Редактировать");
+      const edit = text("button", item.status === "published" ? "Новая версия" : item.status === "archived" ? "Открыть в админке" : "Редактировать");
       edit.type = "button";
-      edit.disabled = item.status === "archived";
       edit.addEventListener("click", () => {
         if (item.status === "published") loadCmsContentDetails(item.content_id).then(createContentRevision).catch(showApiError);
         else loadCmsContentDetails(item.content_id).catch(showApiError);
@@ -632,8 +631,8 @@
       if (!realMemberMode) {
         const toolbar = document.createElement("section");
         toolbar.className = "member-card member-admin-toolbar";
-        const edit = text("button", item.status === "published" ? "Создать новую версию" : "Редактировать");
-        edit.type = "button"; edit.disabled = item.status === "archived";
+        const edit = text("button", item.status === "published" ? "Создать новую версию" : "Открыть в админке");
+        edit.type = "button";
         edit.addEventListener("click", () => loadCmsContentDetails(item.content_id).then(() => item.status === "published" ? createContentRevision() : null).catch(showApiError));
         toolbar.append(edit);
         if (item.status === "draft" || item.status === "published") {
@@ -1917,8 +1916,8 @@
     const actions=document.createElement("div"); actions.className="studio-card-actions";
     const edit=text("button",item.status==="draft" ? "Редактировать" : "Открыть","secondary"); edit.type="button";
     edit.addEventListener("click",()=>loadCmsContentDetails(item.content_id));
-    const preview=text("button","Предпросмотр","secondary"); preview.type="button";
-    preview.addEventListener("click",()=>openCmsContentPreview(item.content_id));
+    const preview=text("button","Посмотреть в клубе","secondary"); preview.type="button";
+    preview.addEventListener("click",()=>loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
     actions.append(edit,preview);
     article.append(button,actions);
     return article;
@@ -2401,10 +2400,14 @@
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("open-subscriptions-mobile").addEventListener("click", () => loadSubscriptions().catch(showApiError));
+  document.getElementById("open-schedule-mobile").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("open-content-legacy").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
+  document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("nav-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
   failedSubscriptionsFilter.addEventListener("change", () => { failedSubscriptionsCursor=null; loadFailedSubscriptions(false); });
   failedSubscriptionsMore.addEventListener("click", () => loadFailedSubscriptions(true));
   document.getElementById("failed-subscriptions-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
