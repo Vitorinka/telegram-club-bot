@@ -11,48 +11,43 @@
 <body>
   <main class="shell" aria-live="polite">
     <section id="admin-hero" class="card hero-card">
-      <p class="eyebrow">Telegram Club Bot</p>
-      <h1 id="title">Админ-платформа</h1>
+      <div class="admin-topbar-copy"><p class="eyebrow">Natalia_SoulFit</p><h1 id="title">Рабочее пространство</h1></div>
       <p class="admin-status-line">
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <button id="refresh" type="button" hidden>Обновить данные</button>
+      <div class="admin-topbar-actions"><button id="refresh" class="secondary" type="button" hidden>Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button></div>
     </section>
     <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
-      <article class="card"><h2>Обзор</h2><dl>
+      <header class="admin-page-heading"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия</h1><p>Контент, участники и задачи, которым нужно внимание.</p></div><button id="dashboard-create-content" type="button">+ Создать материал</button></header>
+      <article class="card admin-summary-card admin-summary-members"><span class="admin-summary-icon" aria-hidden="true">○</span><h2>Участники</h2><dl>
         <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
         <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
         <div><dt>Trial</dt><dd data-metric="users.trial"></dd></div>
         <div><dt>Просроченные доступы</dt><dd data-metric="users.expired_paid"></dd></div>
       </dl></article>
-      <article class="card"><h2>Оплата</h2><dl>
+      <article class="card admin-summary-card admin-summary-subscriptions"><span class="admin-summary-icon" aria-hidden="true">◇</span><h2>Подписки</h2><dl>
         <div><dt>Неудачные оплаты</dt><dd data-metric="billing.failed_payments"></dd></div>
         <div><dt>Активный grace</dt><dd data-metric="billing.active_grace"></dd></div>
         <div><dt>Истёкший grace</dt><dd data-metric="billing.expired_grace"></dd></div>
         <div><dt>Автопродление</dt><dd data-metric="billing.auto_renew"></dd></div>
       </dl></article>
-      <article class="card"><h2>Доставка</h2><dl>
+      <article class="card dashboard-feature admin-summary-content"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, готовность и публикация в одном пространстве.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть студию</button><button id="open-member-preview" class="secondary" type="button">Посмотреть клуб</button></div></article>
+      <article class="card admin-summary-card admin-summary-attention"><span class="admin-summary-icon" aria-hidden="true">!</span><h2>Требуют внимания</h2><dl>
         <div><dt>Pending</dt><dd data-metric="deliveries.pending"></dd></div>
         <div><dt>Failed</dt><dd data-metric="deliveries.failed"></dd></div>
         <div><dt>Permanently failed</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
       </dl></article>
-      <article class="card"><h2>Система</h2><dl>
-        <div><dt>DB pool used</dt><dd data-metric="system.db_pool.pool_used"></dd></div>
-        <div><dt>Migrations</dt><dd data-metric="system.migrations.count"></dd></div>
-        <div><dt>Latest</dt><dd data-metric="system.migrations.latest"></dd></div>
-        <div><dt>Scheduler jobs</dt><dd data-metric="system.scheduler.known_jobs"></dd></div>
-      </dl></article>
       <article class="card secondary-navigation">
         <h2>Дополнительные разделы</h2>
+        <button id="open-subscriptions-mobile" type="button">Подписки</button>
+        <button id="open-schedule-mobile" type="button">Расписание</button>
         <button id="open-gifts" type="button">🎁 Подарки</button>
-        <button id="open-content" type="button">📚 Контент</button>
-        <button id="open-member-preview" type="button">✨ Предпросмотр клуба</button>
         <button id="open-failed-subscriptions" type="button">⚠️ Проблемы продления</button>
       </article>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
-      <header class="studio-heading"><div><p class="eyebrow">Режим администратора</p><h1>Контент</h1><p>Управляйте материалами прямо в интерфейсе клуба.</p></div><button id="content-create-open" type="button">+ Добавить</button></header>
+      <header class="studio-heading"><div><p class="eyebrow">Редакционная студия</p><h1>Контент</h1><p>Создавайте вдохновляющие материалы для клуба.</p></div><button id="content-create-open" type="button">+ Создать материал</button></header>
       <article class="card studio-filters">
         <div id="content-status-filters" class="studio-chips" aria-label="Статус материалов">
           <button class="active" data-content-status="all" type="button">Все</button><button data-content-status="draft" type="button">Черновики</button><button data-content-status="published" type="button">Опубликованные</button><button data-content-status="archived" type="button">Архив</button>
@@ -63,7 +58,7 @@
       </article>
       <div id="cms-content-list" class="studio-grid"></div>
       <p id="cms-content-empty" class="card" hidden>Материалов по выбранным фильтрам нет.</p>
-      <details class="card studio-legacy"><summary>Ещё · служебные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Служебных материалов нет.</p></details>
+      <details class="card studio-legacy"><summary>Дополнительные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Дополнительных материалов пока нет.</p></details>
       <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
     </section>
     <section id="content-create" class="screen page" data-screen="content-create" hidden>
@@ -415,13 +410,14 @@
       <button id="deliveries-more" type="button" hidden>Показать ещё</button>
       <article class="card"><h2>Планировщик</h2><div id="scheduler-runs" class="compact-list"></div></article>
       <article class="card"><h2>Миграции</h2><dl id="system-migrations"></dl></article>
+      <article class="card secondary-navigation"><h2>Служебные инструменты</h2><button id="open-content-legacy" type="button">Content Studio</button></article>
     </section>
     <section id="delivery-details" class="screen page" data-screen="delivery-details" hidden>
       <button id="deliveries-back" class="secondary" type="button">← К системе</button>
       <div id="delivery-details-content" class="dashboard"></div>
     </section>
     <div id="member-shell-header" class="member-shell-header" hidden>
-      <div class="member-preview-strip"><span>Режим предпросмотра</span><button class="member-exit" type="button">Вернуться в админку</button></div>
+      <div class="member-preview-strip"><span id="member-mode-label">Режим администратора</span><button class="member-exit" type="button">Вернуться в админку</button></div>
       <header class="member-header"><div><span>Закрытый клуб</span><strong>Натальи Ребковец</strong></div><span class="member-header-mark" aria-hidden="true">✦</span></header>
     </div>
     <section id="member-home" class="screen member-page" data-screen="member-home" hidden>
@@ -430,7 +426,7 @@
         <div class="member-hero-media" role="img" aria-label="Wellness-практика"></div>
       </article>
       <section class="member-section">
-        <div class="member-section-title"><h2>Тренировки</h2><button id="member-home-all" type="button">Все тренировки</button></div>
+        <div class="member-section-title"><h2>Тренировки</h2><div class="member-section-actions"><button class="member-admin-create" data-create-content="lesson" type="button">+ Добавить</button><button id="member-home-all" type="button">Все тренировки</button></div></div>
         <div class="member-grid member-training-tiles" aria-label="Направления тренировок">
           <button type="button" data-member-category-nav="strength"><span data-member-icon="strength" aria-hidden="true"></span><small>Силовые</small></button>
           <button type="button" data-member-category-nav="flexibility"><span data-member-icon="flexibility" aria-hidden="true"></span><small>Гибкость</small></button>
@@ -473,12 +469,18 @@
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
+    <div class="admin-nav-brand" aria-hidden="true"><span class="admin-brand-lotus">◇</span><strong>Natalia_SoulFit</strong><small>Больше, чем клуб</small></div>
+    <span class="admin-nav-group">Рабочее пространство</span>
     <button type="button" data-nav="overview">Обзор</button>
     <button type="button" data-nav="content">Контент</button>
     <button type="button" data-nav="users">Пользователи</button>
     <button type="button" data-nav="subscriptions">Подписки</button>
     <button type="button" data-nav="schedule">Расписание</button>
+    <button id="nav-gifts" type="button">Подарки</button>
+    <button id="nav-failed-subscriptions" type="button">Проблемы продления</button>
+    <span class="admin-nav-group">Управление</span>
     <button type="button" data-nav="system">Система</button>
+    <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
     <button type="button" data-member-nav="member-home"><span aria-hidden="true">⌂</span><small>Главная</small></button>

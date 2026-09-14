@@ -5,7 +5,7 @@ from nutrition_cms import get_nutrition_body
 
 
 MEMBER_PREVIEW_LIMIT = 50
-MEMBER_PREVIEW_STATUSES = ("draft", "published")
+MEMBER_PREVIEW_STATUSES = ("draft", "published", "archived")
 MEMBER_PREVIEW_CONTENT_TYPES = frozenset({"lesson", "meditation", "recipe", "nutrition_material"})
 
 
@@ -105,7 +105,7 @@ def list_member_preview_content(get_connection, *, limit=MEMBER_PREVIEW_LIMIT,
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = %s
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             """ + category_clause + """
             ORDER BY c.sort_order ASC, c.updated_at DESC, c.content_id ASC
             LIMIT %s
@@ -133,7 +133,7 @@ def get_member_preview_content(get_connection, content_id, *, content_type=None)
             WHERE c.content_id = %s
               AND c.content_type = COALESCE(%s, c.content_type)
               AND c.content_type IN ('lesson', 'meditation', 'recipe', 'nutrition_material')
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             """,
             (content_id, content_type),
         )
@@ -160,7 +160,7 @@ def get_member_preview_home(get_connection):
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'lesson'
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             ORDER BY c.updated_at DESC, c.content_id ASC
             LIMIT 6
             """
@@ -169,7 +169,7 @@ def get_member_preview_home(get_connection):
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'meditation'
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             ORDER BY c.updated_at DESC, c.content_id ASC
             LIMIT 6
             """
@@ -178,7 +178,7 @@ def get_member_preview_home(get_connection):
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'recipe'
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             ORDER BY c.updated_at DESC, c.content_id ASC
             LIMIT 6
             """
@@ -187,7 +187,7 @@ def get_member_preview_home(get_connection):
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'nutrition_material'
-              AND c.status IN ('draft', 'published')
+              AND c.status IN ('draft', 'published', 'archived')
             ORDER BY c.updated_at DESC, c.content_id ASC
             LIMIT 6
             """
@@ -195,13 +195,13 @@ def get_member_preview_home(get_connection):
         latest_nutrition_materials = [_item(row) for row in cur.fetchall()]
         cur.execute("""SELECT cc.slug,cc.title,COUNT(*) FROM content_categories cc
           JOIN content_item_categories cic USING(category_id) JOIN content_items c USING(content_id)
-          WHERE cc.content_type='lesson' AND cc.is_active=TRUE AND c.status IN ('draft','published')
+          WHERE cc.content_type='lesson' AND cc.is_active=TRUE AND c.status IN ('draft','published','archived')
           GROUP BY cc.slug,cc.title,cc.sort_order ORDER BY cc.sort_order,cc.slug""")
         categories = [
             {"category": row[0], "title": row[1], "count": int(row[2])}
             for row in cur.fetchall()
         ]
-        cur.execute("SELECT COUNT(*) FROM content_items WHERE content_type='lesson' AND status IN ('draft','published')")
+        cur.execute("SELECT COUNT(*) FROM content_items WHERE content_type='lesson' AND status IN ('draft','published','archived')")
         total = int(cur.fetchone()[0])
         conn.rollback()
         return {

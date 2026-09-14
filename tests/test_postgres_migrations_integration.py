@@ -2899,6 +2899,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         try:
             with conn.cursor() as cur:
                 cur.execute(
+                    "INSERT INTO users (telegram_id, paid, expiry_date) "
+                    "VALUES (99101, TRUE, NOW()+INTERVAL '30 days')"
+                )
+                cur.execute(
                     "UPDATE content_items SET status='published',published_at=NOW() WHERE content_id=%s",
                     (published_recipe["content_id"],),
                 )
@@ -2920,12 +2924,23 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        self.assertEqual(
-            [item["content_id"] for item in list_member_preview_content(
+        admin_items = {
+            item["content_id"]: item
+            for item in list_member_preview_content(
                 self.get_conn, content_type="recipe"
-            )["items"]],
-            [published_recipe["content_id"]],
-        )
+            )["items"]
+        }
+        self.assertEqual(admin_items[published_recipe["content_id"]]["status"], "published")
+        self.assertEqual(admin_items[recipe["content_id"]]["status"], "archived")
+        member_ids = {
+            item["content_id"]
+            for item in list_member_catalog(
+                self.get_conn, 99101, content_type="recipe"
+            )["items"]
+        }
+        self.assertIn(published_recipe["content_id"], member_ids)
+        self.assertNotIn(recipe["content_id"], member_ids)
+        self.assertIsNone(get_member_content(self.get_conn, 99101, recipe["content_id"]))
         with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
             replace_recipe_structure(self.get_conn, recipe["content_id"], {
                 "expected_version": 4, "ingredients": [], "steps": [],
@@ -3095,7 +3110,30 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(archived_item["published_at"], item["published_at"])
         self.assertIsNotNone(archived_item["archived_at"])
         self.assertEqual(len(list_versions(self.get_conn, recipe["content_id"])["items"]), 2)
-        self.assertIsNone(get_member_preview_content(self.get_conn, recipe["content_id"], content_type="recipe"))
+        admin_archived = get_member_preview_content(
+            self.get_conn, recipe["content_id"], content_type="recipe"
+        )
+        self.assertEqual(admin_archived["status"], "archived")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, paid, expiry_date) "
+                    "VALUES (99102, TRUE, NOW()+INTERVAL '30 days')"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(get_member_content(self.get_conn, 99102, recipe["content_id"]))
+        self.assertNotIn(
+            recipe["content_id"],
+            {
+                entry["content_id"]
+                for entry in list_member_catalog(
+                    self.get_conn, 99102, content_type="recipe"
+                )["items"]
+            },
+        )
 
         conn = self.get_conn()
         try:
@@ -3401,13 +3439,37 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         conn = self.get_conn()
         try:
             with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, paid, expiry_date) "
+                    "VALUES (99103, TRUE, NOW()+INTERVAL '30 days')"
+                )
                 cur.execute("UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s", (material["content_id"],))
             conn.commit()
         finally:
             conn.close()
-        self.assertEqual(list_member_preview_content(
+        admin_nutrition = list_member_preview_content(
             self.get_conn, content_type="nutrition_material"
-        )["items"], [])
+        )["items"]
+        self.assertEqual(
+            {entry["content_id"]: entry["status"] for entry in admin_nutrition},
+            {material["content_id"]: "archived"},
+        )
+        self.assertEqual(
+            get_member_preview_content(
+                self.get_conn, material["content_id"],
+                content_type="nutrition_material",
+            )["status"],
+            "archived",
+        )
+        self.assertEqual(
+            list_member_catalog(
+                self.get_conn, 99103, content_type="nutrition_material"
+            )["items"],
+            [],
+        )
+        self.assertIsNone(get_member_content(
+            self.get_conn, 99103, material["content_id"]
+        ))
         with self.assertRaisesRegex(ContentCmsError, "content_not_editable"):
             update_nutrition_draft(self.get_conn, material["content_id"], {
                 "expected_version": 3, "title": "Нельзя", "body": "Нельзя",
@@ -3518,7 +3580,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         catalog = list_member_preview_content(self.get_conn)
         self.assertEqual(
             {item["content_id"] for item in catalog["items"]},
-            {draft["content_id"], published["content_id"]},
+            {draft["content_id"], published["content_id"], archived["content_id"]},
+        )
+        self.assertEqual(
+            get_member_preview_content(self.get_conn, archived["content_id"])["status"],
+            "archived",
         )
         lesson = get_member_preview_content(self.get_conn, draft["content_id"])
         self.assertEqual(lesson["content_type"], "lesson")
@@ -3533,17 +3599,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
         home = get_member_preview_home(self.get_conn)
-        self.assertEqual(home["total_lessons"], 2)
+        self.assertEqual(home["total_lessons"], 3)
         self.assertEqual(
-            [item["content_id"] for item in home["latest_meditations"]],
-            [meditation["content_id"]],
+            {item["content_id"] for item in home["latest_meditations"]},
+            {meditation["content_id"], archived_meditation["content_id"]},
         )
         meditation_catalog = list_member_preview_content(
             self.get_conn, content_type="meditation"
         )
         self.assertEqual(
-            [item["content_id"] for item in meditation_catalog["items"]],
-            [meditation["content_id"]],
+            {item["content_id"] for item in meditation_catalog["items"]},
+            {meditation["content_id"], archived_meditation["content_id"]},
         )
         self.assertEqual(
             get_member_preview_content(
