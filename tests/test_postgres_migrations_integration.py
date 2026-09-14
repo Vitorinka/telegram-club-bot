@@ -64,6 +64,7 @@ from content_cms import (
     create_content_draft,
     get_cms_content,
     list_cms_content,
+    list_cms_content_studio,
     update_content_draft,
 )
 from content_media import (
@@ -2252,6 +2253,15 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
 
         listing = list_cms_content(self.get_conn, status="draft", limit=25)
         self.assertEqual([item["content_id"] for item in listing["items"]], [created["content_id"]])
+        connection_calls = 0
+        def counted_connection():
+            nonlocal connection_calls
+            connection_calls += 1
+            return self.get_conn()
+        studio_listing = list_cms_content_studio(counted_connection, status="draft", limit=25)
+        self.assertEqual(connection_calls, 1)
+        self.assertEqual(studio_listing["items"][0]["media"], [])
+        self.assertEqual(studio_listing["items"][0]["categories"], [])
         details = get_cms_content(self.get_conn, created["content_id"])
         self.assertEqual(details["created_by_telegram_id"], 1)
 

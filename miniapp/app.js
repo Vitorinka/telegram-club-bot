@@ -1,5 +1,65 @@
 (() => {
   "use strict";
+  const contentStudioMediaPreflightError = (mediaType, file) => {
+    if (!file) return null;
+    const megabytes = (file.size / 1024 / 1024).toFixed(1);
+    if (mediaType === "cover") {
+      const extensionOk = /\.(jpe?g|png|webp)$/i.test(file.name);
+      const mimeOk = ["image/jpeg", "image/png", "image/webp"].includes(file.type);
+      if (!mimeOk && !extensionOk) return "Обложка должна быть JPEG, PNG или WebP.";
+      if (file.size > 10 * 1024 * 1024) return `Обложка слишком большая: ${megabytes} МБ. Текущий максимум — 10 МБ.`;
+    }
+    if (mediaType === "video") {
+      if (file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) return "Этот формат пока не поддерживается. Загрузите MP4.";
+      if (file.size > 20 * 1024 * 1024) return `Видео слишком большое: ${megabytes} МБ. Текущий максимум — 20 МБ.`;
+    }
+    if (mediaType === "audio") {
+      if (file.type !== "audio/mpeg" && !file.name.toLowerCase().endsWith(".mp3")) return "Этот формат пока не поддерживается. Загрузите MP3.";
+      if (file.size > 20 * 1024 * 1024) return `Аудио слишком большое: ${megabytes} МБ. Текущий максимум — 20 МБ.`;
+    }
+    return null;
+  };
+  const contentStudioCanStartMedia = (dirty) => !dirty;
+  const contentStudioEffectiveCategory = (items, selected) => {
+    const available = new Set(items.flatMap((item) => (item.categories || []).map((entry) => entry.id)));
+    return selected !== "all" && available.has(selected) ? selected : "all";
+  };
+  const contentStudioCoverUrl = ({localUrl, localMediaType, attachedUrl}) =>
+    localMediaType === "cover" && localUrl ? localUrl : attachedUrl;
+  const contentStudioMove = (items, index, offset, onChange = () => {}) => {
+    const target = index + offset;
+    if (target < 0 || target >= items.length) return false;
+    [items[index], items[target]] = [items[target], items[index]];
+    onChange();
+    return true;
+  };
+  const contentStudioSaveRecipe = ({saveMetadata, saveRecipe, reload}) =>
+    saveMetadata().then(saveRecipe).then(reload);
+  const contentStudioCreateDraft = ({files, createDraft, saveDomain, attachMedia, openDraft}) => {
+    const preflightError = files.map(([mediaType, file]) => contentStudioMediaPreflightError(mediaType, file)).find(Boolean);
+    if (preflightError) return Promise.resolve({status: "preflight_failed", error: preflightError, draft: null});
+    let draft;
+    let stage = "create";
+    return createDraft().then((created) => {
+      draft = created;
+      stage = "domain";
+      return saveDomain(created);
+    }).then(() => {
+      stage = "media";
+      return files.reduce(
+        (chain, [mediaType, file]) => chain.then(() => attachMedia(draft, mediaType, file)),
+        Promise.resolve(),
+      );
+    }).then(() => ({status: "completed", draft})).catch((error) => {
+      if (!draft) throw error;
+      const status = stage === "domain" ? "domain_failed" : "media_failed";
+      return openDraft(draft).then(() => ({status, error, draft}));
+    });
+  };
+  if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
+    module.exports = {contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    return;
+  }
   const webApp = window.Telegram && window.Telegram.WebApp;
   const status = document.getElementById("status");
   const identity = document.getElementById("identity");
@@ -74,6 +134,8 @@
   const giftMetricNodes = document.querySelectorAll("[data-gift-metric]");
   const contentSearch = document.getElementById("content-search");
   const contentCategory = document.getElementById("content-category");
+  const contentType = document.getElementById("content-type");
+  const contentStatusFilters = document.getElementById("content-status-filters");
   const contentList = document.getElementById("content-list");
   const contentEmpty = document.getElementById("content-empty");
   const contentDetailsContent = document.getElementById("content-details-content");
@@ -104,6 +166,13 @@
   const contentEditDuration = document.getElementById("content-edit-duration");
   const contentEditOrder = document.getElementById("content-edit-order");
   const contentEditMessage = document.getElementById("content-edit-message");
+  const contentEditorState = document.getElementById("content-editor-state");
+  const contentLivePreview = document.getElementById("content-live-preview");
+  const contentToolbarPreview = document.getElementById("content-toolbar-preview");
+  const contentToolbarPublish = document.getElementById("content-toolbar-publish");
+  const contentStudioWorkspace = document.getElementById("content-studio-workspace");
+  const contentStudioTabs = document.getElementById("content-studio-tabs");
+  const contentUnsavedDialog = document.getElementById("content-unsaved-dialog");
   const contentMediaCard = document.getElementById("content-media-card");
   const contentCoverCurrent = document.getElementById("content-cover-current");
   const contentVideoCurrent = document.getElementById("content-video-current");
@@ -184,8 +253,10 @@
   let currentCmsContent = null;
   let contentMediaUploadId = null;
   let contentMediaLocalUrl = null;
+  let contentMediaLocalType = null;
   let contentMediaServerUrl = null;
   let contentMediaAttachedCoverUrl = null;
+  let contentMediaGeneration = 0;
   let contentLifecycleActionId = null;
   let contentLifecycleMode = null;
   let memberPreviewMode = false;
@@ -201,6 +272,12 @@
   let memberMeditationItems = [];
   let memberRecipeItems = [];
   let memberNutritionItems = [];
+  let cmsContentStatus = "all";
+  let studioCoverUrls = [];
+  let studioCoverObserver = null;
+  let studioCoverGeneration = 0;
+  let contentEditorDirty = false;
+  let pendingContentNavigation = null;
   let memberRecipeCategory = "all";
   let memberDetailContentType = "lesson";
   let recipeIngredients = [];
@@ -775,17 +852,27 @@
     scheduleUploadServerUrl = null;
   };
   const clearContentMediaUrls = () => {
+    contentMediaGeneration += 1;
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
     if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
     contentMediaLocalUrl = null;
+    contentMediaLocalType = null;
     contentMediaServerUrl = null;
     contentMediaAttachedCoverUrl = null;
+  };
+  const clearStudioCoverLoads = () => {
+    studioCoverGeneration += 1;
+    if (studioCoverObserver) studioCoverObserver.disconnect();
+    studioCoverObserver = null;
+    studioCoverUrls.forEach((url) => URL.revokeObjectURL(url));
+    studioCoverUrls = [];
   };
   const resetContentMediaDraft = () => {
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
     contentMediaLocalUrl = null;
+    contentMediaLocalType = null;
     contentMediaServerUrl = null;
     contentMediaUploadId = null;
     contentCoverFile.value = "";
@@ -1595,20 +1682,38 @@
   };
   const loadContent = () => {
     status.textContent = "Загружаем контент…";
-    const params = new URLSearchParams({category: contentCategory.value});
+    clearStudioCoverLoads();
+    const params = new URLSearchParams({category: "all"});
     if (contentSearch.value.trim()) params.set("q", contentSearch.value.trim());
     return Promise.all([
       api(`/api/admin/content?${params.toString()}`),
-      api("/api/admin/content/cms?status=all&limit=50"),
+      api(`/api/admin/content/cms?status=${encodeURIComponent(cmsContentStatus)}&limit=50`),
     ]).then(([data, cms]) => {
       contentList.replaceChildren();
       data.items.forEach((item) => contentList.append(contentCard(item)));
       contentEmpty.hidden = data.items.length !== 0;
+      const selectedCategory = contentCategory.value;
+      const categories = new Map();
+      cms.items.forEach((item) => (item.categories || []).forEach((entry) => categories.set(entry.id, entry.title)));
+      const effectiveCategory = contentStudioEffectiveCategory(cms.items, selectedCategory);
+      contentCategory.replaceChildren();
+      const allCategories = document.createElement("option"); allCategories.value = "all"; allCategories.textContent = "Все категории"; contentCategory.append(allCategories);
+      [...categories.entries()].sort((left, right) => left[1].localeCompare(right[1], "ru")).forEach(([value, label]) => {
+        const option = document.createElement("option"); option.value = value; option.textContent = label; contentCategory.append(option);
+      });
+      contentCategory.value = effectiveCategory;
+      const query = contentSearch.value.trim().toLocaleLowerCase("ru");
+      const items = cms.items.filter((item) => {
+        const matchesType = contentType.value === "all" || item.content_type === contentType.value;
+        const matchesCategory = effectiveCategory === "all" || (item.categories || []).some((entry) => entry.id === effectiveCategory);
+        const matchesQuery = !query || item.title.toLocaleLowerCase("ru").includes(query);
+        return matchesType && matchesCategory && matchesQuery;
+      });
       cmsContentList.replaceChildren();
-      cms.items.forEach((item) => cmsContentList.append(cmsContentCard(item)));
-      cmsContentEmpty.hidden = cms.items.length !== 0;
+      items.forEach((item) => cmsContentList.append(cmsContentCard(item)));
+      cmsContentEmpty.hidden = items.length !== 0;
       showScreen("content");
-      status.textContent = `Legacy: ${data.items.length} · CMS: ${cms.items.length}`;
+      status.textContent = `Материалов: ${items.length}`;
     });
   };
   function loadContentDetails(contentId) {
@@ -1633,6 +1738,54 @@
   }
 
   const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт", nutrition_material: "Материал нутрициолога"}[contentType] || contentType);
+  const cmsStatusLabel = (value) => ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[value] || value);
+  const setContentEditorDirty = (dirty = true) => {
+    contentEditorDirty = dirty;
+    contentEditorState.textContent = dirty ? "Есть несохранённые изменения" : "Все изменения сохранены ✓";
+    contentEditorState.classList.toggle("dirty", dirty);
+  };
+  const runPendingContentNavigation = () => {
+    const action = pendingContentNavigation;
+    pendingContentNavigation = null;
+    contentUnsavedDialog.close();
+    if (action) action();
+  };
+  const guardContentNavigation = (action) => {
+    if (!contentEditorDirty) { action(); return; }
+    pendingContentNavigation = action;
+    contentUnsavedDialog.showModal();
+  };
+  const renderContentLivePreview = (item = currentCmsContent) => {
+    contentLivePreview.replaceChildren(text("p", "Предпросмотр участника", "eyebrow"));
+    if (!item) {
+      contentLivePreview.append(text("h2", "Выберите материал"), text("p", "Здесь появится безопасный preview.", "hint"));
+      return;
+    }
+    const title = item.status === "draft" ? contentEditTitle.value.trim() || item.title : item.title;
+    const description = item.status === "draft" ? contentEditDescription.value.trim() : item.description;
+    const duration = item.status === "draft" ? contentEditDuration.value.trim() : (item.duration_seconds ? formatDuration(item.duration_seconds) : "");
+    const mediaTypes = new Set((item.media || []).map((entry) => entry.media_type));
+    const cover = document.createElement("div"); cover.className = "studio-preview-cover";
+    const coverUrl = contentStudioCoverUrl({
+      localUrl: contentMediaLocalUrl,
+      localMediaType: contentMediaLocalType,
+      attachedUrl: contentMediaAttachedCoverUrl,
+    });
+    if (coverUrl) {
+      const image = document.createElement("img"); image.src = coverUrl; image.alt = `Обложка ${title}`; cover.append(image);
+    } else cover.append(text("span", mediaTypes.has("cover") ? "Обложка материала" : cmsTypeLabel(item.content_type)));
+    contentLivePreview.append(cover, text("span", cmsStatusLabel(item.status), `badge studio-status ${item.status}`), text("h2", title));
+    if (duration) contentLivePreview.append(text("p", duration, "studio-preview-duration"));
+    const categories = item.status === "draft"
+      ? [...contentEditTaxonomy.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.closest("label").textContent.trim())
+      : (item.categories || []).map((entry) => entry.title);
+    if (categories.length) contentLivePreview.append(text("p", categories.join(" · "), "studio-preview-categories"));
+    if (description) appendRestrictedText(contentLivePreview, description);
+    else contentLivePreview.append(text("p", "Описание пока не заполнено.", "hint"));
+    const mediaLabel = item.content_type === "lesson" ? (mediaTypes.has("video") ? "Видео прикреплено" : "Видео ещё не добавлено")
+      : item.content_type === "meditation" ? (mediaTypes.has("audio") || mediaTypes.has("video") ? "Практика готова" : "Аудио или видео ещё не добавлено") : null;
+    if (mediaLabel) contentLivePreview.append(text("p", mediaLabel, "studio-preview-media"));
+  };
   const selectedTaxonomyIds = (fieldset) => [...fieldset.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.value);
   const renderTaxonomy = (fieldset, categories, selected = []) => {
     const host = fieldset.querySelector(".taxonomy-options"); host.replaceChildren(); fieldset.hidden = categories.length === 0;
@@ -1641,9 +1794,7 @@
   };
   const loadTaxonomy = (contentType, fieldset, selected=[]) => api(`/api/admin/content/categories?content_type=${encodeURIComponent(contentType)}`).then((data) => { cmsTaxonomy=data.items || []; renderTaxonomy(fieldset,cmsTaxonomy,selected); });
   const recipeMove = (items, index, offset) => {
-    const target = index + offset;
-    if (target < 0 || target >= items.length) return;
-    [items[index], items[target]] = [items[target], items[index]];
+    if (!contentStudioMove(items, index, offset, () => setContentEditorDirty(true))) return;
     renderRecipeEditor();
   };
   const recipeRowButton = (label, handler) => {
@@ -1658,35 +1809,79 @@
       const row = document.createElement("div"); row.className = "recipe-editor-row";
       const name = document.createElement("input"); name.type = "text"; name.maxLength = 200; name.placeholder = "Ингредиент"; name.value = item.name;
       const amount = document.createElement("input"); amount.type = "text"; amount.maxLength = 100; amount.placeholder = "Количество"; amount.value = item.amount || "";
-      name.addEventListener("input", () => { item.name = name.value; });
-      amount.addEventListener("input", () => { item.amount = amount.value; });
+      name.addEventListener("input", () => { item.name = name.value; setContentEditorDirty(true); });
+      amount.addEventListener("input", () => { item.amount = amount.value; setContentEditorDirty(true); });
       const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
-      controls.append(recipeRowButton("↑", () => recipeMove(recipeIngredients, index, -1)), recipeRowButton("↓", () => recipeMove(recipeIngredients, index, 1)), recipeRowButton("Удалить", () => { recipeIngredients.splice(index, 1); renderRecipeEditor(); }));
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeIngredients, index, -1)), recipeRowButton("↓", () => recipeMove(recipeIngredients, index, 1)), recipeRowButton("Удалить", () => { recipeIngredients.splice(index, 1); setContentEditorDirty(true); renderRecipeEditor(); }));
       row.append(name, amount, controls); recipeIngredientsList.append(row);
     });
     recipeStepsList.replaceChildren();
     recipeSteps.forEach((item, index) => {
       const row = document.createElement("div"); row.className = "recipe-editor-row";
       const instruction = document.createElement("textarea"); instruction.maxLength = 2000; instruction.placeholder = `Шаг ${index + 1}`; instruction.value = item.instruction;
-      instruction.addEventListener("input", () => { item.instruction = instruction.value; });
+      instruction.addEventListener("input", () => { item.instruction = instruction.value; setContentEditorDirty(true); });
       const controls = document.createElement("div"); controls.className = "recipe-editor-actions";
-      controls.append(recipeRowButton("↑", () => recipeMove(recipeSteps, index, -1)), recipeRowButton("↓", () => recipeMove(recipeSteps, index, 1)), recipeRowButton("Удалить", () => { recipeSteps.splice(index, 1); renderRecipeEditor(); }));
+      controls.append(recipeRowButton("↑", () => recipeMove(recipeSteps, index, -1)), recipeRowButton("↓", () => recipeMove(recipeSteps, index, 1)), recipeRowButton("Удалить", () => { recipeSteps.splice(index, 1); setContentEditorDirty(true); renderRecipeEditor(); }));
       row.append(instruction, controls); recipeStepsList.append(row);
     });
   };
+  const observeStudioCover = (visual, item, cover) => {
+    if (!cover || !("IntersectionObserver" in window)) return;
+    if (!studioCoverObserver) {
+      const generation = studioCoverGeneration;
+      studioCoverObserver = new IntersectionObserver((entries, observer) => {
+        entries.filter((entry) => entry.isIntersecting).forEach((entry) => {
+          observer.unobserve(entry.target);
+          const load = entry.target._studioCoverLoad;
+          if (load) load(generation);
+        });
+      }, {rootMargin: "180px 0px"});
+    }
+    visual._studioCoverLoad = (generation) => fetch(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(cover.media_id)}`, {
+      headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+    }).then((response) => {
+      if (!response.ok) throw new Error("content_cover_unavailable");
+      return response.blob();
+    }).then((blob) => {
+      if (generation !== studioCoverGeneration || !visual.isConnected) return;
+      const url=URL.createObjectURL(blob); studioCoverUrls.push(url);
+      const image=document.createElement("img"); image.src=url; image.alt=`Обложка ${item.title}`;
+      visual.replaceChildren(image);
+    }).catch(() => {
+      if (generation === studioCoverGeneration && visual.isConnected) visual.replaceChildren(text("span", "Обложка недоступна"));
+    });
+    studioCoverObserver.observe(visual);
+  };
+  const openCmsContentPreview = (contentId) => loadCmsContentDetails(contentId).then(() => {
+    contentStudioWorkspace.classList.add("preview-active");
+    contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((button) => button.classList.toggle("active", button.dataset.studioPanel === "preview"));
+    contentLivePreview.scrollIntoView({behavior: "smooth", block: "start"});
+  });
   const cmsContentCard = (item) => {
     const article = document.createElement("article");
-    article.className = "card user-card";
-    const button = document.createElement("button");
-    button.type = "button";
+    article.className = "card studio-content-card";
+    const button = document.createElement("button"); button.type = "button"; button.className = "studio-card-open";
     const typeLabel = cmsTypeLabel(item.content_type);
-    button.append(text("p", `CMS · ${typeLabel}`, "eyebrow"), text("h2", item.title));
+    const cover=(item.media || []).find((entry)=>entry.media_type==="cover");
+    const visual=document.createElement("div"); visual.className="studio-card-cover";
+    visual.append(text("span",cover ? "Обложка" : typeLabel));
+    observeStudioCover(visual, item, cover);
+    button.append(visual,text("p", typeLabel, "eyebrow"), text("h2", item.title));
     const badges = document.createElement("div");
     badges.className = "badges";
-    badges.append(text("span", item.status, "badge"), text("span", `v${item.version}`, "badge"));
-    button.append(badges, text("p", item.category || "Без категории"));
+    badges.append(text("span", cmsStatusLabel(item.status), `badge studio-status ${item.status}`));
+    const categories=(item.categories || []).map((entry)=>entry.title).join(", ") || item.category || "Без категории";
+    button.append(badges,text("p",`${item.duration_seconds ? formatDuration(item.duration_seconds)+" · " : ""}${categories}`));
+    if(!item.media_ready && ["lesson","meditation"].includes(item.content_type)) button.append(text("p",item.content_type==="lesson" ? "Не добавлено видео" : "Не добавлено аудио или видео","studio-warning"));
+    button.append(text("small",`Обновлено ${formatDate(item.updated_at)}`));
     button.addEventListener("click", () => loadCmsContentDetails(item.content_id));
-    article.append(button);
+    const actions=document.createElement("div"); actions.className="studio-card-actions";
+    const edit=text("button",item.status==="draft" ? "Редактировать" : "Открыть","secondary"); edit.type="button";
+    edit.addEventListener("click",()=>loadCmsContentDetails(item.content_id));
+    const preview=text("button","Предпросмотр","secondary"); preview.type="button";
+    preview.addEventListener("click",()=>openCmsContentPreview(item.content_id));
+    actions.append(edit,preview);
+    article.append(button,actions);
     return article;
   };
   const renderVersionDetails = (version) => {
@@ -1715,7 +1910,7 @@
   const resetContentLifecycle = (item) => {
     contentLifecycleActionId = null;
     contentLifecycleMode = item.status === "published" ? "archive" : "publish";
-    contentLifecycleCard.hidden = item.status === "archived";
+    contentLifecycleCard.hidden = true;
     contentLifecycleTitle.textContent = item.status === "published" ? "Архивирование" : "Публикация";
     contentLifecyclePreviewButton.textContent = item.status === "published" ? "Предпросмотр архивирования" : "Предпросмотр публикации";
     contentLifecycleMessage.textContent = item.status === "published"
@@ -1729,14 +1924,30 @@
   const previewContentLifecycle = () => {
     if (!currentCmsContent || !contentLifecycleMode) return Promise.resolve();
     const mode = contentLifecycleMode;
+    contentLifecycleCard.hidden = false;
     contentLifecycleMessage.textContent = "Проверяем финальное состояние…";
     return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${mode}-preview`, {expected_version: currentCmsContent.version}).then((preview) => {
       contentLifecycleActionId = preview.action_id;
+      const mediaTypes = new Set(preview.media.map((entry) => entry.media_type));
+      const checklist = document.createElement("ul"); checklist.className = "studio-publish-checklist";
+      if (mode === "publish") {
+        checklist.append(text("li", "Обязательно", "checklist-heading"));
+        const required = [[Boolean(preview.title), "Название"]];
+        if (preview.content_type === "lesson") required.push([Boolean(preview.duration_seconds), "Длительность"], [mediaTypes.has("video"), "Видео"]);
+        if (preview.content_type === "meditation") required.push([Boolean(preview.duration_seconds), "Длительность"], [mediaTypes.has("audio") || mediaTypes.has("video"), "Аудио или видео"]);
+        if (preview.content_type === "recipe") required.push([Boolean(preview.domain.ingredients.length), "Ингредиенты"], [Boolean(preview.domain.steps.length), "Шаги"]);
+        if (preview.content_type === "nutrition_material") required.push([Boolean((preview.domain.body || "").trim()), "Основной текст"]);
+        required.forEach(([ready, label]) => checklist.append(text("li", `${ready ? "✓" : "—"} ${label}`, ready ? "ready" : "missing")));
+        checklist.append(text("li", "Рекомендуется", "checklist-heading"));
+        [[Boolean((preview.categories || []).length || preview.category), "Категория"], [mediaTypes.has("cover"), "Обложка"]]
+          .forEach(([ready, label]) => checklist.append(text("li", `${ready ? "✓" : "—"} ${label}`, ready ? "ready" : "recommended")));
+      }
       contentLifecyclePreview.replaceChildren(
         text("strong", preview.title),
         text("span", cmsTypeLabel(preview.content_type)),
         text("span", preview.description || "Без описания"),
         text("span", `Медиа: ${preview.media.map((entry) => entry.media_type).join(", ") || "нет"}`),
+        checklist,
         text("span", `Действительно до ${formatDate(preview.preview_expires_at)}`)
       );
       contentLifecyclePreview.hidden = false;
@@ -1745,6 +1956,7 @@
       contentLifecycleMessage.textContent = mode === "archive"
         ? "Материал перестанет отображаться в будущей пользовательской библиотеке, но история и данные сохранятся."
         : "Проверьте итоговые данные перед публикацией.";
+      contentLifecycleCard.scrollIntoView({behavior: "smooth", block: "center"});
     }).catch((error) => { contentLifecycleMessage.textContent = contentErrorMessage(error); });
   };
   const confirmContentLifecycle = () => {
@@ -1759,7 +1971,7 @@
   const cancelContentLifecycle = () => {
     if (!currentCmsContent || !contentLifecycleActionId || !contentLifecycleMode) return Promise.resolve();
     return writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/${contentLifecycleMode}-cancel`, {action_id: contentLifecycleActionId})
-      .then(() => { resetContentLifecycle(currentCmsContent); status.textContent = "Операция отменена"; })
+      .then(() => { resetContentLifecycle(currentCmsContent); contentLifecycleCard.hidden = true; status.textContent = "Операция отменена"; })
       .catch(showApiError);
   };
   const loadCmsContentDetails = (contentId) => {
@@ -1801,6 +2013,14 @@
       renderRecipeEditor();
       renderContentMedia(item);
       resetContentLifecycle(item);
+      setContentEditorDirty(false);
+      const previewOnly = item.status !== "draft";
+      contentStudioWorkspace.classList.toggle("preview-active", previewOnly);
+      contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((button) => button.classList.toggle("active", button.dataset.studioPanel === (previewOnly ? "preview" : "editor")));
+      renderContentLivePreview(item);
+      contentEditorState.textContent = item.status === "draft" ? "Все изменения сохранены ✓" : cmsStatusLabel(item.status);
+      contentToolbarPublish.textContent = item.status === "published" ? "Архивировать" : item.status === "archived" ? "В архиве" : "Опубликовать";
+      contentToolbarPublish.disabled = item.status === "archived";
       loadContentVersions(item.content_id).catch(showApiError);
       showScreen("content-details");
       status.textContent = item.title;
@@ -1813,19 +2033,26 @@
     image.src = url;
     return image;
   };
-  const fetchContentCover = (item, media) => fetch(
+  const fetchContentCover = (item, media) => {
+    const generation = contentMediaGeneration;
+    return fetch(
     `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(media.media_id)}`,
     {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
-  ).then((response) => {
+    ).then((response) => {
     if (!response.ok) throw new Error("content_media_preview_failed");
     return response.blob();
   }).then((blob) => {
+    if (generation !== contentMediaGeneration || !currentCmsContent || currentCmsContent.content_id !== item.content_id) return;
     if (contentMediaAttachedCoverUrl) URL.revokeObjectURL(contentMediaAttachedCoverUrl);
     contentMediaAttachedCoverUrl = URL.createObjectURL(blob);
     contentCoverCurrent.replaceChildren(mediaImage(contentMediaAttachedCoverUrl, `Обложка ${item.title}`));
+    renderContentLivePreview(item);
   }).catch(() => {
-    contentCoverCurrent.replaceChildren(text("span", "Обложка недоступна", "schedule-image-loading"));
+    if (generation === contentMediaGeneration && currentCmsContent && currentCmsContent.content_id === item.content_id) {
+      contentCoverCurrent.replaceChildren(text("span", "Обложка недоступна", "schedule-image-loading"));
+    }
   });
+  };
   function renderContentMedia(item) {
     const cover = (item.media || []).find((entry) => entry.media_type === "cover");
     const video = (item.media || []).find((entry) => entry.media_type === "video");
@@ -1843,16 +2070,32 @@
     const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
+    contentMediaLocalType = file ? mediaType : null;
     contentMediaPreview.replaceChildren();
     if (!file) contentMediaPreview.append(text("span", "Выберите файл", "schedule-image-loading"));
-    else if (mediaType === "cover") contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки"));
+    else if (mediaType === "cover") { contentMediaPreview.append(mediaImage(contentMediaLocalUrl, "Локальный просмотр обложки")); renderContentLivePreview(); }
     else contentMediaPreview.append(text("span", `Локально выбрано ${mediaType === "audio" ? "аудио" : "видео"}: ${file.name}`, "schedule-image-loading"));
   };
   const validateContentMedia = (mediaType) => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
+    if (!contentStudioCanStartMedia(contentEditorDirty)) {
+      contentMediaMessage.textContent = "Сначала сохраните изменения материала, затем загрузите медиа.";
+      contentMediaConfirmation.hidden = false;
+      return Promise.resolve();
+    }
     const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
     if (!file) {
       contentMediaMessage.textContent = "Выберите файл.";
+      contentMediaConfirmation.hidden = false;
+      return Promise.resolve();
+    }
+    if (mediaType === "video" && file.size > 20 * 1024 * 1024) {
+      contentMediaMessage.textContent = `Видео слишком большое: ${(file.size / 1024 / 1024).toFixed(1)} МБ. Текущий максимум — 20 МБ.`;
+      contentMediaConfirmation.hidden = false;
+      return Promise.resolve();
+    }
+    if (mediaType === "video" && file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) {
+      contentMediaMessage.textContent = "Этот формат пока не поддерживается. Загрузите MP4.";
       contentMediaConfirmation.hidden = false;
       return Promise.resolve();
     }
@@ -1898,6 +2141,10 @@
   };
   const confirmContentMedia = () => {
     if (!contentMediaUploadId || !currentCmsContent) return Promise.resolve();
+    if (!contentStudioCanStartMedia(contentEditorDirty)) {
+      contentMediaMessage.textContent = "Сначала сохраните изменения материала, затем загрузите медиа.";
+      return Promise.resolve();
+    }
     contentMediaConfirm.disabled = true;
     contentMediaMessage.textContent = "Загружаем и прикрепляем…";
     return postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`)
@@ -1926,6 +2173,8 @@
   });
   const attachAuthoringMedia = (contentId, mediaType, file) => {
     if (!file) return Promise.resolve();
+    if (mediaType === "video" && file.size > 20 * 1024 * 1024) return Promise.reject(new Error("content_video_too_large"));
+    if (mediaType === "video" && file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) return Promise.reject(new Error("unsupported_video_format"));
     if (mediaType === "audio" && !file.name.toLowerCase().endsWith(".mp3")) {
       return Promise.reject(new Error("unsupported_audio_format"));
     }
@@ -1935,6 +2184,11 @@
       .then((result) => { if (result.status !== "completed") throw new Error(result.failure_category || result.status); });
   };
   const createCmsDraft = () => {
+    const files = [
+      ["cover", contentCreateCoverFile.files[0]],
+      ["video", contentCreateVideoFile.files[0]],
+      ["audio", contentCreateAudioFile.files[0]],
+    ];
     contentCreateMessage.textContent = "Создаём черновик…";
     const payload = {
       content_type: contentCreateType.value, title: contentCreateTitle.value,
@@ -1945,19 +2199,30 @@
     if (contentCreateType.value !== "nutrition_material") payload.category_ids = selectedTaxonomyIds(contentCreateTaxonomy);
     if (contentCreateType.value === "nutrition_material") payload.body = contentCreateBody.value;
     const recipePayload = contentCreateType.value === "recipe" ? createRecipePayload() : null;
-    const files = [
-      ["cover", contentCreateCoverFile.files[0]],
-      ["video", contentCreateVideoFile.files[0]],
-      ["audio", contentCreateAudioFile.files[0]],
-    ];
-    return writeAdminJson("POST", "/api/admin/content/drafts", payload).then((item) => {
-      const domainSave = recipePayload
+    return contentStudioCreateDraft({
+      files,
+      createDraft: () => writeAdminJson("POST", "/api/admin/content/drafts", payload),
+      saveDomain: (item) => recipePayload
         ? writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(item.content_id)}/recipe`, {expected_version: item.version, ...recipePayload})
-        : Promise.resolve(item);
-      return domainSave.then(() => files.reduce(
-        (chain, [mediaType, file]) => chain.then(() => attachAuthoringMedia(item.content_id, mediaType, file)), Promise.resolve()
-      )).then(() => item);
-    }).then((item) => {
+        : Promise.resolve(item),
+      attachMedia: (item, mediaType, file) => attachAuthoringMedia(item.content_id, mediaType, file),
+      openDraft: (item) => loadCmsContentDetails(item.content_id),
+    }).then((result) => {
+      if (result.status === "preflight_failed") {
+        contentCreateMessage.textContent = result.error;
+        return null;
+      }
+      if (result.status === "media_failed") {
+        contentMediaMessage.textContent = "Черновик сохранён. Медиа загрузить не удалось. Добавьте файл ещё раз.";
+        status.textContent = "Черновик сохранён, медиа требует повторной загрузки";
+        return null;
+      }
+      if (result.status === "domain_failed") {
+        contentEditMessage.textContent = "Черновик сохранён, но дополнительные данные сохранить не удалось. Проверьте материал и повторите сохранение.";
+        status.textContent = "Черновик сохранён, дополнительные данные требуют проверки";
+        return null;
+      }
+      const item = result.draft;
       contentCreateTitle.value = ""; contentCreateCategory.value = "";
       contentCreateDescription.value = ""; contentCreateDuration.value = "";
       contentCreateBody.value = ""; contentCreateIngredients.value = ""; contentCreateSteps.value = "";
@@ -1966,11 +2231,13 @@
     }).catch((error) => {
       contentCreateMessage.textContent = error.message === "unsupported_audio_format"
         ? "Этот формат пока не поддерживается. Загрузите MP3."
+        : error.message === "content_video_too_large" ? "Видео слишком большое. Текущий максимум — 20 МБ."
+        : error.message === "unsupported_video_format" ? "Этот формат пока не поддерживается. Загрузите MP4."
         : contentErrorMessage(error, {content_type: contentCreateType.value});
-      throw error;
+      return null;
     });
   };
-  const saveCmsDraft = () => {
+  const saveCmsDraft = ({reload = true} = {}) => {
     if (!currentCmsContent) return Promise.resolve();
     contentEditMessage.textContent = "Сохраняем…";
     return writeAdminJson(
@@ -1981,7 +2248,11 @@
        description: contentEditDescription.value || null,
        duration_seconds: parseDuration(contentEditDuration.value),
        sort_order: Number(contentEditOrder.value)}
-    ).then((item) => loadCmsContentDetails(item.content_id).then(() => item)).catch((error) => {
+    ).then((item) => {
+      currentCmsContent = {...currentCmsContent, ...item};
+      if (!reload) return item;
+      return loadCmsContentDetails(item.content_id).then(() => { setContentEditorDirty(false); return item; });
+    }).catch((error) => {
       contentEditMessage.textContent = contentErrorMessage(error);
       throw error;
     });
@@ -1996,19 +2267,20 @@
   };
   const saveAndPreviewPublish = () => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
-    const save = currentCmsContent.content_type === "nutrition_material"
-      ? saveNutrition()
-      : saveCmsDraft().then(() => currentCmsContent.content_type === "recipe" ? saveRecipe() : null);
-    return save.then(() => previewContentLifecycle()).catch(() => null);
+    return saveCurrentContent().then(() => previewContentLifecycle()).catch(() => null);
   };
-  const saveRecipe = () => {
+  const saveRecipe = ({reload = true} = {}) => {
     if (!currentCmsContent || currentCmsContent.content_type !== "recipe") return Promise.resolve();
     recipeEditMessage.textContent = "Сохраняем…";
     return writeAdminJson("PUT", `/api/admin/content/cms/${encodeURIComponent(currentCmsContent.content_id)}/recipe`, {
       expected_version: currentCmsContent.version,
       ingredients: recipeIngredients.map((item, index) => ({name: item.name, amount: item.amount || null, sort_order: index})),
       steps: recipeSteps.map((item, index) => ({step_number: index + 1, instruction: item.instruction})),
-    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+    }).then((item) => {
+      currentCmsContent = {...currentCmsContent, ...item};
+      if (!reload) return item;
+      return loadCmsContentDetails(currentCmsContent.content_id).then(() => { setContentEditorDirty(false); return item; });
+    }).catch((error) => {
       recipeEditMessage.textContent = contentErrorMessage(error);
       throw error;
     });
@@ -2024,10 +2296,23 @@
       duration_seconds: null,
       sort_order: Number(contentEditOrder.value),
       body: contentNutritionBody.value,
-    }).then(() => loadCmsContentDetails(currentCmsContent.content_id)).catch((error) => {
+    }).then(() => loadCmsContentDetails(currentCmsContent.content_id).then(() => setContentEditorDirty(false))).catch((error) => {
       contentNutritionMessage.textContent = contentErrorMessage(error);
       throw error;
     });
+  };
+  const saveCurrentContent = () => {
+    if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve(currentCmsContent);
+    if (currentCmsContent.content_type === "nutrition_material") return saveNutrition();
+    if (currentCmsContent.content_type === "recipe") {
+      return contentStudioSaveRecipe({
+        saveMetadata: () => saveCmsDraft({reload: false}),
+        saveRecipe: () => saveRecipe({reload: false}),
+        reload: () => loadCmsContentDetails(currentCmsContent.content_id),
+      })
+        .then(() => { setContentEditorDirty(false); return currentCmsContent; });
+    }
+    return saveCmsDraft();
   };
 
   hydrateMemberIcons();
@@ -2040,12 +2325,15 @@
   webApp.expand();
   document.querySelectorAll("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => {
-      if (button.dataset.nav === "overview") loadDashboard().catch(showApiError);
-      else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
-      else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
-      else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
-      else if (button.dataset.nav === "schedule") loadSchedule().catch(showApiError);
-      else showScreen(button.dataset.nav);
+      guardContentNavigation(() => {
+        if (button.dataset.nav === "overview") loadDashboard().catch(showApiError);
+        else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
+        else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
+        else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
+        else if (button.dataset.nav === "schedule") loadSchedule().catch(showApiError);
+        else if (button.dataset.nav === "content") loadContent().catch(showApiError);
+        else showScreen(button.dataset.nav);
+      });
     });
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
@@ -2097,20 +2385,31 @@
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
   document.getElementById("content-create-publish").addEventListener("click", () => {
-    createCmsDraft().then(() => previewContentLifecycle()).catch(() => null);
+    createCmsDraft().then((item) => item ? previewContentLifecycle() : null).catch(() => null);
   });
   contentCreateType.addEventListener("change", () => loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError));
-  document.getElementById("content-edit-save").addEventListener("click", saveCmsDraft);
+  document.getElementById("content-edit-save").addEventListener("click", saveCurrentContent);
   document.getElementById("content-authoring-publish").addEventListener("click", saveAndPreviewPublish);
+  contentToolbarPreview.addEventListener("click", () => {
+    renderContentLivePreview();
+    contentStudioWorkspace.classList.add("preview-active");
+    contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((button) => button.classList.toggle("active", button.dataset.studioPanel === "preview"));
+    contentLivePreview.scrollIntoView({behavior: "smooth", block: "start"});
+  });
+  contentToolbarPublish.addEventListener("click", () => {
+    if (!currentCmsContent) return;
+    if (currentCmsContent.status === "draft") saveAndPreviewPublish();
+    else if (currentCmsContent.status === "published") previewContentLifecycle();
+  });
   contentCreateRevision.addEventListener("click", createContentRevision);
   document.querySelectorAll(".authoring-textarea").forEach((field) => {
     const grow = () => { field.style.height = "auto"; field.style.height = `${Math.max(160, field.scrollHeight)}px`; };
     field.addEventListener("input", grow);
   });
-  document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); renderRecipeEditor(); } });
-  document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); renderRecipeEditor(); } });
-  document.getElementById("recipe-save").addEventListener("click", saveRecipe);
-  document.getElementById("content-nutrition-save").addEventListener("click", saveNutrition);
+  document.getElementById("recipe-add-ingredient").addEventListener("click", () => { if (recipeIngredients.length < 100) { recipeIngredients.push({name: "", amount: ""}); setContentEditorDirty(true); renderRecipeEditor(); } });
+  document.getElementById("recipe-add-step").addEventListener("click", () => { if (recipeSteps.length < 50) { recipeSteps.push({instruction: ""}); setContentEditorDirty(true); renderRecipeEditor(); } });
+  document.getElementById("recipe-save").addEventListener("click", saveCurrentContent);
+  document.getElementById("content-nutrition-save").addEventListener("click", saveCurrentContent);
   contentCreateType.addEventListener("change", () => {
     const nutrition = contentCreateType.value === "nutrition_material";
     const recipe = contentCreateType.value === "recipe";
@@ -2189,12 +2488,38 @@
   document.getElementById("gifts-back").addEventListener("click", () => showScreen("gifts"));
   document.getElementById("gifts-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
   contentCategory.addEventListener("change", () => loadContent().catch(showApiError));
+  contentType.addEventListener("change", () => loadContent().catch(showApiError));
+  contentStatusFilters.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-content-status]");
+    if (!button) return;
+    cmsContentStatus = button.dataset.contentStatus;
+    contentStatusFilters.querySelectorAll("[data-content-status]").forEach((node) => node.classList.toggle("active", node === button));
+    loadContent().catch(showApiError);
+  });
   contentSearch.addEventListener("input", () => {
     window.clearTimeout(contentSearchTimer);
     contentSearchTimer = window.setTimeout(() => loadContent().catch(showApiError), 300);
   });
-  document.getElementById("content-back").addEventListener("click", () => showScreen("content"));
+  document.getElementById("content-back").addEventListener("click", () => guardContentNavigation(() => loadContent().catch(showApiError)));
   document.getElementById("content-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
+  [contentEditTitle, contentEditDescription, contentEditDuration, contentEditOrder].forEach((field) => {
+    field.addEventListener("input", () => { setContentEditorDirty(true); renderContentLivePreview(); });
+  });
+  contentEditTaxonomy.addEventListener("change", () => { setContentEditorDirty(true); renderContentLivePreview(); });
+  contentNutritionBody.addEventListener("input", () => { setContentEditorDirty(true); renderContentLivePreview(); });
+  contentStudioTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-studio-panel]");
+    if (!button) return;
+    const preview = button.dataset.studioPanel === "preview";
+    contentStudioWorkspace.classList.toggle("preview-active", preview);
+    contentStudioTabs.querySelectorAll("[data-studio-panel]").forEach((node) => node.classList.toggle("active", node === button));
+    if (preview) renderContentLivePreview();
+  });
+  document.getElementById("content-unsaved-save").addEventListener("click", () => {
+    saveCurrentContent().then(runPendingContentNavigation).catch(() => null);
+  });
+  document.getElementById("content-unsaved-discard").addEventListener("click", () => { setContentEditorDirty(false); runPendingContentNavigation(); });
+  document.getElementById("content-unsaved-cancel").addEventListener("click", () => { pendingContentNavigation = null; contentUnsavedDialog.close(); });
   fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",

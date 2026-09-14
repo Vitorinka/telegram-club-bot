@@ -9620,6 +9620,38 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(nutrition_missing.status, 401)
 
+    async def test_miniapp_content_studio_list_has_safe_editor_projection(self):
+        content_id = "00000000-0000-0000-0000-000000000001"
+        app = self.main.create_app()
+        handler = self.route_handler(app, "GET", "/api/admin/content/cms")
+        item = {
+            "content_id": content_id, "content_type": "lesson",
+            "title": "Силовая тренировка", "status": "draft",
+            "duration_seconds": 1200, "updated_at": "2026-09-13T10:00:00",
+        }
+        categories = [{"id": "category-safe", "title": "Силовые"}]
+        item.update({
+            "media": [{"media_id": "media-safe", "media_type": "video", "size_bytes": 1000}],
+            "categories": categories, "media_ready": True,
+        })
+        session = SimpleNamespace(telegram_id=1, session_id="session-ref")
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_cms_content_studio", return_value={"items": [item]}) as listing, \
+             patch.object(self.main, "list_content_media", side_effect=AssertionError("N+1 media query")), \
+             patch.object(self.main, "get_content_categories", side_effect=AssertionError("N+1 category query")), \
+             patch.object(self.main.stripe.Subscription, "retrieve", side_effect=AssertionError("Stripe must not be called")), \
+             patch.object(self.main.bot, "send_message", side_effect=AssertionError("Telegram must not be called")):
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer token", path="/api/admin/content/cms", query={"status": "all", "limit": "50"}), handler,
+            )
+        payload = json.loads(response.text)
+        self.assertEqual(response.status, 200)
+        self.assertTrue(payload["items"][0]["media_ready"])
+        self.assertEqual(payload["items"][0]["categories"], categories)
+        listing.assert_called_once_with(self.main.get_db_conn, status="all", limit="50")
+        self.assertNotIn("telegram_file_id", response.text)
+        self.assertNotIn("server_reference", response.text)
+
     async def test_real_member_routes_use_separate_bearer_auth_and_rollout_gate(self):
         app = self.main.create_app()
         member_routes = (
@@ -10224,6 +10256,29 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Этот формат пока не поддерживается. Загрузите MP3.", javascript)
         self.assertIn("formatDuration", javascript)
         self.assertIn("Материал изменился. Обновите данные и повторите.", javascript)
+        self.assertIn("Режим администратора", index)
+        self.assertIn('data-nav="content"', index)
+        self.assertIn("studio-workspace", index)
+        self.assertIn("content-live-preview", index)
+        self.assertIn("cmsContentStatus", javascript)
+        self.assertIn("setContentEditorDirty", javascript)
+        self.assertIn("renderContentLivePreview", javascript)
+        self.assertIn("Сначала сохраните изменения материала, затем загрузите медиа.", javascript)
+        self.assertIn("contentStudioCreateDraft", javascript)
+        self.assertIn("contentStudioSaveRecipe", javascript)
+        self.assertIn("Черновик сохранён. Медиа загрузить не удалось.", javascript)
+        self.assertIn("content-unsaved-dialog", index)
+        self.assertIn("Выйти без сохранения", index)
+        self.assertIn("data-studio-panel=\"editor\"", index)
+        self.assertIn("data-studio-panel=\"preview\"", index)
+        self.assertIn("IntersectionObserver", javascript)
+        self.assertIn("studioCoverGeneration", javascript)
+        self.assertIn("contentMediaGeneration", javascript)
+        self.assertIn("studio-card-actions", javascript)
+        self.assertIn("20 * 1024 * 1024", javascript)
+        self.assertIn("Видео слишком большое", javascript)
+        self.assertIn("studio-publish-checklist", javascript)
+        self.assertIn("grid-template-columns: repeat(6", stylesheet)
         self.assertIn("${mode}-preview", javascript)
         self.assertIn("contentMediaLocalUrl", javascript)
         self.assertIn("contentMediaServerUrl", javascript)
@@ -10353,8 +10408,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("loadContent", javascript)
         self.assertIn("content-create-submit", index)
         self.assertIn("content-edit-save", index)
-        self.assertIn("Legacy content", index)
-        self.assertIn("CMS content", index)
+        self.assertNotIn("Legacy content", index)
+        self.assertNotIn("CMS content", index)
+        self.assertIn("Ещё · служебные материалы", index)
         self.assertIn("Подарков пока нет.", index)
         self.assertIn("loadGifts", javascript)
         self.assertIn("admin-status-line", index)
