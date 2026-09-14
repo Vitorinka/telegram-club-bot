@@ -3518,7 +3518,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         catalog = list_member_preview_content(self.get_conn)
         self.assertEqual(
             {item["content_id"] for item in catalog["items"]},
-            {draft["content_id"], published["content_id"]},
+            {draft["content_id"], published["content_id"], archived["content_id"]},
+        )
+        self.assertEqual(
+            get_member_preview_content(self.get_conn, archived["content_id"])["status"],
+            "archived",
         )
         lesson = get_member_preview_content(self.get_conn, draft["content_id"])
         self.assertEqual(lesson["content_type"], "lesson")
@@ -3533,17 +3537,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
         home = get_member_preview_home(self.get_conn)
-        self.assertEqual(home["total_lessons"], 2)
+        self.assertEqual(home["total_lessons"], 3)
         self.assertEqual(
-            [item["content_id"] for item in home["latest_meditations"]],
-            [meditation["content_id"]],
+            {item["content_id"] for item in home["latest_meditations"]},
+            {meditation["content_id"], archived_meditation["content_id"]},
         )
         meditation_catalog = list_member_preview_content(
             self.get_conn, content_type="meditation"
         )
         self.assertEqual(
-            [item["content_id"] for item in meditation_catalog["items"]],
-            [meditation["content_id"]],
+            {item["content_id"] for item in meditation_catalog["items"]},
+            {meditation["content_id"], archived_meditation["content_id"]},
         )
         self.assertEqual(
             get_member_preview_content(

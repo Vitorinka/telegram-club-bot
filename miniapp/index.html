@@ -32,22 +32,15 @@
         <div><dt>Истёкший grace</dt><dd data-metric="billing.expired_grace"></dd></div>
         <div><dt>Автопродление</dt><dd data-metric="billing.auto_renew"></dd></div>
       </dl></article>
+      <article class="card dashboard-feature"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, проверка готовности и публикация — в едином workspace.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть Content Studio</button><button id="open-member-preview" class="secondary" type="button">Предпросмотр клуба</button></div></article>
       <article class="card"><h2>Доставка</h2><dl>
         <div><dt>Pending</dt><dd data-metric="deliveries.pending"></dd></div>
         <div><dt>Failed</dt><dd data-metric="deliveries.failed"></dd></div>
         <div><dt>Permanently failed</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
       </dl></article>
-      <article class="card"><h2>Система</h2><dl>
-        <div><dt>DB pool used</dt><dd data-metric="system.db_pool.pool_used"></dd></div>
-        <div><dt>Migrations</dt><dd data-metric="system.migrations.count"></dd></div>
-        <div><dt>Latest</dt><dd data-metric="system.migrations.latest"></dd></div>
-        <div><dt>Scheduler jobs</dt><dd data-metric="system.scheduler.known_jobs"></dd></div>
-      </dl></article>
       <article class="card secondary-navigation">
         <h2>Дополнительные разделы</h2>
         <button id="open-gifts" type="button">🎁 Подарки</button>
-        <button id="open-content" type="button">📚 Контент</button>
-        <button id="open-member-preview" type="button">✨ Предпросмотр клуба</button>
         <button id="open-failed-subscriptions" type="button">⚠️ Проблемы продления</button>
       </article>
     </section>
@@ -415,13 +408,14 @@
       <button id="deliveries-more" type="button" hidden>Показать ещё</button>
       <article class="card"><h2>Планировщик</h2><div id="scheduler-runs" class="compact-list"></div></article>
       <article class="card"><h2>Миграции</h2><dl id="system-migrations"></dl></article>
+      <article class="card secondary-navigation"><h2>Служебные инструменты</h2><button id="open-content-legacy" type="button">Content Studio</button></article>
     </section>
     <section id="delivery-details" class="screen page" data-screen="delivery-details" hidden>
       <button id="deliveries-back" class="secondary" type="button">← К системе</button>
       <div id="delivery-details-content" class="dashboard"></div>
     </section>
     <div id="member-shell-header" class="member-shell-header" hidden>
-      <div class="member-preview-strip"><span>Режим предпросмотра</span><button class="member-exit" type="button">Вернуться в админку</button></div>
+      <div class="member-preview-strip"><span id="member-mode-label">Режим администратора</span><button class="member-exit" type="button">Вернуться в админку</button></div>
       <header class="member-header"><div><span>Закрытый клуб</span><strong>Натальи Ребковец</strong></div><span class="member-header-mark" aria-hidden="true">✦</span></header>
     </div>
     <section id="member-home" class="screen member-page" data-screen="member-home" hidden>
@@ -430,7 +424,7 @@
         <div class="member-hero-media" role="img" aria-label="Wellness-практика"></div>
       </article>
       <section class="member-section">
-        <div class="member-section-title"><h2>Тренировки</h2><button id="member-home-all" type="button">Все тренировки</button></div>
+        <div class="member-section-title"><h2>Тренировки</h2><div class="member-section-actions"><button class="member-admin-create" data-create-content="lesson" type="button">+ Добавить</button><button id="member-home-all" type="button">Все тренировки</button></div></div>
         <div class="member-grid member-training-tiles" aria-label="Направления тренировок">
           <button type="button" data-member-category-nav="strength"><span data-member-icon="strength" aria-hidden="true"></span><small>Силовые</small></button>
           <button type="button" data-member-category-nav="flexibility"><span data-member-icon="flexibility" aria-hidden="true"></span><small>Гибкость</small></button>

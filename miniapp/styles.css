@@ -6,6 +6,10 @@
   color: var(--tg-theme-text-color, #163c3c);
   --ui-border: rgb(97 128 128 / 22%);
   --ui-soft: var(--tg-theme-bg-color, #f4f7f7);
+  --admin-ink: #173f3d;
+  --admin-teal: #0b716d;
+  --admin-canvas: #f3f6f3;
+  --admin-gold: #c79a4b;
 }
 
 * { box-sizing: border-box; }
@@ -95,6 +99,10 @@ button:disabled { opacity: .55; cursor: default; }
   color: var(--tg-theme-link-color, #168787);
   border-color: currentColor;
 }
+.dashboard-feature { overflow: hidden; border-color: rgb(11 113 109 / 18%); background: radial-gradient(circle at 92% 5%, rgb(199 154 75 / 22%), transparent 34%), linear-gradient(135deg, #fff, #edf5f1); }
+.dashboard-feature h2 { font-family: Georgia, "Times New Roman", serif; color: var(--admin-ink); font-size: 24px; }
+.dashboard-feature-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.dashboard-feature-actions button { flex: 1 1 190px; margin: 0; }
 
 .search-label { display: block; margin: 12px 0 4px; color: var(--tg-theme-hint-color, #618080); font-size: 13px; }
 input, select {
@@ -355,6 +363,15 @@ body.member-preview-mode { background: #fbfaf7; }
 .member-description-excerpt { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .member-lesson-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--member-teal); font-size: 11px; font-weight: 750; }
 .member-badge, .member-preview-badge { padding: 3px 7px; border-radius: 999px; background: #f5e4bc; color: #765419; }
+.member-status-published { background: #dcefe4; color: #286443; }
+.member-status-archived { background: #ecebea; color: #666; }
+.member-media-missing { color: #9a4d3f; }
+.member-admin-card-actions, .member-admin-toolbar, .member-section-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.member-admin-card-actions { padding: 0 14px 14px; }
+.member-admin-card-actions button, .member-admin-toolbar button { flex: 1 1 120px; min-height: 44px; margin: 0; }
+.member-admin-toolbar { padding: 12px; border: 1px solid #dfc989; background: #fffbef; }
+.member-admin-create { width: auto; min-height: 44px; margin-top: 10px; }
+body.member-preview-mode .member-admin-create[hidden] { display: none; }
 .member-empty-state { min-width: 0; padding: 30px 18px; border-radius: 22px; background: var(--member-surface); color: var(--member-muted); text-align: center; }
 .member-empty-art { min-height: 270px; display: grid; place-items: center; align-content: center; gap: 7px; }
 .member-empty-art > span { color: var(--member-gold); font-size: 42px; }
@@ -560,7 +577,25 @@ body.member-preview-mode { background: #fbfaf7; }
 .studio-dialog::backdrop { background: rgb(10 40 40 / 45%); }
 
 @media (min-width: 900px) {
-  .shell:has(.screen[data-screen="content"]:not([hidden])), .shell:has(.screen[data-screen="content-details"]:not([hidden])), .shell:has(.screen[data-screen="content-create"]:not([hidden])) { width: min(100%, 1320px); }
+  body:not(.member-preview-mode) { padding: 0 0 0 232px; background: var(--admin-canvas); }
+  body:not(.member-preview-mode) .shell { width: min(100%, 1380px); margin: 0; padding: 24px 30px 44px; gap: 16px; }
+  body:not(.member-preview-mode) .hero-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 20px; padding: 15px 18px; border-color: rgb(11 113 109 / 14%); background: rgb(255 255 255 / 88%); }
+  body:not(.member-preview-mode) .hero-card .eyebrow,
+  body:not(.member-preview-mode) .hero-card h1,
+  body:not(.member-preview-mode) .hero-card .admin-status-line { grid-column: 1; }
+  body:not(.member-preview-mode) .hero-card #refresh { grid-column: 2; grid-row: 1 / 4; width: auto; min-width: 150px; margin: 0; }
+  body:not(.member-preview-mode) .dashboard { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  body:not(.member-preview-mode) .dashboard > .secondary-navigation,
+  body:not(.member-preview-mode) .dashboard > .dashboard-feature { grid-column: span 2; }
+  body:not(.member-preview-mode) .bottom-nav { position: fixed; inset: 0 auto 0 0; width: 232px; display: flex; flex-direction: column; align-items: stretch; gap: 5px; padding: 28px 16px; border: 0; border-right: 1px solid rgb(255 255 255 / 9%); background: linear-gradient(180deg, #0b615f, #123f40); transform: none; }
+  body:not(.member-preview-mode) .bottom-nav[hidden] { display: none; }
+  body:not(.member-preview-mode) .bottom-nav::before { content: "Natalia_SoulFit"; margin: 2px 10px 24px; color: #fff; font-family: Georgia, "Times New Roman", serif; font-size: 21px; }
+  body:not(.member-preview-mode) .bottom-nav button { min-height: 46px; padding: 10px 12px; border-radius: 11px; color: rgb(255 255 255 / 76%); font-size: 13px; text-align: left; }
+  body:not(.member-preview-mode) .bottom-nav button.active { color: #fff; background: rgb(255 255 255 / 13%); }
+  .shell:has(.screen[data-screen="content"]:not([hidden])), .shell:has(.screen[data-screen="content-details"]:not([hidden])), .shell:has(.screen[data-screen="content-create"]:not([hidden])) { width: min(100%, 1380px); }
+  .studio-workspace { grid-template-columns: minmax(460px, 1.15fr) minmax(340px, .85fr); gap: 20px; }
+  .studio-preview { border-radius: 22px; box-shadow: 0 18px 45px rgb(20 64 61 / 12%); }
+  .studio-editor { padding: 22px; }
 }
 @media (max-width: 760px) {
   .studio-workspace { grid-template-columns: 1fr; }

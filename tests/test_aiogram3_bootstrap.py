@@ -10314,7 +10314,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не удалось загрузить изображение", javascript)
         self.assertIn("blob:", self.main.MINIAPP_SECURITY_HEADERS["Content-Security-Policy"])
         self.assertIn("id=\"open-gifts\"", index)
-        self.assertIn("id=\"open-content\"", index)
+        self.assertIn("id=\"open-content-legacy\"", index)
         self.assertIn('id="open-member-preview"', index)
         self.assertIn("/api/admin/member-preview/home", javascript)
         self.assertIn("/api/admin/member-preview/content", javascript)
@@ -10336,7 +10336,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for invented in ("calories", "protein", "carbs", "difficulty", "servings"):
             self.assertNotIn(invented, javascript.lower())
         self.assertIn('id="member-bottom-nav"', index)
-        self.assertIn("Режим предпросмотра", index)
+        self.assertIn("Режим администратора", index)
         self.assertIn("Медитации появятся здесь", index)
         self.assertIn("Рецепты появятся здесь", index)
         self.assertIn("adminHero.hidden = true", javascript)

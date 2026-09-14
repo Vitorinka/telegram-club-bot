@@ -491,7 +491,13 @@
     const meta = document.createElement("div");
     meta.className = "member-lesson-meta";
     meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
-    if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
+    if (!realMemberMode) {
+      const statusBadge = text("span", ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[item.status] || item.status), `member-preview-badge member-status-${item.status}`);
+      meta.append(statusBadge);
+      if ((item.content_type === "lesson" && !item.has_video) || (item.content_type === "meditation" && !item.has_audio)) {
+        meta.append(text("span", item.content_type === "meditation" ? "Не добавлено аудио" : "Не добавлено видео", "member-media-missing"));
+      }
+    }
     const bookmark = text("span", "☆");
     bookmark.setAttribute("aria-hidden", "true");
     meta.append(bookmark);
@@ -501,6 +507,22 @@
     button.append(copy);
     button.addEventListener("click", () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
     article.append(button);
+    if (!realMemberMode) {
+      const actions = document.createElement("div");
+      actions.className = "member-admin-card-actions";
+      const edit = text("button", item.status === "published" ? "Новая версия" : item.status === "archived" ? "Только просмотр" : "Редактировать");
+      edit.type = "button";
+      edit.disabled = item.status === "archived";
+      edit.addEventListener("click", () => {
+        if (item.status === "published") loadCmsContentDetails(item.content_id).then(createContentRevision).catch(showApiError);
+        else loadCmsContentDetails(item.content_id).catch(showApiError);
+      });
+      const preview = text("button", "Предпросмотр", "secondary");
+      preview.type = "button";
+      preview.addEventListener("click", () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
+      actions.append(edit, preview);
+      article.append(actions);
+    }
     return article;
   };
   const showMemberScreen = (name) => {
@@ -512,6 +534,8 @@
     bottomNav.hidden = true;
     memberBottomNav.hidden = false;
     memberShellHeader.hidden = false;
+    document.getElementById("member-mode-label").textContent = realMemberMode ? "Закрытый клуб" : "Режим администратора";
+    document.querySelectorAll(".member-admin-create").forEach((button) => { button.hidden = realMemberMode; });
     showScreen(name);
     const navigationName = (
       name === "member-lesson" || name === "member-meditations"
@@ -596,7 +620,7 @@
       const meta = document.createElement("div");
       meta.className = "member-lesson-meta";
       meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
-      if (item.status === "draft") meta.append(text("span", "Черновик", "member-preview-badge"));
+      if (!realMemberMode) meta.append(text("span", ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[item.status] || item.status), `member-preview-badge member-status-${item.status}`));
       heading.append(meta, text("h1", item.title));
       if (item.duration_seconds) heading.append(text(
         "p",
@@ -605,6 +629,21 @@
           : `${Math.ceil(item.duration_seconds / 60)} минут`
       ));
       memberLessonContent.append(heading);
+      if (!realMemberMode) {
+        const toolbar = document.createElement("section");
+        toolbar.className = "member-card member-admin-toolbar";
+        const edit = text("button", item.status === "published" ? "Создать новую версию" : "Редактировать");
+        edit.type = "button"; edit.disabled = item.status === "archived";
+        edit.addEventListener("click", () => loadCmsContentDetails(item.content_id).then(() => item.status === "published" ? createContentRevision() : null).catch(showApiError));
+        toolbar.append(edit);
+        if (item.status === "draft" || item.status === "published") {
+          const lifecycle = text("button", item.status === "published" ? "Архивировать" : "Опубликовать", "secondary");
+          lifecycle.type = "button";
+          lifecycle.addEventListener("click", () => loadCmsContentDetails(item.content_id).then(previewContentLifecycle).catch(showApiError));
+          toolbar.append(lifecycle);
+        }
+        memberLessonContent.append(toolbar);
+      }
       if (item.description) {
         const description = document.createElement("section");
         description.className = "member-description formatted-content";
@@ -2316,6 +2355,30 @@
   };
 
   hydrateMemberIcons();
+  const installMemberAdminCreateActions = () => {
+    const targets = [
+      ["#member-home .member-section-title", "lesson", "+ Добавить"],
+      ["#member-library .member-page-heading", "lesson", "+ Добавить тренировку"],
+      ["#member-meditations .member-page-heading", "meditation", "+ Добавить медитацию"],
+      ["#member-recipes .member-page-heading", "recipe", "+ Добавить рецепт"],
+      ["#member-nutrition .member-page-heading", "nutrition_material", "+ Добавить материал"],
+    ];
+    targets.forEach(([selector, type, label]) => {
+      const target = document.querySelector(selector);
+      if (!target || target.querySelector("[data-create-content]")) return;
+      const button = text("button", label, "member-admin-create member-button");
+      button.type = "button"; button.dataset.createContent = type;
+      button.addEventListener("click", () => {
+        contentCreateType.value = type;
+        showScreen("content-create");
+        memberShellHeader.hidden = false;
+        memberBottomNav.hidden = false;
+        loadTaxonomy(type, contentCreateTaxonomy).catch(showApiError);
+      });
+      target.append(button);
+    });
+  };
+  installMemberAdminCreateActions();
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -2338,6 +2401,7 @@
   });
   refresh.addEventListener("click", () => loadDashboard().catch(showApiError));
   document.getElementById("open-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
+  document.getElementById("open-content-legacy").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
