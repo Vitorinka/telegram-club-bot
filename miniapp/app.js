@@ -2404,6 +2404,8 @@
   document.getElementById("open-schedule-mobile").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("open-content-legacy").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("open-content").addEventListener("click", () => loadContent().catch(showApiError));
+  document.getElementById("topbar-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
+  document.getElementById("dashboard-create-content").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
   document.getElementById("open-member-preview").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
   document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));

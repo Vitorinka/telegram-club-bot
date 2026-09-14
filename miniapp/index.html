@@ -11,30 +11,29 @@
 <body>
   <main class="shell" aria-live="polite">
     <section id="admin-hero" class="card hero-card">
-      <p class="eyebrow">Telegram Club Bot</p>
-      <h1 id="title">Админ-платформа</h1>
+      <div class="admin-topbar-copy"><p class="eyebrow">Natalia_SoulFit</p><h1 id="title">Рабочее пространство</h1></div>
       <p class="admin-status-line">
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <button id="refresh" type="button" hidden>Обновить данные</button>
+      <div class="admin-topbar-actions"><button id="refresh" class="secondary" type="button" hidden>Обновить</button><button id="topbar-create-content" type="button">+ Создать материал</button></div>
     </section>
     <section id="dashboard" class="dashboard screen" data-screen="overview" hidden>
-      <header class="admin-page-heading"><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день</h1><p>Контент, участники и задачи, которым нужно внимание.</p></header>
-      <article class="card"><h2>Участники</h2><dl>
+      <header class="admin-page-heading"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия</h1><p>Контент, участники и задачи, которым нужно внимание.</p></div><button id="dashboard-create-content" type="button">+ Создать материал</button></header>
+      <article class="card admin-summary-card admin-summary-members"><span class="admin-summary-icon" aria-hidden="true">○</span><h2>Участники</h2><dl>
         <div><dt>Активные участники</dt><dd data-metric="users.active_access"></dd></div>
         <div><dt>Всего пользователей</dt><dd data-metric="users.total"></dd></div>
         <div><dt>Trial</dt><dd data-metric="users.trial"></dd></div>
         <div><dt>Просроченные доступы</dt><dd data-metric="users.expired_paid"></dd></div>
       </dl></article>
-      <article class="card"><h2>Оплата</h2><dl>
+      <article class="card admin-summary-card admin-summary-subscriptions"><span class="admin-summary-icon" aria-hidden="true">◇</span><h2>Подписки</h2><dl>
         <div><dt>Неудачные оплаты</dt><dd data-metric="billing.failed_payments"></dd></div>
         <div><dt>Активный grace</dt><dd data-metric="billing.active_grace"></dd></div>
         <div><dt>Истёкший grace</dt><dd data-metric="billing.expired_grace"></dd></div>
         <div><dt>Автопродление</dt><dd data-metric="billing.auto_renew"></dd></div>
       </dl></article>
-      <article class="card dashboard-feature"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, проверка готовности и публикация — в едином workspace.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть Content Studio</button><button id="open-member-preview" class="secondary" type="button">Предпросмотр клуба</button></div></article>
-      <article class="card"><h2>Доставка</h2><dl>
+      <article class="card dashboard-feature admin-summary-content"><p class="eyebrow">Редакционная студия</p><h2>Контент клуба</h2><p>Черновики, медиа, готовность и публикация в одном пространстве.</p><div class="dashboard-feature-actions"><button id="open-content" type="button">Открыть студию</button><button id="open-member-preview" class="secondary" type="button">Посмотреть клуб</button></div></article>
+      <article class="card admin-summary-card admin-summary-attention"><span class="admin-summary-icon" aria-hidden="true">!</span><h2>Требуют внимания</h2><dl>
         <div><dt>Pending</dt><dd data-metric="deliveries.pending"></dd></div>
         <div><dt>Failed</dt><dd data-metric="deliveries.failed"></dd></div>
         <div><dt>Permanently failed</dt><dd data-metric="deliveries.permanently_failed"></dd></div>
@@ -48,7 +47,7 @@
       </article>
     </section>
     <section id="content-screen" class="screen page" data-screen="content" hidden>
-      <header class="studio-heading"><div><p class="eyebrow">Режим администратора</p><h1>Контент</h1><p>Управляйте материалами прямо в интерфейсе клуба.</p></div><button id="content-create-open" type="button">+ Добавить</button></header>
+      <header class="studio-heading"><div><p class="eyebrow">Редакционная студия</p><h1>Контент</h1><p>Создавайте вдохновляющие материалы для клуба.</p></div><button id="content-create-open" type="button">+ Создать материал</button></header>
       <article class="card studio-filters">
         <div id="content-status-filters" class="studio-chips" aria-label="Статус материалов">
           <button class="active" data-content-status="all" type="button">Все</button><button data-content-status="draft" type="button">Черновики</button><button data-content-status="published" type="button">Опубликованные</button><button data-content-status="archived" type="button">Архив</button>
@@ -470,7 +469,8 @@
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
-    <div class="admin-nav-brand" aria-hidden="true"><span>◇</span><strong>Natalia_SoulFit</strong><small>Управление клубом</small></div>
+    <div class="admin-nav-brand" aria-hidden="true"><span class="admin-brand-lotus">◇</span><strong>Natalia_SoulFit</strong><small>Больше, чем клуб</small></div>
+    <span class="admin-nav-group">Рабочее пространство</span>
     <button type="button" data-nav="overview">Обзор</button>
     <button type="button" data-nav="content">Контент</button>
     <button type="button" data-nav="users">Пользователи</button>
@@ -478,6 +478,7 @@
     <button type="button" data-nav="schedule">Расписание</button>
     <button id="nav-gifts" type="button">Подарки</button>
     <button id="nav-failed-subscriptions" type="button">Проблемы продления</button>
+    <span class="admin-nav-group">Управление</span>
     <button type="button" data-nav="system">Система</button>
     <div class="admin-nav-profile"><span class="admin-nav-avatar" aria-hidden="true">N</span><div><strong>Администратор</strong><small>Защищённый режим</small></div></div>
   </nav>
