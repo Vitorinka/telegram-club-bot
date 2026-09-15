@@ -1927,6 +1927,116 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "STRIPE_GRACE_ACTIVE")
         ensure_grace.assert_called_once_with(123, "sub_retry")
 
+    async def test_active_subscription_at_renewal_boundary_open_invoice_creates_grace(self):
+        old_period_end = int((datetime.utcnow() - timedelta(minutes=1)).timestamp())
+        for invoice_status in ("open", "draft", "uncollectible"):
+            with self.subTest(invoice_status=invoice_status):
+                invoice = SimpleNamespace(
+                    id="in_boundary",
+                    status=invoice_status,
+                    paid=False,
+                    payment_intent=SimpleNamespace(status="requires_action"),
+                )
+                subscription = SimpleNamespace(
+                    status="active",
+                    current_period_end=old_period_end,
+                    latest_invoice=invoice,
+                )
+                first_failure = datetime.utcnow()
+                grace_until = first_failure + timedelta(hours=48)
+                with patch.object(
+                    self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)
+                ), patch.object(
+                    self.main,
+                    "ensure_failed_renewal_grace_from_recheck",
+                    return_value=(first_failure, grace_until),
+                ) as ensure_grace:
+                    result = await self.main.refresh_active_stripe_subscription(
+                        123, "sub_boundary"
+                    )
+
+                self.assertEqual(result, "STRIPE_GRACE_ACTIVE")
+                self.assertEqual(result.stripe_status, "active")
+                self.assertEqual(result.invoice_status, invoice_status)
+                ensure_grace.assert_called_once_with(123, "sub_boundary")
+
+    async def test_active_subscription_at_renewal_boundary_ambiguous_invoice_preserves_access(self):
+        old_period_end = int((datetime.utcnow() - timedelta(minutes=1)).timestamp())
+        for latest_invoice in (None, SimpleNamespace(id="in_unknown", status=None, paid=False)):
+            with self.subTest(latest_invoice=latest_invoice):
+                subscription = SimpleNamespace(
+                    status="active",
+                    current_period_end=old_period_end,
+                    latest_invoice=latest_invoice,
+                )
+                with patch.object(
+                    self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)
+                ), patch.object(
+                    self.main, "ensure_failed_renewal_grace_from_recheck"
+                ) as ensure_grace:
+                    result = await self.main.refresh_active_stripe_subscription(
+                        123, "sub_boundary"
+                    )
+
+                self.assertEqual(result, "STRIPE_RENEWAL_PENDING")
+                ensure_grace.assert_not_called()
+
+    async def test_paid_renewal_invoice_recovers_authoritative_new_period(self):
+        old_period_end = int((datetime.utcnow() - timedelta(minutes=1)).timestamp())
+        new_period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        invoice = {
+            "id": "in_paid",
+            "status": "paid",
+            "paid": True,
+            "lines": {"data": [{"period": {"end": new_period_end}}]},
+        }
+        subscription = SimpleNamespace(
+            status="active",
+            current_period_end=old_period_end,
+            latest_invoice=invoice,
+        )
+        conn = FakeConnection()
+        with patch.object(
+            self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)
+        ), patch.object(self.main, "get_db_conn", return_value=conn):
+            result = await self.main.refresh_active_stripe_subscription(
+                123, "sub_boundary"
+            )
+
+        self.assertEqual(result, "STRIPE_ACTIVE")
+        update_queries = [
+            (query, params) for query, params in conn.cursor_obj.queries
+            if "UPDATE users" in query
+        ]
+        self.assertEqual(len(update_queries), 1)
+        self.assertEqual(update_queries[0][1][1], 123)
+        self.assertGreater(update_queries[0][1][0], datetime.utcnow())
+
+    async def test_ambiguous_renewal_recheck_never_reaches_telegram_ban(self):
+        claim_conn = FakeConnection()
+        expired = datetime.utcnow() - timedelta(minutes=1)
+        pending = self.main.stripe_removal_recheck_result(
+            "STRIPE_RENEWAL_PENDING", "active", "open"
+        )
+        with patch.object(self.main, "get_db_conn", return_value=claim_conn), \
+             patch.object(self.main, "claim_subscription_removal", return_value={"status": "claimed", "owner_id": "test-owner", "claim_generation": 1}), \
+             patch.object(self.main, "fetch_subscription_removal_user", return_value=(
+                 True, expired, "sub_boundary", False, None, None, True, "cus_boundary",
+             )), \
+             patch.object(self.main, "refresh_active_stripe_subscription", AsyncMock(return_value=pending)), \
+             patch.object(self.main, "mark_subscription_removal_short") as mark_short, \
+             patch.object(self.main.bot, "get_chat_member", AsyncMock()) as get_member, \
+             patch.object(self.main.bot, "ban_chat_member", AsyncMock()) as ban:
+            result = await self.main.ban_user_logic(123)
+
+        self.assertEqual(result, "STRIPE_RENEWAL_PENDING")
+        self.assertTrue(any(
+            call.args[:3] == (123, "pending", "STRIPE_RENEWAL_PENDING")
+            for call in mark_short.call_args_list
+        ))
+        get_member.assert_not_awaited()
+        ban.assert_not_awaited()
+
     async def test_subscription_removal_ban_failure_is_retryable_and_not_finalized(self):
         claim_conn = FakeConnection()
         with patch.object(self.main, "get_db_conn", return_value=claim_conn), \

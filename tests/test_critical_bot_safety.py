@@ -886,6 +886,36 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertNotIn("bot.ban_chat_member", cancel_failure)
         self.assertNotIn("finalize_subscription_removal_in_db", cancel_failure)
 
+    def test_final_pre_ban_fence_checks_grace_identity_and_positive_stripe_evidence(self):
+        fence = MAIN_SOURCE[
+            MAIN_SOURCE.index("def subscription_removal_claim_is_current"):
+            MAIN_SOURCE.index("def fail_telegram_unban_compensation")
+        ]
+        self.assertIn("payment_failed_at + (%s * INTERVAL '1 hour') > NOW()", fence)
+        self.assertIn("grace_period_end > NOW()", fence)
+        self.assertIn("user_row.stripe_subscription_id = removal.stripe_subscription_id", fence)
+        self.assertIn("removal.stripe_canceled_at IS NULL", fence)
+        removal = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def ban_user_logic"):
+            MAIN_SOURCE.index("async def check_subscriptions_and_reminders")
+        ]
+        final_fence = removal.rindex("subscription_removal_claim_is_current")
+        ban_call = removal.index("await bot.ban_chat_member", final_fence)
+        between = removal[final_fence:ban_call]
+        self.assertNotIn("await ", between)
+        self.assertIn("USER_REMOVE_FINAL_DECISION", between)
+        termination = MAIN_SOURCE[
+            MAIN_SOURCE.index("async def terminate_failed_subscription"):
+            MAIN_SOURCE.index("async def cancel_failed_renewal_subscription_after_grace")
+        ]
+        termination_fence = termination.index("failed_termination_pre_ban_fence")
+        termination_ban = termination.index("await bot.ban_chat_member", termination_fence)
+        self.assertNotIn("await ", termination[termination_fence:termination_ban])
+        self.assertIn(
+            "FAILED_SUBSCRIPTION_FINAL_TELEGRAM_DECISION",
+            termination[termination_fence:termination_ban],
+        )
+
     def test_subscription_check_releases_batch_cursor_before_side_effects(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def check_subscriptions_and_reminders"):MAIN_SOURCE.index("async def check_free_lesson_followups")]
         self.assertLess(source.index("conn.close()"), source.index("for (telegram_id, expiry"))
@@ -1027,10 +1057,15 @@ class CriticalBotSafetyTests(unittest.TestCase):
 
     def test_group_join_handler_checks_live_telegram_status_before_removal(self):
         source = MAIN_SOURCE[MAIN_SOURCE.index("async def delete_join_leave_service_messages"):MAIN_SOURCE.index("GROUP_SERVICE_MESSAGE")]
+        self.assertIn("refresh_active_stripe_subscription", source)
         self.assertIn("bot.get_chat_member", source)
         self.assertIn('telegram_status in ("administrator", "creator")', source)
         self.assertIn("GROUP_JOIN_TELEGRAM_STATUS_ERROR", source)
         self.assertLess(source.index("bot.get_chat_member"), source.index("bot.ban_chat_member"))
+        fence_pos = source.index("unauthorized_group_join_removal_is_still_safe")
+        ban_pos = source.index("await bot.ban_chat_member", fence_pos)
+        self.assertNotIn("await ", source[fence_pos:ban_pos])
+        self.assertIn("until_date=join_ban_until", source[ban_pos:])
 
     def test_followup_uses_per_user_delivery_claim(self):
         start = MAIN_SOURCE.index("async def send_free_lesson_followup")

@@ -4638,6 +4638,75 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(duplicate, "already_processing_or_completed")
         retrieve_again.assert_not_called()
 
+    def test_failed_termination_new_access_after_member_lookup_is_fenced_before_ban_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 97501
+        now = datetime.utcnow()
+        old_expiry = now - timedelta(hours=3)
+        new_expiry = now + timedelta(days=30)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=old_expiry,
+            stripe_customer_id="cus_failed_97501",
+            stripe_subscription_id="sub_failed_97501",
+            payment_failed=True,
+            payment_failed_at=now - timedelta(hours=49),
+            grace_period_end=now - timedelta(hours=1),
+            auto_renew=True,
+        )
+        failed_invoice = mock.Mock(
+            id="in_failed_97501", subscription="sub_failed_97501", status="open",
+        )
+        voided_invoice = mock.Mock(
+            id="in_failed_97501", subscription="sub_failed_97501", status="void",
+        )
+        subscription = mock.Mock(
+            status="past_due", latest_invoice=failed_invoice,
+        )
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+
+        async def grant_new_access_during_member_lookup(**_kwargs):
+            conn = self.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET stripe_subscription_id = %s, paid = TRUE,
+                        expiry_date = %s, payment_failed = FALSE,
+                        payment_failed_at = NULL, grace_period_end = NULL,
+                        auto_renew = TRUE
+                    WHERE telegram_id = %s
+                    """,
+                    ("sub_new_97501", new_expiry, user_id),
+                )
+            conn.commit()
+            conn.close()
+            return SimpleNamespace(status="member")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[failed_invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(side_effect=grant_new_access_during_member_lookup)), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            result = asyncio.run(main.terminate_failed_subscription(
+                user_id, "grace_period_expired"
+            ))
+
+        self.assertEqual(result, "new_access_protected")
+        ban.assert_not_awaited()
+        unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT stripe_subscription_id, paid, expiry_date FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), ("sub_new_97501", True, new_expiry))
+        self.assertEqual(self.query_one(
+            "SELECT status FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (user_id,),
+        )[0], "superseded")
+
     def test_failed_subscription_stripe_and_telegram_failures_remain_retryable_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
@@ -6847,6 +6916,99 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "SELECT status, last_error FROM subscription_removal_events WHERE telegram_id = %s",
             (user_id,),
         ), ("superseded", "active_access_in_db"))
+
+    def test_final_pre_ban_fence_requires_due_grace_and_exact_stripe_identity_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 99061
+        now = datetime.utcnow()
+        expiry = now - timedelta(minutes=1)
+        self.insert_recovery_user(
+            user_id,
+            paid=True,
+            expiry_date=expiry,
+            payment_failed=True,
+            payment_failed_at=now,
+            grace_period_end=now + timedelta(hours=48),
+            auto_renew=True,
+            stripe_subscription_id="sub_boundary_fence",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            claim = main.claim_subscription_removal(
+                cur, user_id, "subscription_expired", owner_id="worker-fence",
+                return_token=True,
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertFalse(main.subscription_removal_claim_is_current(
+                user_id, claim["owner_id"], claim["claim_generation"]
+            ))
+            self.assertFalse(main.unauthorized_group_join_removal_is_still_safe(
+                user_id
+            ))
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET payment_failed_at = NOW() - INTERVAL '49 hours',
+                    grace_period_end = NOW() - INTERVAL '1 hour'
+                WHERE telegram_id = %s
+                """,
+                (user_id,),
+            )
+            cur.execute(
+                """
+                UPDATE subscription_removal_events
+                SET stripe_canceled_at = NOW()
+                WHERE telegram_id = %s
+                """,
+                (user_id,),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertTrue(main.subscription_removal_claim_is_current(
+                user_id, claim["owner_id"], claim["claim_generation"]
+            ))
+            self.assertFalse(main.unauthorized_group_join_removal_is_still_safe(
+                user_id
+            ))
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET auto_renew = FALSE WHERE telegram_id = %s",
+                (user_id,),
+            )
+        conn.commit()
+        conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertTrue(main.unauthorized_group_join_removal_is_still_safe(
+                user_id
+            ))
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET stripe_subscription_id = %s WHERE telegram_id = %s",
+                ("sub_new_access", user_id),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertFalse(main.subscription_removal_claim_is_current(
+                user_id, claim["owner_id"], claim["claim_generation"]
+            ))
 
     def test_subscription_removal_and_scheduled_job_claims_are_generation_fenced_real_postgres(self):
         run_migrations(self.get_conn)
