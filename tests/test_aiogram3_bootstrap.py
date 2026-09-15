@@ -1988,7 +1988,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "id": "in_paid",
             "status": "paid",
             "paid": True,
-            "lines": {"data": [{"period": {"end": new_period_end}}]},
+            "lines": {"data": [{
+                "subscription": "sub_boundary",
+                "period": {"end": new_period_end},
+            }]},
         }
         subscription = SimpleNamespace(
             status="active",
@@ -2011,6 +2014,74 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(update_queries), 1)
         self.assertEqual(update_queries[0][1][1], 123)
         self.assertGreater(update_queries[0][1][0], datetime.utcnow())
+
+    async def test_paid_renewal_ignores_later_unrelated_invoice_line(self):
+        old_period_end = int((datetime.utcnow() - timedelta(minutes=1)).timestamp())
+        exact_period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        unrelated_period_end = int((datetime.utcnow() + timedelta(days=365)).timestamp())
+        invoice = {
+            "status": "paid",
+            "paid": True,
+            "lines": {"data": [
+                {
+                    "parent": {"subscription_item_details": {
+                        "subscription": "sub_boundary",
+                    }},
+                    "period": {"end": exact_period_end},
+                },
+                {
+                    "subscription": "sub_unrelated",
+                    "period": {"end": unrelated_period_end},
+                },
+            ]},
+        }
+        subscription = SimpleNamespace(
+            status="active", current_period_end=old_period_end,
+            latest_invoice=invoice,
+        )
+        conn = FakeConnection()
+        with patch.object(
+            self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)
+        ), patch.object(self.main, "get_db_conn", return_value=conn):
+            result = await self.main.refresh_active_stripe_subscription(
+                123, "sub_boundary"
+            )
+
+        self.assertEqual(result, "STRIPE_ACTIVE")
+        update = next(
+            params for query, params in conn.cursor_obj.queries
+            if "UPDATE users" in query
+        )
+        self.assertEqual(
+            update[0], datetime.utcfromtimestamp(exact_period_end)
+        )
+
+    async def test_paid_renewal_without_exact_subscription_line_preserves_access(self):
+        old_period_end = int((datetime.utcnow() - timedelta(minutes=1)).timestamp())
+        invoice = {
+            "status": "paid",
+            "paid": True,
+            "lines": {"data": [{
+                "subscription": "sub_other",
+                "period": {"end": int((datetime.utcnow() + timedelta(days=30)).timestamp())},
+            }]},
+        }
+        subscription = SimpleNamespace(
+            status="active", current_period_end=old_period_end,
+            latest_invoice=invoice,
+        )
+        conn = FakeConnection()
+        with patch.object(
+            self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)
+        ), patch.object(self.main, "get_db_conn", return_value=conn):
+            result = await self.main.refresh_active_stripe_subscription(
+                123, "sub_boundary"
+            )
+
+        self.assertEqual(result, "STRIPE_RENEWAL_PENDING")
+        self.assertFalse(any(
+            "UPDATE users" in query for query, _params in conn.cursor_obj.queries
+        ))
 
     async def test_ambiguous_renewal_recheck_never_reaches_telegram_ban(self):
         claim_conn = FakeConnection()
