@@ -9819,6 +9819,24 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         async def download_video(file_path, destination, **kwargs):
             self.assertEqual(file_path, "private/video/path")
             destination.write(video_bytes)
+        free_video = dict(video, content_access_level="free")
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=free_video), \
+             patch.object(self.main, "member_access", side_effect=AssertionError("free media must not require paid entitlement")), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=len(video_bytes))), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_video):
+            free_delivery = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(free_delivery.status, 200)
+        self.assertEqual(free_delivery.body, video_bytes)
+        self.assertNotIn("private-ref", str(free_delivery.headers))
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", side_effect=[free_video, video]), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock, return_value=SimpleNamespace(file_path="private/video/path", file_size=len(video_bytes))), \
+             patch.object(self.main.bot, "download_file", new_callable=AsyncMock, side_effect=download_video):
+            changed_to_paid = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(changed_to_paid.status, 403)
+
         with patch.object(self.main, "load_member_session", return_value=session), \
              patch.object(self.main, "get_member_media_reference", return_value=video), \
              patch.object(self.main, "member_access", return_value={"has_active_access": True}) as access_check, \
@@ -10412,6 +10430,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="member-meditation-list"', index)
         self.assertIn('id="member-recipe-list"', index)
         self.assertIn('id="member-nutrition-list"', index)
+        self.assertIn('id="member-free-section"', index)
+        self.assertIn('id="member-free-lesson"', index)
+        self.assertIn('id="content-create-access"', index)
+        self.assertIn('id="content-edit-access"', index)
+        self.assertIn('value="paid">По подписке', index)
+        self.assertIn('value="free">Бесплатно', index)
+        self.assertIn('item.access_level === "free"', javascript)
+        self.assertIn('data.free_lessons || []', javascript)
+        self.assertIn('"Смотреть урок"', javascript)
         self.assertIn('id="content-recipe-card"', index)
         self.assertIn("loadMemberMeditations", javascript)
         self.assertIn("loadMemberRecipes", javascript)

@@ -66,6 +66,9 @@
           </select>
         </label>
         <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
+        <label>Доступ
+          <select id="content-create-access"><option value="paid">По подписке</option><option value="free">Бесплатно</option></select>
+        </label>
         <details class="studio-create-options"><summary>Заполнить дополнительные поля сразу</summary>
         <input id="content-create-category" type="hidden">
         <fieldset id="content-create-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
@@ -102,6 +105,9 @@
         <label class="authoring-field">Описание <textarea id="content-edit-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
         <label class="authoring-field">Длительность <input id="content-edit-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04"></label>
         <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
+        <label>Доступ
+          <select id="content-edit-access"><option value="paid">По подписке</option><option value="free">Бесплатно</option></select>
+        </label>
         <p id="content-edit-message" class="hint"></p>
         <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button></div>
       </article><aside id="content-live-preview" class="card studio-preview"><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
@@ -436,6 +442,10 @@
         <div><p id="member-greeting" class="member-kicker">Здравствуйте!</p><h1>Рады видеть вас<br>в клубе Natalia_SoulFit</h1><button id="member-continue" class="member-button" type="button">Выбрать тренировку</button></div>
         <div class="member-hero-media" role="img" aria-label="Wellness-практика"></div>
       </article>
+      <section id="member-free-section" class="member-section member-free-section" hidden>
+        <div class="member-section-title"><div><p class="member-kicker">Начните бесплатно</p><h2>Бесплатный урок</h2></div></div>
+        <div id="member-free-lesson"></div>
+      </section>
       <section class="member-section">
         <div class="member-section-title"><h2>Тренировки</h2><div class="member-section-actions"><button class="member-admin-create" data-create-content="lesson" type="button">+ Добавить</button><button id="member-home-all" type="button">Все тренировки</button></div></div>
         <div class="member-grid member-training-tiles" aria-label="Направления тренировок">

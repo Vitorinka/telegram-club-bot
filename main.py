@@ -22434,14 +22434,15 @@ async def miniapp_member_content_details(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_categories(request):
-    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"))
+    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"),request["miniapp_member"].telegram_id)
     except MemberCatalogError as error: return member_error(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_home(request):
     lessons=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6)
-    categories=list_member_categories(get_db_conn,"lesson")
-    return apply_miniapp_security_headers(web.json_response({"latest_lessons":lessons["items"],"categories":categories["items"],"access":lessons["access"],"published_only":True}))
+    categories=list_member_categories(get_db_conn,"lesson",request["miniapp_member"].telegram_id)
+    free_lessons = [item for item in lessons["items"] if item.get("access_level") == "free"]
+    return apply_miniapp_security_headers(web.json_response({"latest_lessons":lessons["items"],"free_lessons":free_lessons,"categories":categories["items"],"access":lessons["access"],"published_only":True}))
 
 async def miniapp_member_schedule(request):
     month=datetime.now(MOSCOW_TZ).strftime("%Y-%m")
@@ -22465,7 +22466,8 @@ async def miniapp_member_media(request):
     access_level=member_media_access_level(media["media_type"])
     if access_level is None:
         return member_error(MemberCatalogError("media_not_found",404))
-    if access_level == "premium" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
+    free_content = media.get("content_access_level") == "free"
+    if access_level == "premium" and not free_content and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
         return member_error(MemberCatalogError("active_access_required",403))
     limit={"cover":COVER_MAX_BYTES,"audio":AUDIO_MAX_BYTES,"video":VIDEO_MAX_BYTES}[media["media_type"]]
     try:
@@ -22481,7 +22483,17 @@ async def miniapp_member_media(request):
                 raise MemberCatalogError("media_unavailable",502)
     except MemberCatalogError as error: return member_error(error)
     except Exception: return member_error(MemberCatalogError("media_unavailable",503))
-    if access_level=="premium" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
+    try:
+        current_media = get_member_media_reference(
+            get_db_conn,
+            request.match_info.get("content_id"),
+            request.match_info.get("media_id"),
+        )
+    except ContentMediaError:
+        current_media = None
+    if current_media is None:
+        return member_error(MemberCatalogError("media_not_found",404))
+    if access_level=="premium" and current_media.get("content_access_level") != "free" and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
         return member_error(MemberCatalogError("active_access_required",403))
     response=web.Response(body=data,content_type=media["mime_type"])
     response.headers["Content-Disposition"]="inline"

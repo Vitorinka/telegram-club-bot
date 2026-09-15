@@ -152,6 +152,7 @@
   const cmsContentEmpty = document.getElementById("cms-content-empty");
   const contentCreateTitle = document.getElementById("content-create-title");
   const contentCreateType = document.getElementById("content-create-type");
+  const contentCreateAccess = document.getElementById("content-create-access");
   const contentCreateCategory = document.getElementById("content-create-category");
   const contentCreateDescription = document.getElementById("content-create-description");
   const contentCreateDuration = document.getElementById("content-create-duration");
@@ -174,6 +175,7 @@
   const contentEditDescription = document.getElementById("content-edit-description");
   const contentEditDuration = document.getElementById("content-edit-duration");
   const contentEditOrder = document.getElementById("content-edit-order");
+  const contentEditAccess = document.getElementById("content-edit-access");
   const contentEditMessage = document.getElementById("content-edit-message");
   const contentEditorState = document.getElementById("content-editor-state");
   const contentEditorTitle = document.getElementById("content-editor-title");
@@ -213,6 +215,8 @@
   const contentVersionHistoryEmpty = document.getElementById("content-version-history-empty");
   const contentCreateRevision = document.getElementById("content-create-revision");
   const memberHomeLessons = document.getElementById("member-home-lessons");
+  const memberFreeSection = document.getElementById("member-free-section");
+  const memberFreeLesson = document.getElementById("member-free-lesson");
   const memberHomeEmpty = document.getElementById("member-home-empty");
   const memberHomeCategories = document.getElementById("member-home-categories");
   const memberTrainingList = document.getElementById("member-training-list");
@@ -505,6 +509,7 @@
     const meta = document.createElement("div");
     meta.className = "member-lesson-meta";
     meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
+    if (item.access_level === "free") meta.append(text("span", "Бесплатно", "member-free-badge"));
     if (!realMemberMode) {
       const statusBadge = text("span", ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[item.status] || item.status), `member-preview-badge member-status-${item.status}`);
       meta.append(statusBadge);
@@ -518,6 +523,7 @@
     copy.append(meta, text("h2", item.title));
     if (item.duration_seconds) meta.append(text("span", `${Math.ceil(item.duration_seconds / 60)} мин.`, "member-duration-badge"));
     if (item.description) copy.append(text("p", item.description, "member-description-excerpt"));
+    if (item.access_level === "free") copy.append(text("span", "Смотреть урок", "member-free-cta"));
     button.append(copy);
     button.addEventListener("click", () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError));
     article.append(button);
@@ -563,8 +569,13 @@
       syncMemberAccess(data.access);
       clearMemberCoverUrls();
       memberHomeLessons.replaceChildren();
-      data.latest_lessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
-      memberHomeEmpty.hidden = data.latest_lessons.length !== 0;
+      const regularLessons = data.latest_lessons.filter((item) => item.access_level !== "free");
+      regularLessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
+      memberHomeEmpty.hidden = regularLessons.length !== 0;
+      memberFreeLesson.replaceChildren();
+      const freeLesson = (data.free_lessons || []).find((item) => item.content_type === "lesson");
+      memberFreeSection.hidden = !freeLesson;
+      if (freeLesson) memberFreeLesson.append(memberContentCard(freeLesson));
       memberHomeCategories.replaceChildren();
       data.categories.forEach((entry) => {
         const card = document.createElement("article");
@@ -634,6 +645,7 @@
       meta.className = "member-lesson-meta";
       meta.append(text("span", (item.categories || []).map((entry) => entry.title).join(" · ") || memberCategoryLabel(item.category)));
       if (!realMemberMode) meta.append(text("span", ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[item.status] || item.status), `member-preview-badge member-status-${item.status}`));
+      if (item.access_level === "free") meta.append(text("span", "Бесплатный урок", "member-free-badge"));
       heading.append(meta, text("h1", item.title));
       if (item.duration_seconds) heading.append(text(
         "p",
@@ -1962,6 +1974,8 @@
       const image = document.createElement("img"); image.src = coverUrl; image.alt = `Обложка ${title}`; cover.append(image);
     } else cover.append(text("span", mediaTypes.has("cover") ? "Обложка материала" : cmsTypeLabel(item.content_type)));
     contentLivePreview.append(cover, text("span", cmsStatusLabel(item.status), `badge studio-status ${item.status}`), text("h2", title));
+    const previewAccess = item.status === "draft" ? contentEditAccess.value : item.access_level;
+    if (previewAccess === "free") contentLivePreview.insertBefore(text("span", "Бесплатно", "badge member-free-badge"), contentLivePreview.querySelector("h2"));
     if (duration) contentLivePreview.append(text("p", duration, "studio-preview-duration"));
     const categories = item.status === "draft"
       ? [...contentEditTaxonomy.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.closest("label").textContent.trim())
@@ -2057,6 +2071,7 @@
     const badges = document.createElement("div");
     badges.className = "badges";
     badges.append(text("span", cmsStatusLabel(item.status), `badge studio-status ${item.status}`));
+    if (item.access_level === "free") badges.append(text("span", "Бесплатно", "badge member-free-badge"));
     const categories=(item.categories || []).map((entry)=>entry.title).join(", ") || item.category || "Без категории";
     button.append(badges,text("p",`${item.duration_seconds ? formatDuration(item.duration_seconds)+" · " : ""}${categories}`));
     if(!item.media_ready && ["lesson","meditation"].includes(item.content_type)) button.append(text("p",item.content_type==="lesson" ? "Не добавлено видео" : "Не добавлено аудио или видео","studio-warning"));
@@ -2193,6 +2208,7 @@
         ["Статус", cmsStatusLabel(item.status)],
         ["Последнее изменение", formatDate(item.updated_at)],
         ["Готовность", item.media_ready ? "Основное медиа добавлено" : "Требуется проверить медиа"],
+        ["Доступ", item.access_level === "free" ? "Бесплатно" : "По подписке"],
       ]);
       const description = document.createElement("article"); description.className = "card authoring-readable";
       description.append(text("h2", "Описание"));
@@ -2214,6 +2230,7 @@
       contentEditDuration.closest("label").hidden = item.content_type === "nutrition_material";
       document.getElementById("content-edit-save").hidden = item.content_type === "nutrition_material";
       contentEditOrder.value = item.sort_order;
+      contentEditAccess.value = item.access_level || "paid";
       contentEditMessage.textContent = "Изменения сохраняются только по кнопке.";
       recipeIngredients = item.recipe ? item.recipe.ingredients.map((entry) => ({name: entry.name, amount: entry.amount || ""})) : [];
       recipeSteps = item.recipe ? item.recipe.steps.map((entry) => ({instruction: entry.instruction})) : [];
@@ -2428,6 +2445,7 @@
       category: contentCreateCategory.value || null,
       description: contentCreateDescription.value || null,
       duration_seconds: contentCreateType.value === "nutrition_material" ? null : parseDuration(contentCreateDuration.value),
+      access_level: contentCreateAccess.value,
     };
     if (contentCreateType.value !== "nutrition_material") payload.category_ids = selectedTaxonomyIds(contentCreateTaxonomy);
     if (contentCreateType.value === "nutrition_material") payload.body = contentCreateBody.value;
@@ -2457,6 +2475,7 @@
       }
       const item = result.draft;
       contentCreateTitle.value = ""; contentCreateCategory.value = "";
+      contentCreateAccess.value = "paid";
       contentCreateDescription.value = ""; contentCreateDuration.value = "";
       contentCreateBody.value = ""; contentCreateIngredients.value = ""; contentCreateSteps.value = "";
       contentCreateCoverFile.value = ""; contentCreateVideoFile.value = ""; contentCreateAudioFile.value = "";
@@ -2480,7 +2499,7 @@
        category_ids: selectedTaxonomyIds(contentEditTaxonomy),
        description: contentEditDescription.value || null,
        duration_seconds: parseDuration(contentEditDuration.value),
-       sort_order: Number(contentEditOrder.value)}
+       sort_order: Number(contentEditOrder.value), access_level: contentEditAccess.value}
     ).then((item) => {
       currentCmsContent = {...currentCmsContent, ...item};
       if (!reload) return item;
@@ -2528,6 +2547,7 @@
       description: contentEditDescription.value || null,
       duration_seconds: null,
       sort_order: Number(contentEditOrder.value),
+      access_level: contentEditAccess.value,
       body: contentNutritionBody.value,
     }).then(() => loadCmsContentDetails(currentCmsContent.content_id).then(() => setContentEditorDirty(false))).catch((error) => {
       contentNutritionMessage.textContent = contentErrorMessage(error);
@@ -2830,7 +2850,7 @@
   });
   document.getElementById("content-back").addEventListener("click", () => guardContentNavigation(() => loadContent().catch(showApiError)));
   document.getElementById("content-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));
-  [contentEditTitle, contentEditDescription, contentEditDuration, contentEditOrder].forEach((field) => {
+  [contentEditTitle, contentEditDescription, contentEditDuration, contentEditOrder, contentEditAccess].forEach((field) => {
     field.addEventListener("input", () => { setContentEditorDirty(true); renderContentLivePreview(); });
   });
   contentEditTaxonomy.addEventListener("change", () => { setContentEditorDirty(true); renderContentLivePreview(); });

@@ -29,6 +29,7 @@ def _load_state(cur, content_id, *, lock=False):
         SELECT content_id,content_type,category,title,description,duration_seconds,
                sort_order,status,version,published_at,archived_at,
                logical_content_id,revision_of,revision_number
+               ,access_level
         FROM content_items WHERE content_id=%s AND deleted_at IS NULL
     """ + (" FOR UPDATE" if lock else ""), (content_id,))
     row = cur.fetchone()
@@ -42,6 +43,7 @@ def _load_state(cur, content_id, *, lock=False):
         "logical_content_id": str(row[11]),
         "revision_of": str(row[12]) if row[12] else None,
         "revision_number": int(row[13]),
+        "access_level": row[14],
     }
     cur.execute("""
         SELECT media_id,media_type,version,sort_order,mime_type,size_bytes,sha256
@@ -90,6 +92,7 @@ def _fingerprint(state, secret):
         "logical_content_id": state["logical_content_id"],
         "revision_of": state["revision_of"],
         "revision_number": state["revision_number"],
+        "access_level": state["access_level"],
     }
     encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     return hmac.new(secret.encode(), encoded, hashlib.sha256).hexdigest()
@@ -128,6 +131,7 @@ def _safe_preview(state, action_id, expires_at):
         "content_type": state["content_type"], "title": state["title"],
         "category": state["category"], "description": state["description"],
         "duration_seconds": state["duration_seconds"], "media": media,
+        "access_level": state["access_level"],
         "domain": domain, "warnings": [], "expected_version": state["version"],
         "categories": state["categories"],
         "preview_expires_at": expires_at.isoformat(),
@@ -203,11 +207,12 @@ def _insert_snapshot(cur, state, action_id, admin_id, event_type, now):
             version_id,content_id,content_version,event_type,content_type,status,
             title,description,category,duration_seconds,sort_order,published_at,
             archived_at,action_id,created_by_telegram_id,created_at
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ,access_level
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (version_id,state["content_id"],result_version,event_type,state["content_type"],
           snapshot_status,state["title"],state["description"],state["category"],
           state["duration_seconds"],state["sort_order"],published_at,archived_at,
-          action_id,int(admin_id),now))
+          action_id,int(admin_id),now,state["access_level"]))
     for item in state["media"]:
         cur.execute("""
             INSERT INTO content_item_version_media
@@ -352,13 +357,14 @@ def get_version(get_connection, content_id, version_id):
             SELECT v.version_id,v.content_version,v.event_type,v.content_type,v.status,
                    v.title,v.description,v.category,v.duration_seconds,v.sort_order,
                    v.published_at,v.archived_at,v.created_by_telegram_id,v.created_at
+                   ,v.access_level
             FROM content_item_versions v
             JOIN content_items vi ON vi.content_id=v.content_id
             JOIN content_items requested ON requested.content_id=%s
             WHERE vi.logical_content_id=requested.logical_content_id AND v.version_id=%s
         """, (content_id,version_id)); row=cur.fetchone()
         if not row: conn.rollback(); return None
-        result={"version_id":str(row[0]),"version":int(row[1]),"event_type":row[2],"content_type":row[3],"status":row[4],"title":row[5],"description":row[6],"category":row[7],"duration_seconds":row[8],"sort_order":int(row[9]),"published_at":_iso(row[10]),"archived_at":_iso(row[11]),"admin_id":int(row[12]),"created_at":_iso(row[13])}
+        result={"version_id":str(row[0]),"version":int(row[1]),"event_type":row[2],"content_type":row[3],"status":row[4],"title":row[5],"description":row[6],"category":row[7],"duration_seconds":row[8],"sort_order":int(row[9]),"published_at":_iso(row[10]),"archived_at":_iso(row[11]),"admin_id":int(row[12]),"created_at":_iso(row[13]),"access_level":row[14]}
         cur.execute("SELECT media_id,media_type,media_version,sort_order,mime_type,size_bytes FROM content_item_version_media WHERE version_id=%s ORDER BY media_type", (version_id,))
         result["media"]=[{"media_id":str(r[0]),"media_type":r[1],"version":int(r[2]),"sort_order":int(r[3]),"mime_type":r[4],"size_bytes":int(r[5])} for r in cur.fetchall()]
         cur.execute("SELECT category_id,slug,title,group_slug,sort_order FROM content_item_version_categories WHERE version_id=%s ORDER BY position", (version_id,))

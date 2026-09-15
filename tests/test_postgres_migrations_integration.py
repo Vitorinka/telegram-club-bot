@@ -397,6 +397,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIn("0028_content_revisions", first["applied"])
         self.assertIn("0029_content_draft_soft_delete", first["applied"])
         self.assertIn("0029_content_draft_soft_delete", second["applied"])
+        self.assertIn("0030_content_access_level", first["applied"])
+        self.assertIn("0030_content_access_level", second["applied"])
         self.assertEqual(
             self.query_one(
                 "SELECT to_regclass('public.miniapp_member_sessions')"
@@ -421,6 +423,23 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         hidden = create_content_draft(self.get_conn, 1, {
             "content_type": "lesson", "title": "Черновик скрыт",
             "category": "strength", "duration_seconds": 600,
+        })
+        free_lesson = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Бесплатный урок для спины",
+            "category": "strength", "duration_seconds": 600,
+            "access_level": "free",
+        })
+        free_draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Бесплатный черновик",
+            "duration_seconds": 600, "access_level": "free",
+        })
+        free_archived = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Архивный бесплатный",
+            "duration_seconds": 600, "access_level": "free",
+        })
+        deleted_free = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Удалённый бесплатный",
+            "duration_seconds": 600, "access_level": "free",
         })
         recipe = create_content_draft(self.get_conn, 1, {
             "content_type": "recipe", "title": "Рецепт клуба",
@@ -456,13 +475,21 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 cur.execute(
                     "UPDATE content_items SET status='published',published_at=NOW() "
                     "WHERE content_id=ANY(%s::uuid[])",
-                    ([lesson["content_id"], recipe["content_id"], nutrition["content_id"]],),
+                    ([lesson["content_id"], free_lesson["content_id"], recipe["content_id"], nutrition["content_id"]],),
                 )
+                cur.execute("UPDATE content_items SET status='archived',archived_at=NOW() WHERE content_id=%s", (free_archived["content_id"],))
+                cur.execute("UPDATE content_items SET deleted_at=NOW(),deleted_by_telegram_id=1 WHERE content_id=%s", (deleted_free["content_id"],))
                 cur.execute(
                     "INSERT INTO content_item_categories (content_id,category_id) "
                     "SELECT %s,category_id FROM content_categories "
                     "WHERE content_type='lesson' AND slug='strength'",
                     (lesson["content_id"],),
+                )
+                cur.execute(
+                    "INSERT INTO content_item_categories (content_id,category_id) "
+                    "SELECT %s,category_id FROM content_categories "
+                    "WHERE content_type='lesson' AND slug='strength'",
+                    (free_lesson["content_id"],),
                 )
                 cur.execute(
                     "INSERT INTO content_item_categories (content_id,category_id) "
@@ -475,13 +502,19 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.close()
 
         unpaid = list_member_catalog(self.get_conn, 88001, content_type="lesson")
-        self.assertEqual([item["content_id"] for item in unpaid["items"]], [lesson["content_id"]])
-        self.assertTrue(unpaid["items"][0]["locked"])
+        self.assertEqual([item["content_id"] for item in unpaid["items"]], [free_lesson["content_id"]])
+        self.assertFalse(unpaid["items"][0]["locked"])
+        self.assertEqual(unpaid["items"][0]["access_level"], "free")
+        active = list_member_catalog(self.get_conn, 88002, content_type="lesson")
+        self.assertEqual({item["content_id"] for item in active["items"]}, {free_lesson["content_id"], lesson["content_id"]})
         filtered = list_member_catalog(
             self.get_conn, 88001, content_type="lesson", category="strength"
         )
-        self.assertEqual([item["content_id"] for item in filtered["items"]], [lesson["content_id"]])
+        self.assertEqual([item["content_id"] for item in filtered["items"]], [free_lesson["content_id"]])
         self.assertNotIn(hidden["content_id"], json.dumps(unpaid))
+        self.assertNotIn(free_draft["content_id"], json.dumps(unpaid))
+        self.assertNotIn(free_archived["content_id"], json.dumps(unpaid))
+        self.assertNotIn(deleted_free["content_id"], json.dumps(unpaid))
         self.assertFalse(member_access(self.get_conn, 88001)["has_active_access"])
         self.assertTrue(member_access(self.get_conn, 88002)["has_active_access"])
         self.assertFalse(member_access(self.get_conn, 88003)["has_active_access"])
@@ -490,9 +523,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.assertTrue(member_access(self.get_conn, telegram_id)["has_active_access"])
 
         locked_recipe = get_member_content(self.get_conn, 88001, recipe["content_id"])
-        self.assertTrue(locked_recipe["locked"])
-        self.assertNotIn("ingredients", locked_recipe)
-        self.assertNotIn("steps", locked_recipe)
+        self.assertIsNone(locked_recipe)
+        self.assertEqual(get_member_content(self.get_conn, 88001, free_lesson["content_id"])["access_level"], "free")
+        self.assertEqual(get_member_preview_content(self.get_conn, free_lesson["content_id"])["access_level"], "free")
         open_recipe = get_member_content(self.get_conn, 88002, recipe["content_id"])
         self.assertFalse(open_recipe["locked"])
         self.assertEqual(open_recipe["ingredients"][0]["name"], "Вода")
@@ -500,14 +533,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         recipe_filtered = list_member_catalog(
             self.get_conn, 88001, content_type="recipe", category="breakfast"
         )
-        self.assertEqual(
-            [item["content_id"] for item in recipe_filtered["items"]],
-            [recipe["content_id"]],
-        )
+        self.assertEqual(recipe_filtered["items"], [])
         locked_nutrition = get_member_content(
             self.get_conn, 88001, nutrition["content_id"]
         )
-        self.assertNotIn("body", locked_nutrition)
+        self.assertIsNone(locked_nutrition)
         open_nutrition = get_member_content(
             self.get_conn, 88004, nutrition["content_id"]
         )
@@ -520,8 +550,48 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             conn.commit()
         finally:
             conn.close()
-        self.assertTrue(get_member_content(self.get_conn, 88002, recipe["content_id"])["locked"])
-        categories = list_member_categories(self.get_conn, "lesson")["items"]
+        self.assertIsNone(get_member_content(self.get_conn, 88002, recipe["content_id"]))
+        self.assertIsNotNone(get_member_content(self.get_conn, 88002, free_lesson["content_id"]))
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO content_media
+                  (media_id,content_id,media_type,storage_kind,server_reference,mime_type,size_bytes,sha256,created_by_telegram_id)
+                  VALUES (%s,%s,'video','telegram_file_id','free_video_private','video/mp4',100,%s,1)""",
+                  (str(uuid.uuid4()), free_lesson["content_id"], "d" * 64))
+            conn.commit()
+        finally:
+            conn.close()
+        paid_revision = create_published_revision(self.get_conn, free_lesson["content_id"], 1)
+        paid_revision = update_content_draft(self.get_conn, paid_revision["content_id"], {
+            "expected_version": paid_revision["version"], "access_level": "paid",
+        })
+        paid_preview = create_lifecycle_preview(
+            self.get_conn, paid_revision["content_id"], 1,
+            paid_revision["version"], "member-free-secret",
+        )
+        confirm_lifecycle(
+            self.get_conn, paid_revision["content_id"], paid_preview["action_id"],
+            1, "member-free-secret",
+        )
+        self.assertIsNone(get_member_content(self.get_conn, 88001, paid_revision["content_id"]))
+        free_revision = create_published_revision(self.get_conn, paid_revision["content_id"], 1)
+        free_revision = update_content_draft(self.get_conn, free_revision["content_id"], {
+            "expected_version": free_revision["version"], "access_level": "free",
+        })
+        free_preview = create_lifecycle_preview(
+            self.get_conn, free_revision["content_id"], 1,
+            free_revision["version"], "member-free-secret",
+        )
+        confirm_lifecycle(
+            self.get_conn, free_revision["content_id"], free_preview["action_id"],
+            1, "member-free-secret",
+        )
+        self.assertEqual(get_member_content(self.get_conn, 88001, free_revision["content_id"])["access_level"], "free")
+        versions = list_versions(self.get_conn, free_revision["content_id"])["items"]
+        latest_version = get_version(self.get_conn, free_revision["content_id"], versions[0]["version_id"])
+        self.assertEqual(latest_version["access_level"], "free")
+        categories = list_member_categories(self.get_conn, "lesson", 88002)["items"]
         self.assertIn("strength", {item["slug"] for item in categories})
 
         serialized = json.dumps({"list": unpaid, "details": locked_recipe})
@@ -718,8 +788,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 30,
-            "latest": "0029_content_draft_soft_delete",
+            "count": 31,
+            "latest": "0030_content_access_level",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2203,7 +2273,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 30)
+        self.assertEqual(len(migrations), 31)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2727,6 +2797,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.get_conn, first["content_id"], video_id
         )
         self.assertEqual(resolved_video["access_level"], "premium")
+        self.assertEqual(resolved_video["content_access_level"], "paid")
         self.assertEqual(resolved_video["media_type"], "video")
         self.assertEqual(resolved_video["mime_type"], "video/mp4")
         self.assertIsNone(get_member_media_reference(
@@ -2735,6 +2806,18 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertIsNone(get_member_media_reference(
             self.get_conn, second["content_id"], video_id
         ))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE content_items SET access_level='free' WHERE content_id=%s", (first["content_id"],))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            get_member_media_reference(self.get_conn, first["content_id"], video_id)["content_access_level"],
+            "free",
+        )
 
         conn = self.get_conn()
         try:
@@ -10426,8 +10509,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 30)
-        self.assertEqual(system["migrations"]["latest"], "0029_content_draft_soft_delete")
+        self.assertEqual(system["migrations"]["count"], 31)
+        self.assertEqual(system["migrations"]["latest"], "0030_content_access_level")
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

@@ -18,6 +18,7 @@ class ContentCmsValidationTests(unittest.TestCase):
         })
         self.assertEqual(values["title"], "Первый урок")
         self.assertEqual(values["description"], "Описание")
+        self.assertEqual(values["access_level"], "paid")
 
         meditation = validate_create_payload({
             "content_type": "meditation", "title": " Спокойствие ",
@@ -61,6 +62,24 @@ class ContentCmsValidationTests(unittest.TestCase):
         ):
             with self.assertRaises(ContentCmsError):
                 validate_update_payload(payload)
+
+    def test_access_level_is_explicit_and_fail_closed(self):
+        free = validate_create_payload({
+            "content_type": "lesson", "title": "Free", "access_level": "free",
+        })
+        self.assertEqual(free["access_level"], "free")
+        version, values = validate_update_payload({
+            "expected_version": 1, "access_level": "paid",
+        })
+        self.assertEqual((version, values), (1, {"access_level": "paid"}))
+        for invalid in (None, "public", "FREE", True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ContentCmsError, "invalid_access_level"
+            ):
+                validate_create_payload({
+                    "content_type": "lesson", "title": "X",
+                    "access_level": invalid,
+                })
 
 
 if __name__ == "__main__":

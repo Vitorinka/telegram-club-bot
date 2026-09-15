@@ -65,14 +65,15 @@ def member_access(get_connection, telegram_id, now=None):
 SELECT="""SELECT c.content_id,c.content_type,c.title,c.description,c.duration_seconds,c.sort_order,
  cover.media_id,video.media_id,audio.media_id,
  ARRAY(SELECT cc.slug FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug),
- ARRAY(SELECT cc.title FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug)
+ ARRAY(SELECT cc.title FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug),
+ c.access_level
  FROM content_items c
  LEFT JOIN content_media cover ON cover.content_id=c.content_id AND cover.media_type='cover' AND cover.deleted_at IS NULL
  LEFT JOIN content_media video ON video.content_id=c.content_id AND video.media_type='video' AND video.deleted_at IS NULL
  LEFT JOIN content_media audio ON audio.content_id=c.content_id AND audio.media_type='audio' AND audio.deleted_at IS NULL"""
 
 def _item(row,locked):
-    return {"content_id":str(row[0]),"content_type":row[1],"title":row[2],"description":row[3],"duration_seconds":row[4],"sort_order":int(row[5]),"cover_media_id":str(row[6]) if row[6] else None,"video_media_id":str(row[7]) if row[7] else None,"audio_media_id":str(row[8]) if row[8] else None,"has_cover":bool(row[6]),"has_video":bool(row[7]),"has_audio":bool(row[8]),"categories":[{"slug":s,"title":t} for s,t in zip(row[9] or [],row[10] or [])],"locked":bool(locked)}
+    return {"content_id":str(row[0]),"content_type":row[1],"title":row[2],"description":row[3],"duration_seconds":row[4],"sort_order":int(row[5]),"cover_media_id":str(row[6]) if row[6] else None,"video_media_id":str(row[7]) if row[7] else None,"audio_media_id":str(row[8]) if row[8] else None,"has_cover":bool(row[6]),"has_video":bool(row[7]),"has_audio":bool(row[8]),"categories":[{"slug":s,"title":t} for s,t in zip(row[9] or [],row[10] or [])],"locked":bool(locked),"access_level":row[11]}
 
 def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",category=None,query="",limit=50):
     if content_type not in MEMBER_TYPES: raise MemberCatalogError("invalid_content_type")
@@ -88,11 +89,13 @@ def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",ca
     access=member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
-        cur.execute(SELECT+""" WHERE c.status='published' AND c.deleted_at IS NULL AND c.content_type=%s AND (%s IS NULL OR EXISTS
+        cur.execute(SELECT+""" WHERE c.status='published' AND c.deleted_at IS NULL AND c.content_type=%s
+          AND (%s OR c.access_level='free') AND (%s IS NULL OR EXISTS
           (SELECT 1 FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id AND cc.slug=%s))
-          AND (%s='' OR c.title ILIKE '%%'||%s||'%%') ORDER BY c.sort_order,c.updated_at DESC,c.content_id LIMIT %s""",
-          (content_type,category,category,query,query,limit))
-        items=[_item(r,not access["has_active_access"]) for r in cur.fetchall()]; conn.rollback()
+          AND (%s='' OR c.title ILIKE '%%'||%s||'%%')
+          ORDER BY CASE c.access_level WHEN 'free' THEN 0 ELSE 1 END,c.sort_order,c.updated_at DESC,c.content_id LIMIT %s""",
+          (content_type,access["has_active_access"],category,category,query,query,limit))
+        items=[_item(r,False) for r in cur.fetchall()]; conn.rollback()
         return {"items":items,"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]},"published_only":True}
     finally: cur.close(); conn.close()
 
@@ -103,22 +106,28 @@ def get_member_content(get_connection,telegram_id,content_id):
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute(SELECT+" WHERE c.content_id=%s AND c.status='published' AND c.deleted_at IS NULL",(content_id,)); row=cur.fetchone()
         if not row: conn.rollback(); return None
-        result=_item(row,not access["has_active_access"])
-        if access["has_active_access"] and result["content_type"]=='recipe':
+        result=_item(row,False)
+        content_allowed = access["has_active_access"] or result["access_level"] == "free"
+        if not content_allowed:
+            conn.rollback(); return None
+        if result["content_type"]=='recipe':
             cur.execute("SELECT name,amount FROM recipe_ingredients WHERE content_id=%s ORDER BY sort_order,ingredient_id",(content_id,)); result["ingredients"]=[{"name":r[0],"amount":r[1]} for r in cur.fetchall()]
             cur.execute("SELECT step_number,instruction FROM recipe_steps WHERE content_id=%s ORDER BY step_number,step_id",(content_id,)); result["steps"]=[{"step_number":int(r[0]),"instruction":r[1]} for r in cur.fetchall()]
-        if access["has_active_access"] and result["content_type"]=='nutrition_material':
+        if result["content_type"]=='nutrition_material':
             cur.execute("SELECT body FROM nutrition_material_bodies WHERE content_id=%s",(content_id,)); body=cur.fetchone(); result["body"]=body[0] if body else ""
         conn.rollback(); return result
     finally: cur.close(); conn.close()
 
-def list_member_categories(get_connection,content_type):
+def list_member_categories(get_connection,content_type,telegram_id):
     if content_type not in MEMBER_TYPES: raise MemberCatalogError("invalid_content_type")
+    access = member_access(get_connection, telegram_id)
     conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("""SELECT cc.slug,cc.title,cc.group_slug,COUNT(c.content_id)
           FROM content_categories cc LEFT JOIN content_item_categories cic ON cic.category_id=cc.category_id
           LEFT JOIN content_items c ON c.content_id=cic.content_id AND c.status='published' AND c.deleted_at IS NULL
-          WHERE cc.content_type=%s AND cc.is_active=TRUE GROUP BY cc.slug,cc.title,cc.group_slug,cc.sort_order ORDER BY cc.sort_order""",(content_type,))
+            AND (%s OR c.access_level='free')
+          WHERE cc.content_type=%s AND cc.is_active=TRUE GROUP BY cc.slug,cc.title,cc.group_slug,cc.sort_order ORDER BY cc.sort_order""",
+          (access["has_active_access"], content_type))
         rows=[{"slug":r[0],"title":r[1],"group":r[2],"count":int(r[3])} for r in cur.fetchall()]; conn.rollback(); return {"items":rows}
     finally: cur.close(); conn.close()

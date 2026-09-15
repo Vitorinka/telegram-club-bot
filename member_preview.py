@@ -27,7 +27,7 @@ def _item(row):
     (
         content_id, content_type, title, description, category, duration_seconds,
         status, sort_order, cover_media_id, video_media_id, audio_media_id,
-        category_slugs, category_titles,
+        category_slugs, category_titles, access_level,
     ) = row
     return {
         "content_id": str(content_id),
@@ -47,6 +47,7 @@ def _item(row):
             {"slug": slug, "title": title}
             for slug, title in zip(category_slugs or [], category_titles or [])
         ],
+        "access_level": access_level,
     }
 
 
@@ -56,6 +57,7 @@ MEMBER_CONTENT_SELECT = """
            cover.media_id, video.media_id, audio.media_id,
            ARRAY(SELECT cc.slug FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug),
            ARRAY(SELECT cc.title FROM content_item_categories cic JOIN content_categories cc USING(category_id) WHERE cic.content_id=c.content_id ORDER BY COALESCE(cic.sort_order,cc.sort_order),cc.slug)
+           ,c.access_level
     FROM content_items c
     LEFT JOIN content_media cover
       ON cover.content_id = c.content_id
@@ -168,6 +170,15 @@ def get_member_preview_home(get_connection):
         latest = [_item(row) for row in cur.fetchall()]
         cur.execute(
             MEMBER_CONTENT_SELECT + """
+            WHERE c.content_type = 'lesson' AND c.access_level = 'free'
+              AND c.status = 'published' AND c.deleted_at IS NULL
+            ORDER BY c.sort_order ASC, c.published_at DESC, c.content_id ASC
+            LIMIT 6
+            """
+        )
+        free_lessons = [_item(row) for row in cur.fetchall()]
+        cur.execute(
+            MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'meditation'
               AND c.status IN ('draft', 'published', 'archived') AND c.deleted_at IS NULL
             ORDER BY c.updated_at DESC, c.content_id ASC
@@ -206,6 +217,7 @@ def get_member_preview_home(get_connection):
         conn.rollback()
         return {
             "latest_lessons": latest,
+            "free_lessons": free_lessons,
             "latest_meditations": latest_meditations,
             "latest_recipes": latest_recipes,
             "latest_nutrition_materials": latest_nutrition_materials,

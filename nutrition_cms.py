@@ -37,6 +37,7 @@ def _body_projection(row):
 def create_nutrition_draft(get_connection, admin_id, payload):
     if not isinstance(payload, dict) or set(payload) - {
         "content_type", "title", "category", "description", "duration_seconds", "body",
+        "access_level",
     } or "body" not in payload:
         raise ContentCmsError("invalid_content_payload")
     metadata = validate_create_payload({key: value for key, value in payload.items() if key != "body"})
@@ -52,10 +53,10 @@ def create_nutrition_draft(get_connection, admin_id, payload):
             INSERT INTO content_items (
                 content_id,content_type,category,title,description,duration_seconds,
                 sort_order,status,version,created_by_telegram_id,logical_content_id,
-                revision_number,created_at,updated_at
-            ) VALUES (%s,'nutrition_material',%s,%s,%s,NULL,0,'draft',1,%s,%s,1,NOW(),NOW())
+                revision_number,access_level,created_at,updated_at
+            ) VALUES (%s,'nutrition_material',%s,%s,%s,NULL,0,'draft',1,%s,%s,1,%s,NOW(),NOW())
             RETURNING version
-        """, (content_id, metadata["category"], metadata["title"], metadata["description"], int(admin_id), content_id))
+        """, (content_id, metadata["category"], metadata["title"], metadata["description"], int(admin_id), content_id, metadata["access_level"]))
         version = int(cur.fetchone()[0])
         cur.execute("""
             INSERT INTO nutrition_material_bodies (content_id,body,created_at,updated_at)
