@@ -28,19 +28,41 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pip-audit
-      - name: Compile
-        run: >
-          PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
-          main.py stripe_invoice_rules.py weekly_report.py checkout_safety.py
-          admin_security.py scheduled_jobs.py group_access.py
-          stripe_webhook_safety.py db_migrations.py tests/test_stripe_invoice_rules.py
-          tests/test_weekly_report.py tests/test_stripe_webhook_safety.py
-          tests/test_db_migrations.py tests/test_postgres_migrations_integration.py
+      - name: Compile all production Python
+        run: |
+          git ls-files -z '*.py' ':!:tests/**' |
+            xargs -0 env PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m py_compile
+      - name: JavaScript syntax
+        run: node --check miniapp/app.js
+      - name: Dependency consistency
+        run: pip check
+      - name: Migration tracking policy
+        run: |
+          if git check-ignore -q migrations/0031_failed_subscription_termination_cycles.sql; then
+            echo "Tracked migration files must not be ignored"
+            exit 1
+          fi
+          test -n "$(git ls-files 'migrations/*.sql')"
+      - name: Conflict marker scan
+        run: |
+          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- ':!*.patch'; then
+            echo "Conflict markers found"
+            exit 1
+          fi
+      - name: innerHTML safety scan
+        run: |
+          if git grep -nE '\.innerHTML[[:space:]]*=' -- 'miniapp/*.js'; then
+            echo "Unsafe innerHTML assignment found"
+            exit 1
+          fi
       - name: PostgreSQL migration integration tests
         run: >
           PYTHONPYCACHEPREFIX=/tmp/codex-pycache python3 -m unittest

@@ -5,6 +5,7 @@ outputs/
 *.zip
 *.patch
 *.sql
+!migrations/*.sql
 *.sql.enc
 .env
 backup_*
