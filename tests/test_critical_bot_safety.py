@@ -868,6 +868,41 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("stripe_cancellation_errors += 1", scheduler)
         self.assertNotIn('ban_status in ("removed", "kick_failed")', scheduler)
 
+    def test_all_production_telegram_bans_are_confined_to_fenced_removal_paths(self):
+        tree = ast.parse(MAIN_SOURCE)
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        ban_owners = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and func.attr == "ban_chat_member"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "bot"
+            ):
+                continue
+            owner = parents.get(node)
+            while owner is not None and not isinstance(
+                owner, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                owner = parents.get(owner)
+            ban_owners.append(owner.name if owner else None)
+
+        self.assertEqual(
+            set(ban_owners),
+            {
+                "ban_user_logic",
+                "terminate_failed_subscription",
+                "delete_join_leave_service_messages",
+            },
+        )
+
     def test_failed_renewal_cancellation_precedes_telegram_and_local_finalization(self):
         removal = MAIN_SOURCE[
             MAIN_SOURCE.index("async def ban_user_logic"):
@@ -1281,7 +1316,11 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("first_payment_done = CASE WHEN %s THEN TRUE ELSE users.first_payment_done END", block)
         cur = FakeCursor()
         query = block[block.index('cur.execute("""') + len('cur.execute("""'):block.index('""", (')]
-        params = (1, "sub_1", datetime.utcnow(), datetime.utcnow(), "sub_1", "cus_1", 123, 123, True)
+        event_at = datetime.utcnow()
+        params = (
+            1, "sub_1", "in_1", event_at, event_at,
+            event_at, event_at, "sub_1", "cus_1", event_at, event_at, True,
+        )
         cur.execute(query, params)
         self.assertEqual(query.count("%s"), len(params))
 
@@ -1295,7 +1334,7 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("users.last_successful_invoice_created_at", block)
         params_start = block.index('""", (')
         params_block = block[params_start:]
-        self.assertEqual(params_block.count("event_created_at"), 2)
+        self.assertEqual(params_block.count("event_created_at"), 4)
 
     def test_ambiguous_checkout_under_retry_limit_reuses_same_key(self):
         old = datetime.utcnow() - timedelta(hours=19)

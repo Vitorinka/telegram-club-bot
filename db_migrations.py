@@ -282,11 +282,12 @@ MIGRATION_BASELINE_REQUIREMENTS = {
                 "access_expiry", "stripe_cancelled_at", "collection_stopped_at", "telegram_banned_at",
                 "telegram_removed_at", "db_finalized_at", "completed_at", "attempt_count",
                 "last_error_category", "created_at", "updated_at",
+                "failure_cycle_started_at",
             ),
         },
         "indexes": (
             "failed_subscription_terminations_due_idx",
-            "failed_subscription_terminations_subscription_uidx",
+            "failed_subscription_terminations_subscription_cycle_uidx",
             "failed_subscription_terminations_user_idx",
         ),
     },
@@ -867,6 +868,15 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "content_items_access_level_check": {"table":"content_items","definition_contains":("access_level","paid","free"),"validated":False},
             "content_item_versions_access_level_check": {"table":"content_item_versions","definition_contains":("access_level","paid","free"),"validated":False},
         },
+    },
+    "0031_failed_subscription_termination_cycles": {
+        "tables": ("failed_subscription_terminations",),
+        "columns": {
+            "failed_subscription_terminations": ("failure_cycle_started_at",),
+        },
+        "indexes": (
+            "failed_subscription_terminations_subscription_cycle_uidx",
+        ),
     },
 }
 

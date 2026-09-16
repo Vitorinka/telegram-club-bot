@@ -788,8 +788,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 31,
-            "latest": "0030_content_access_level",
+            "count": 32,
+            "latest": "0031_failed_subscription_termination_cycles",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2273,7 +2273,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 31)
+        self.assertEqual(len(migrations), 32)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2313,6 +2313,96 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         run_migrations(self.get_conn)
         rows_after = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual(rows, rows_after)
+
+    def test_failed_termination_cycle_migration_upgrades_0030_database_real_postgres(self):
+        migrations = load_migrations()
+        with tempfile.TemporaryDirectory() as directory:
+            migration_dir = Path(directory)
+            for migration in migrations:
+                if migration["version"] > "0030_content_access_level":
+                    continue
+                (migration_dir / migration["path"].name).write_text(
+                    migration["sql"], encoding="utf-8"
+                )
+            run_migrations(self.get_conn, migrations_dir=migration_dir)
+
+        user_id = 975030
+        subscription_id = "sub_upgrade_cycle_975030"
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=datetime.utcnow() - timedelta(hours=2),
+            stripe_subscription_id=subscription_id, auto_renew=True,
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry, created_at, updated_at
+                    ) VALUES (
+                        'fst-upgrade-existing', %s, %s, 'grace_period_expired',
+                        'superseded', NOW() - INTERVAL '1 day',
+                        NOW() - INTERVAL '3 days', NOW() - INTERVAL '1 day'
+                    )
+                    """,
+                    (user_id, subscription_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        run_migrations(self.get_conn)
+        existing = self.query_one(
+            """
+            SELECT status, failure_cycle_started_at = created_at
+            FROM failed_subscription_terminations
+            WHERE operation_id = 'fst-upgrade-existing'
+            """
+        )
+        self.assertEqual(existing, ("superseded", True))
+        indexes = {
+            row[0] for row in self.query_all(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE tablename = 'failed_subscription_terminations'
+                """
+            )
+        }
+        self.assertNotIn("failed_subscription_terminations_subscription_uidx", indexes)
+        self.assertIn(
+            "failed_subscription_terminations_subscription_cycle_uidx", indexes
+        )
+
+        main = import_main()
+        cycle_two = datetime.utcnow()
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                first = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    "in_upgrade_cycle_two", "upgrade-worker",
+                    datetime.utcnow() - timedelta(hours=2),
+                    failure_cycle_started_at=cycle_two,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNotNone(first)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                duplicate = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    "in_upgrade_cycle_two", "duplicate-worker",
+                    datetime.utcnow() - timedelta(hours=2),
+                    failure_cycle_started_at=cycle_two,
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+        self.assertIsNone(duplicate)
 
     def test_content_cms_draft_crud_fencing_and_constraints_real_postgres(self):
         run_migrations(self.get_conn)
@@ -4637,6 +4727,434 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             duplicate = asyncio.run(main.terminate_failed_subscription(user_id, "grace_period_expired"))
         self.assertEqual(duplicate, "already_processing_or_completed")
         retrieve_again.assert_not_called()
+
+    def test_same_subscription_new_failed_cycle_gets_distinct_operation_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 975001
+        subscription_id = "sub_repeat_cycle_975001"
+        expiry = datetime.utcnow() - timedelta(hours=2)
+        cycle_one = datetime.utcnow() - timedelta(days=5)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry,
+            stripe_subscription_id=subscription_id, auto_renew=True,
+            payment_failed=True, payment_failed_at=cycle_one,
+            grace_period_end=cycle_one + timedelta(hours=48),
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                first = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    "in_cycle_one", "worker-one", expiry,
+                    failure_cycle_started_at=cycle_one,
+                )
+                cur.execute(
+                    """
+                    UPDATE failed_subscription_terminations
+                    SET status = 'superseded', completed_at = NOW(),
+                        lease_until = NULL
+                    WHERE operation_id = %s
+                    """,
+                    (first[0],),
+                )
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET payment_failed = FALSE, payment_failed_at = NULL,
+                        grace_period_end = NULL
+                    WHERE telegram_id = %s
+                    """,
+                    (user_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            cycle_two, cycle_two_deadline = main.ensure_failed_renewal_grace_from_recheck(
+                user_id, subscription_id
+            )
+        self.assertEqual(cycle_two_deadline, cycle_two + timedelta(hours=48))
+        self.assertNotEqual(cycle_one, cycle_two)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET grace_period_end = NOW() - INTERVAL '1 minute' WHERE telegram_id = %s",
+                    (user_id,),
+                )
+                second = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    "in_cycle_two", "worker-two", expiry,
+                    failure_cycle_started_at=cycle_two,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(self.query_one(
+            "SELECT status, failed_invoice_id, failure_cycle_started_at FROM failed_subscription_terminations WHERE operation_id = %s",
+            (first[0],),
+        ), ("superseded", "in_cycle_one", cycle_one))
+        self.assertEqual(self.query_one(
+            "SELECT status, failed_invoice_id, failure_cycle_started_at FROM failed_subscription_terminations WHERE operation_id = %s",
+            (second[0],),
+        ), ("processing", "in_cycle_two", cycle_two))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                stale_cycle_claim = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    "in_late_cycle_one", "late-worker", expiry,
+                    failure_cycle_started_at=cycle_one,
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+        self.assertIsNone(stale_cycle_claim)
+        self.assertEqual(self.query_one(
+            "SELECT status, failed_invoice_id FROM failed_subscription_terminations WHERE operation_id = %s",
+            (second[0],),
+        ), ("processing", "in_cycle_two"))
+
+    def test_same_subscription_webhooks_are_failure_cycle_aware_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+
+        def operation(user_id, subscription_id, invoice_id, cycle_at, status):
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO failed_subscription_terminations (
+                            operation_id, telegram_id, stripe_subscription_id,
+                            failed_invoice_id, reason, status, access_expiry,
+                            failure_cycle_started_at, created_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, 'grace_period_expired', %s,
+                                  %s, %s, %s, %s)
+                        """,
+                        (
+                            f"fst-{user_id}-{invoice_id}", user_id, subscription_id,
+                            invoice_id, status, now - timedelta(hours=2), cycle_at,
+                            cycle_at, cycle_at,
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+        def invoice_event(event_id, event_type, invoice_id, subscription_id, created_at):
+            paid = event_type == "invoice.payment_succeeded"
+            return SimpleNamespace(
+                id=event_id, type=event_type,
+                created=int(created_at.replace(tzinfo=ZoneInfo("UTC")).timestamp()),
+                data=SimpleNamespace(object=SimpleNamespace(
+                    id=invoice_id, subscription=subscription_id,
+                    customer=f"cus_{subscription_id}", metadata={},
+                    lines=SimpleNamespace(data=[SimpleNamespace(
+                        subscription=subscription_id,
+                        period=SimpleNamespace(
+                            start=int(now.timestamp()),
+                            end=int((now + timedelta(days=30)).timestamp()),
+                        ),
+                        price=SimpleNamespace(id="price_1m"),
+                    )]),
+                    billing_reason="subscription_cycle",
+                    status="paid" if paid else "open", paid=paid,
+                    amount_paid=1000 if paid else 0, amount_due=1000,
+                    currency="rub", customer_email=None, payment_intent=None,
+                    payments=SimpleNamespace(data=[SimpleNamespace(
+                        status="paid", amount_paid=1000,
+                        payment=SimpleNamespace(
+                            type="payment_intent", payment_intent="pi_cycle_test",
+                        ),
+                    )] if paid else []),
+                )),
+            )
+
+        def run_event(event, subscription):
+            request = SimpleNamespace(
+                headers={"Stripe-Signature": "sig", "Content-Type": "application/json"},
+                path="/stripe-payment", host="club.example",
+                read=mock.AsyncMock(return_value=b"{}"),
+            )
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main, "construct_verified_stripe_event", return_value=event), \
+                 mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+                 mock.patch.object(main.stripe.Invoice, "retrieve", return_value=event.data.object), \
+                 mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+                return asyncio.run(main.stripe_webhook(request))
+
+        # An old paid invoice cannot clear or supersede the current failure cycle.
+        user_id = 975031
+        subscription_id = "sub_cycle_webhook_975031"
+        cycle_one = now - timedelta(days=5)
+        cycle_two = now - timedelta(hours=50)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=now - timedelta(hours=2),
+            stripe_customer_id=f"cus_{subscription_id}",
+            stripe_subscription_id=subscription_id, auto_renew=True,
+            payment_failed=True, payment_failed_at=cycle_two,
+            grace_period_end=cycle_two + timedelta(hours=48),
+        )
+        operation(user_id, subscription_id, "in_cycle_one", cycle_one, "superseded")
+        operation(user_id, subscription_id, "in_cycle_two", cycle_two, "processing")
+        active_subscription = SimpleNamespace(
+            id=subscription_id, customer=f"cus_{subscription_id}", status="active",
+            current_period_end=int((now + timedelta(days=30)).timestamp()),
+            trial_end=None, metadata={},
+        )
+        old_success = invoice_event(
+            "evt_old_cycle_success", "invoice.payment_succeeded",
+            "in_cycle_one", subscription_id, cycle_one + timedelta(hours=1),
+        )
+        self.assertEqual(run_event(old_success, active_subscription).status, 200)
+        self.assertEqual(self.query_one(
+            "SELECT payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (True, cycle_two, cycle_two + timedelta(hours=48)))
+        self.assertEqual(self.query_one(
+            "SELECT status FROM failed_subscription_terminations WHERE failed_invoice_id = 'in_cycle_two'"
+        )[0], "processing")
+
+        # The exact paid invoice for cycle two recovers access and supersedes only cycle two.
+        current_success = invoice_event(
+            "evt_current_cycle_success", "invoice.payment_succeeded",
+            "in_cycle_two", subscription_id, cycle_two + timedelta(hours=1),
+        )
+        current_event_at = datetime.utcfromtimestamp(current_success.created)
+        cycle_proof = self.query_one(
+            """
+            SELECT failed_invoice_id = %s, %s IS NOT NULL,
+                   failure_cycle_started_at, %s,
+                   failure_cycle_started_at <= %s
+            FROM failed_subscription_terminations
+            WHERE stripe_subscription_id = %s AND status = 'processing'
+            """,
+            (
+                "in_cycle_two", current_event_at, current_event_at,
+                current_event_at, subscription_id,
+            ),
+        )
+        self.assertTrue(cycle_proof[0], cycle_proof)
+        self.assertTrue(cycle_proof[4], cycle_proof)
+        self.assertEqual(self.query_all(
+            """
+            SELECT status, failed_invoice_id
+            FROM failed_subscription_terminations
+            WHERE stripe_subscription_id = %s
+              AND (
+                  status IN ('completed', 'manual_review')
+                  OR (
+                      status <> 'superseded'
+                      AND NOT (
+                          failed_invoice_id = %s
+                          AND %s IS NOT NULL
+                          AND failure_cycle_started_at <= %s
+                      )
+                  )
+              )
+            """,
+            (subscription_id, "in_cycle_two", current_event_at, current_event_at),
+        ), [])
+        self.assertEqual(run_event(current_success, active_subscription).status, 200)
+        self.assertEqual(self.query_one(
+            "SELECT payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (user_id,),
+        ), (False, None, None))
+        self.assertEqual(self.query_all(
+            "SELECT failed_invoice_id, status FROM failed_subscription_terminations WHERE telegram_id = %s ORDER BY failure_cycle_started_at",
+            (user_id,),
+        ), [("in_cycle_one", "superseded"), ("in_cycle_two", "superseded")])
+
+        # A superseded tombstone does not block a later legitimate failed cycle.
+        failed_user_id = 975032
+        failed_subscription_id = "sub_cycle_webhook_975032"
+        self.insert_recovery_user(
+            failed_user_id, paid=True, expiry_date=now + timedelta(days=2),
+            stripe_customer_id=f"cus_{failed_subscription_id}",
+            stripe_subscription_id=failed_subscription_id, auto_renew=True,
+            payment_failed=False,
+        )
+        operation(
+            failed_user_id, failed_subscription_id, "in_old_failed_cycle",
+            now - timedelta(days=10), "superseded",
+        )
+        failed_event = invoice_event(
+            "evt_new_cycle_failed", "invoice.payment_failed",
+            "in_new_failed_cycle", failed_subscription_id, now,
+        )
+        past_due_subscription = SimpleNamespace(
+            id=failed_subscription_id, customer=f"cus_{failed_subscription_id}",
+            status="past_due", current_period_end=int((now + timedelta(days=2)).timestamp()),
+            trial_end=None, metadata={}, latest_invoice=failed_event.data.object,
+        )
+        self.assertEqual(run_event(failed_event, past_due_subscription).status, 200)
+        failed_state = self.query_one(
+            "SELECT payment_failed, payment_failed_at, grace_period_end FROM users WHERE telegram_id = %s",
+            (failed_user_id,),
+        )
+        self.assertTrue(failed_state[0])
+        self.assertEqual(failed_state[2], failed_state[1] + timedelta(hours=48))
+
+        # An older deleted event cannot advance or clear a newer active cycle.
+        deleted_user_id = 975033
+        deleted_subscription_id = "sub_cycle_webhook_975033"
+        deleted_cycle = now - timedelta(hours=2)
+        self.insert_recovery_user(
+            deleted_user_id, paid=True, expiry_date=now + timedelta(days=2),
+            stripe_customer_id=f"cus_{deleted_subscription_id}",
+            stripe_subscription_id=deleted_subscription_id, auto_renew=True,
+            payment_failed=True, payment_failed_at=deleted_cycle,
+            grace_period_end=deleted_cycle + timedelta(hours=48),
+        )
+        operation(
+            deleted_user_id, deleted_subscription_id, "in_deleted_cycle",
+            deleted_cycle, "processing",
+        )
+        deleted_event = SimpleNamespace(
+            id="evt_old_cycle_deleted", type="customer.subscription.deleted",
+            created=int(
+                (deleted_cycle - timedelta(days=1))
+                .replace(tzinfo=ZoneInfo("UTC")).timestamp()
+            ),
+            data=SimpleNamespace(object=SimpleNamespace(
+                id=deleted_subscription_id,
+                customer=f"cus_{deleted_subscription_id}", status="canceled",
+            )),
+        )
+        self.assertEqual(run_event(deleted_event, past_due_subscription).status, 200)
+        self.assertEqual(self.query_one(
+            "SELECT paid, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s",
+            (deleted_user_id,),
+        ), (True, True, deleted_subscription_id))
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_cancelled_at FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (deleted_user_id,),
+        ), ("processing", None))
+
+    def test_durable_termination_uses_canonical_recovery_decisions_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+
+        cases = (
+            (975021, "sub_pending_missing_invoice", None, "retryable_failed"),
+            (
+                975022,
+                "sub_pending_wrong_line",
+                {
+                    "status": "paid", "paid": True,
+                    "lines": {"data": [{
+                        "subscription": "sub_other",
+                        "period": {"end": int((now + timedelta(days=30)).timestamp())},
+                    }]},
+                },
+                "retryable_failed",
+            ),
+            (
+                975023,
+                "sub_recovered_exact_line",
+                {
+                    "status": "paid", "paid": True,
+                    "lines": {"data": [{
+                        "subscription": "sub_recovered_exact_line",
+                        "period": {"end": int((now + timedelta(days=30)).timestamp())},
+                    }]},
+                },
+                "superseded",
+            ),
+        )
+        for user_id, subscription_id, invoice, expected_status in cases:
+            with self.subTest(subscription_id=subscription_id):
+                expired = datetime.utcnow() - timedelta(hours=2)
+                failed_at = datetime.utcnow() - timedelta(hours=50)
+                self.insert_recovery_user(
+                    user_id, paid=True, expiry_date=expired,
+                    stripe_subscription_id=subscription_id, auto_renew=True,
+                    payment_failed=True, payment_failed_at=failed_at,
+                    grace_period_end=failed_at + timedelta(hours=48),
+                )
+                subscription = SimpleNamespace(
+                    status="active",
+                    current_period_end=int(expired.timestamp()),
+                    latest_invoice=invoice,
+                )
+                with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                     mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+                     mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban:
+                    result = asyncio.run(main.terminate_failed_subscription(
+                        user_id, "grace_period_expired"
+                    ))
+
+                ban.assert_not_awaited()
+                self.assertEqual(self.query_one(
+                    "SELECT status FROM failed_subscription_terminations WHERE telegram_id = %s ORDER BY created_at DESC LIMIT 1",
+                    (user_id,),
+                )[0], expected_status)
+                if expected_status == "superseded":
+                    self.assertEqual(result, "payment_recovered")
+                else:
+                    self.assertEqual(result, "stripe_retryable")
+
+    def test_missing_grace_deadline_fallback_is_processed_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 975024
+        subscription_id = "sub_missing_deadline_975024"
+        failed_at = datetime.utcnow() - timedelta(hours=49)
+        expiry = datetime.utcnow() - timedelta(hours=3)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry,
+            stripe_customer_id="cus_missing_deadline_975024",
+            stripe_subscription_id=subscription_id, auto_renew=True,
+            payment_failed=True, payment_failed_at=failed_at,
+            grace_period_end=None,
+        )
+        recent_user_id = 975025
+        self.insert_recovery_user(
+            recent_user_id, paid=True, expiry_date=expiry,
+            stripe_subscription_id="sub_recent_missing_deadline_975025",
+            auto_renew=True, payment_failed=True,
+            payment_failed_at=datetime.utcnow() - timedelta(hours=1),
+            grace_period_end=None,
+        )
+        invoice = mock.Mock(
+            id="in_missing_deadline_975024", subscription=subscription_id,
+            status="open",
+        )
+        voided_invoice = mock.Mock(
+            id="in_missing_deadline_975024", subscription=subscription_id,
+            status="void",
+        )
+        subscription = mock.Mock(
+            status="past_due", current_period_end=None, latest_invoice=invoice,
+        )
+        subscription.cancel.return_value = mock.Mock(status="canceled")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", side_effect=[invoice, voided_invoice]), \
+             mock.patch.object(main.bot, "get_chat_member", mock.AsyncMock(return_value=SimpleNamespace(status="member"))), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()):
+            result = asyncio.run(main.process_expired_failed_subscription_grace())
+
+        self.assertEqual(result["candidates"], 1)
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(self.query_one(
+            "SELECT status, failure_cycle_started_at FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (user_id,),
+        ), ("completed", failed_at))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM failed_subscription_terminations WHERE telegram_id = %s",
+            (recent_user_id,),
+        )[0], 0)
 
     def test_failed_termination_new_access_after_member_lookup_is_fenced_before_ban_real_postgres(self):
         run_migrations(self.get_conn)
@@ -11004,8 +11522,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 31)
-        self.assertEqual(system["migrations"]["latest"], "0030_content_access_level")
+        self.assertEqual(system["migrations"]["count"], 32)
+        self.assertEqual(
+            system["migrations"]["latest"],
+            "0031_failed_subscription_termination_cycles",
+        )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
         for forbidden in (

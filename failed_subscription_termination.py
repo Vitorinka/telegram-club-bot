@@ -16,23 +16,24 @@ def operation_reference(subscription_id):
 
 
 def claim_termination(cur, telegram_id, subscription_id, reason, invoice_id, owner_id, access_expiry,
-                      now=None, lease_minutes=30):
+                      now=None, lease_minutes=30, failure_cycle_started_at=None):
     now = now or datetime.utcnow()
+    failure_cycle_started_at = failure_cycle_started_at or now
     lease_until = now + timedelta(minutes=lease_minutes)
     cur.execute(
         """
         INSERT INTO failed_subscription_terminations (
             operation_id, telegram_id, stripe_subscription_id, failed_invoice_id,
             reason, status, owner_id, claim_generation, lease_until, access_expiry,
-            attempt_count, created_at, updated_at
+            failure_cycle_started_at, attempt_count, created_at, updated_at
         )
-        VALUES (%s, %s, %s, %s, %s, 'processing', %s, 1, %s, %s, 1, %s, %s)
-        ON CONFLICT (stripe_subscription_id) DO NOTHING
+        VALUES (%s, %s, %s, %s, %s, 'processing', %s, 1, %s, %s, %s, 1, %s, %s)
+        ON CONFLICT (stripe_subscription_id, failure_cycle_started_at) DO NOTHING
         RETURNING operation_id, claim_generation, status, stripe_cancelled_at,
                   collection_stopped_at, telegram_banned_at, telegram_removed_at, db_finalized_at, access_expiry
         """,
         (operation_reference(subscription_id), int(telegram_id), subscription_id, invoice_id,
-         reason, owner_id, lease_until, access_expiry, now, now),
+         reason, owner_id, lease_until, access_expiry, failure_cycle_started_at, now, now),
     )
     row = cur.fetchone()
     if row:
@@ -45,9 +46,10 @@ def claim_termination(cur, telegram_id, subscription_id, reason, invoice_id, own
                db_finalized_at, access_expiry
         FROM failed_subscription_terminations
         WHERE stripe_subscription_id = %s
+          AND failure_cycle_started_at = %s
         FOR UPDATE
         """,
-        (subscription_id,),
+        (subscription_id, failure_cycle_started_at),
     )
     existing = cur.fetchone()
     if not existing or int(existing[1]) != int(telegram_id) or existing[2] in TERMINAL_STATUSES:
