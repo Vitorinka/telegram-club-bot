@@ -9751,7 +9751,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "active", "cancel_at_period_end": False}):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(result, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
         self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000004'")[0], "reserved")
 
     def test_reserved_gift_scheduler_applies_after_cancelled_subscription_real_postgres(self):
@@ -9785,7 +9785,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              mock.patch.object(main.stripe.Subscription, "retrieve", return_value={"status": "canceled", "cancel_at_period_end": False}):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(result, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
         self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000005'")[0], "reserved")
         self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expiry))
 
@@ -9833,27 +9833,38 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(second_action, "blocked_active_auto_renew")
         self.assertEqual(first_expiry, old_expiry)
         self.assertEqual(second_expiry, old_expiry)
-        self.assertEqual(first["status"], "paid_unclaimed")
-        self.assertEqual(second["status"], "paid_unclaimed")
-        self.assertIn("напишите администратору", main.build_gift_reserved_recipient_text(first))
+        self.assertEqual(first["status"], "reserved")
+        self.assertEqual(second["status"], "reserved")
+        self.assertIn("активирован автоматически", main.build_gift_reserved_recipient_text(first))
         self.assertEqual(
             self.query_one("SELECT paid, expiry_date, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s", (recipient_id,)),
             (True, old_expiry, True, "sub_live_auto"),
         )
-        self.assertEqual(
-            self.query_one("""
-                SELECT status, recipient_telegram_id, reserved_at, redeemed_at, applied_at, applied_expiry
-                FROM gift_access_grants
-                WHERE public_reference = 'GIFT-0000000000000008'
-            """),
-            ("paid_unclaimed", None, None, None, None, None),
-        )
+        reserved_row = self.query_one("""
+            SELECT status, recipient_telegram_id, reserved_at, redeemed_at, applied_at, applied_expiry
+            FROM gift_access_grants
+            WHERE public_reference = 'GIFT-0000000000000008'
+        """)
+        self.assertEqual(reserved_row[:2], ("reserved", recipient_id))
+        self.assertIsNotNone(reserved_row[2])
+        self.assertEqual(reserved_row[3:], (None, None, None))
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM gift_access_events WHERE public_reference = %s AND event_type = 'gift_reserved'",
+            ("GIFT-0000000000000008",),
+        )[0], 1)
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM message_delivery_events WHERE delivery_key LIKE %s", ("gift:GIFT-0000000000000008:%",))[0],
             0,
         )
-        self.assertEqual(asyncio.run(main.apply_reserved_gifts(limit=10)), {"applied": 0, "skipped": 0})
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state",
+            mock.AsyncMock(return_value={"action": "block_active_auto_renew", "subscription_id": "sub_live_auto", "status": "active"}),
+        ):
+            self.assertEqual(
+                asyncio.run(main.apply_reserved_gifts(limit=10)),
+                {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0},
+            )
 
     def test_gift_activation_paid_false_future_expiry_starts_from_now_real_postgres(self):
         run_migrations(self.get_conn)
@@ -10108,10 +10119,374 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
              ):
             result = asyncio.run(main.apply_reserved_gifts(limit=10))
 
-        self.assertEqual(result, {"applied": 0, "skipped": 0})
+        self.assertEqual(result, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
         self.assertEqual(self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000000007'")[0], "reserved")
         self.assertEqual(self.query_one("SELECT paid, expiry_date FROM users WHERE telegram_id = %s", (recipient_id,)), (True, expired))
         self.assertEqual(self.query_one("SELECT COUNT(*) FROM access_events WHERE telegram_id = %s", (recipient_id,))[0], 0)
+
+    def test_reserved_gifts_apply_fifo_one_at_a_time_and_ignore_checkout_expiry_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 99340
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew, stripe_subscription_id)
+                VALUES (%s, FALSE, NOW() - INTERVAL '1 day', FALSE, NULL)
+            """, (recipient_id,))
+            gifts = (
+                ("00000000-0000-0000-0000-000000099341", "GIFT-0000000000099341", "gift_1m", 30, "3 days"),
+                ("00000000-0000-0000-0000-000000099342", "GIFT-0000000000099342", "gift_6m", 180, "2 days"),
+            )
+            for gift_id, reference, tariff, duration, age in gifts:
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                        recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                        status, token_hash, token_version, paid_at, reserved_at,
+                        checkout_expires_at, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, 99349, %s, 'Recipient', 'Sender', '', %s, %s,
+                        'reserved', %s, 1, NOW() - (%s::interval), NOW() - (%s::interval),
+                        NOW() - INTERVAL '30 days', NOW() - (%s::interval), NOW()
+                    )
+                """, (
+                    gift_id, reference, recipient_id, tariff, duration,
+                    main.gift_token_hash_for_reference(reference, 1), age, age, age,
+                ))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        safe_state = {"action": "apply", "subscription_id": None, "status": None}
+        with mock.patch.object(
+            main, "get_db_conn", side_effect=self.get_conn,
+        ), mock.patch.object(
+            main, "gift_recipient_subscription_state", mock.AsyncMock(return_value=safe_state),
+        ):
+            first = asyncio.run(main.apply_reserved_gifts(limit=10))
+            blocked_second = asyncio.run(main.apply_reserved_gifts(limit=10))
+
+        self.assertEqual(first, {"candidates": 1, "applied": 1, "skipped": 0, "retryable": 0})
+        self.assertEqual(blocked_second, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
+        self.assertEqual(
+            self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = %s", (gifts[0][1],))[0],
+            "redeemed",
+        )
+        self.assertEqual(
+            self.query_one("SELECT status FROM gift_access_grants WHERE public_reference = %s", (gifts[1][1],))[0],
+            "reserved",
+        )
+        first_expiry = self.query_one("SELECT expiry_date FROM users WHERE telegram_id = %s", (recipient_id,))[0]
+        self.assertGreater(first_expiry, datetime.utcnow() + timedelta(days=29))
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE users SET paid = FALSE, expiry_date = NOW() - INTERVAL '1 second' WHERE telegram_id = %s",
+                (recipient_id,),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", mock.AsyncMock(return_value=safe_state),
+        ):
+            second = asyncio.run(main.apply_reserved_gifts(limit=10))
+            duplicate = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(second, {"candidates": 1, "applied": 1, "skipped": 0, "retryable": 0})
+        self.assertEqual(duplicate, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM access_events WHERE telegram_id = %s AND event_type = 'gift_access_redeemed'",
+            (recipient_id,),
+        )[0], 2)
+
+    def test_reserved_gift_final_fences_new_access_invalid_state_and_recipient_change_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 99350
+
+        def insert_reserved(reference, suffix, status="reserved"):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                        recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                        status, token_hash, token_version, paid_at, reserved_at
+                    ) VALUES (%s, %s, 99359, %s, 'Recipient', 'Sender', '',
+                              'gift_1m', 30, %s, %s, 1, NOW(), NOW())
+                """, (
+                    f"00000000-0000-0000-0000-{suffix:012d}", reference, recipient_id,
+                    status, main.gift_token_hash_for_reference(reference, 1),
+                ))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+
+        insert_reserved("GIFT-0000000000099351", 99351)
+
+        async def add_new_access(_recipient_id):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    INSERT INTO users (telegram_id, paid, expiry_date, auto_renew)
+                    VALUES (%s, TRUE, NOW() + INTERVAL '10 days', FALSE)
+                    ON CONFLICT (telegram_id) DO UPDATE
+                    SET paid = TRUE, expiry_date = NOW() + INTERVAL '10 days'
+                """, (recipient_id,))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return {"action": "apply", "subscription_id": None, "status": None}
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", side_effect=add_new_access,
+        ):
+            protected = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(protected, {"candidates": 1, "applied": 0, "skipped": 1, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT status FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000099351'"
+        )[0], "reserved")
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("UPDATE users SET paid = FALSE, expiry_date = NULL WHERE telegram_id = %s", (recipient_id,))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        async def change_recipient_after_selection(_recipient_id):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    UPDATE gift_access_grants SET recipient_telegram_id = %s
+                    WHERE public_reference = 'GIFT-0000000000099351'
+                """, (recipient_id + 1,))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return {"action": "apply", "subscription_id": None, "status": None}
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", side_effect=change_recipient_after_selection,
+        ):
+            identity_result = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(identity_result, {"candidates": 1, "applied": 0, "skipped": 1, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s", (recipient_id,)
+        ), (False,))
+        self.assertEqual(self.query_one(
+            "SELECT status, recipient_telegram_id FROM gift_access_grants WHERE public_reference = 'GIFT-0000000000099351'"
+        ), ("reserved", recipient_id + 1))
+
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE gift_access_grants
+                SET status = 'refunded', refunded_at = NOW()
+                WHERE public_reference = 'GIFT-0000000000099351'
+            """)
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        for offset, state in enumerate(("cancelled", "refunded"), start=2):
+            insert_reserved(f"GIFT-000000000009935{offset}", 99350 + offset, status=state)
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state",
+            mock.AsyncMock(return_value={"action": "apply", "subscription_id": None, "status": None}),
+        ):
+            invalid = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(invalid["candidates"], 0)
+
+    def test_reserved_gift_concurrent_workers_apply_once_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        recipient_id = 99360
+        reference = "GIFT-0000000000099360"
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO users (telegram_id, paid, expiry_date, auto_renew)
+                VALUES (%s, FALSE, NOW() - INTERVAL '1 day', FALSE)
+            """, (recipient_id,))
+            cur.execute("""
+                INSERT INTO gift_access_grants (
+                    id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                    recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                    status, token_hash, token_version, paid_at, reserved_at
+                ) VALUES (
+                    '00000000-0000-0000-0000-000000099360', %s, 99369, %s,
+                    'Recipient', 'Sender', '', 'gift_1m', 30, 'reserved', %s, 1, NOW(), NOW()
+                )
+            """, (reference, recipient_id, main.gift_token_hash_for_reference(reference, 1)))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+
+        barrier = threading.Barrier(2)
+        results = []
+        errors = []
+
+        async def synchronized_state(_recipient_id):
+            barrier.wait(timeout=5)
+            return {"action": "apply", "subscription_id": None, "status": None}
+
+        def worker():
+            try:
+                with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+                    main, "gift_recipient_subscription_state", side_effect=synchronized_state,
+                ):
+                    results.append(asyncio.run(main.apply_reserved_gifts(limit=10)))
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertFalse(errors)
+        self.assertEqual(sum(result["applied"] for result in results), 1)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM access_events WHERE telegram_id = %s AND event_type = 'gift_access_redeemed'",
+            (recipient_id,),
+        )[0], 1)
+
+    def test_reserved_gift_worker_grace_status_change_and_rollback_retry_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+
+        def insert_reserved(recipient_id, suffix):
+            reference = f"GIFT-{suffix:016d}"
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    INSERT INTO users (
+                        telegram_id, paid, expiry_date, payment_failed,
+                        payment_failed_at, grace_period_end, auto_renew
+                    ) VALUES (%s, FALSE, NOW() - INTERVAL '1 day', FALSE, NULL, NULL, FALSE)
+                    ON CONFLICT (telegram_id) DO UPDATE SET
+                        paid = FALSE,
+                        expiry_date = NOW() - INTERVAL '1 day',
+                        payment_failed = FALSE,
+                        payment_failed_at = NULL,
+                        grace_period_end = NULL,
+                        auto_renew = FALSE
+                """, (recipient_id,))
+                cur.execute("""
+                    INSERT INTO gift_access_grants (
+                        id, public_reference, purchaser_telegram_id, recipient_telegram_id,
+                        recipient_name, sender_name, gift_message, tariff_code, duration_days,
+                        status, token_hash, token_version, paid_at, reserved_at
+                    ) VALUES (
+                        %s, %s, 99499, %s, 'Recipient', 'Sender', '', 'gift_1m', 30,
+                        'reserved', %s, 1, NOW(), NOW()
+                    )
+                """, (
+                    f"00000000-0000-0000-0000-{suffix:012d}", reference, recipient_id,
+                    main.gift_token_hash_for_reference(reference, 1),
+                ))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return reference
+
+        safe_state = {"action": "apply", "subscription_id": None, "status": None}
+
+        grace_recipient = 99470
+        grace_reference = insert_reserved(grace_recipient, 99470)
+        conn = self.get_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                UPDATE users
+                SET payment_failed = TRUE,
+                    payment_failed_at = NOW(),
+                    grace_period_end = NOW() + INTERVAL '48 hours'
+                WHERE telegram_id = %s
+            """, (grace_recipient,))
+            conn.commit()
+        finally:
+            cur.close()
+            conn.close()
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", mock.AsyncMock(return_value=safe_state),
+        ):
+            grace_result = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(grace_result, {"candidates": 0, "applied": 0, "skipped": 0, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT status FROM gift_access_grants WHERE public_reference = %s", (grace_reference,),
+        )[0], "reserved")
+
+        changed_recipient = 99471
+        changed_reference = insert_reserved(changed_recipient, 99471)
+
+        async def refund_after_selection(_recipient_id):
+            conn = self.get_conn()
+            cur = conn.cursor()
+            try:
+                cur.execute("""
+                    UPDATE gift_access_grants
+                    SET status = 'refunded', refunded_at = NOW()
+                    WHERE public_reference = %s
+                """, (changed_reference,))
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+            return safe_state
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", side_effect=refund_after_selection,
+        ):
+            changed_result = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(changed_result, {"candidates": 1, "applied": 0, "skipped": 1, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT paid FROM users WHERE telegram_id = %s", (changed_recipient,),
+        ), (False,))
+
+        retry_recipient = 99472
+        retry_reference = insert_reserved(retry_recipient, 99472)
+        original_apply = main.apply_gift_access_in_transaction
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", mock.AsyncMock(return_value=safe_state),
+        ), mock.patch.object(
+            main, "apply_gift_access_in_transaction", side_effect=RuntimeError("simulated_worker_crash"),
+        ):
+            failed_result = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(failed_result, {"candidates": 1, "applied": 0, "skipped": 0, "retryable": 1})
+        self.assertEqual(self.query_one(
+            "SELECT status FROM gift_access_grants WHERE public_reference = %s", (retry_reference,),
+        )[0], "reserved")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), mock.patch.object(
+            main, "gift_recipient_subscription_state", mock.AsyncMock(return_value=safe_state),
+        ), mock.patch.object(main, "apply_gift_access_in_transaction", side_effect=original_apply):
+            retry_result = asyncio.run(main.apply_reserved_gifts(limit=10))
+        self.assertEqual(retry_result, {"candidates": 1, "applied": 1, "skipped": 0, "retryable": 0})
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM access_events WHERE telegram_id = %s AND event_type = 'gift_access_redeemed'",
+            (retry_recipient,),
+        )[0], 1)
 
     def test_checksum_mismatch_fails_closed(self):
         run_migrations(self.get_conn)
