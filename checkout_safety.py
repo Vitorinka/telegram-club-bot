@@ -352,8 +352,14 @@ def has_active_access(paid, expiry_date, payment_failed=False, grace_period_end=
 def backup_decision(env):
     enabled = str(env.get("BACKUP_TELEGRAM_ENABLED", "false")).lower() == "true"
     key = env.get("BACKUP_ENCRYPTION_KEY")
-    if enabled and not key:
-        return {"telegram_enabled": True, "allowed": False, "reason": "BACKUP_ENCRYPTION_KEY required"}
+    if enabled and (
+        not isinstance(key, str) or not key.strip() or "\x00" in key
+    ):
+        return {
+            "telegram_enabled": True,
+            "allowed": False,
+            "reason": "valid BACKUP_ENCRYPTION_KEY required",
+        }
     return {"telegram_enabled": enabled, "allowed": True, "reason": None}
 
 

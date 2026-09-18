@@ -89,6 +89,12 @@ from checkout_safety import (
     subscription_status_action,
 )
 from db_migrations import run_migrations
+from db_backup_stream import (
+    BackupProcessError,
+    create_streaming_encrypted_backup,
+    redact_backup_process_error,
+    verify_pg_dump_without_file,
+)
 from failed_subscription_termination import (
     RETRYABLE_STATUSES as FAILED_TERMINATION_RETRYABLE_STATUSES,
     claim_termination as claim_failed_subscription_termination,
@@ -10231,7 +10237,6 @@ async def check_free_lesson_followups():
 
 # --- БЭКАП БАЗЫ ДАННЫХ ---
 async def send_db_backup():
-    filename = f"backup_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.sql"
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         await notify_admins("❌ Ошибка бэкапа: DATABASE_URL не задан!")
@@ -10242,70 +10247,54 @@ async def send_db_backup():
         await notify_admins(f"❌ Ошибка бэкапа: {decision['reason']}")
         return
 
+    encrypted_filename = None
     try:
         pg_dump_argv, pg_dump_env = build_pg_dump_command(db_url, os.environ)
-        process = await asyncio.create_subprocess_exec(
-            *pg_dump_argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=pg_dump_env,
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            error_msg = mask_secret_text(stderr.decode('utf-8'))
-            logging.error(f"pg_dump failed (code {process.returncode}): {error_msg}")
-            await notify_admins(f"❌ Ошибка дампа БД. Код: {process.returncode}. Подробности в логах.")
-            return
-
-        # Записываем дамп в файл
-        with open(filename, 'wb') as f:
-            f.write(stdout)
-
-        logging.info(f"Бэкап создан: {filename} (размер: {len(stdout)} байт)")
-
         if not decision["telegram_enabled"]:
+            await verify_pg_dump_without_file(pg_dump_argv, pg_dump_env)
             await notify_admins(
-                "✅ Бэкап БД создан и проверен локально, отправка файла в Telegram отключена "
-                "(BACKUP_TELEGRAM_ENABLED=false). Локальный .sql удалён."
+                "✅ Дамп БД проверен без записи plaintext-файла, отправка в Telegram отключена "
+                "(BACKUP_TELEGRAM_ENABLED=false)."
             )
             return
 
-        encrypted_filename = filename + ".enc"
         key = os.getenv("BACKUP_ENCRYPTION_KEY")
-        encrypt_process = await asyncio.create_subprocess_exec(
-            "openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2",
-            "-pass", "env:BACKUP_ENCRYPTION_KEY",
-            "-in", filename,
-            "-out", encrypted_filename,
-            env={**os.environ, "BACKUP_ENCRYPTION_KEY": key},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        encrypted_filename = await create_streaming_encrypted_backup(
+            pg_dump_argv, pg_dump_env, key,
         )
-        _, enc_stderr = await encrypt_process.communicate()
-        if encrypt_process.returncode != 0:
-            logging.error("backup encryption failed: %s", mask_secret_text(enc_stderr.decode("utf-8")))
-            await notify_admins("❌ Ошибка шифрования бэкапа. Файл не отправлен.")
-            return
-        if os.path.exists(filename):
-            os.remove(filename)
+        logging.info("Encrypted database backup prepared for delivery")
 
         for admin_id in ADMIN_IDS:
             try:
                 with open(encrypted_filename, 'rb') as f:
                     await bot.send_document(admin_id, f, caption=f"📦 Зашифрованный бэкап БД от {datetime.now().strftime('%d.%m.%Y %H:%M')}")
             except Exception as e:
-                logging.error(f"Не удалось отправить бэкап админу {admin_id}: {e}")
+                error_ref = safe_admin_error_reference("db_backup_send", e)
+                logging.error(
+                    "Database backup delivery failed: admin_id=%s error_ref=%s",
+                    admin_id, error_ref,
+                )
+
+    except BackupProcessError as e:
+        error_msg = redact_backup_process_error(
+            e.stderr,
+            (db_url, pg_dump_env.get("PGPASSWORD") if "pg_dump_env" in locals() else None),
+        )
+        error_msg = mask_secret_text(error_msg)
+        logging.error(
+            "Database backup process failed: stage=%s code=%s details=%s",
+            e.stage, e.returncode, error_msg,
+        )
+        await notify_admins(
+            f"❌ Ошибка создания защищённого бэкапа. Этап: {e.stage}. Подробности в логах."
+        )
 
     except Exception as e:
-        logging.exception(f"Критическая ошибка бэкапа: {e}")
         error_ref = safe_admin_error_reference("db_backup", e)
+        logging.exception("Critical database backup error: error_ref=%s", error_ref)
         await notify_admins(f"❌ Непредвиденная ошибка бэкапа. ref: {error_ref}")
     finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-        encrypted_filename = filename + ".enc"
-        if os.path.exists(encrypted_filename):
+        if encrypted_filename and os.path.exists(encrypted_filename):
             os.remove(encrypted_filename)
 
 @router.message(F.content_type == 'video', StateFilter(None))

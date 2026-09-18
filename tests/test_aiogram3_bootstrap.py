@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import unittest
 import uuid
@@ -299,6 +300,71 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.main.bot.session.close()
+
+    async def test_backup_send_failure_always_removes_encrypted_temp_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            encrypted_path = Path(directory) / "club-db-backup.sql.enc"
+            encrypted_path.write_bytes(b"encrypted")
+            with patch.dict(os.environ, {
+                "DATABASE_URL": TEST_ENV["DATABASE_URL"],
+                "BACKUP_TELEGRAM_ENABLED": "true",
+                "BACKUP_ENCRYPTION_KEY": "test-encryption-key",
+            }), patch.object(
+                self.main, "create_streaming_encrypted_backup",
+                new=AsyncMock(return_value=str(encrypted_path)),
+            ) as create_backup, patch.object(
+                self.main.bot, "send_document",
+                new=AsyncMock(side_effect=RuntimeError("send failed")),
+            ) as send_document, patch.object(
+                self.main, "notify_admins", new=AsyncMock(),
+            ):
+                await self.main.send_db_backup()
+
+            create_backup.assert_awaited_once()
+            self.assertEqual(send_document.await_count, len(self.main.ADMIN_IDS))
+            self.assertFalse(encrypted_path.exists())
+
+    async def test_backup_happy_path_sends_encrypted_artifact_and_cleans_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            encrypted_path = Path(directory) / "club-db-backup.sql.enc"
+            encrypted_path.write_bytes(b"encrypted")
+            with patch.dict(os.environ, {
+                "DATABASE_URL": TEST_ENV["DATABASE_URL"],
+                "BACKUP_TELEGRAM_ENABLED": "true",
+                "BACKUP_ENCRYPTION_KEY": "test-encryption-key",
+            }), patch.object(
+                self.main, "create_streaming_encrypted_backup",
+                new=AsyncMock(return_value=str(encrypted_path)),
+            ) as create_backup, patch.object(
+                self.main.bot, "send_document", new=AsyncMock(),
+            ) as send_document, patch.object(
+                self.main, "notify_admins", new=AsyncMock(),
+            ):
+                await self.main.send_db_backup()
+
+            create_backup.assert_awaited_once()
+            self.assertEqual(send_document.await_count, len(self.main.ADMIN_IDS))
+            self.assertFalse(encrypted_path.exists())
+
+    async def test_backup_missing_or_invalid_key_fails_before_dump_generation(self):
+        for invalid_key in (None, "   "):
+            environment = {
+                "DATABASE_URL": TEST_ENV["DATABASE_URL"],
+                "BACKUP_TELEGRAM_ENABLED": "true",
+            }
+            if invalid_key is not None:
+                environment["BACKUP_ENCRYPTION_KEY"] = invalid_key
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                self.main, "create_streaming_encrypted_backup", new=AsyncMock(),
+            ) as create_backup, patch.object(
+                self.main, "verify_pg_dump_without_file", new=AsyncMock(),
+            ) as verify_dump, patch.object(
+                self.main, "notify_admins", new=AsyncMock(),
+            ) as notify_admins:
+                await self.main.send_db_backup()
+            create_backup.assert_not_awaited()
+            verify_dump.assert_not_awaited()
+            notify_admins.assert_awaited_once()
 
     async def test_storage_diagnostics_private_admin_only(self):
         diagnostic_data = {"tables": [], "operational": {}, "retention": {}}
