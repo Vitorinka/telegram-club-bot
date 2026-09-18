@@ -35,11 +35,17 @@ OPENSSL_SCRIPT = """\
 #!/usr/bin/env python3
 import os
 from pathlib import Path
+import signal
 import sys
 import time
 
 mode = "fail" if "fail" in Path(sys.argv[0]).name else "ok"
 output_path = Path(sys.argv[sys.argv.index("-out") + 1])
+if "late-writer" in Path(sys.argv[0]).name:
+    def write_during_shutdown(_signum, _frame):
+        output_path.write_bytes(b"PARTIAL DURING TERMINATION")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, write_during_shutdown)
 if mode == "sleep":
     time.sleep(30)
 payload = sys.stdin.buffer.read()
@@ -129,7 +135,7 @@ class BackupStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_terminates_pipeline_and_removes_partial_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             pg_dump = self.make_executable(directory, "fake-pg-dump", PG_DUMP_SCRIPT)
-            openssl = self.make_executable(directory, "fake-openssl", OPENSSL_SCRIPT)
+            openssl = self.make_executable(directory, "fake-openssl-late-writer", OPENSSL_SCRIPT)
             env = {**os.environ, "FAKE_PG_DUMP_MODE": "sleep"}
             task = asyncio.create_task(create_streaming_encrypted_backup(
                 [pg_dump], env, "test-encryption-key",
@@ -145,7 +151,7 @@ class BackupStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_terminates_pipeline_and_removes_partial_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             pg_dump = self.make_executable(directory, "fake-pg-dump", PG_DUMP_SCRIPT)
-            openssl = self.make_executable(directory, "fake-openssl", OPENSSL_SCRIPT)
+            openssl = self.make_executable(directory, "fake-openssl-late-writer", OPENSSL_SCRIPT)
             env = {**os.environ, "FAKE_PG_DUMP_MODE": "sleep"}
             with self.assertRaisesRegex(BackupProcessError, "timeout_failed"):
                 await create_streaming_encrypted_backup(

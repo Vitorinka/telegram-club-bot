@@ -25,7 +25,11 @@ def redact_backup_process_error(stderr, secret_values=()):
 async def _terminate_process(process):
     if process is None or process.returncode is not None:
         return
-    process.terminate()
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        await process.wait()
+        return
     try:
         await asyncio.wait_for(process.wait(), timeout=5)
     except (asyncio.TimeoutError, ProcessLookupError):
@@ -59,6 +63,7 @@ async def create_streaming_encrypted_backup(
     pg_dump_process = None
     encryption_process = None
     pipeline_task = None
+    completed = False
     try:
         read_fd, write_fd = os.pipe()
         encryption_process = await asyncio.create_subprocess_exec(
@@ -102,19 +107,11 @@ async def create_streaming_encrypted_backup(
             raise BackupProcessError(
                 "encryption", encryption_process.returncode, encryption_stderr,
             )
+        completed = True
         return output_path
     except asyncio.TimeoutError as error:
-        if pipeline_task is not None and not pipeline_task.done():
-            pipeline_task.cancel()
-        if pipeline_task is not None:
-            try:
-                await pipeline_task
-            except BaseException:
-                pass
-        if os.path.exists(output_path):
-            os.remove(output_path)
         raise BackupProcessError("timeout") from error
-    except BaseException:
+    finally:
         if pipeline_task is not None and not pipeline_task.done():
             pipeline_task.cancel()
         if pipeline_task is not None:
@@ -122,16 +119,16 @@ async def create_streaming_encrypted_backup(
                 await pipeline_task
             except BaseException:
                 pass
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise
-    finally:
+        await asyncio.gather(
+            _terminate_process(pg_dump_process),
+            _terminate_process(encryption_process),
+        )
         if read_fd is not None:
             os.close(read_fd)
         if write_fd is not None:
             os.close(write_fd)
-        await _terminate_process(pg_dump_process)
-        await _terminate_process(encryption_process)
+        if not completed and os.path.exists(output_path):
+            os.remove(output_path)
 
 
 async def verify_pg_dump_without_file(
