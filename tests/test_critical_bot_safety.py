@@ -544,9 +544,21 @@ class CriticalBotSafetyTests(unittest.TestCase):
     def test_backup_config_decision(self):
         self.assertEqual(backup_decision({})["telegram_enabled"], False)
         self.assertFalse(backup_decision({"BACKUP_TELEGRAM_ENABLED": "true"})["allowed"])
+        self.assertFalse(backup_decision({
+            "BACKUP_TELEGRAM_ENABLED": "true", "BACKUP_ENCRYPTION_KEY": "invalid\x00key",
+        })["allowed"])
         self.assertTrue(
             backup_decision({"BACKUP_TELEGRAM_ENABLED": "true", "BACKUP_ENCRYPTION_KEY": "secret"})["allowed"]
         )
+
+    def test_backup_pipeline_has_no_plaintext_file_or_shell_boundary(self):
+        source = (ROOT / "db_backup_stream.py").read_text(encoding="utf-8")
+        self.assertIn("os.pipe()", source)
+        self.assertIn("suffix=\".sql.enc\"", source)
+        self.assertIn("os.chmod(output_path, 0o600)", source)
+        self.assertNotIn('"-in"', source)
+        self.assertNotIn("shell=True", source)
+        self.assertNotIn(".sql\"", source)
 
     def test_no_direct_blocking_stripe_calls_in_async_functions(self):
         tree = ast.parse(MAIN_SOURCE)
