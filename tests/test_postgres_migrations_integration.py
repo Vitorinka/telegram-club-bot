@@ -5039,6 +5039,164 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (deleted_user_id,),
         ), ("processing", None))
 
+    def test_deleted_webhook_keeps_failed_termination_as_single_removal_authority_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        user_id = 975034
+        subscription_id = "sub_failed_deleted_authority_975034"
+        invoice_id = "in_failed_deleted_authority_975034"
+        expiry = now - timedelta(hours=2)
+        self.insert_recovery_user(
+            user_id, paid=True, expiry_date=expiry,
+            stripe_customer_id=f"cus_{subscription_id}",
+            stripe_subscription_id=subscription_id, auto_renew=True,
+        )
+
+        failed_event = SimpleNamespace(
+            id="evt_failed_deleted_authority", type="invoice.payment_failed",
+            created=int(now.replace(tzinfo=ZoneInfo("UTC")).timestamp()),
+            data=SimpleNamespace(object=SimpleNamespace(
+                id=invoice_id, subscription=subscription_id,
+                customer=f"cus_{subscription_id}", metadata={},
+                lines=SimpleNamespace(data=[SimpleNamespace(
+                    subscription=subscription_id,
+                    period=SimpleNamespace(
+                        start=int((now - timedelta(days=30)).timestamp()),
+                        end=int(expiry.timestamp()),
+                    ),
+                    price=SimpleNamespace(id="price_1m"),
+                )]),
+                billing_reason="subscription_cycle", status="open", paid=False,
+                amount_paid=0, amount_due=1000, currency="rub",
+                customer_email=None, payment_intent=None,
+                next_payment_attempt=None, payments=SimpleNamespace(data=[]),
+            )),
+        )
+        request = SimpleNamespace(
+            headers={"Stripe-Signature": "sig", "Content-Type": "application/json"},
+            path="/stripe-payment", host="club.example",
+            read=mock.AsyncMock(return_value=b"{}"),
+        )
+        past_due_subscription = SimpleNamespace(
+            id=subscription_id, customer=f"cus_{subscription_id}",
+            status="past_due", current_period_end=int(expiry.timestamp()),
+            trial_end=None, metadata={}, latest_invoice=failed_event.data.object,
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "construct_verified_stripe_event", return_value=failed_event), \
+             mock.patch.object(main.stripe.Subscription, "retrieve", return_value=past_due_subscription), \
+             mock.patch.object(main.stripe.Invoice, "retrieve", return_value=failed_event.data.object), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            self.assertEqual(asyncio.run(main.stripe_webhook(request)).status, 200)
+
+        payment_failed_at = self.query_one(
+            "SELECT payment_failed_at FROM users WHERE telegram_id = %s", (user_id,),
+        )[0]
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                operation = main.claim_failed_subscription_termination(
+                    cur, user_id, subscription_id, "grace_period_expired",
+                    invoice_id, "failed-owner", expiry,
+                    failure_cycle_started_at=payment_failed_at,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        operation_id = operation[0]
+
+        def deleted_event(event_id):
+            return SimpleNamespace(
+                id=event_id, type="customer.subscription.deleted",
+                created=int(
+                    (payment_failed_at + timedelta(minutes=1))
+                    .replace(tzinfo=ZoneInfo("UTC")).timestamp()
+                ),
+                data=SimpleNamespace(object=SimpleNamespace(
+                    id=subscription_id, customer=f"cus_{subscription_id}",
+                    status="canceled",
+                )),
+            )
+
+        for event_id in ("evt_deleted_authority", "evt_deleted_authority_duplicate"):
+            request.read = mock.AsyncMock(return_value=b"{}")
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(
+                     main, "construct_verified_stripe_event",
+                     return_value=deleted_event(event_id),
+                 ):
+                self.assertEqual(asyncio.run(main.stripe_webhook(request)).status, 200)
+
+        self.assertEqual(self.query_one(
+            "SELECT status, stripe_cancelled_at IS NOT NULL FROM failed_subscription_terminations "
+            "WHERE operation_id = %s",
+            (operation_id,),
+        ), ("stripe_cancelled", True))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events "
+            "WHERE telegram_id = %s AND stripe_subscription_id = %s "
+            "AND status NOT IN ('db_finalized', 'cancelled', 'not_due', 'superseded')",
+            (user_id, subscription_id),
+        ), (0,))
+
+        open_invoice = mock.Mock(
+            id=invoice_id, subscription=subscription_id, status="open",
+        )
+        open_invoice.void_invoice.return_value = mock.Mock(status="void")
+        void_invoice = mock.Mock(
+            id=invoice_id, subscription=subscription_id, status="void",
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.stripe.Invoice, "retrieve",
+                 side_effect=[open_invoice, void_invoice],
+             ), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as failed_ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as failed_unban:
+            result = asyncio.run(main.terminate_failed_subscription(
+                user_id, "grace_period_expired",
+                target_operation_id=operation_id,
+                target_subscription_id=subscription_id,
+            ))
+        self.assertEqual(result, "completed")
+        failed_ban.assert_awaited_once()
+        failed_unban.assert_awaited_once()
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET stripe_subscription_id = %s WHERE telegram_id = %s",
+                    (subscription_id, user_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        request.read = mock.AsyncMock(return_value=b"{}")
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "construct_verified_stripe_event",
+                 return_value=deleted_event("evt_deleted_after_failed_completion"),
+             ):
+            self.assertEqual(asyncio.run(main.stripe_webhook(request)).status, 200)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), (0,))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ordinary_ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as ordinary_unban:
+            self.assertNotIn(user_id, {row[0] for row in main.fetch_expired_access_candidates()})
+            self.assertEqual(main.reconcile_terminal_stranded_subscription_removals(), 0)
+        ordinary_ban.assert_not_awaited()
+        ordinary_unban.assert_not_awaited()
+
     def test_durable_termination_uses_canonical_recovery_decisions_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
@@ -8602,7 +8760,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (user_id,),
         )[0], 1)
 
-    def test_deleted_subscription_webhook_preserves_retry_and_is_idempotent_real_postgres(self):
+    def test_deleted_subscription_webhook_hands_off_before_identity_clear_and_completes_real_postgres(self):
         run_migrations(self.get_conn)
         main = import_main()
         user_id = 9963
@@ -8612,19 +8770,6 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             user_id, paid=True, expiry_date=expiry, auto_renew=True,
             stripe_subscription_id=sub_id, stripe_customer_id="cus_deleted_real_path",
         )
-        conn = self.get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO subscription_removal_events (
-                    telegram_id, status, reason, stripe_subscription_id, access_expiry
-                ) VALUES (%s, 'pending', 'subscription_expired', %s, %s)
-                """,
-                (user_id, sub_id, expiry),
-            )
-        conn.commit()
-        conn.close()
-
         event = SimpleNamespace(
             id="evt_deleted_real_path",
             type="customer.subscription.deleted",
@@ -8650,25 +8795,740 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (event.id,),
         ), (True, 1))
         self.assertEqual(self.query_one(
-            "SELECT status, stripe_canceled_at IS NOT NULL FROM subscription_removal_events WHERE telegram_id = %s",
+            "SELECT status, reason, stripe_subscription_id, access_expiry, "
+            "stripe_canceled_at IS NOT NULL FROM subscription_removal_events WHERE telegram_id = %s",
             (user_id,),
-        ), ("stripe_canceled", True))
+        ), ("stripe_canceled", "subscription_terminal", sub_id, expiry, True))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), (1,))
         self.assertEqual(self.query_one(
             "SELECT paid, auto_renew, stripe_subscription_id FROM users WHERE telegram_id = %s",
             (user_id,),
         ), (False, False, None))
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            candidates = main.fetch_expired_access_candidates()
+        self.assertIn(user_id, {row[0] for row in candidates})
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "reconcile_terminal_stranded_subscription_removals", return_value=0
+             ), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            metrics = asyncio.run(main.process_expired_access())
+
+        ban.assert_awaited_once()
+        unban.assert_awaited_once()
+        self.assertEqual(metrics["finalized"], 1)
+        self.assertEqual(self.query_one(
+            "SELECT status, telegram_removed_at IS NOT NULL, db_finalized_at IS NOT NULL "
+            "FROM subscription_removal_events WHERE telegram_id = %s",
+            (user_id,),
+        ), ("db_finalized", True, True))
+
+    def test_terminal_deleted_removal_is_fenced_by_new_access_identity_and_grace_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        expired = datetime.utcnow() - timedelta(days=1)
+
+        def deliver_deleted(user_id, sub_id):
+            self.insert_recovery_user(
+                user_id, paid=True, expiry_date=expired, auto_renew=True,
+                stripe_subscription_id=sub_id,
+                stripe_customer_id=f"cus_{sub_id}",
+            )
+            event = SimpleNamespace(
+                id=f"evt_deleted_{sub_id}",
+                type="customer.subscription.deleted",
+                created=int(datetime.utcnow().timestamp()),
+                data=SimpleNamespace(object=SimpleNamespace(
+                    id=sub_id, customer=f"cus_{sub_id}", status="canceled",
+                )),
+            )
+            request = SimpleNamespace(
+                headers={"Stripe-Signature": "sig", "Content-Type": "application/json"},
+                path="/stripe-payment", host="club.example",
+                read=mock.AsyncMock(return_value=b"{}"),
+            )
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main, "construct_verified_stripe_event", return_value=event):
+                response = asyncio.run(main.stripe_webhook(request))
+            self.assertEqual(response.status, 200)
+
+        access_user = 9964
+        identity_user = 9965
+        grace_user = 9966
+        deliver_deleted(access_user, "sub_terminal_new_access")
+        deliver_deleted(identity_user, "sub_terminal_new_identity")
+        deliver_deleted(grace_user, "sub_terminal_new_grace")
+
         conn = self.get_conn()
         cur = conn.cursor()
-        try:
-            retry = main.claim_subscription_removal(
-                cur, user_id, "subscription_expired", owner_id="retry-worker",
-                return_token=True,
+        cur.execute(
+            "UPDATE users SET paid=TRUE, expiry_date=NOW()+INTERVAL '30 days' "
+            "WHERE telegram_id=%s",
+            (access_user,),
+        )
+        cur.execute(
+            "UPDATE users SET paid=TRUE, stripe_subscription_id=%s "
+            "WHERE telegram_id=%s",
+            ("sub_replacement_identity", identity_user),
+        )
+        cur.execute(
+            "UPDATE users SET payment_failed=TRUE, payment_failed_at=NOW(), "
+            "grace_period_end=NOW()+INTERVAL '48 hours' WHERE telegram_id=%s",
+            (grace_user,),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()), \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            access_result = asyncio.run(main.ban_user_logic(access_user))
+            identity_result = asyncio.run(main.ban_user_logic(identity_user))
+            grace_result = asyncio.run(main.ban_user_logic(grace_user))
+
+        ban.assert_not_awaited()
+        self.assertEqual(access_result, "active_in_db")
+        self.assertEqual(identity_result, "active_in_db")
+        self.assertEqual(grace_result, "recent_payment_failure")
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id=%s",
+            (access_user,),
+        ), ("superseded",))
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id=%s",
+            (identity_user,),
+        ), ("superseded",))
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id=%s",
+            (grace_user,),
+        ), ("pending",))
+
+    def test_terminal_stranded_reconciliation_is_bounded_idempotent_and_left_safe_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9967
+        sub_id = "sub_historical_terminal_stranded"
+        failed_owner_user_id = 9968
+        failed_owner_sub_id = "sub_historical_failed_owner"
+        expired = datetime.utcnow() - timedelta(days=10)
+        self.insert_recovery_user(
+            user_id, paid=False, expiry_date=expired, auto_renew=False,
+            stripe_subscription_id=None, stripe_customer_id="cus_historical_terminal",
+        )
+        self.insert_recovery_user(
+            failed_owner_user_id, paid=False, expiry_date=expired, auto_renew=False,
+            stripe_subscription_id=None, stripe_customer_id="cus_historical_failed_owner",
+        )
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO stripe_links (
+                telegram_id, stripe_customer_id, stripe_subscription_id,
+                status, current_period_end, is_active, source
+            ) VALUES (%s, %s, %s, 'canceled', %s, FALSE, 'test_terminal_history')
+            """,
+            (user_id, "cus_historical_terminal", sub_id, expired),
+        )
+        cur.execute(
+            """
+            INSERT INTO stripe_links (
+                telegram_id, stripe_customer_id, stripe_subscription_id,
+                status, current_period_end, is_active, source
+            ) VALUES (%s, %s, %s, 'canceled', %s, FALSE, 'test_failed_owner_history')
+            """,
+            (
+                failed_owner_user_id, "cus_historical_failed_owner",
+                failed_owner_sub_id, expired,
+            ),
+        )
+        cur.execute(
+            """
+            INSERT INTO failed_subscription_terminations (
+                operation_id, telegram_id, stripe_subscription_id,
+                reason, status, access_expiry, failure_cycle_started_at,
+                created_at, updated_at
+            ) VALUES (%s, %s, %s, 'grace_period_expired', 'retryable_failed',
+                      %s, %s, NOW(), NOW())
+            """,
+            (
+                "fst-historical-failed-owner-9968", failed_owner_user_id,
+                failed_owner_sub_id, expired, expired,
+            ),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            first = main.reconcile_terminal_stranded_subscription_removals(limit=10)
+            second = main.reconcile_terminal_stranded_subscription_removals(limit=10)
+            candidates = main.fetch_expired_access_candidates()
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        self.assertIn(user_id, {row[0] for row in candidates})
+        self.assertNotIn(failed_owner_user_id, {row[0] for row in candidates})
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*), MIN(status), MIN(reason), MIN(stripe_subscription_id) "
+            "FROM subscription_removal_events WHERE telegram_id=%s",
+            (user_id,),
+        ), (1, "stripe_canceled", "subscription_terminal_reconciled", sub_id))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id=%s",
+            (failed_owner_user_id,),
+        ), (0,))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="left")),
+             ) as get_member, \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            result = asyncio.run(main.ban_user_logic(user_id))
+
+        self.assertEqual(result, "db_finalized")
+        get_member.assert_awaited_once()
+        ban.assert_not_awaited()
+        unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status, telegram_removed_at IS NOT NULL, db_finalized_at IS NOT NULL "
+            "FROM subscription_removal_events WHERE telegram_id=%s",
+            (user_id,),
+        ), ("db_finalized", True, True))
+
+    def test_historical_reconciliation_uses_latest_failed_cycle_authority_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        old_expiry = now - timedelta(days=40)
+        current_expiry = now - timedelta(days=1)
+        superseded_user = 9981
+        completed_new_cycle_user = 9982
+        completed_same_cycle_user = 9983
+        manual_review_user = 9984
+        retryable_user = 9985
+        cases = (
+            (superseded_user, "superseded", old_expiry),
+            (completed_new_cycle_user, "completed", old_expiry),
+            (completed_same_cycle_user, "completed", current_expiry),
+            (manual_review_user, "manual_review", old_expiry),
+            (retryable_user, "retryable_failed", old_expiry),
+        )
+
+        for user_id, _status, _failed_expiry in cases:
+            self.insert_recovery_user(
+                user_id, paid=False, expiry_date=current_expiry,
+                auto_renew=False, stripe_subscription_id=None,
+                stripe_customer_id=f"cus_historical_{user_id}",
             )
+
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            for user_id, status, failed_expiry in cases:
+                sub_id = f"sub_historical_{user_id}"
+                cur.execute(
+                    """
+                    INSERT INTO stripe_links (
+                        telegram_id, stripe_customer_id, stripe_subscription_id,
+                        status, current_period_end, is_active, source
+                    ) VALUES (%s, %s, %s, 'canceled', %s, FALSE,
+                              'historical_fst_authority_test')
+                    """,
+                    (user_id, f"cus_historical_{user_id}", sub_id, current_expiry),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry,
+                        failure_cycle_started_at, completed_at,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'grace_period_expired', %s, %s,
+                              %s, CASE WHEN %s IN ('completed', 'superseded', 'manual_review')
+                                      THEN %s ELSE NULL END, NOW(), NOW())
+                    """,
+                    (
+                        f"fst-historical-{user_id}", user_id, sub_id, status,
+                        failed_expiry, now - timedelta(days=30), status,
+                        now - timedelta(days=29),
+                    ),
+                )
+            # An older unresolved cycle must not override the deterministic latest
+            # superseded tombstone for the same subscription.
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id,
+                    reason, status, access_expiry, failure_cycle_started_at,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, 'grace_period_expired',
+                          'retryable_failed', %s, %s, NOW(), NOW())
+                """,
+                (
+                    "fst-historical-9981-older", superseded_user,
+                    f"sub_historical_{superseded_user}", old_expiry,
+                    now - timedelta(days=60),
+                ),
+            )
+            # The existing ordinary tombstone must be rearmed in place through
+            # the canonical helper, not replaced with a duplicate operation.
+            cur.execute(
+                """
+                INSERT INTO subscription_removal_events (
+                    telegram_id, status, reason, stripe_subscription_id,
+                    access_expiry, claim_generation, created_at, updated_at
+                ) VALUES (%s, 'superseded', 'old_cycle', %s, %s, 4, NOW(), NOW())
+                """,
+                (
+                    superseded_user, f"sub_historical_{superseded_user}",
+                    old_expiry,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            first = main.reconcile_terminal_stranded_subscription_removals(limit=100)
+            second = main.reconcile_terminal_stranded_subscription_removals(limit=100)
+
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*), MIN(status), MIN(claim_generation), MIN(access_expiry) "
+            "FROM subscription_removal_events WHERE telegram_id = %s",
+            (superseded_user,),
+        ), (1, "stripe_canceled", 5, current_expiry))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*), MIN(status), MIN(access_expiry) "
+            "FROM subscription_removal_events WHERE telegram_id = %s",
+            (completed_new_cycle_user,),
+        ), (1, "stripe_canceled", current_expiry))
+        for blocked_user in (
+            completed_same_cycle_user, manual_review_user, retryable_user,
+        ):
+            self.assertEqual(self.query_one(
+                "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+                (blocked_user,),
+            ), (0,))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "reconcile_terminal_stranded_subscription_removals", return_value=0), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            metrics = asyncio.run(main.process_expired_access())
+
+        self.assertEqual(metrics["finalized"], 2)
+        self.assertEqual(ban.await_count, 2)
+        self.assertEqual(unban.await_count, 2)
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id = %s",
+            (superseded_user,),
+        ), ("db_finalized",))
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "terminate_failed_subscription",
+                 mock.AsyncMock(return_value="stripe_retryable"),
+             ) as failed_terminate:
+            failed_result = asyncio.run(
+                main.process_expired_failed_subscription_grace()
+            )
+        self.assertEqual(failed_result["candidates"], 1)
+        failed_terminate.assert_awaited_once()
+        self.assertEqual(
+            failed_terminate.await_args.kwargs["target_operation_id"],
+            "fst-historical-9985",
+        )
+
+    def test_failed_scheduler_selects_only_latest_failure_cycle_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        cases = (
+            (9986, "superseded", False),
+            (9987, "completed", False),
+            (9988, "manual_review", False),
+            (9989, "retryable_failed", True),
+        )
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            for user_id, newer_status, _selected in cases:
+                sub_id = f"sub_latest_cycle_{user_id}"
+                self.insert_recovery_user(
+                    user_id, paid=False, expiry_date=now - timedelta(days=1),
+                    stripe_subscription_id=None,
+                )
+                cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry, failure_cycle_started_at,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'grace_period_expired',
+                              'retryable_failed', %s, %s, NOW(), NOW())
+                    """,
+                    (
+                        f"fst-old-{user_id}", user_id, sub_id,
+                        now - timedelta(days=1), now - timedelta(days=10),
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry, failure_cycle_started_at,
+                        completed_at, created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'grace_period_expired', %s, %s, %s,
+                              CASE WHEN %s IN ('completed', 'superseded', 'manual_review')
+                                   THEN NOW() ELSE NULL END, NOW(), NOW())
+                    """,
+                    (
+                        f"fst-new-{user_id}", user_id, sub_id, newer_status,
+                        now - timedelta(days=1), now - timedelta(days=2),
+                        newer_status,
+                    ),
+                )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "terminate_failed_subscription",
+                 mock.AsyncMock(return_value="stripe_retryable"),
+             ) as terminate:
+            first = asyncio.run(main.process_expired_failed_subscription_grace())
+            second = asyncio.run(main.process_expired_failed_subscription_grace())
+
+        self.assertEqual(first["candidates"], 1)
+        self.assertEqual(second["candidates"], 1)
+        self.assertEqual(terminate.await_count, 2)
+        for call in terminate.await_args_list:
+            self.assertEqual(
+                call.kwargs["target_operation_id"], "fst-new-9989"
+            )
+
+        for user_id, _newer_status, _selected in cases[:3]:
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main.stripe.Subscription, "retrieve") as stripe_retrieve, \
+                 mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+                 mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+                result = asyncio.run(main.terminate_failed_subscription(
+                    user_id,
+                    "grace_period_expired",
+                    target_operation_id=f"fst-old-{user_id}",
+                    target_subscription_id=f"sub_latest_cycle_{user_id}",
+                ))
+            self.assertEqual(result, "stale_cycle")
+            stripe_retrieve.assert_not_called()
+            ban.assert_not_awaited()
+            unban.assert_not_awaited()
+
+    def test_failed_preban_fence_rejects_cycle_created_after_claim_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9990
+        sub_id = "sub_preban_newer_cycle_9990"
+        now = datetime.utcnow()
+        expiry = now - timedelta(days=1)
+        self.insert_recovery_user(
+            user_id, paid=False, expiry_date=expiry,
+            stripe_subscription_id=None, payment_failed=False,
+        )
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id,
+                    failed_invoice_id, reason, status, access_expiry,
+                    stripe_cancelled_at, collection_stopped_at,
+                    failure_cycle_started_at, created_at, updated_at
+                ) VALUES (%s, %s, %s, 'in_preban_old',
+                          'grace_period_expired', 'retryable_failed', %s,
+                          NOW(), NOW(), %s, NOW(), NOW())
+                """,
+                (
+                    "fst-preban-old-9990", user_id, sub_id, expiry,
+                    now - timedelta(days=10),
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        async def create_newer_cycle(*_args, **_kwargs):
+            race_conn = self.get_conn()
+            with race_conn.cursor() as race_cur:
+                race_cur.execute(
+                    """
+                    INSERT INTO failed_subscription_terminations (
+                        operation_id, telegram_id, stripe_subscription_id,
+                        reason, status, access_expiry,
+                        failure_cycle_started_at, completed_at,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, 'grace_period_expired',
+                              'superseded', %s, %s, NOW(), NOW(), NOW())
+                    """,
+                    (
+                        "fst-preban-new-9990", user_id, sub_id, expiry,
+                        now - timedelta(days=2),
+                    ),
+                )
+            race_conn.commit()
+            race_conn.close()
+            return SimpleNamespace(status="member")
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(side_effect=create_newer_cycle),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban:
+            result = asyncio.run(main.terminate_failed_subscription(
+                user_id,
+                "grace_period_expired",
+                target_operation_id="fst-preban-old-9990",
+                target_subscription_id=sub_id,
+            ))
+
+        self.assertEqual(result, "stale_cycle")
+        ban.assert_not_awaited()
+        unban.assert_not_awaited()
+        self.assertEqual(self.query_one(
+            "SELECT status FROM failed_subscription_terminations "
+            "WHERE operation_id = 'fst-preban-old-9990'",
+        ), ("processing",))
+
+    def test_same_subscription_terminal_cycles_rearm_from_deleted_webhook_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        old_expiry = now - timedelta(days=40)
+        new_expiry = now - timedelta(days=1)
+        cases = (
+            (9971, "superseded"),
+            (9972, "db_finalized"),
+            (9973, "cancelled"),
+            (9974, "not_due"),
+        )
+
+        def deleted_event(user_id, sub_id):
+            event = SimpleNamespace(
+                id=f"evt_rearm_{user_id}",
+                type="customer.subscription.deleted",
+                created=int(now.timestamp()),
+                data=SimpleNamespace(object=SimpleNamespace(
+                    id=sub_id, customer=f"cus_{user_id}", status="canceled",
+                )),
+            )
+            request = SimpleNamespace(
+                headers={"Stripe-Signature": "sig", "Content-Type": "application/json"},
+                path="/stripe-payment", host="club.example",
+                read=mock.AsyncMock(return_value=b"{}"),
+            )
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+                 mock.patch.object(main, "construct_verified_stripe_event", return_value=event):
+                self.assertEqual(asyncio.run(main.stripe_webhook(request)).status, 200)
+
+        for user_id, terminal_status in cases:
+            sub_id = f"sub_rearm_{terminal_status}"
+            self.insert_recovery_user(
+                user_id, paid=True, expiry_date=new_expiry, auto_renew=True,
+                stripe_subscription_id=sub_id, stripe_customer_id=f"cus_{user_id}",
+            )
+            conn = self.get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, owner_id, claimed_at,
+                        lease_until, attempt_count, stripe_subscription_id,
+                        access_expiry, stripe_canceled_at, telegram_banned_at,
+                        telegram_removed_at, db_finalized_at, admin_notified_at,
+                        revoke_started_at, last_error, claim_generation,
+                        created_at, updated_at
+                    ) VALUES (
+                        %s, %s, 'old_cycle', 'old-worker', NOW(),
+                        NOW() + INTERVAL '10 minutes', 4, %s, %s, NOW(), NOW(),
+                        NOW(), NOW(), NOW(), NOW(), 'old failure', 7,
+                        NOW() - INTERVAL '40 days', NOW() - INTERVAL '30 days'
+                    )
+                    """,
+                    (user_id, terminal_status, sub_id, old_expiry),
+                )
             conn.commit()
-        finally:
-            cur.close()
             conn.close()
-        self.assertEqual(retry["status"], "claimed")
+            deleted_event(user_id, sub_id)
+
+            row = self.query_one(
+                """
+                SELECT status, reason, access_expiry, owner_id, claimed_at,
+                       lease_until, attempt_count, telegram_banned_at,
+                       telegram_removed_at, db_finalized_at, admin_notified_at,
+                       revoke_started_at, last_error, claim_generation
+                FROM subscription_removal_events WHERE telegram_id = %s
+                """,
+                (user_id,),
+            )
+            self.assertEqual(row[:3], ("stripe_canceled", "subscription_terminal", new_expiry))
+            self.assertEqual(
+                row[3:13],
+                (None, None, None, 0, None, None, None, None, None, None),
+            )
+            self.assertEqual(row[13], 8)
+            self.assertEqual(self.query_one(
+                "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+                (user_id,),
+            ), (1,))
+            with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+                self.assertFalse(main.subscription_removal_claim_is_current(
+                    user_id, "old-worker", 7
+                ))
+
+        removal_user = cases[0][0]
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(main, "reconcile_terminal_stranded_subscription_removals", return_value=0), \
+             mock.patch.object(
+                 main.bot, "get_chat_member",
+                 mock.AsyncMock(return_value=SimpleNamespace(status="member")),
+             ), \
+             mock.patch.object(main.bot, "ban_chat_member", mock.AsyncMock()) as ban, \
+             mock.patch.object(main.bot, "unban_chat_member", mock.AsyncMock()) as unban, \
+             mock.patch.object(main, "notify_admins", mock.AsyncMock()):
+            first = asyncio.run(main.process_expired_access())
+            second = asyncio.run(main.process_expired_access())
+        self.assertEqual(first["finalized"], 4)
+        self.assertEqual(second["finalized"], 0)
+        self.assertEqual(ban.await_count, 4)
+        self.assertEqual(unban.await_count, 4)
+        self.assertEqual(self.query_one(
+            "SELECT status FROM subscription_removal_events WHERE telegram_id = %s",
+            (removal_user,),
+        ), ("db_finalized",))
+
+    def test_terminal_cycle_rearm_requires_proof_and_reconciliation_uses_canonical_helper_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        now = datetime.utcnow()
+        old_expiry = now - timedelta(days=30)
+        newer_expiry = now - timedelta(days=1)
+        ambiguous_user = 9975
+        payment_user = 9976
+        reconcile_user = 9977
+        failed_owner_user = 9978
+        null_ambiguous_user = 9979
+
+        for user_id in (
+            ambiguous_user, payment_user, reconcile_user, failed_owner_user,
+            null_ambiguous_user,
+        ):
+            self.insert_recovery_user(
+                user_id, paid=False, expiry_date=newer_expiry, auto_renew=False,
+                stripe_subscription_id=None, stripe_customer_id=f"cus_{user_id}",
+            )
+        conn = self.get_conn()
+        with conn.cursor() as cur:
+            for user_id, status, stored_expiry in (
+                (ambiguous_user, "superseded", newer_expiry),
+                (payment_user, "db_finalized", None),
+                (reconcile_user, "cancelled", old_expiry),
+                (failed_owner_user, "superseded", old_expiry),
+                (null_ambiguous_user, "not_due", None),
+            ):
+                sub_id = f"sub_reconcile_{user_id}"
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, stripe_subscription_id,
+                        access_expiry, db_finalized_at, claim_generation
+                    ) VALUES (%s, %s, 'old_cycle', %s, %s, NOW() - INTERVAL '5 days', 3)
+                    """,
+                    (user_id, status, sub_id, stored_expiry),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO stripe_links (
+                        telegram_id, stripe_customer_id, stripe_subscription_id,
+                        status, current_period_end, is_active, source
+                    ) VALUES (%s, %s, %s, 'canceled', %s, FALSE, 'cycle_rearm_test')
+                    """,
+                    (user_id, f"cus_{user_id}", sub_id, newer_expiry),
+                )
+            cur.execute(
+                "UPDATE users SET last_payment_succeeded_at = NOW() "
+                "WHERE telegram_id = %s",
+                (payment_user,),
+            )
+            cur.execute(
+                """
+                INSERT INTO failed_subscription_terminations (
+                    operation_id, telegram_id, stripe_subscription_id,
+                    reason, status, access_expiry, failure_cycle_started_at
+                ) VALUES (%s, %s, %s, 'grace_period_expired',
+                          'retryable_failed', %s, %s)
+                """,
+                (
+                    "fst-rearm-owner-9978", failed_owner_user,
+                    f"sub_reconcile_{failed_owner_user}", newer_expiry, old_expiry,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            first = main.reconcile_terminal_stranded_subscription_removals(limit=100)
+            second = main.reconcile_terminal_stranded_subscription_removals(limit=100)
+
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0)
+        self.assertEqual(self.query_one(
+            "SELECT status, claim_generation FROM subscription_removal_events "
+            "WHERE telegram_id = %s", (reconcile_user,),
+        ), ("stripe_canceled", 4))
+        self.assertEqual(self.query_one(
+            "SELECT status, claim_generation FROM subscription_removal_events "
+            "WHERE telegram_id = %s", (payment_user,),
+        ), ("stripe_canceled", 4))
+        self.assertEqual(self.query_one(
+            "SELECT status, claim_generation FROM subscription_removal_events "
+            "WHERE telegram_id = %s", (ambiguous_user,),
+        ), ("superseded", 3))
+        self.assertEqual(self.query_one(
+            "SELECT status, claim_generation FROM subscription_removal_events "
+            "WHERE telegram_id = %s", (failed_owner_user,),
+        ), ("superseded", 3))
+        self.assertEqual(self.query_one(
+            "SELECT status, claim_generation FROM subscription_removal_events "
+            "WHERE telegram_id = %s", (null_ambiguous_user,),
+        ), ("not_due", 3))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM subscription_removal_events WHERE telegram_id = %s",
+            (reconcile_user,),
+        ), (1,))
 
     def test_superseded_removal_rearms_only_for_new_due_access_real_postgres(self):
         run_migrations(self.get_conn)

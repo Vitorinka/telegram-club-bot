@@ -7432,6 +7432,119 @@ def claim_subscription_removal(
     return removal_claim_result("not_claimed", return_token=return_token)
 
 
+def enqueue_terminal_subscription_removal_cur(
+    cur,
+    telegram_id,
+    stripe_subscription_id,
+    access_expiry,
+    reason="subscription_terminal",
+):
+    """Durably hand an exact terminal subscription cycle to the removal worker."""
+    cur.execute(
+        """
+        SELECT status, stripe_subscription_id, access_expiry, db_finalized_at,
+               reason, claim_generation
+        FROM subscription_removal_events
+        WHERE telegram_id = %s
+        FOR UPDATE
+        """,
+        (int(telegram_id),),
+    )
+    existing = cur.fetchone()
+    if not existing:
+        cur.execute(
+            """
+            INSERT INTO subscription_removal_events (
+                telegram_id, status, reason, owner_id, claimed_at, lease_until,
+                attempt_count, stripe_subscription_id, access_expiry,
+                stripe_canceled_at, created_at, updated_at, claim_generation
+            )
+            VALUES (%s, 'stripe_canceled', %s, NULL, NULL, NULL, 0, %s, %s,
+                    NOW(), NOW(), NOW(), 0)
+            RETURNING status, stripe_subscription_id, access_expiry
+            """,
+            (int(telegram_id), reason, stripe_subscription_id, access_expiry),
+        )
+        return cur.fetchone()
+
+    (
+        current_status, current_subscription_id, current_access_expiry,
+        current_db_finalized_at, current_reason, _current_generation,
+    ) = existing
+    same_subscription = current_subscription_id == stripe_subscription_id
+    terminal_status = current_status in (
+        "db_finalized", "cancelled", "not_due", "superseded",
+    )
+    newer_expiry = bool(
+        access_expiry is not None
+        and current_access_expiry is not None
+        and access_expiry > current_access_expiry
+    )
+    authoritative_payment = False
+    if same_subscription and current_status == "db_finalized" and current_db_finalized_at:
+        cur.execute(
+            """
+            SELECT 1
+            FROM users
+            WHERE telegram_id = %s
+              AND last_payment_succeeded_at IS NOT NULL
+              AND last_payment_succeeded_at > %s
+            LIMIT 1
+            """,
+            (int(telegram_id), current_db_finalized_at),
+        )
+        authoritative_payment = cur.fetchone() is not None
+    rearm_cycle = (not same_subscription) or (
+        terminal_status and (newer_expiry or authoritative_payment)
+    )
+    if same_subscription and terminal_status and not rearm_cycle:
+        return current_status, current_subscription_id, current_access_expiry
+
+    if rearm_cycle:
+        cur.execute(
+            """
+            UPDATE subscription_removal_events
+            SET status = 'stripe_canceled', reason = %s,
+                owner_id = NULL, claimed_at = NULL, lease_until = NULL,
+                attempt_count = 0, stripe_subscription_id = %s,
+                access_expiry = %s, stripe_canceled_at = NOW(),
+                telegram_banned_at = NULL, telegram_removed_at = NULL,
+                db_finalized_at = NULL, admin_notified_at = NULL,
+                revoke_started_at = NULL, last_error = NULL,
+                claim_generation = claim_generation + 1,
+                created_at = NOW(), updated_at = NOW()
+            WHERE telegram_id = %s
+            RETURNING status, stripe_subscription_id, access_expiry
+            """,
+            (reason, stripe_subscription_id, access_expiry, int(telegram_id)),
+        )
+        return cur.fetchone()
+
+    preserved_reason = (
+        current_reason
+        if current_subscription_id is None
+        and current_reason in ("subscription_refund_reconciled", "manual_access_revoked")
+        else reason
+    )
+    cur.execute(
+        """
+        UPDATE subscription_removal_events
+        SET status = CASE WHEN status = 'telegram_removed'
+                          THEN 'telegram_removed' ELSE 'stripe_canceled' END,
+            reason = %s, stripe_subscription_id = %s, access_expiry = %s,
+            stripe_canceled_at = COALESCE(stripe_canceled_at, NOW()),
+            updated_at = NOW()
+        WHERE telegram_id = %s
+        RETURNING status, stripe_subscription_id, access_expiry
+        """,
+        (
+            preserved_reason, stripe_subscription_id, access_expiry,
+            int(telegram_id),
+        ),
+    )
+    return cur.fetchone()
+
+
 def mark_subscription_removal_status(
     cur,
     telegram_id,
@@ -8354,7 +8467,22 @@ def failed_termination_pre_ban_fence(
                    user_row.telegram_id, user_row.stripe_subscription_id,
                    user_row.paid, user_row.expiry_date,
                    user_row.payment_failed, user_row.payment_failed_at,
-                   user_row.grace_period_end
+                   user_row.grace_period_end,
+                   EXISTS (
+                       SELECT 1
+                       FROM failed_subscription_terminations newer
+                       WHERE newer.stripe_subscription_id
+                             = operation.stripe_subscription_id
+                         AND (
+                             newer.failure_cycle_started_at
+                                 > operation.failure_cycle_started_at
+                             OR (
+                                 newer.failure_cycle_started_at
+                                     = operation.failure_cycle_started_at
+                                 AND newer.operation_id > operation.operation_id
+                             )
+                         )
+                   ) AS newer_cycle_exists
             FROM failed_subscription_terminations operation
             LEFT JOIN users user_row ON user_row.telegram_id = operation.telegram_id
             WHERE operation.operation_id = %s
@@ -8369,7 +8497,7 @@ def failed_termination_pre_ban_fence(
             actual_subscription_id, status, lease_until, stripe_cancelled_at,
             collection_stopped_at, operation_created_at, user_telegram_id,
             current_subscription_id, paid, current_expiry, payment_failed,
-            payment_failed_at, grace_period_end,
+            payment_failed_at, grace_period_end, newer_cycle_exists,
         ) = row
         if (
             actual_owner_id != owner_id
@@ -8380,6 +8508,8 @@ def failed_termination_pre_ban_fence(
             or lease_until <= datetime.utcnow()
         ):
             return "ownership_lost"
+        if newer_cycle_exists:
+            return "stale_cycle"
         if (
             status not in (
                 "processing", "stripe_cancelled", "collection_stopped",
@@ -8558,10 +8688,25 @@ async def terminate_failed_subscription(
             claim_cur.execute(
                 """
                 SELECT stripe_subscription_id, failed_invoice_id, access_expiry,
-                       status, reason, failure_cycle_started_at
-                FROM failed_subscription_terminations
-                WHERE operation_id = %s AND telegram_id = %s
-                  AND stripe_subscription_id = %s
+                       status, reason, failure_cycle_started_at,
+                       EXISTS (
+                           SELECT 1
+                           FROM failed_subscription_terminations newer
+                           WHERE newer.stripe_subscription_id
+                                 = operation.stripe_subscription_id
+                             AND (
+                                 newer.failure_cycle_started_at
+                                     > operation.failure_cycle_started_at
+                                 OR (
+                                     newer.failure_cycle_started_at
+                                         = operation.failure_cycle_started_at
+                                     AND newer.operation_id > operation.operation_id
+                                 )
+                             )
+                       ) AS newer_cycle_exists
+                FROM failed_subscription_terminations operation
+                WHERE operation.operation_id = %s AND operation.telegram_id = %s
+                  AND operation.stripe_subscription_id = %s
                 """,
                 (target_operation_id, int(telegram_id), target_subscription_id),
             )
@@ -8569,12 +8714,29 @@ async def terminate_failed_subscription(
             claim_cur.execute(
                 """
                 SELECT stripe_subscription_id, failed_invoice_id, access_expiry,
-                       status, reason, failure_cycle_started_at
-                FROM failed_subscription_terminations
-                WHERE telegram_id = %s
-                  AND (stripe_subscription_id = %s OR %s IS NULL)
-                  AND status NOT IN ('completed', 'superseded', 'manual_review')
-                ORDER BY failure_cycle_started_at DESC, operation_id DESC LIMIT 1
+                       status, reason, failure_cycle_started_at,
+                       FALSE AS newer_cycle_exists
+                FROM failed_subscription_terminations operation
+                WHERE operation.telegram_id = %s
+                  AND (operation.stripe_subscription_id = %s OR %s IS NULL)
+                  AND operation.status NOT IN ('completed', 'superseded', 'manual_review')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM failed_subscription_terminations newer
+                      WHERE newer.stripe_subscription_id
+                            = operation.stripe_subscription_id
+                        AND (
+                            newer.failure_cycle_started_at
+                                > operation.failure_cycle_started_at
+                            OR (
+                                newer.failure_cycle_started_at
+                                    = operation.failure_cycle_started_at
+                                AND newer.operation_id > operation.operation_id
+                            )
+                        )
+                  )
+                ORDER BY operation.failure_cycle_started_at DESC,
+                         operation.operation_id DESC LIMIT 1
                 """,
                 (int(telegram_id), current_subscription_id, current_subscription_id),
             )
@@ -8588,7 +8750,8 @@ async def terminate_failed_subscription(
             claim_cur.execute(
                 """
                 SELECT stripe_subscription_id, failed_invoice_id, access_expiry,
-                       status, reason, failure_cycle_started_at
+                       status, reason, failure_cycle_started_at,
+                       FALSE AS newer_cycle_exists
                 FROM failed_subscription_terminations
                 WHERE telegram_id = %s
                   AND stripe_subscription_id = %s
@@ -8601,6 +8764,9 @@ async def terminate_failed_subscription(
         if target_operation_id is not None and not existing_operation:
             claim_conn.rollback()
             return "missing_operation"
+        if existing_operation and existing_operation[6]:
+            claim_conn.rollback()
+            return "stale_cycle"
         if existing_operation and existing_operation[3] in ("completed", "superseded", "manual_review"):
             claim_conn.rollback()
             return "already_processing_or_completed"
@@ -8816,6 +8982,8 @@ async def terminate_failed_subscription(
                         "pre_ban_phase_incomplete",
                     )
                     return "phase_incomplete"
+                if pre_ban_decision == "stale_cycle":
+                    return "stale_cycle"
                 if pre_ban_decision != "safe_to_remove":
                     return "ownership_lost"
                 logging.warning(
@@ -9337,6 +9505,20 @@ async def ban_user_logic(telegram_id, cur=None):
                 )
                 mark_owned("pending", "telegram_admin")
                 return "telegram_admin"
+            if telegram_status == "left":
+                if mark_owned("telegram_removed") is False:
+                    return "ownership_lost"
+                finalize_kwargs = {
+                    "subscription_cancelled_after_grace": failed_renewal_grace_expired,
+                }
+                if not legacy_claim_result:
+                    finalize_kwargs.update(
+                        owner_id=removal_owner_id,
+                        claim_generation=removal_claim_generation,
+                    )
+                return finalize_subscription_removal_in_db(
+                    telegram_id, effective_expiry, **finalize_kwargs
+                )
             if telegram_status in ("kicked", "banned"):
                 if mark_banned_owned() is False:
                     return "ownership_lost"
@@ -9619,11 +9801,18 @@ async def check_subscriptions_and_reminders():
                users.stripe_customer_id
         FROM subscription_removal_events removal
         JOIN users ON users.telegram_id = removal.telegram_id
-        WHERE removal.status IN ('pending', 'stripe_canceled', 'telegram_failed', 'telegram_removed')
-           OR (
-                removal.status = 'processing'
-                AND (removal.lease_until IS NULL OR removal.lease_until < NOW())
-           )
+        WHERE (
+                removal.status IN ('pending', 'stripe_canceled', 'telegram_failed', 'telegram_removed')
+                OR (
+                    removal.status = 'processing'
+                    AND (removal.lease_until IS NULL OR removal.lease_until < NOW())
+                )
+              )
+          AND (
+                removal.reason IN ('subscription_refund_reconciled', 'manual_access_revoked')
+                OR removal.access_expiry IS NULL
+                OR removal.access_expiry <= NOW()
+              )
         ORDER BY removal.updated_at ASC, removal.telegram_id ASC
     """)
     retry_removal_users = cur.fetchall()
@@ -10061,18 +10250,188 @@ async def check_subscriptions_and_reminders():
     )
 
 
+def reconcile_terminal_stranded_subscription_removals(limit=100):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT users.telegram_id, terminal_link.stripe_subscription_id,
+                   users.expiry_date
+            FROM users
+            JOIN LATERAL (
+                SELECT stripe_subscription_id
+                FROM stripe_links
+                WHERE stripe_links.telegram_id = users.telegram_id
+                  AND stripe_links.stripe_subscription_id IS NOT NULL
+                  AND stripe_links.is_active = FALSE
+                  AND stripe_links.status IN (
+                      'canceled', 'ended', 'incomplete_expired', 'unpaid'
+                  )
+                  AND (
+                      stripe_links.current_period_end IS NULL
+                      OR stripe_links.current_period_end <= NOW()
+                  )
+                ORDER BY stripe_links.updated_at DESC, stripe_links.id DESC
+                LIMIT 1
+            ) terminal_link ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT operation_id, status, access_expiry, completed_at
+                FROM failed_subscription_terminations
+                WHERE failed_subscription_terminations.stripe_subscription_id
+                      = terminal_link.stripe_subscription_id
+                ORDER BY failure_cycle_started_at DESC, operation_id DESC
+                LIMIT 1
+            ) latest_failed_termination ON TRUE
+            WHERE users.paid IS NOT TRUE
+              AND users.expiry_date IS NOT NULL
+              AND users.expiry_date <= NOW()
+              AND users.stripe_subscription_id IS NULL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM stripe_links active_link
+                    WHERE active_link.telegram_id = users.telegram_id
+                      AND active_link.is_active = TRUE
+                      AND active_link.status IN ('active', 'trialing')
+                      AND (
+                          active_link.current_period_end IS NULL
+                          OR active_link.current_period_end > NOW()
+                      )
+              )
+              AND NOT (
+                    users.payment_failed = TRUE
+                    AND users.payment_failed_at IS NOT NULL
+                    AND users.payment_failed_at
+                        + (%s * INTERVAL '1 hour') > NOW()
+              )
+              AND NOT (
+                    users.grace_period_end IS NOT NULL
+                    AND users.grace_period_end > NOW()
+              )
+              AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM subscription_removal_events removal
+                        WHERE removal.telegram_id = users.telegram_id
+                          AND removal.stripe_subscription_id
+                              = terminal_link.stripe_subscription_id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM subscription_removal_events removal
+                        WHERE removal.telegram_id = users.telegram_id
+                          AND removal.stripe_subscription_id
+                              = terminal_link.stripe_subscription_id
+                          AND removal.status IN (
+                              'db_finalized', 'cancelled', 'not_due', 'superseded'
+                          )
+                          AND (
+                              (
+                                  users.expiry_date IS NOT NULL
+                                  AND removal.access_expiry IS NOT NULL
+                                  AND users.expiry_date > removal.access_expiry
+                              )
+                              OR (
+                                  removal.status = 'db_finalized'
+                                  AND removal.db_finalized_at IS NOT NULL
+                                  AND users.last_payment_succeeded_at IS NOT NULL
+                                  AND users.last_payment_succeeded_at
+                                      > removal.db_finalized_at
+                              )
+                          )
+                    )
+              )
+              AND (
+                    latest_failed_termination.operation_id IS NULL
+                    OR latest_failed_termination.status = 'superseded'
+                    OR (
+                        latest_failed_termination.status = 'completed'
+                        AND (
+                            (
+                                users.expiry_date IS NOT NULL
+                                AND latest_failed_termination.access_expiry IS NOT NULL
+                                AND users.expiry_date
+                                    > latest_failed_termination.access_expiry
+                            )
+                            OR (
+                                users.last_payment_succeeded_at IS NOT NULL
+                                AND latest_failed_termination.completed_at IS NOT NULL
+                                AND users.last_payment_succeeded_at
+                                    > latest_failed_termination.completed_at
+                            )
+                        )
+                    )
+              )
+            ORDER BY users.expiry_date ASC, users.telegram_id ASC
+            FOR UPDATE OF users SKIP LOCKED
+            LIMIT %s
+            """,
+            (PAYMENT_RETRY_GRACE_HOURS, int(limit)),
+        )
+        candidates = cur.fetchall()
+        for telegram_id, subscription_id, access_expiry in candidates:
+            enqueue_terminal_subscription_removal_cur(
+                cur,
+                telegram_id,
+                subscription_id,
+                access_expiry,
+                reason="subscription_terminal_reconciled",
+            )
+        conn.commit()
+        return len(candidates)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def fetch_expired_access_candidates():
     conn = get_db_conn()
     cur = conn.cursor()
     try:
         cur.execute(
             """
-            SELECT telegram_id, payment_failed, grace_period_end
-            FROM users
-            WHERE paid = TRUE
-              AND expiry_date IS NOT NULL
-              AND expiry_date <= NOW()
-            ORDER BY expiry_date ASC, telegram_id ASC
+            WITH candidates AS (
+                SELECT users.telegram_id, users.payment_failed,
+                       users.grace_period_end, users.expiry_date, 1 AS priority
+                FROM users
+                WHERE users.paid = TRUE
+                  AND users.expiry_date IS NOT NULL
+                  AND users.expiry_date <= NOW()
+                UNION ALL
+                SELECT users.telegram_id, users.payment_failed,
+                       users.grace_period_end,
+                       COALESCE(removal.access_expiry, users.expiry_date),
+                       0 AS priority
+                FROM subscription_removal_events removal
+                JOIN users ON users.telegram_id = removal.telegram_id
+                WHERE (
+                        removal.status IN (
+                            'pending', 'stripe_canceled', 'telegram_failed',
+                            'telegram_removed'
+                        )
+                        OR (
+                            removal.status = 'processing'
+                            AND (
+                                removal.lease_until IS NULL
+                                OR removal.lease_until < NOW()
+                            )
+                        )
+                      )
+                  AND (
+                        removal.reason IN (
+                            'subscription_refund_reconciled', 'manual_access_revoked'
+                        )
+                        OR removal.access_expiry IS NULL
+                        OR removal.access_expiry <= NOW()
+                      )
+            )
+            SELECT DISTINCT ON (telegram_id)
+                   telegram_id, payment_failed, grace_period_end
+            FROM candidates
+            ORDER BY telegram_id, priority, expiry_date ASC NULLS FIRST
             """
         )
         return [
@@ -10085,8 +10444,10 @@ def fetch_expired_access_candidates():
 
 
 async def process_expired_access():
+    reconciled = reconcile_terminal_stranded_subscription_removals(limit=100)
     candidates = fetch_expired_access_candidates()
     metrics = {
+        "terminal_stranded_reconciled": reconciled,
         "candidates": len(candidates),
         "active_grace_skipped": 0,
         "recovered_protected": 0,
@@ -10152,9 +10513,10 @@ async def process_expired_access():
                 metrics["telegram_errors"] += 1
 
     logging.info(
-        "EXPIRED_ACCESS_HOURLY_COMPLETED: candidates=%s, active_grace_skipped=%s, "
+        "EXPIRED_ACCESS_HOURLY_COMPLETED: reconciled=%s, candidates=%s, active_grace_skipped=%s, "
         "recovered_protected=%s, ordinary_expired_processed=%s, post_grace_processed=%s, "
         "finalized=%s, retryable_failures=%s, telegram_errors=%s",
+        metrics["terminal_stranded_reconciled"],
         metrics["candidates"],
         metrics["active_grace_skipped"],
         metrics["recovered_protected"],
@@ -18620,64 +18982,116 @@ async def stripe_webhook(request):
                     cur = conn.cursor()
                     cur.execute(
                         """
-                        UPDATE subscription_removal_events
-                        SET stripe_canceled_at = COALESCE(stripe_canceled_at, NOW()),
-                            status = CASE
-                                WHEN status IN ('telegram_removed', 'db_finalized') THEN status
-                                ELSE 'stripe_canceled'
-                            END,
-                            updated_at = NOW()
+                        SELECT telegram_id, expiry_date
+                        FROM users
                         WHERE stripe_subscription_id = %s
-                          AND status IN (
-                              'pending', 'processing', 'stripe_canceled',
-                              'telegram_failed', 'telegram_removed'
-                          )
+                        FOR UPDATE
                         """,
                         (sub_id,),
                     )
+                    terminal_user = cur.fetchone()
                     cur.execute(
                         """
-                        UPDATE failed_subscription_terminations
-                        SET stripe_cancelled_at = COALESCE(stripe_cancelled_at, NOW()),
-                            status = CASE WHEN status = 'processing' THEN 'stripe_cancelled' ELSE status END,
-                            updated_at = NOW()
-                        WHERE operation_id = (
-                            SELECT operation_id
-                            FROM failed_subscription_terminations
-                            WHERE stripe_subscription_id = %s
-                              AND status NOT IN ('completed', 'superseded', 'manual_review')
-                              AND %s IS NOT NULL
-                              AND failure_cycle_started_at <= %s
-                            ORDER BY failure_cycle_started_at DESC, operation_id DESC
-                            LIMIT 1
-                        )
-                        """,
-                        (sub_id, event_created_at, event_created_at),
-                    )
-                    cur.execute("""
-                        UPDATE users
-                        SET paid = CASE
-                                WHEN expiry_date IS NOT NULL AND expiry_date > NOW() THEN paid
-                                ELSE FALSE
-                            END,
-                            auto_renew = FALSE,
-                            stripe_subscription_id = NULL
+                        SELECT operation_id, failure_cycle_started_at, status
+                        FROM failed_subscription_terminations
                         WHERE stripe_subscription_id = %s
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM failed_subscription_terminations fst
-                              WHERE fst.stripe_subscription_id = %s
-                                AND fst.status NOT IN (
-                                    'completed', 'superseded', 'manual_review'
-                                )
-                                AND (
-                                    %s IS NULL
-                                    OR fst.failure_cycle_started_at > %s
-                                )
-                          )
-                        RETURNING telegram_id, paid, expiry_date
-                    """, (sub_id, sub_id, event_created_at, event_created_at))
-                    row = cur.fetchone()
+                        ORDER BY failure_cycle_started_at DESC, operation_id DESC
+                        LIMIT 1
+                        FOR UPDATE
+                        """,
+                        (sub_id,),
+                    )
+                    latest_failed_termination = cur.fetchone()
+                    failed_termination_owner = (
+                        latest_failed_termination
+                        if latest_failed_termination
+                        and latest_failed_termination[2] not in (
+                            'completed', 'superseded', 'manual_review'
+                        )
+                        else None
+                    )
+                    failed_termination_tombstone = bool(
+                        latest_failed_termination
+                        and latest_failed_termination[2] in ('completed', 'manual_review')
+                    )
+                    deleted_event_applies = bool(
+                        failed_termination_owner
+                        and event_created_at is not None
+                        and failed_termination_owner[1] <= event_created_at
+                    )
+                    if (
+                        terminal_user
+                        and not failed_termination_owner
+                        and not failed_termination_tombstone
+                    ):
+                        enqueue_terminal_subscription_removal_cur(
+                            cur,
+                            terminal_user[0],
+                            sub_id,
+                            terminal_user[1],
+                        )
+                    if failed_termination_owner or failed_termination_tombstone:
+                        cur.execute(
+                            """
+                            UPDATE subscription_removal_events
+                            SET status = 'superseded', owner_id = NULL,
+                                claimed_at = NULL, lease_until = NULL,
+                                last_error = 'failed_termination_authoritative',
+                                updated_at = NOW()
+                            WHERE stripe_subscription_id = %s
+                              AND status IN (
+                                  'pending', 'processing', 'stripe_canceled',
+                                  'telegram_failed'
+                              )
+                            """,
+                            (sub_id,),
+                        )
+                        if failed_termination_owner and deleted_event_applies:
+                            cur.execute(
+                                """
+                                UPDATE failed_subscription_terminations
+                                SET stripe_cancelled_at = COALESCE(stripe_cancelled_at, NOW()),
+                                    status = CASE
+                                        WHEN status = 'processing' THEN 'stripe_cancelled'
+                                        ELSE status
+                                    END,
+                                    updated_at = NOW()
+                                WHERE operation_id = %s
+                                """,
+                                (failed_termination_owner[0],),
+                            )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE subscription_removal_events
+                            SET stripe_canceled_at = COALESCE(stripe_canceled_at, NOW()),
+                                status = CASE
+                                    WHEN status IN ('telegram_removed', 'db_finalized') THEN status
+                                    ELSE 'stripe_canceled'
+                                END,
+                                updated_at = NOW()
+                            WHERE stripe_subscription_id = %s
+                              AND status IN (
+                                  'pending', 'processing', 'stripe_canceled',
+                                  'telegram_failed', 'telegram_removed'
+                              )
+                            """,
+                            (sub_id,),
+                        )
+                    row = None
+                    if not failed_termination_owner or deleted_event_applies:
+                        cur.execute("""
+                            UPDATE users
+                            SET paid = CASE
+                                    WHEN expiry_date IS NOT NULL AND expiry_date > NOW() THEN paid
+                                    ELSE FALSE
+                                END,
+                                auto_renew = FALSE,
+                                stripe_subscription_id = NULL
+                            WHERE stripe_subscription_id = %s
+                            RETURNING telegram_id, paid, expiry_date
+                        """, (sub_id,))
+                        row = cur.fetchone()
                     mark_stripe_link_subscription_terminal(cur, sub_id, status or "canceled")
                     conn.commit()
                 except Exception:
@@ -21758,7 +22172,14 @@ async def process_expired_failed_subscription_grace(limit=100):
     try:
         cur.execute(
             """
-            WITH candidate_rows AS (
+            WITH latest_cycles AS (
+                SELECT DISTINCT ON (stripe_subscription_id)
+                       operation_id, telegram_id, stripe_subscription_id,
+                       status, lease_until, failure_cycle_started_at
+                FROM failed_subscription_terminations
+                ORDER BY stripe_subscription_id,
+                         failure_cycle_started_at DESC, operation_id DESC
+            ), candidate_rows AS (
                 SELECT NULL::TEXT AS operation_id, telegram_id,
                        stripe_subscription_id, 1 AS priority,
                        payment_failed_at AS failure_cycle_started_at
@@ -21773,10 +22194,21 @@ async def process_expired_failed_subscription_grace(limit=100):
                                 + (%s * INTERVAL '1 hour') <= NOW()
                         )
                   )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM latest_cycles latest
+                        WHERE latest.stripe_subscription_id
+                              = users.stripe_subscription_id
+                          AND (
+                              users.payment_failed_at IS NULL
+                              OR latest.failure_cycle_started_at
+                                  >= users.payment_failed_at
+                          )
+                  )
                 UNION ALL
                 SELECT operation_id, telegram_id, stripe_subscription_id, 0 AS priority,
                        failure_cycle_started_at
-                FROM failed_subscription_terminations
+                FROM latest_cycles
                 WHERE (
                     status = ANY(%s)
                     OR (
@@ -21785,16 +22217,9 @@ async def process_expired_failed_subscription_grace(limit=100):
                         AND lease_until <= (NOW() AT TIME ZONE 'UTC')
                     )
                 )
-            ), deduplicated AS (
-                SELECT DISTINCT ON (telegram_id, stripe_subscription_id)
-                       operation_id, telegram_id, stripe_subscription_id
-                FROM candidate_rows
-                ORDER BY telegram_id, stripe_subscription_id, priority,
-                         failure_cycle_started_at DESC NULLS LAST,
-                         operation_id DESC NULLS LAST
             )
             SELECT operation_id, telegram_id, stripe_subscription_id
-            FROM deduplicated
+            FROM candidate_rows
             ORDER BY telegram_id, stripe_subscription_id
             LIMIT %s
             """,

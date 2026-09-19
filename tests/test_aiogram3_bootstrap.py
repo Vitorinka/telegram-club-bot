@@ -10838,7 +10838,16 @@ class ExpiredAccessHourlyTests(unittest.IsolatedAsyncioTestCase):
     def setUpClass(cls):
         cls.main = import_main()
 
-    def test_candidate_query_is_limited_to_paid_due_access(self):
+    def setUp(self):
+        self.reconcile_patcher = patch.object(
+            self.main,
+            "reconcile_terminal_stranded_subscription_removals",
+            return_value=0,
+        )
+        self.reconcile_patcher.start()
+        self.addCleanup(self.reconcile_patcher.stop)
+
+    def test_candidate_query_includes_paid_due_and_durable_terminal_access(self):
         grace = datetime.utcnow() - timedelta(hours=1)
         conn = FakeConnection(fetches=[[(101, False, None), (202, True, grace)]])
 
@@ -10852,6 +10861,8 @@ class ExpiredAccessHourlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("paid = TRUE", normalized)
         self.assertIn("expiry_date IS NOT NULL", normalized)
         self.assertIn("expiry_date <= NOW()", normalized)
+        self.assertIn("FROM subscription_removal_events removal", normalized)
+        self.assertIn("removal.access_expiry <= NOW()", normalized)
 
     async def test_future_access_is_not_selected(self):
         with patch.object(
