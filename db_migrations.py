@@ -878,6 +878,22 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "failed_subscription_terminations_subscription_cycle_uidx",
         ),
     },
+    "0032_admin_notification_acknowledgements": {
+        "tables": ("admin_notification_acknowledgements",),
+        "columns": {
+            "admin_notification_acknowledgements": (
+                "admin_telegram_id", "notification_key", "read_at",
+            ),
+        },
+        "indexes": ("admin_notification_acknowledgements_read_at_idx",),
+        "constraints": {
+            "admin_notification_acknowledgements_key_length_check": {
+                "table": "admin_notification_acknowledgements",
+                "definition_contains": ("notification_key", "200"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

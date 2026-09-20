@@ -59,6 +59,10 @@ from admin_schedule import (
 )
 from admin_gifts import get_admin_gift_details, list_admin_gifts
 from admin_content import list_admin_content
+from admin_notification_acknowledgements import (
+    acknowledge_admin_notification,
+    list_admin_notification_acknowledgements,
+)
 from content_cms import (
     ContentCmsError,
     create_content_draft,
@@ -326,6 +330,44 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         finally:
             conn.rollback()
             conn.close()
+
+    def test_admin_notification_acknowledgements_are_durable_idempotent_and_admin_scoped(self):
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0032_admin_notification_acknowledgements", first["applied"])
+        self.assertIn("0032_admin_notification_acknowledgements", second["applied"])
+        self.assertEqual(
+            self.query_one("SELECT to_regclass('public.admin_notification_acknowledgements')")[0],
+            "admin_notification_acknowledgements",
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, paid, auto_renew) VALUES (91001, FALSE, FALSE)"
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        before = self.query_one("SELECT paid, auto_renew FROM users WHERE telegram_id=91001")
+        first_ack = acknowledge_admin_notification(self.get_conn, 101, "failed:operation-1")
+        duplicate_ack = acknowledge_admin_notification(self.get_conn, 101, "failed:operation-1")
+        acknowledge_admin_notification(self.get_conn, 202, "failed:operation-1")
+        self.assertEqual(first_ack, duplicate_ack)
+        self.assertEqual(
+            self.query_one("SELECT COUNT(*) FROM admin_notification_acknowledgements")[0], 2
+        )
+        self.assertEqual(
+            list_admin_notification_acknowledgements(self.get_conn, 101),
+            {"notification_keys": ["failed:operation-1"]},
+        )
+        self.assertEqual(
+            list_admin_notification_acknowledgements(self.get_conn, 202),
+            {"notification_keys": ["failed:operation-1"]},
+        )
+        self.assertEqual(
+            self.query_one("SELECT paid, auto_renew FROM users WHERE telegram_id=91001"), before
+        )
 
     def test_miniapp_sessions_are_hashed_durable_revocable_and_limited(self):
         run_migrations(self.get_conn)
@@ -788,8 +830,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 32,
-            "latest": "0031_failed_subscription_termination_cycles",
+            "count": 33,
+            "latest": "0032_admin_notification_acknowledgements",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2273,7 +2315,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 32)
+        self.assertEqual(len(migrations), 33)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -9557,9 +9599,9 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                         telegram_id, status, reason, attempt_count, access_expiry,
                         created_at, updated_at
                     )
-                    VALUES (%s, 'superseded', 'subscription_expired', 2, %s, NOW(), NOW())
+                    VALUES (%s, 'superseded', 'subscription_expired', 2, %s, %s, NOW())
                     """,
-                    (telegram_id, historical_expiry),
+                    (telegram_id, historical_expiry, now - timedelta(days=10)),
                 )
             conn.commit()
         finally:
@@ -9584,14 +9626,14 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.assertEqual(result, expected)
             row = self.query_one(
                 """
-                SELECT status, access_expiry, attempt_count
+                SELECT status, access_expiry, attempt_count, created_at
                 FROM subscription_removal_events
                 WHERE telegram_id = %s
                 """,
                 (telegram_id,),
             )
             if expected == "claimed":
-                self.assertEqual(row, ("processing", current_expiry, 1))
+                self.assertEqual(row, ("processing", current_expiry, 1, now))
                 self.assertEqual(
                     self.query_one(
                         """
@@ -9641,6 +9683,147 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     """,
                     (telegram_id,),
                 )[0], 0)
+
+    def test_db_finalized_rearm_rotates_removal_incident_marker_once_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        user_id = 9955
+        admin_id = 995500
+        lifecycle_started_at = datetime.utcnow() - timedelta(days=30)
+        finalized_at = datetime.utcnow() - timedelta(days=20)
+        current_expiry = datetime.utcnow() - timedelta(days=1)
+        rearm_at = datetime.utcnow()
+        self.insert_recovery_user(
+            user_id,
+            paid=False,
+            expiry_date=current_expiry,
+            auto_renew=False,
+            stripe_subscription_id=None,
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, attempt_count,
+                        access_expiry, created_at, updated_at, claim_generation
+                    ) VALUES (
+                        %s, 'telegram_failed', 'subscription_expired', 4,
+                        %s, %s, %s, 4
+                    )
+                    """,
+                    (
+                        user_id, lifecycle_started_at - timedelta(days=1),
+                        lifecycle_started_at, finalized_at,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        old_system = collect_admin_system(self.get_conn, lambda: {}, 1)
+        old_marker = old_system["removals"]["latest_retryable_incident"]
+        old_key = f"system:removals:{old_marker}"
+        acknowledge_admin_notification(self.get_conn, admin_id, old_key)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE subscription_removal_events
+                    SET status = 'db_finalized', db_finalized_at = %s,
+                        telegram_banned_at = %s, telegram_removed_at = %s,
+                        admin_notified_at = %s, revoke_started_at = %s,
+                        last_error = 'old-cycle-error'
+                    WHERE telegram_id = %s
+                    """,
+                    (
+                        finalized_at, finalized_at, finalized_at,
+                        finalized_at, finalized_at, user_id,
+                    ),
+                )
+                cur.execute(
+                    """
+                    UPDATE users
+                    SET last_payment_succeeded_at = %s, expiry_date = %s
+                    WHERE telegram_id = %s
+                    """,
+                    (finalized_at + timedelta(days=1), current_expiry, user_id),
+                )
+                claim = main.claim_subscription_removal(
+                    cur, user_id, "subscription_expired",
+                    owner_id="cycle-two-worker", now=rearm_at,
+                    return_token=True,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(claim["status"], "claimed")
+        self.assertEqual(claim["claim_generation"], 5)
+        self.assertEqual(self.query_one(
+            """
+            SELECT created_at, attempt_count, revoke_started_at,
+                   telegram_banned_at, telegram_removed_at, db_finalized_at,
+                   admin_notified_at, last_error
+            FROM subscription_removal_events WHERE telegram_id = %s
+            """,
+            (user_id,),
+        ), (rearm_at, 1, None, None, None, None, None, None))
+        self.assertGreater(rearm_at, lifecycle_started_at)
+
+        new_system = collect_admin_system(self.get_conn, lambda: {}, 1)
+        new_marker = new_system["removals"]["latest_retryable_incident"]
+        new_key = f"system:removals:{new_marker}"
+        self.assertNotEqual(new_marker, old_marker)
+        acknowledged = set(list_admin_notification_acknowledgements(
+            self.get_conn, admin_id,
+        )["notification_keys"])
+        self.assertIn(old_key, acknowledged)
+        self.assertNotIn(new_key, acknowledged)
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE subscription_removal_events
+                    SET status = 'telegram_failed', owner_id = NULL,
+                        claimed_at = NULL, lease_until = NULL
+                    WHERE telegram_id = %s
+                    """,
+                    (user_id,),
+                )
+                retry = main.claim_subscription_removal(
+                    cur, user_id, "subscription_expired",
+                    owner_id="cycle-two-retry",
+                    now=rearm_at + timedelta(minutes=10),
+                    return_token=True,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(retry["status"], "claimed")
+        self.assertEqual(retry["claim_generation"], 6)
+        retry_row = self.query_one(
+            """
+            SELECT created_at, attempt_count
+            FROM subscription_removal_events WHERE telegram_id = %s
+            """,
+            (user_id,),
+        )
+        self.assertEqual(retry_row, (rearm_at, 2))
+        retry_system = collect_admin_system(self.get_conn, lambda: {}, 1)
+        self.assertEqual(
+            retry_system["removals"]["latest_retryable_incident"], new_marker,
+        )
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertFalse(main.subscription_removal_claim_is_current(
+                user_id, "cycle-two-worker", 5,
+            ))
 
     def test_superseded_cycle_rearms_after_new_access_expires_and_finalizes_once_real_postgres(self):
         run_migrations(self.get_conn)
@@ -12754,13 +12937,17 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         })
         self.assertEqual(system["scheduler"]["running"], 1)
         self.assertEqual(system["scheduler"]["failed_last_24h"], 1)
+        scheduler_incident = system["scheduler"]["latest_failed_incident"]
+        self.assertTrue(scheduler_incident.startswith("job:"))
         self.assertEqual(system["scheduler"]["stale"], 1)
         self.assertEqual(system["removals"]["retryable"], 1)
+        removal_incident = system["removals"]["latest_retryable_incident"]
+        self.assertTrue(removal_incident.startswith("removal:"))
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 32)
+        self.assertEqual(system["migrations"]["count"], 33)
         self.assertEqual(
             system["migrations"]["latest"],
-            "0031_failed_subscription_termination_cycles",
+            "0032_admin_notification_acknowledgements",
         )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
@@ -12769,6 +12956,46 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "private alert payload", "db_url",
         ):
             self.assertNotIn(forbidden, system_json)
+
+        same_system = collect_admin_system(
+            self.get_conn, lambda: {"pool_available": 4}, 9,
+        )
+        self.assertEqual(
+            same_system["scheduler"]["latest_failed_incident"], scheduler_incident,
+        )
+        self.assertEqual(
+            same_system["removals"]["latest_retryable_incident"], removal_incident,
+        )
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO scheduled_job_runs (
+                        job_key, job_name, schedule_slot, status, updated_at
+                    ) VALUES ('system-failed-new', 'subscription_check', 'slot-c', 'failed', NOW() + INTERVAL '1 second')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO subscription_removal_events (
+                        telegram_id, status, reason, created_at, updated_at
+                    ) VALUES (9805, 'telegram_failed', 'subscription_expired', NOW(), NOW() + INTERVAL '1 second')
+                    """
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        newer_system = collect_admin_system(
+            self.get_conn, lambda: {"pool_available": 4}, 9,
+        )
+        self.assertNotEqual(
+            newer_system["scheduler"]["latest_failed_incident"], scheduler_incident,
+        )
+        self.assertNotEqual(
+            newer_system["removals"]["latest_retryable_incident"], removal_incident,
+        )
 
         permanent = list_admin_deliveries(
             self.get_conn, status="permanently_failed", limit=50

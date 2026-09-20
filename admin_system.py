@@ -328,6 +328,14 @@ def collect_admin_system(get_connection, db_pool_health, scheduler_job_count):
         """)
         removals = cur.fetchone()
         cur.execute("""
+            SELECT telegram_id, created_at
+            FROM subscription_removal_events
+            WHERE status IN ('processing', 'stripe_canceled', 'telegram_failed', 'telegram_removed')
+            ORDER BY updated_at DESC, telegram_id DESC
+            LIMIT 1
+        """)
+        latest_retryable_removal = cur.fetchone()
+        cur.execute("""
             SELECT
                 COUNT(*) FILTER (WHERE status = 'running'),
                 COUNT(*) FILTER (WHERE status = 'failed' AND updated_at >= NOW() - INTERVAL '24 hours'),
@@ -335,6 +343,15 @@ def collect_admin_system(get_connection, db_pool_health, scheduler_job_count):
             FROM scheduled_job_runs
         """)
         scheduler = cur.fetchone()
+        cur.execute("""
+            SELECT job_key
+            FROM scheduled_job_runs
+            WHERE status = 'failed'
+              AND updated_at >= NOW() - INTERVAL '24 hours'
+            ORDER BY updated_at DESC, job_key DESC
+            LIMIT 1
+        """)
+        latest_failed_job = cur.fetchone()
         cur.execute("""
             SELECT job_key, job_name, status, started_at, completed_at,
                    updated_at, error_text, lease_until,
@@ -409,6 +426,10 @@ def collect_admin_system(get_connection, db_pool_health, scheduler_job_count):
             "known_jobs": int(scheduler_job_count),
             "running": int(scheduler[0] or 0),
             "failed_last_24h": int(scheduler[1] or 0),
+            "latest_failed_incident": (
+                _safe_reference("job", latest_failed_job[0])
+                if latest_failed_job else None
+            ),
             "stale": int(scheduler[2] or 0),
             "recent_runs": safe_runs,
         },
@@ -422,6 +443,13 @@ def collect_admin_system(get_connection, db_pool_health, scheduler_job_count):
         "removals": {
             "pending": int(removals[0] or 0),
             "retryable": int(removals[1] or 0),
+            "latest_retryable_incident": (
+                _safe_reference(
+                    "removal",
+                    f"{latest_retryable_removal[0]}:{_iso(latest_retryable_removal[1])}",
+                )
+                if latest_retryable_removal else None
+            ),
             "finalized_last_24h": int(removals[2] or 0),
         },
         "alerts": alerts,

@@ -188,6 +188,18 @@ class DbMigrationTests(unittest.TestCase):
             ),
         )
 
+    def test_admin_notification_acknowledgements_migration_is_required(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0032_admin_notification_acknowledgements"]
+        self.assertEqual(migration["tables"], ("admin_notification_acknowledgements",))
+        self.assertEqual(
+            migration["columns"]["admin_notification_acknowledgements"],
+            ("admin_telegram_id", "notification_key", "read_at"),
+        )
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0032_admin_notification_acknowledgements.sql").read_text()
+        self.assertIn("PRIMARY KEY (admin_telegram_id, notification_key)", sql)
+        self.assertIn("CHECK (char_length(notification_key) BETWEEN 1 AND 200)", sql)
+
     def test_message_delivery_due_indexes_migration_has_exact_sql(self):
         root = Path(__file__).resolve().parents[1]
         migration_sql = (root / "migrations" / "0010_message_delivery_due_indexes.sql").read_text()
