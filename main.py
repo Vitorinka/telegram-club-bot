@@ -70,6 +70,11 @@ from admin_notification_acknowledgements import (
     acknowledge_admin_notification,
     list_admin_notification_acknowledgements,
 )
+from admin_analytics import (
+    AdminAnalyticsQueryError,
+    analytics_period_bounds,
+    analytics_projection,
+)
 from checkout_safety import (
     active_or_resumable_subscriptions,
     backup_decision,
@@ -23769,6 +23774,33 @@ async def miniapp_admin_dashboard(request):
     return apply_miniapp_security_headers(web.json_response(dashboard))
 
 
+async def miniapp_admin_analytics(request):
+    try:
+        days = request.query.get("days", "30")
+        start, end, comparison_start, comparison_end = analytics_period_bounds(days)
+    except AdminAnalyticsQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": str(error)}, status=400
+        ))
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("SET LOCAL statement_timeout = 5000")
+        metrics = _fetch_weekly_metrics(cur, start, end)
+        comparison = _fetch_weekly_metrics(cur, comparison_start, comparison_end)
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+    return apply_miniapp_security_headers(web.json_response(
+        analytics_projection(days, start, end, metrics, comparison)
+    ))
+
+
 async def miniapp_admin_content(request):
     try:
         result = list_admin_content(
@@ -25663,6 +25695,8 @@ def create_app():
         app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     if not _route_exists(app, "GET", "/api/admin/dashboard"):
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
+    if not _route_exists(app, "GET", "/api/admin/analytics"):
+        app.router.add_get('/api/admin/analytics', miniapp_admin_analytics)
     if not _route_exists(app, "GET", "/api/admin/content"):
         app.router.add_get('/api/admin/content', miniapp_admin_content)
     if not _route_exists(app, "GET", "/api/admin/member-preview/home"):

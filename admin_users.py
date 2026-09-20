@@ -7,6 +7,7 @@ from datetime import datetime
 USERS_STATUSES = frozenset({
     "all", "active", "trial", "failed_payment", "active_grace",
     "expired", "auto_renew", "non_renewing",
+    "gift",
 })
 DEFAULT_USERS_LIMIT = 25
 MAX_USERS_LIMIT = 50
@@ -89,6 +90,7 @@ STATUS_SQL = {
     "expired": f"u.paid IS TRUE AND u.expiry_date IS NOT NULL AND u.expiry_date <= (NOW() AT TIME ZONE 'UTC') AND NOT {ACTIVE_GRACE_SQL}",
     "auto_renew": "u.paid IS TRUE AND u.auto_renew IS TRUE",
     "non_renewing": "u.paid IS TRUE AND u.auto_renew IS NOT TRUE",
+    "gift": CURRENT_GIFT_SQL,
 }
 
 

@@ -659,6 +659,57 @@ body.member-preview-mode .member-admin-create[hidden] { display: none; }
   .dashboard-more { display: block; }
 }
 
+/* Natalia_SoulFit admin information architecture */
+body:not(.member-preview-mode) .admin-page-heading {
+  display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 18px;
+}
+body:not(.member-preview-mode) .admin-page-heading h1 { margin: 2px 0 4px; color: #123b3a; font-size: clamp(24px, 3vw, 30px); }
+body:not(.member-preview-mode) .admin-page-heading p { margin: 0; color: #71807e; }
+body:not(.member-preview-mode) .admin-page-heading select { width: auto; min-width: 140px; }
+body:not(.member-preview-mode) .admin-sidebar-branding {
+  position: relative; display: grid; gap: 5px; margin-top: auto; padding: 18px 14px; overflow: hidden;
+  border: 1px solid #edf0eb; border-radius: 12px; background: linear-gradient(145deg,#fbfaf5,#f1f6f1); color: #526a68;
+}
+body:not(.member-preview-mode) .admin-sidebar-branding q { position: relative; max-width: 150px; font: italic 15px/1.35 Georgia,serif; }
+body:not(.member-preview-mode) .admin-sidebar-branding small { position: relative; font-size: 10px; letter-spacing: .04em; }
+body:not(.member-preview-mode) .admin-botanical-placeholder { position: absolute; right: -18px; bottom: -22px; width: 90px; height: 110px; opacity: .12; border: 2px solid #477c6c; border-radius: 70% 10% 70% 15%; transform: rotate(-22deg); }
+body:not(.member-preview-mode) .admin-sidebar-club { margin-top: 8px; }
+body:not(.member-preview-mode) .admin-insight-page { max-width: 1260px; }
+body:not(.member-preview-mode) .analytics-bars { display: grid; gap: 0; }
+body:not(.member-preview-mode) .analytics-bars > div { display: grid; grid-template-columns: minmax(150px,1fr) auto minmax(150px,auto); gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--admin-line); }
+body:not(.member-preview-mode) .analytics-bars > div:last-child { border-bottom: 0; }
+body:not(.member-preview-mode) .analytics-bars small,
+body:not(.member-preview-mode) .analytics-delta { color: #71807e; font-size: 11px; }
+body:not(.member-preview-mode) .notification-center-toolbar { display: flex; gap: 10px; margin: 14px 0; padding: 10px; }
+body:not(.member-preview-mode) .notification-center-toolbar select { margin: 0; }
+body:not(.member-preview-mode) .notification-center-list { display: grid; gap: 7px; }
+body:not(.member-preview-mode) .notification-center-item { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; padding: 4px; }
+body:not(.member-preview-mode) .notification-center-item.read { opacity: .68; }
+body:not(.member-preview-mode) #settings-screen dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; }
+body:not(.member-preview-mode) #settings-screen dt { color: #71807e; }
+body:not(.member-preview-mode) #settings-screen dd { margin: 0; font-weight: 650; }
+body:not(.member-preview-mode) .admin-profile-panel > button { width: 100%; min-height: 38px; margin: 2px 0 0; text-align: left; }
+body:not(.member-preview-mode) .admin-topbar-actions [data-admin-icon] > span:first-child svg,
+body:not(.member-preview-mode) .admin-global-search > span svg { width: 20px; height: 20px; }
+body:not(.member-preview-mode) #topbar-create-content,
+body:not(.member-preview-mode) #open-club-global { display: inline-flex; align-items: center; gap: 7px; }
+body:not(.member-preview-mode) .user-identity-cell > div { min-width: 0; }
+body:not(.member-preview-mode) .user-identity-cell small { display: block; margin-top: 2px; color: #71807e; font-size: 10px; }
+
+@media (max-width: 1023px) {
+  body:not(.member-preview-mode) .admin-sidebar-branding { display: none; }
+  body:not(.member-preview-mode) .admin-page-heading { align-items: stretch; flex-direction: column; gap: 10px; }
+  body:not(.member-preview-mode) .admin-page-heading select { width: 100%; }
+  body:not(.member-preview-mode) .notification-center-toolbar { flex-direction: column; }
+}
+
+@media (max-width: 430px) {
+  body:not(.member-preview-mode) .analytics-bars > div { grid-template-columns: 1fr auto; }
+  body:not(.member-preview-mode) .analytics-bars > div small { grid-column: 1 / -1; }
+  body:not(.member-preview-mode) .notification-center-item { grid-template-columns: 1fr; }
+  body:not(.member-preview-mode) .notification-center-item .admin-notification-mark { justify-self: start; }
+}
+
 @media (min-width: 1024px) {
   body:not(.member-preview-mode) { padding: 0 0 0 240px; }
   body:not(.member-preview-mode) .shell { width: min(100%, 1480px); max-width: 1480px; margin: 0; padding: 22px 30px 48px; }
@@ -1388,6 +1439,12 @@ body:not(.member-preview-mode) .admin-profile-heading > div { min-width: 0; disp
 body:not(.member-preview-mode) .admin-profile-panel small,
 body:not(.member-preview-mode) .admin-profile-panel span { color: #75807f; font-size: 11px; }
 body:not(.member-preview-mode) .admin-profile-toggle { display: flex; align-items: center; gap: 8px; color: #172323; border-color: transparent; }
+body:not(.member-preview-mode) .users-table-head { display:none; }
+body:not(.member-preview-mode) .participant-profile-hero { grid-column:1 / -1; display:grid; grid-template-columns:48px minmax(0,1fr) auto; align-items:center; gap:12px; }
+body:not(.member-preview-mode) .participant-profile-hero h1 { margin:0; font-family:inherit; font-size:20px; }
+body:not(.member-preview-mode) .participant-profile-hero p,
+body:not(.member-preview-mode) .participant-profile-hero small { margin:2px 0 0; color:#75807f; font-size:11px; }
+body:not(.member-preview-mode) .participant-avatar { width:48px; height:48px; display:grid; place-items:center; border-radius:50%; background:#e4f3ef; color:#0b6663; font-weight:750; }
 body:not(.member-preview-mode) .admin-profile-copy { min-width: 0; display: grid; gap: 1px; text-align: left; }
 body:not(.member-preview-mode) .admin-profile-copy strong { max-width: 130px; overflow: hidden; color: #172323; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 body:not(.member-preview-mode) .admin-profile-copy small { color: #75807f; font-size: 10px; }
@@ -1487,6 +1544,17 @@ body:not(.member-preview-mode) #admin-notifications:not(.has-unread) .topbar-att
   body:not(.member-preview-mode) .admin-global-search:focus-within { border-color: rgb(11 95 95 / 42%); background: #fff; box-shadow: 0 0 0 3px rgb(11 95 95 / 7%); }
   body:not(.member-preview-mode) .admin-global-search input { min-height: 40px; margin: 0; padding: 6px 0; background: transparent; color: #172323; font-size: 12px; }
   body:not(.member-preview-mode) .admin-global-search input::placeholder { color: #939c9b; }
+  body:not(.member-preview-mode) .users-table-head { display:grid; grid-template-columns:minmax(190px,1.4fr) minmax(130px,1fr) minmax(120px,.8fr) minmax(110px,.8fr) minmax(100px,.7fr) minmax(100px,.7fr) 76px; gap:8px; padding:7px 10px; color:#75807f; font-size:10px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; }
+  body:not(.member-preview-mode) #users-list.user-list { display:grid; grid-template-columns:1fr; gap:0; overflow:hidden; border:1px solid #e5e9e7; border-radius:10px; background:#fff; }
+  body:not(.member-preview-mode) #users-list .user-card { padding:0; border:0; border-radius:0; box-shadow:none; }
+  body:not(.member-preview-mode) #users-list .user-card + .user-card { border-top:1px solid #edf0ef; }
+  body:not(.member-preview-mode) #users-list .user-card > button { width:100%; min-height:54px; display:grid; grid-template-columns:minmax(190px,1.4fr) minmax(130px,1fr) minmax(120px,.8fr) minmax(110px,.8fr) minmax(100px,.7fr) minmax(100px,.7fr) 76px; align-items:center; gap:8px; margin:0; padding:7px 10px; border:0; border-radius:0; background:transparent; color:#172323; text-align:left; }
+  body:not(.member-preview-mode) #users-list .user-card > button:hover { background:#f7f9f8; }
+  body:not(.member-preview-mode) #users-list .user-card h2 { margin:0; font-size:12px; }
+  body:not(.member-preview-mode) #users-list .badges { margin:0; }
+  body:not(.member-preview-mode) #users-list p,
+  body:not(.member-preview-mode) #users-list small { margin:0; color:#75807f; font-size:10px; }
+  body:not(.member-preview-mode) #users-list .user-action-cell { color:#0b6663; font-size:10px; font-weight:650; }
   body:not(.member-preview-mode) .hero-card .admin-topbar-actions { grid-column: 2; display: flex; gap: 7px; }
   body:not(.member-preview-mode) .hero-card .admin-status-line { display: none; }
   body:not(.member-preview-mode) .admin-topbar-actions button { min-height: 42px; margin: 0; }
