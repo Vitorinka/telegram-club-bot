@@ -10551,7 +10551,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="nav-gifts"', index)
         self.assertIn('id="nav-failed-subscriptions"', index)
         self.assertIn("admin-nav-brand", index)
-        self.assertIn("admin-nav-profile", index)
+        self.assertIn('id="admin-profile-toggle"', index)
+        self.assertIn('id="admin-profile-panel"', index)
         self.assertIn('id="topbar-create-content"', index)
         self.assertNotIn('id="dashboard-create-content"', index)
         self.assertIn('id="admin-fullscreen"', index)
@@ -10591,8 +10592,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("renderDashboardContent", javascript)
         self.assertIn("renderDashboardUsers", javascript)
         self.assertIn("renderDashboardSchedules", javascript)
+        self.assertIn("/api/admin/notification-acknowledgements", javascript)
         self.assertNotIn("innerHTML", javascript)
-        self.assertIn('class="admin-nav-group"', index)
+        self.assertIn('id="admin-content-subnav"', index)
+        self.assertIn('data-content-nav="recipe"', index)
         self.assertIn("body:not(.member-preview-mode) .bottom-nav", stylesheet)
         self.assertIn("width: min(100%, 1380px)", stylesheet)
         self.assertIn("@media (min-width: 1024px)", stylesheet)
@@ -10616,6 +10619,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Сначала сохраните изменения материала, затем загрузите медиа.", javascript)
         self.assertIn("contentStudioCreateDraft", javascript)
         self.assertIn("contentStudioSaveRecipe", javascript)
+
         self.assertIn("Черновик сохранён. Медиа загрузить не удалось.", javascript)
         self.assertIn("content-unsaved-dialog", index)
         self.assertIn("Выйти без сохранения", index)
@@ -10796,6 +10800,64 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("innerHTML", javascript)
         for forbidden_storage in ("localStorage", "sessionStorage", "document.cookie", "indexedDB"):
             self.assertNotIn(forbidden_storage, javascript)
+
+    async def test_admin_notification_acknowledgements_are_authenticated_and_session_scoped(self):
+        app = self.main.create_app()
+        get_handler = self.route_handler(app, "GET", "/api/admin/notification-acknowledgements")
+        put_handler = self.route_handler(app, "PUT", "/api/admin/notification-acknowledgements")
+        self.assertIsNotNone(get_handler)
+        self.assertIsNotNone(put_handler)
+        session = SimpleNamespace(telegram_id=1, session_id="session-1")
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "list_admin_notification_acknowledgements", return_value={"notification_keys":["failed:one"]}) as listing:
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer token", path="/api/admin/notification-acknowledgements"),
+                get_handler,
+            )
+        self.assertEqual(response.status, 200)
+        listing.assert_called_once_with(self.main.get_db_conn, 1)
+
+        with patch.object(self.main, "load_miniapp_admin_session", return_value=session), \
+             patch.object(self.main, "acknowledge_admin_notification", return_value={"notification_key":"gift:one","read_at":"2026-09-19T12:00:00"}) as acknowledge:
+            response = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(
+                    app, "Bearer token", path="/api/admin/notification-acknowledgements",
+                    method="PUT", json_data={"notification_key":"gift:one","admin_telegram_id":999},
+                ), put_handler,
+            )
+        self.assertEqual(response.status, 200)
+        acknowledge.assert_called_once_with(self.main.get_db_conn, 1, "gift:one")
+
+        unauthorized = await self.main.miniapp_admin_auth_middleware(
+            FakeMiniAppRequest(app, path="/api/admin/notification-acknowledgements"),
+            get_handler,
+        )
+        self.assertEqual(unauthorized.status, 401)
+        with patch.object(
+            self.main, "load_miniapp_admin_session",
+            return_value=SimpleNamespace(telegram_id=999, session_id="non-admin"),
+        ):
+            forbidden = await self.main.miniapp_admin_auth_middleware(
+                FakeMiniAppRequest(app, "Bearer token", path="/api/admin/notification-acknowledgements"),
+                get_handler,
+            )
+        self.assertEqual(forbidden.status, 403)
+
+    async def test_admin_notification_acknowledgement_rejects_invalid_key(self):
+        app = self.main.create_app()
+        handler = self.route_handler(app, "PUT", "/api/admin/notification-acknowledgements")
+        session = SimpleNamespace(telegram_id=1, session_id="session-1")
+        for key in (None, "", "x" * 201):
+            with self.subTest(key=key), patch.object(
+                self.main, "load_miniapp_admin_session", return_value=session
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(
+                    FakeMiniAppRequest(
+                        app, "Bearer token", path="/api/admin/notification-acknowledgements",
+                        method="PUT", json_data={"notification_key":key},
+                    ), handler,
+                )
+            self.assertEqual(response.status, 400)
 
     def test_admin_menu_webapp_button_requires_valid_https_configuration(self):
         self.assertIsNone(self.main.normalize_miniapp_base_url(None))

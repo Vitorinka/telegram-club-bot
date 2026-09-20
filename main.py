@@ -65,6 +65,11 @@ from admin_security import (
     fail_admin_action,
     make_action_request,
 )
+from admin_notification_acknowledgements import (
+    AdminNotificationAcknowledgementError,
+    acknowledge_admin_notification,
+    list_admin_notification_acknowledgements,
+)
 from checkout_safety import (
     active_or_resumable_subscriptions,
     backup_decision,
@@ -7390,9 +7395,9 @@ def claim_subscription_removal(
                     can_start_new_cycle,
                     can_start_new_cycle,
                     can_start_new_cycle,
-                    can_rearm_superseded_cycle,
-                    can_rearm_superseded_cycle,
-                    can_rearm_superseded_cycle,
+                    can_start_new_cycle,
+                    can_start_new_cycle,
+                    can_start_new_cycle,
                     now,
                     now,
                     int(telegram_id),
@@ -23723,6 +23728,32 @@ async def miniapp_admin_me(request):
     return apply_miniapp_security_headers(web.json_response(payload))
 
 
+async def miniapp_admin_notification_acknowledgements(request):
+    session = request["miniapp_admin"]
+    result = list_admin_notification_acknowledgements(
+        get_db_conn, session.telegram_id
+    )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_notification_acknowledge(request):
+    session = request["miniapp_admin"]
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise AdminNotificationAcknowledgementError("invalid_request")
+        result = acknowledge_admin_notification(
+            get_db_conn, session.telegram_id, body.get("notification_key")
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError, AdminNotificationAcknowledgementError) as error:
+        category = getattr(error, "category", "invalid_request")
+        status_code = getattr(error, "status", 400)
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": category}, status=status_code
+        ))
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_session_revoke(request):
     session = request["miniapp_admin"]
     revoke_miniapp_admin_session(get_db_conn, session.session_id)
@@ -25616,6 +25647,16 @@ def create_app():
         app.router.add_get('/api/member/content/{content_id}',miniapp_member_content_details)
     if not _route_exists(app, "GET", "/api/admin/me"):
         app.router.add_get('/api/admin/me', miniapp_admin_me)
+    if not _route_exists(app, "GET", "/api/admin/notification-acknowledgements"):
+        app.router.add_get(
+            '/api/admin/notification-acknowledgements',
+            miniapp_admin_notification_acknowledgements,
+        )
+    if not _route_exists(app, "PUT", "/api/admin/notification-acknowledgements"):
+        app.router.add_put(
+            '/api/admin/notification-acknowledgements',
+            miniapp_admin_notification_acknowledge,
+        )
     if not _route_exists(app, "POST", "/api/admin/session"):
         app.router.add_post('/api/admin/session', miniapp_admin_session_create)
     if not _route_exists(app, "POST", "/api/admin/session/revoke"):

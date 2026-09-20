@@ -36,6 +36,60 @@
   const contentStudioSaveRecipe = ({saveMetadata, saveRecipe, reload}) =>
     saveMetadata().then(saveRecipe).then(reload);
   const adminScreenIsVisible = (activeScreen, candidateScreen) => activeScreen === candidateScreen;
+  const adminSearchMatches = (values, query) => {
+    const normalized=String(query || "").trim().toLocaleLowerCase("ru");
+    return normalized.length >= 2 && values.some((value)=>String(value || "").toLocaleLowerCase("ru").includes(normalized));
+  };
+  const adminNotificationUnreadCount = (items, readKeys) => items.filter((item)=>!readKeys.has(item.key)).length;
+  const adminSystemIncidentKey = (category, marker) => marker ? `system:${category}:${marker}` : null;
+  const MAX_NOTIFICATION_PAGES = 100;
+  const MAX_NOTIFICATION_PANEL_ITEMS = 25;
+  const collectAdminNotificationKeys = async ({firstPage, fetchNext, keyFor, aggregate, maxPages=MAX_NOTIFICATION_PAGES}) => {
+    const keys=new Set(); const items=new Map(); const cursors=new Set(); let page=firstPage; let pages=0;
+    while (page) {
+      pages += 1;
+      (page.items || []).forEach((item)=>{ const key=keyFor(item); if (key) { keys.add(key); if (!items.has(key)) items.set(key,item); } });
+      if (!page.has_more) return {keys,items:[...items.values()],complete:true,aggregate:Number(aggregate || 0),pages};
+      const cursor=page.next_cursor;
+      if (!cursor || cursors.has(cursor) || pages >= maxPages) return {keys,items:[...items.values()],complete:false,aggregate:Number(aggregate || 0),pages};
+      cursors.add(cursor);
+      try { page=await fetchNext(cursor); }
+      catch (_error) { return {keys,items:[...items.values()],complete:false,aggregate:Number(aggregate || 0),pages}; }
+    }
+    return {keys,items:[...items.values()],complete:false,aggregate:Number(aggregate || 0),pages};
+  };
+  const adminNotificationUnknownUnread = (result) => result.complete ? 0 : Math.max(0,Number(result.aggregate || 0)-result.keys.size);
+  const adminNotificationOverflowCount = (currentCount, panelItems) => Math.max(0,Number(currentCount || 0)-new Set(panelItems.map((item)=>item.key).filter(Boolean)).size);
+  const orderAdminNotificationItems = (items) => {
+    const unique=new Map();
+    items.forEach((item)=>{ if (item && item.key && !unique.has(item.key)) unique.set(item.key,item); });
+    return [...unique.values()].sort((left,right)=>{
+      const leftTime=Date.parse(left.timestamp || ""); const rightTime=Date.parse(right.timestamp || "");
+      const safeLeft=Number.isFinite(leftTime) ? leftTime : 0; const safeRight=Number.isFinite(rightTime) ? rightTime : 0;
+      return safeRight-safeLeft || String(left.key).localeCompare(String(right.key));
+    });
+  };
+  const adminNotificationPanelPage = (items, limit) => ({
+    visible:items.slice(0,Math.max(0,limit)), remaining:Math.max(0,items.length-Math.max(0,limit)),
+  });
+  const hydrateAdminNotificationReadState = (readState, keys) => {
+    readState.clear();
+    (keys || []).forEach((key)=>readState.add(key));
+    return readState;
+  };
+  const persistAdminNotificationRead = ({key,persist,readState}) => Promise.resolve(persist(key)).then(()=>{
+    readState.add(key); return true;
+  });
+  const adminProfilePresentation = (user = {}) => {
+    const displayName = [user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || "Администратор";
+    const initials = [user.first_name,user.last_name].filter(Boolean).map((part)=>String(part).slice(0,1)).join("").slice(0,2).toUpperCase() || "A";
+    let photoUrl = null;
+    try {
+      const parsed = new URL(String(user.photo_url || ""));
+      if (parsed.protocol === "https:") photoUrl = parsed.href;
+    } catch (_error) { photoUrl = null; }
+    return {displayName,initials,photoUrl};
+  };
   const contentStudioCreateDraft = ({files, createDraft, saveDomain, attachMedia, openDraft}) => {
     const preflightError = files.map(([mediaType, file]) => contentStudioMediaPreflightError(mediaType, file)).find(Boolean);
     if (preflightError) return Promise.resolve({status: "preflight_failed", error: preflightError, draft: null});
@@ -58,7 +112,7 @@
     });
   };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {adminScreenIsVisible, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
     return;
   }
   const webApp = window.Telegram && window.Telegram.WebApp;
@@ -70,6 +124,14 @@
   const bottomNav = document.getElementById("bottom-nav");
   const adminFullscreen = document.getElementById("admin-fullscreen");
   const fullscreenMessage = document.getElementById("fullscreen-message");
+  const adminGlobalSearch = document.getElementById("admin-global-search");
+  const adminSearchResults = document.getElementById("admin-search-results");
+  const adminNotifications = document.getElementById("admin-notifications");
+  const adminNotificationPanel = document.getElementById("admin-notification-panel");
+  const adminProfileToggle = document.getElementById("admin-profile-toggle");
+  const adminProfilePanel = document.getElementById("admin-profile-panel");
+  const adminContentNav = document.getElementById("admin-content-nav");
+  const adminContentSubnav = document.getElementById("admin-content-subnav");
   const memberBottomNav = document.getElementById("member-bottom-nav");
   const memberShellHeader = document.getElementById("member-shell-header");
   const usersSearch = document.getElementById("users-search");
@@ -302,6 +364,16 @@
   let recipeSteps = [];
   let cmsTaxonomy = [];
   let memberLibraryCategory = "all";
+  let adminSearchTimer = null;
+  let adminSearchGeneration = 0;
+  let adminNotificationItems = [];
+  let adminCurrentNotificationKeys = new Set();
+  let adminNotificationUnknownUnreadCount = 0;
+  let adminNotificationPaginationIncomplete = false;
+  let adminNotificationDisplayLimit = MAX_NOTIFICATION_PANEL_ITEMS;
+  const adminNotificationReadState = new Set();
+  const adminNotificationAckPending = new Set();
+  let adminNotificationAckError = "";
 
   const text = (tag, value, className) => {
     const node = document.createElement(tag);
@@ -309,6 +381,24 @@
     if (className) node.className = className;
     return node;
   };
+  const adminIconPaths = {
+    home: ["M3 11.5 12 4l9 7.5", "M5.5 10v10h13V10", "M9.5 20v-6h5v6"],
+    content: ["M6 3h9l3 3v15H6z", "M15 3v4h4", "M9 11h6M9 15h6"],
+    users: ["M16 20v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2", "M9 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z", "M22 20v-2a4 4 0 0 0-3-3.87M16 2.13a4 4 0 0 1 0 7.75"],
+    subscriptions: ["M3 6h18v12H3z", "M3 10h18", "M7 15h4"],
+    calendar: ["M4 5h16v16H4z", "M8 3v4M16 3v4M4 10h16"],
+    gift: ["M3 9h18v12H3z", "M2 5h20v4H2z", "M12 5v16", "M12 5H8.5a2.5 2.5 0 1 1 3.5-2.3V5Zm0 0h3.5A2.5 2.5 0 1 0 12 2.7V5Z"],
+    renewal: ["M12 9v4M12 17h.01", "M10.3 3.7 2.5 17.2h19L13.7 3.7a2 2 0 0 0-3.4 0Z"],
+    settings: ["M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z", "M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.12 2.12-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.55V20h-3v-.09a1.7 1.7 0 0 0-1.03-1.55 1.7 1.7 0 0 0-1.88.34l-.06.06-2.12-2.12.06-.06A1.7 1.7 0 0 0 7 14.7a1.7 1.7 0 0 0-1.55-1.03H5v-3h.45A1.7 1.7 0 0 0 7 9.64a1.7 1.7 0 0 0-.34-1.88L6.6 7.7l2.12-2.12.06.06A1.7 1.7 0 0 0 10.66 6 1.7 1.7 0 0 0 11.7 4.45V4h3v.45A1.7 1.7 0 0 0 15.73 6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.12 2.12-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.55 1.03H21v3h-.06A1.7 1.7 0 0 0 19.4 15Z"],
+  };
+  const installAdminIcons = () => document.querySelectorAll("[data-admin-icon]").forEach((button) => {
+    const host = button.querySelector(":scope > span:first-child");
+    if (!host || host.childNodes.length) return;
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("fill", "none"); svg.setAttribute("stroke", "currentColor"); svg.setAttribute("stroke-width", "1.7"); svg.setAttribute("stroke-linecap", "round"); svg.setAttribute("stroke-linejoin", "round");
+    (adminIconPaths[button.dataset.adminIcon] || []).forEach((value) => { const path=document.createElementNS("http://www.w3.org/2000/svg","path"); path.setAttribute("d",value); svg.append(path); });
+    host.append(svg);
+  });
   const memberIconPaths = {
     strength: ["M5 9v6M8 7v10M16 7v10M19 9v6M8 12h8"],
     flexibility: ["M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM12 6v6l-5 5M12 9l6 3M12 12l4 7"],
@@ -1085,15 +1175,34 @@
     document.getElementById("sidebar-attention").textContent=String(count);
     document.getElementById("more-attention").textContent=String(count);
   };
+  const notificationPageUrl = (path,cursor) => `${path}&cursor=${encodeURIComponent(cursor)}`;
   const refreshAttentionCount = () => Promise.all([
-    api("/api/admin/failed-subscriptions?state=attention&limit=1"),
-    api("/api/admin/gifts?status=review_required&duration=all&limit=1"),
+    api("/api/admin/failed-subscriptions?state=attention&limit=50"),
+    api("/api/admin/gifts?status=review_required&duration=all&limit=50"),
+    api("/api/admin/deliveries?status=permanently_failed&limit=50"),
     api("/api/admin/system"),
-  ]).then(([failed,gifts,system]) => setAttentionCount(
-    Number(failed.summary.attention || 0)+Number(gifts.summary.requires_attention || 0)
-    +Number(system.deliveries.permanently_failed || 0)+Number(system.scheduler.failed_last_24h || 0)
-    +Number(system.removals.retryable || 0)
-  ));
+  ]).then(([failed,gifts,deliveries,system]) => {
+    const total = Number(failed.summary.attention || 0)+Number(gifts.summary.requires_attention || 0)
+      +Number(system.deliveries.permanently_failed || 0)+Number(system.scheduler.failed_last_24h || 0)
+      +Number(system.removals.retryable || 0);
+    setAttentionCount(total);
+    const systemItems=buildAdminNotificationItems([],[],[],system);
+    return Promise.all([
+      collectAdminNotificationKeys({firstPage:failed,aggregate:failed.summary.attention,keyFor:(item)=>`failed:${item.operation_id}`,fetchNext:(cursor)=>api(notificationPageUrl("/api/admin/failed-subscriptions?state=attention&limit=50",cursor))}),
+      collectAdminNotificationKeys({firstPage:gifts,aggregate:gifts.summary.requires_attention,keyFor:(item)=>`gift:${item.gift_id}`,fetchNext:(cursor)=>api(notificationPageUrl("/api/admin/gifts?status=review_required&duration=all&limit=50",cursor))}),
+      collectAdminNotificationKeys({firstPage:deliveries,aggregate:system.deliveries.permanently_failed,keyFor:(item)=>`delivery:${item.delivery_id}`,fetchNext:(cursor)=>api(notificationPageUrl("/api/admin/deliveries?status=permanently_failed&limit=50",cursor))}),
+    ]).then((results)=>{
+      adminCurrentNotificationKeys=new Set(systemItems.map((item)=>item.key));
+      results.forEach((result)=>result.keys.forEach((key)=>adminCurrentNotificationKeys.add(key)));
+      adminNotificationUnknownUnreadCount=results.reduce((count,result)=>count+adminNotificationUnknownUnread(result),0);
+      adminNotificationPaginationIncomplete=results.some((result)=>!result.complete);
+      adminNotificationItems=orderAdminNotificationItems([
+        ...buildAdminNotificationItems(results[0].items,results[1].items,results[2].items,{scheduler:{},removals:{}}),
+        ...systemItems,
+      ]);
+      renderAdminNotificationPanel(); updateAdminNotificationBadge();
+    });
+  });
   const loadDashboard = () => {
     status.textContent = "Загружаем данные…";
     const today = new Date();
@@ -2592,6 +2701,129 @@
       target.append(button);
     });
   };
+  const closeAdminHeaderPanels = (except = null) => {
+    [[adminSearchResults, null], [adminNotificationPanel, adminNotifications], [adminProfilePanel, adminProfileToggle]].forEach(([panel, toggle]) => {
+      if (!panel || panel === except) return;
+      panel.hidden = true;
+      if (toggle) toggle.setAttribute("aria-expanded", "false");
+    });
+  };
+  const adminResultGroup = (label, items) => {
+    const group = document.createElement("div"); group.className = "admin-result-group";
+    group.append(text("h3", label));
+    items.forEach((item) => {
+      const button = document.createElement("button"); button.type = "button"; button.className = "admin-result-item";
+      const copy = document.createElement("span"); copy.append(text("strong", item.title), text("small", item.meta));
+      button.append(copy, text("i", "→"));
+      button.addEventListener("click", () => { closeAdminHeaderPanels(); adminGlobalSearch.value = ""; item.open(); });
+      group.append(button);
+    });
+    return group;
+  };
+  const runAdminGlobalSearch = () => {
+    const query = adminGlobalSearch.value.trim();
+    const generation = ++adminSearchGeneration;
+    adminSearchResults.hidden = false;
+    closeAdminHeaderPanels(adminSearchResults);
+    if (query.length < 2) {
+      adminSearchResults.replaceChildren(text("p", "Введите минимум 2 символа.", "admin-panel-state"));
+      return Promise.resolve();
+    }
+    adminSearchResults.replaceChildren(text("p", "Ищем…", "admin-panel-state"));
+    const userParams = new URLSearchParams({limit:"6",status:"all",q:query});
+    return Promise.all([
+      api(`/api/admin/users?${userParams.toString()}`),
+      api("/api/admin/content/cms?status=all&limit=50"),
+      api("/api/admin/failed-subscriptions?state=attention&limit=12"),
+    ]).then(([users,content,failed]) => {
+      if (generation !== adminSearchGeneration) return;
+      const contentLabels = {lesson:"Тренировка",meditation:"Медитация",recipe:"Рецепт",nutrition_material:"Материал"};
+      const contentMatches = content.items.filter((item) => adminSearchMatches([item.title,item.content_type,contentLabels[item.content_type],...(item.categories || []).map((entry)=>entry.title)],query)).slice(0,6);
+      const taskMatches = failed.items.filter((item) => adminSearchMatches([item.username,item.first_name,item.reason_label,item.status],query)).slice(0,6);
+      const groups = [];
+      if (users.items.length) groups.push(adminResultGroup("Пользователи", users.items.map((user)=>({title:user.username ? `@${user.username}` : (user.first_name || `ID ${user.telegram_id}`),meta:`Пользователь · ${statusLabels[user.access_status] || user.access_status}`,open:()=>loadUserDetails(user.telegram_id)}))));
+      if (contentMatches.length) groups.push(adminResultGroup("Контент · 50 последних", contentMatches.map((item)=>({title:item.title,meta:`${contentLabels[item.content_type] || "Материал"} · ${item.status}`,open:()=>loadCmsContentDetails(item.content_id)}))));
+      if (taskMatches.length) groups.push(adminResultGroup("Задачи", taskMatches.map((item)=>({title:item.username ? `@${item.username}` : (item.first_name || "Проблема продления"),meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)}))));
+      adminSearchResults.replaceChildren(...(groups.length ? groups : [text("p", "Ничего не найдено.", "admin-panel-state")]));
+    }).catch((error) => {
+      if (generation === adminSearchGeneration) adminSearchResults.replaceChildren(text("p", "Поиск временно недоступен.", "admin-panel-state"));
+      if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
+    });
+  };
+  const adminNotificationReadKeys = () => adminNotificationReadState;
+  const loadAdminNotificationAcknowledgements = () => api("/api/admin/notification-acknowledgements").then((data) => {
+    hydrateAdminNotificationReadState(adminNotificationReadState,data.notification_keys);
+    adminNotificationAckError="";
+  }).catch((error)=>{
+    adminNotificationReadState.clear();
+    adminNotificationAckError="Не удалось загрузить отметки. Уведомления считаются непрочитанными.";
+    if (error.message === "session_ended" || error.message === "access_revoked") throw error;
+  });
+  const markAdminNotificationRead = (key) => {
+    if (adminNotificationReadState.has(key) || adminNotificationAckPending.has(key)) return Promise.resolve();
+    adminNotificationAckPending.add(key); adminNotificationAckError=""; renderAdminNotificationPanel();
+    return persistAdminNotificationRead({key,readState:adminNotificationReadState,persist:(notificationKey)=>writeAdminJson("PUT","/api/admin/notification-acknowledgements",{notification_key:notificationKey})}).then(()=>{
+      adminNotificationAckError="";
+      updateAdminNotificationBadge();
+    }).catch((error)=>{
+      adminNotificationAckError="Не удалось сохранить отметку. Уведомление осталось непрочитанным.";
+      if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
+    }).finally(()=>{ adminNotificationAckPending.delete(key); renderAdminNotificationPanel(); });
+  };
+  const buildAdminNotificationItems = (failed,gifts,deliveries,system) => [
+    ...failed.map((item)=>({key:`failed:${item.operation_id}`,timestamp:item.updated_at,title:item.username ? `Проблема продления · @${item.username}` : "Проблема продления",meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status} · ${formatDate(item.updated_at)}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)})),
+    ...deliveries.map((item)=>({key:`delivery:${item.delivery_id}`,timestamp:item.updated_at || item.next_attempt_at,title:item.delivery_label,meta:`${item.explanation || item.status} · ${formatDate(item.updated_at || item.next_attempt_at)}`,open:()=>loadDeliveryDetails(item.delivery_id)})),
+    ...gifts.map((item)=>({key:`gift:${item.gift_id}`,timestamp:item.updated_at || item.created_at,title:"Подарок требует проверки",meta:`${item.public_reference} · ${item.status_label} · ${formatDate(item.updated_at || item.created_at)}`,open:()=>loadGiftDetails(item.gift_id)})),
+    ...(Number(system.scheduler.failed_last_24h || 0) && system.scheduler.latest_failed_incident ? [{key:adminSystemIncidentKey("scheduler",system.scheduler.latest_failed_incident),title:"Ошибки планировщика",meta:`За 24 часа: ${system.scheduler.failed_last_24h}`,open:()=>loadSystem()}] : []),
+    ...(Number(system.removals.retryable || 0) && system.removals.latest_retryable_incident ? [{key:adminSystemIncidentKey("removals",system.removals.latest_retryable_incident),title:"Повторные удаления",meta:`Ожидают обработки: ${system.removals.retryable}`,open:()=>loadSystem()}] : []),
+  ];
+  const updateAdminNotificationBadge = () => {
+    const read=adminNotificationReadKeys();
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!read.has(key)).length+adminNotificationUnknownUnreadCount;
+    document.getElementById("topbar-attention").textContent=String(unread);
+    adminNotifications.classList.toggle("has-unread",unread>0);
+  };
+  const renderAdminNotificationPanel = () => {
+    const read=adminNotificationReadKeys();
+    const heading=document.createElement("header"); heading.append(text("strong","Уведомления"),text("small","Просмотр не означает решение проблемы"));
+    const items=document.createElement("div"); items.className="admin-notification-items";
+    const page=adminNotificationPanelPage(adminNotificationItems,adminNotificationDisplayLimit);
+    page.visible.forEach((item)=>{
+      const row=document.createElement("article"); row.className=`admin-notification-item${read.has(item.key) ? " read" : ""}`;
+      const open=document.createElement("button"); open.type="button"; open.className="admin-notification-open"; open.append(text("strong",item.title),text("small",item.meta));
+      open.addEventListener("click",()=>{ markAdminNotificationRead(item.key); closeAdminHeaderPanels(); item.open(); });
+      const mark=document.createElement("button"); mark.type="button"; mark.className="admin-notification-mark"; mark.textContent=read.has(item.key) ? "Просмотрено" : (adminNotificationAckPending.has(item.key) ? "Сохраняем…" : "Прочитано"); mark.disabled=read.has(item.key) || adminNotificationAckPending.has(item.key); mark.addEventListener("click",()=>markAdminNotificationRead(item.key));
+      row.append(open,mark); items.append(row);
+    });
+    if (page.remaining) {
+      const more=document.createElement("button"); more.type="button"; more.className="admin-notification-more secondary"; more.textContent=`Показать ещё ${Math.min(MAX_NOTIFICATION_PANEL_ITEMS,page.remaining)}`;
+      more.addEventListener("click",()=>{ adminNotificationDisplayLimit += MAX_NOTIFICATION_PANEL_ITEMS; renderAdminNotificationPanel(); });
+      items.append(more);
+    }
+    if (adminNotificationPaginationIncomplete) items.append(text("p","Не все уведомления удалось загрузить.","admin-panel-state warning"));
+    if (adminNotificationAckError) items.prepend(text("p",adminNotificationAckError,"admin-panel-state error"));
+    if (!adminNotificationItems.length) items.append(text("p","Новых событий нет.","admin-panel-state"));
+    adminNotificationPanel.replaceChildren(heading,items);
+  };
+  const configureAdminProfile = (identityData) => {
+    const telegramUser = webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user : {};
+    const profile = adminProfilePresentation(telegramUser);
+    const renderAvatar = (element) => {
+      if (!element) return;
+      element.replaceChildren(); element.textContent=profile.initials;
+      if (!profile.photoUrl) return;
+      const image=document.createElement("img"); image.alt=""; image.decoding="async"; image.referrerPolicy="no-referrer";
+      image.addEventListener("error",()=>{ element.replaceChildren(); element.textContent=profile.initials; },{once:true});
+      image.src=profile.photoUrl; element.replaceChildren(image);
+    };
+    const displayName = profile.displayName;
+    document.getElementById("admin-profile-name").textContent=displayName;
+    document.getElementById("admin-profile-panel-name").textContent=displayName;
+    renderAvatar(document.getElementById("admin-topbar-avatar"));
+    renderAvatar(document.getElementById("admin-profile-panel-avatar"));
+    document.getElementById("admin-profile-meta").textContent=telegramUser.username ? `@${telegramUser.username}` : `Telegram ID ${identityData.telegram_id}`;
+  };
+  installAdminIcons();
   installMemberAdminCreateActions();
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
@@ -2631,6 +2863,50 @@
       if (result && typeof result.catch === "function") result.catch(showFullscreenFailure);
     } catch (_error) { showFullscreenFailure(); }
   });
+  adminGlobalSearch.addEventListener("input", () => {
+    window.clearTimeout(adminSearchTimer);
+    adminSearchTimer=window.setTimeout(runAdminGlobalSearch,250);
+  });
+  adminGlobalSearch.addEventListener("focus", () => { if (adminGlobalSearch.value.trim()) runAdminGlobalSearch(); });
+  adminGlobalSearch.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { adminSearchResults.hidden=true; adminGlobalSearch.blur(); return; }
+    const results=[...adminSearchResults.querySelectorAll("button")];
+    if (!results.length || !["ArrowDown","ArrowUp","Enter"].includes(event.key)) return;
+    if (event.key === "Enter" && document.activeElement !== adminGlobalSearch) return;
+    event.preventDefault();
+    if (event.key === "Enter") results[0].click();
+    else results[event.key === "ArrowDown" ? 0 : results.length-1].focus();
+  });
+  adminSearchResults.addEventListener("keydown", (event) => {
+    const results=[...adminSearchResults.querySelectorAll("button")]; const index=results.indexOf(document.activeElement);
+    if (event.key === "Escape") { adminSearchResults.hidden=true; adminGlobalSearch.focus(); }
+    else if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); results[(index+(event.key === "ArrowDown" ? 1 : -1)+results.length)%results.length].focus(); }
+  });
+  adminNotifications.addEventListener("click", () => {
+    const opening=adminNotificationPanel.hidden; closeAdminHeaderPanels(adminNotificationPanel);
+    adminNotificationPanel.hidden=!opening; adminNotifications.setAttribute("aria-expanded",String(opening));
+    if (opening) { adminNotificationDisplayLimit=MAX_NOTIFICATION_PANEL_ITEMS; refreshAttentionCount().catch(showApiError); }
+  });
+  adminProfileToggle.addEventListener("click", () => {
+    const opening=adminProfilePanel.hidden; closeAdminHeaderPanels(adminProfilePanel);
+    adminProfilePanel.hidden=!opening; adminProfileToggle.setAttribute("aria-expanded",String(opening));
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".admin-global-search-wrap,.admin-header-popover")) closeAdminHeaderPanels();
+  });
+  adminContentNav.addEventListener("click", () => {
+    const opening=adminContentSubnav.hidden;
+    adminContentSubnav.hidden=!opening; adminContentNav.setAttribute("aria-expanded",String(opening));
+  });
+  adminContentSubnav.querySelectorAll("[data-content-nav]").forEach((button) => {
+    button.addEventListener("click", () => guardContentNavigation(() => {
+      contentType.value=button.dataset.contentNav === "all" ? "all" : button.dataset.contentNav;
+      cmsContentStatus="all";
+      contentStatusFilters.querySelectorAll("[data-content-status]").forEach((node)=>node.classList.toggle("active",node.dataset.contentStatus === "all"));
+      adminContentSubnav.querySelectorAll("[data-content-nav]").forEach((node)=>node.classList.toggle("active",node===button));
+      loadContent().catch(showApiError);
+    }));
+  });
   document.querySelectorAll("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => {
       guardContentNavigation(() => {
@@ -2667,6 +2943,7 @@
   };
   document.getElementById("open-member-preview").addEventListener("click", openAdminClub);
   document.getElementById("open-club-global").addEventListener("click", () => guardContentNavigation(openAdminClub));
+  document.getElementById("sidebar-open-club").addEventListener("click", () => guardContentNavigation(openAdminClub));
   document.getElementById("dashboard-open-users").addEventListener("click", () => loadUsers().catch(showApiError));
   document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
   document.getElementById("dashboard-open-attention").addEventListener("click", () => loadAttention().catch(showApiError));
@@ -2891,6 +3168,7 @@
   }).then(({admin,identityData}) => {
     if (!admin) return loadMemberHome();
     adminModeConfirmed = true;
+    configureAdminProfile(identityData);
     updateFullscreenControl();
     console.info("MINIAPP_VIEWPORT_DIAGNOSTIC", {
       platform: String(webApp.platform || "unknown"),
@@ -2901,7 +3179,8 @@
       isFullscreen: Boolean(webApp.isFullscreen),
       requestFullscreenSupported: typeof webApp.requestFullscreen === "function",
     });
-    telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false; return loadDashboard();
+    telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false;
+    return loadAdminNotificationAcknowledgements().then(loadDashboard);
   }).catch((error) => {
     if (error.message === "member_rollout_disabled") { status.textContent="Новая платформа пока доступна только участникам тестирования."; identity.hidden=true; return; }
     if (error.message === "telegram_session_expired") {
