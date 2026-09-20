@@ -18,6 +18,7 @@ class ContentStudioFrontendTests(unittest.TestCase):
             "admin-global-search", "admin-search-results", "admin-notifications",
             "admin-notification-panel", "admin-profile-toggle", "admin-profile-panel",
             "admin-profile-panel-avatar", "admin-content-nav", "admin-content-subnav", "sidebar-open-club",
+            "analytics-screen", "notifications-screen", "settings-screen",
         ):
             self.assertEqual(html.count(f'id="{element_id}"'), 1)
         self.assertIn('window.setTimeout(runAdminGlobalSearch,250)', source)
@@ -26,13 +27,17 @@ class ContentStudioFrontendTests(unittest.TestCase):
         self.assertIn('configureAdminProfile(identityData)', source)
         self.assertIn('adminContentNav.setAttribute("aria-expanded"', source)
         self.assertIn('typeof webApp.requestFullscreen !== "function"', source)
-        self.assertIn('id="nav-failed-subscriptions"', html)
-        self.assertIn('<small>Проблемы продления</small>', html)
-        self.assertNotIn('<small>Аналитика</small>', html)
-        self.assertIn('document.getElementById("nav-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false))', source)
+        self.assertIn('data-nav="analytics"', html)
+        self.assertIn('<small>Аналитика</small>', html)
+        self.assertIn('data-nav="notifications"', html)
+        self.assertIn('<small>Уведомления</small>', html)
+        self.assertNotIn('id="nav-failed-subscriptions"', html)
+        self.assertIn('button.dataset.nav === "analytics") loadAnalytics().catch(showApiError)', source)
+        self.assertIn('button.dataset.nav === "notifications") loadNotifications().catch(showApiError)', source)
+        self.assertIn('/api/admin/analytics?days=${encodeURIComponent(days)}', source)
         self.assertIn('/api/admin/content/cms?status=all&limit=50', source)
         self.assertIn('Контент · 50 последних', source)
-        self.assertIn('50 последних материалов', html)
+        self.assertNotIn('50 последних материалов', html)
         self.assertIn('const adminNotificationReadState = new Set()', source)
         self.assertNotIn('localStorage', source)
         self.assertNotIn('sessionStorage', source)

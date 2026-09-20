@@ -3,6 +3,8 @@ from datetime import datetime
 
 from admin_users import (
     AdminUsersQueryError,
+    STATUS_SQL,
+    USERS_STATUSES,
     decode_users_cursor,
     encode_users_cursor,
     escape_like,
@@ -44,6 +46,11 @@ class AdminUsersTests(unittest.TestCase):
         self.assertEqual(masked, "cus_***123456")
         self.assertNotIn(raw, masked)
         self.assertIsNone(mask_stripe_identifier(None))
+
+    def test_gift_filter_uses_current_redeemed_grant(self):
+        self.assertIn("gift", USERS_STATUSES)
+        self.assertIn("gift_access_grants", STATUS_SQL["gift"])
+        self.assertIn("current_gift", STATUS_SQL["trial"])
 
 
 if __name__ == "__main__":

@@ -371,6 +371,7 @@
   let adminNotificationUnknownUnreadCount = 0;
   let adminNotificationPaginationIncomplete = false;
   let adminNotificationDisplayLimit = MAX_NOTIFICATION_PANEL_ITEMS;
+  let adminNotificationPageLimit = MAX_NOTIFICATION_PANEL_ITEMS;
   const adminNotificationReadState = new Set();
   const adminNotificationAckPending = new Set();
   let adminNotificationAckError = "";
@@ -390,6 +391,15 @@
     gift: ["M3 9h18v12H3z", "M2 5h20v4H2z", "M12 5v16", "M12 5H8.5a2.5 2.5 0 1 1 3.5-2.3V5Zm0 0h3.5A2.5 2.5 0 1 0 12 2.7V5Z"],
     renewal: ["M12 9v4M12 17h.01", "M10.3 3.7 2.5 17.2h19L13.7 3.7a2 2 0 0 0-3.4 0Z"],
     settings: ["M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z", "M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.12 2.12-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.55V20h-3v-.09a1.7 1.7 0 0 0-1.03-1.55 1.7 1.7 0 0 0-1.88.34l-.06.06-2.12-2.12.06-.06A1.7 1.7 0 0 0 7 14.7a1.7 1.7 0 0 0-1.55-1.03H5v-3h.45A1.7 1.7 0 0 0 7 9.64a1.7 1.7 0 0 0-.34-1.88L6.6 7.7l2.12-2.12.06.06A1.7 1.7 0 0 0 10.66 6 1.7 1.7 0 0 0 11.7 4.45V4h3v.45A1.7 1.7 0 0 0 15.73 6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.12 2.12-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.55 1.03H21v3h-.06A1.7 1.7 0 0 0 19.4 15Z"],
+    analytics: ["M4 20V10M10 20V4M16 20v-7M22 20V7"],
+    bell: ["M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z", "M10 21h4"],
+    external: ["M14 3h7v7M10 14 21 3", "M21 14v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h6"],
+    refresh: ["M20 6v6h-6", "M4 18v-6h6", "M6.5 8a7 7 0 0 1 11-2l2.5 6M17.5 16a7 7 0 0 1-11 2L4 12"],
+    plus: ["M12 5v14M5 12h14"],
+    search: ["M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16ZM21 21l-4.35-4.35"],
+    fullscreen: ["M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"],
+    warning: ["M12 9v4M12 17h.01", "M10.3 3.7 2.5 17.2h19L13.7 3.7a2 2 0 0 0-3.4 0Z"],
+    more: ["M5 12h.01M12 12h.01M19 12h.01"],
   };
   const installAdminIcons = () => document.querySelectorAll("[data-admin-icon]").forEach((button) => {
     const host = button.querySelector(":scope > span:first-child");
@@ -1200,7 +1210,7 @@
         ...buildAdminNotificationItems(results[0].items,results[1].items,results[2].items,{scheduler:{},removals:{}}),
         ...systemItems,
       ]);
-      renderAdminNotificationPanel(); updateAdminNotificationBadge();
+      renderAdminNotificationPanel(); renderNotificationCenter(); updateAdminNotificationBadge();
     });
   });
   const loadDashboard = () => {
@@ -1243,19 +1253,22 @@
     const button = document.createElement("button");
     button.type = "button";
     const identityCell = document.createElement("div"); identityCell.className = "user-identity-cell";
-    identityCell.append(text("span", (user.username || "?").slice(0, 1).toUpperCase(), "user-avatar"), text("h2", user.username ? `@${user.username}` : "Без username"));
-    const telegram = text("p", `ID ${user.telegram_id}`, "user-telegram-cell");
+    const identityCopy=document.createElement("div"); identityCopy.append(text("h2",user.first_name || (user.username ? `@${user.username}` : "Участник")),text("small",user.username ? `@${user.username}` : "Без username"));
+    identityCell.append(text("span", (user.first_name || user.username || "?").slice(0, 1).toUpperCase(), "user-avatar"),identityCopy);
     const access = document.createElement("div"); access.className = "user-access-cell"; addBadges(access, user);
     const subscription = text("p", user.auto_renew ? "Автопродление" : "Без автопродления", "user-subscription-cell");
     const expiry = text("p", user.expiry_date || "—", "user-expiry-cell");
+    identityCopy.append(text("small", `Telegram ID ${user.telegram_id}`, "user-telegram-cell"));
+    const activity = text("p", "Нет данных", "user-activity-cell");
+    const lastVisit = text("p", "Нет данных", "user-last-visit-cell");
     const action = text("span", "Открыть →", "user-action-cell");
-    button.append(identityCell, telegram, access, subscription, expiry, action);
+    button.append(identityCell, access, subscription, expiry, activity, lastVisit, action);
     button.addEventListener("click", () => loadUserDetails(user.telegram_id));
     article.append(button);
     return article;
   };
   const loadUsers = (append = false) => {
-    status.textContent = "Загружаем пользователей…";
+    status.textContent = "Загружаем участников…";
     const params = new URLSearchParams({limit: "25", status: usersStatus.value});
     if (usersSearch.value.trim()) params.set("q", usersSearch.value.trim());
     if (append && usersCursor) params.set("cursor", usersCursor);
@@ -1265,7 +1278,7 @@
       usersCursor = data.next_cursor;
       usersMore.hidden = !data.has_more;
       showScreen("users");
-      status.textContent = `Пользователей показано: ${usersList.children.length}`;
+      status.textContent = `Участников показано: ${usersList.children.length}`;
     });
   };
   const detailCard = (title, pairs) => {
@@ -1357,10 +1370,17 @@
     status.textContent = "Загружаем профиль…";
     return api(`/api/admin/users/${encodeURIComponent(userId)}`).then((user) => {
       detailsContent.replaceChildren();
+      const displayName=[user.first_name,user.last_name].filter(Boolean).join(" ") || (user.username ? `@${user.username}` : "Участник");
+      const profile=document.createElement("article"); profile.className="card participant-profile-hero";
+      profile.append(text("span",displayName.slice(0,1).toUpperCase(),"participant-avatar"));
+      const profileCopy=document.createElement("div"); profileCopy.append(text("h1",displayName),text("p",user.username ? `@${user.username}` : "Без username"),text("small",`Telegram ID ${user.telegram_id}`));
+      profile.append(profileCopy,text("span",statusLabels[user.access_status] || user.access_status,"badge"));
       detailsContent.append(
-        detailCard("Профиль", [["Telegram ID", user.telegram_id], ["Username", user.username ? `@${user.username}` : "—"], ["Имя", [user.first_name, user.last_name].filter(Boolean).join(" ") || "—"]]),
-        detailCard("Доступ", [["Статус", statusLabels[user.access_status]], ["Тип", typeLabels[user.access_type]], ["До", user.expiry_date], ["Trial использован", user.trial_used ? "Да" : "Нет"]]),
-        detailCard("Оплата", [["Paid", user.paid ? "Да" : "Нет"], ["Автопродление", user.auto_renew ? "Да" : "Нет"], ["Ошибка оплаты", user.payment_failed ? "Да" : "Нет"], ["Grace до", user.grace_period_end], ["Customer", user.stripe.customer_id], ["Subscription", user.stripe.subscription_id]]),
+        profile,
+        detailCard("Подписка", [["Статус", statusLabels[user.access_status]], ["Источник доступа", typeLabels[user.access_type]], ["Доступ до", user.expiry_date], ["Автопродление", user.auto_renew ? "Включено" : "Выключено"], ["Trial использован", user.trial_used ? "Да" : "Нет"]]),
+        detailCard("Оплата", [["Оплаченный доступ", user.paid ? "Да" : "Нет"], ["Ошибка оплаты", user.payment_failed ? "Да" : "Нет"], ["Grace до", user.grace_period_end], ["Customer", user.stripe.customer_id], ["Subscription", user.stripe.subscription_id]]),
+        detailCard("Активность", [["Последняя активность", "Нет данных"], ["Тренировки", "Не отслеживаются"], ["Медитации", "Не отслеживаются"], ["Минуты", "Не отслеживаются"]]),
+        detailCard("Прогресс · 30 дней", [["График активности", "Нет данных"], ["Completion rate", "Не отслеживается"]]),
         detailCard("Удаление", user.removal ? [["Статус", user.removal.status], ["Причина", user.removal.reason], ["Access expiry", user.removal.access_expiry], ["Обновлено", user.removal.updated_at]] : [["Статус", "Нет операции"]]),
         detailCard("История", user.access_history.length ? user.access_history.map((event) => [event.event_type, `${event.source}: ${event.old_expiry || "—"} → ${event.new_expiry || "—"}`]) : [["События", "Нет"]])
       );
@@ -2741,7 +2761,7 @@
       const contentMatches = content.items.filter((item) => adminSearchMatches([item.title,item.content_type,contentLabels[item.content_type],...(item.categories || []).map((entry)=>entry.title)],query)).slice(0,6);
       const taskMatches = failed.items.filter((item) => adminSearchMatches([item.username,item.first_name,item.reason_label,item.status],query)).slice(0,6);
       const groups = [];
-      if (users.items.length) groups.push(adminResultGroup("Пользователи", users.items.map((user)=>({title:user.username ? `@${user.username}` : (user.first_name || `ID ${user.telegram_id}`),meta:`Пользователь · ${statusLabels[user.access_status] || user.access_status}`,open:()=>loadUserDetails(user.telegram_id)}))));
+      if (users.items.length) groups.push(adminResultGroup("Участники", users.items.map((user)=>({title:user.first_name || (user.username ? `@${user.username}` : "Участник"),meta:`${user.username ? `@${user.username} · ` : ""}${statusLabels[user.access_status] || user.access_status}`,open:()=>loadUserDetails(user.telegram_id)}))));
       if (contentMatches.length) groups.push(adminResultGroup("Контент · 50 последних", contentMatches.map((item)=>({title:item.title,meta:`${contentLabels[item.content_type] || "Материал"} · ${item.status}`,open:()=>loadCmsContentDetails(item.content_id)}))));
       if (taskMatches.length) groups.push(adminResultGroup("Задачи", taskMatches.map((item)=>({title:item.username ? `@${item.username}` : (item.first_name || "Проблема продления"),meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)}))));
       adminSearchResults.replaceChildren(...(groups.length ? groups : [text("p", "Ничего не найдено.", "admin-panel-state")]));
@@ -2768,14 +2788,14 @@
     }).catch((error)=>{
       adminNotificationAckError="Не удалось сохранить отметку. Уведомление осталось непрочитанным.";
       if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
-    }).finally(()=>{ adminNotificationAckPending.delete(key); renderAdminNotificationPanel(); });
+    }).finally(()=>{ adminNotificationAckPending.delete(key); renderAdminNotificationPanel(); renderNotificationCenter(); });
   };
   const buildAdminNotificationItems = (failed,gifts,deliveries,system) => [
-    ...failed.map((item)=>({key:`failed:${item.operation_id}`,timestamp:item.updated_at,title:item.username ? `Проблема продления · @${item.username}` : "Проблема продления",meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status} · ${formatDate(item.updated_at)}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)})),
-    ...deliveries.map((item)=>({key:`delivery:${item.delivery_id}`,timestamp:item.updated_at || item.next_attempt_at,title:item.delivery_label,meta:`${item.explanation || item.status} · ${formatDate(item.updated_at || item.next_attempt_at)}`,open:()=>loadDeliveryDetails(item.delivery_id)})),
-    ...gifts.map((item)=>({key:`gift:${item.gift_id}`,timestamp:item.updated_at || item.created_at,title:"Подарок требует проверки",meta:`${item.public_reference} · ${item.status_label} · ${formatDate(item.updated_at || item.created_at)}`,open:()=>loadGiftDetails(item.gift_id)})),
-    ...(Number(system.scheduler.failed_last_24h || 0) && system.scheduler.latest_failed_incident ? [{key:adminSystemIncidentKey("scheduler",system.scheduler.latest_failed_incident),title:"Ошибки планировщика",meta:`За 24 часа: ${system.scheduler.failed_last_24h}`,open:()=>loadSystem()}] : []),
-    ...(Number(system.removals.retryable || 0) && system.removals.latest_retryable_incident ? [{key:adminSystemIncidentKey("removals",system.removals.latest_retryable_incident),title:"Повторные удаления",meta:`Ожидают обработки: ${system.removals.retryable}`,open:()=>loadSystem()}] : []),
+    ...failed.map((item)=>({key:`failed:${item.operation_id}`,category:"failed",timestamp:item.updated_at,title:item.username ? `Проблема продления · @${item.username}` : "Проблема продления",meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status} · ${formatDate(item.updated_at)}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)})),
+    ...deliveries.map((item)=>({key:`delivery:${item.delivery_id}`,category:"delivery",timestamp:item.updated_at || item.next_attempt_at,title:item.delivery_label,meta:`${item.explanation || item.status} · ${formatDate(item.updated_at || item.next_attempt_at)}`,open:()=>loadDeliveryDetails(item.delivery_id)})),
+    ...gifts.map((item)=>({key:`gift:${item.gift_id}`,category:"gift",timestamp:item.updated_at || item.created_at,title:"Подарок требует проверки",meta:`${item.public_reference} · ${item.status_label} · ${formatDate(item.updated_at || item.created_at)}`,open:()=>loadGiftDetails(item.gift_id)})),
+    ...(Number(system.scheduler.failed_last_24h || 0) && system.scheduler.latest_failed_incident ? [{key:adminSystemIncidentKey("scheduler",system.scheduler.latest_failed_incident),category:"system",title:"Ошибки планировщика",meta:`За 24 часа: ${system.scheduler.failed_last_24h}`,open:()=>loadSystem()}] : []),
+    ...(Number(system.removals.retryable || 0) && system.removals.latest_retryable_incident ? [{key:adminSystemIncidentKey("removals",system.removals.latest_retryable_incident),category:"system",title:"Повторные удаления",meta:`Ожидают обработки: ${system.removals.retryable}`,open:()=>loadSystem()}] : []),
   ];
   const updateAdminNotificationBadge = () => {
     const read=adminNotificationReadKeys();
@@ -2805,6 +2825,60 @@
     if (!adminNotificationItems.length) items.append(text("p","Новых событий нет.","admin-panel-state"));
     adminNotificationPanel.replaceChildren(heading,items);
   };
+  const notificationCenterFilteredItems = () => {
+    const category=document.getElementById("notifications-category").value;
+    const readFilter=document.getElementById("notifications-read-filter").value;
+    return adminNotificationItems.filter((item)=>{
+      const isRead=adminNotificationReadState.has(item.key);
+      return (category === "all" || item.category === category)
+        && (readFilter === "all" || (readFilter === "read") === isRead);
+    });
+  };
+  const renderNotificationCenter = () => {
+    const host=document.getElementById("notifications-page-list");
+    if (!host) return;
+    const filtered=notificationCenterFilteredItems(); const page=adminNotificationPanelPage(filtered,adminNotificationPageLimit);
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key)).length+adminNotificationUnknownUnreadCount;
+    document.getElementById("notifications-current").textContent=String(adminCurrentNotificationKeys.size+adminNotificationUnknownUnreadCount);
+    document.getElementById("notifications-unread").textContent=String(unread);
+    const today=new Date().toDateString();
+    document.getElementById("notifications-today").textContent=String(adminNotificationItems.filter((item)=>item.timestamp && new Date(item.timestamp).toDateString() === today).length);
+    const rows=page.visible.map((item)=>{
+      const row=document.createElement("article"); row.className=`card notification-center-item${adminNotificationReadState.has(item.key) ? " read" : ""}`;
+      const copy=document.createElement("button"); copy.type="button"; copy.className="admin-notification-open"; copy.append(text("strong",item.title),text("small",item.meta));
+      copy.addEventListener("click",()=>{ markAdminNotificationRead(item.key); item.open(); });
+      const mark=document.createElement("button"); mark.type="button"; mark.className="admin-notification-mark"; mark.textContent=adminNotificationReadState.has(item.key) ? "Прочитано" : "Отметить прочитанным"; mark.disabled=adminNotificationReadState.has(item.key); mark.addEventListener("click",()=>markAdminNotificationRead(item.key));
+      row.append(copy,mark); return row;
+    });
+    if (!rows.length) rows.push(text("p","Уведомлений по выбранному фильтру нет.","card admin-panel-state"));
+    if (adminNotificationPaginationIncomplete) rows.push(text("p","Не все уведомления удалось загрузить.","card admin-panel-state warning"));
+    host.replaceChildren(...rows);
+    const more=document.getElementById("notifications-page-more"); more.hidden=!page.remaining; more.textContent=`Показать ещё ${Math.min(MAX_NOTIFICATION_PANEL_ITEMS,page.remaining)}`;
+  };
+  const loadNotifications = () => {
+    adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; showScreen("notifications");
+    return refreshAttentionCount();
+  };
+  const analyticsDelta = (current,previous) => {
+    const difference=Number(current || 0)-Number(previous || 0);
+    return difference === 0 ? "без изменений" : `${difference > 0 ? "+" : ""}${difference} к прошлому периоду`;
+  };
+  const loadAnalytics = () => {
+    showScreen("analytics");
+    const days=document.getElementById("analytics-period").value;
+    return api(`/api/admin/analytics?days=${encodeURIComponent(days)}`).then((data)=>{
+      const cards=[
+        ["Всего участников",data.metrics.total_users_now,"total_users_now"],
+        ["Активные участники",data.metrics.active_paid_now,"active_paid_now"],
+        ["Новые участники",data.metrics.new_registrations,"new_registrations"],
+        ["Завершили доступ",data.metrics.access_closed,"access_closed"],
+      ].map(([label,value,key])=>{ const card=document.createElement("article"); card.className="card admin-kpi"; card.append(text("strong",String(value)),text("small",label),text("span",analyticsDelta(value,data.comparison[key]),"analytics-delta")); return card; });
+      document.getElementById("analytics-summary").replaceChildren(...cards);
+      const billing=[["Успешные оплаты","successful_payments"],["Новые подписки","initial_purchases"],["Продления","recurring_payments"],["Ошибки оплаты","failed_payments"],["Восстановлены","recovered_after_failure"],["Отмены автопродления","auto_renew_disabled"]];
+      document.getElementById("analytics-billing").replaceChildren(...billing.map(([label,key])=>{ const row=document.createElement("div"); row.append(text("span",label),text("strong",String(data.metrics[key])),text("small",analyticsDelta(data.metrics[key],data.comparison[key]))); return row; }));
+      const tracking=document.getElementById("analytics-tracking"); tracking.replaceChildren(text("p","Просмотры, старты, завершения, активные минуты и DAU/WAU/MAU пока не собираются. Здесь не отображаются фиктивные значения.","hint"));
+    });
+  };
   const configureAdminProfile = (identityData) => {
     const telegramUser = webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user : {};
     const profile = adminProfilePresentation(telegramUser);
@@ -2822,6 +2896,9 @@
     renderAvatar(document.getElementById("admin-topbar-avatar"));
     renderAvatar(document.getElementById("admin-profile-panel-avatar"));
     document.getElementById("admin-profile-meta").textContent=telegramUser.username ? `@${telegramUser.username}` : `Telegram ID ${identityData.telegram_id}`;
+    document.getElementById("admin-settings-name").textContent=displayName;
+    document.getElementById("admin-settings-meta").textContent=telegramUser.username ? `@${telegramUser.username}` : `Telegram ID ${identityData.telegram_id}`;
+    renderAvatar(document.getElementById("admin-settings-avatar"));
   };
   installAdminIcons();
   installMemberAdminCreateActions();
@@ -2914,6 +2991,9 @@
         else if (button.dataset.nav === "users") loadUsers().catch(showApiError);
         else if (button.dataset.nav === "subscriptions") loadSubscriptions().catch(showApiError);
         else if (button.dataset.nav === "system") loadSystem().catch(showApiError);
+        else if (button.dataset.nav === "analytics") loadAnalytics().catch(showApiError);
+        else if (button.dataset.nav === "notifications") loadNotifications().catch(showApiError);
+        else if (button.dataset.nav === "settings") showScreen("settings");
         else if (button.dataset.nav === "schedule") loadSchedule().catch(showApiError);
         else if (button.dataset.nav === "content") loadContent().catch(showApiError);
         else if (button.dataset.nav === "more") showScreen("more");
@@ -2946,17 +3026,25 @@
   document.getElementById("sidebar-open-club").addEventListener("click", () => guardContentNavigation(openAdminClub));
   document.getElementById("dashboard-open-users").addEventListener("click", () => loadUsers().catch(showApiError));
   document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
-  document.getElementById("dashboard-open-attention").addEventListener("click", () => loadAttention().catch(showApiError));
+  document.getElementById("dashboard-open-attention").addEventListener("click", () => loadNotifications().catch(showApiError));
   document.getElementById("more-subscriptions").addEventListener("click", () => loadSubscriptions().catch(showApiError));
   document.getElementById("more-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("more-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
-  document.getElementById("more-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
-  document.getElementById("more-system").addEventListener("click", () => loadSystem().catch(showApiError));
+  document.getElementById("more-failed-subscriptions").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("more-system").addEventListener("click", () => showScreen("settings"));
   document.getElementById("more-open-club").addEventListener("click", openAdminClub);
   document.getElementById("attention-back").addEventListener("click", () => loadDashboard().catch(showApiError));
-  document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
+  document.getElementById("open-failed-subscriptions").addEventListener("click", () => loadNotifications().catch(showApiError));
   document.getElementById("nav-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
-  document.getElementById("nav-failed-subscriptions").addEventListener("click", () => loadFailedSubscriptions(false));
+  document.getElementById("analytics-period").addEventListener("change", () => loadAnalytics().catch(showApiError));
+  document.getElementById("notifications-category").addEventListener("change", () => { adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
+  document.getElementById("notifications-read-filter").addEventListener("change", () => { adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
+  document.getElementById("notifications-page-more").addEventListener("click", () => { adminNotificationPageLimit += MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
+  document.getElementById("settings-open-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("settings-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
+  document.getElementById("admin-profile-open").addEventListener("click", () => { closeAdminHeaderPanels(); showScreen("settings"); });
+  document.getElementById("admin-settings-open").addEventListener("click", () => { closeAdminHeaderPanels(); showScreen("settings"); });
+  document.getElementById("admin-session-exit").addEventListener("click", () => writeAdminJson("POST","/api/admin/session/revoke",{}).finally(()=>webApp.close()));
   failedSubscriptionsFilter.addEventListener("change", () => { failedSubscriptionsCursor=null; loadFailedSubscriptions(false); });
   failedSubscriptionsMore.addEventListener("click", () => loadFailedSubscriptions(true));
   document.getElementById("failed-subscriptions-dashboard-back").addEventListener("click", () => loadDashboard().catch(showApiError));

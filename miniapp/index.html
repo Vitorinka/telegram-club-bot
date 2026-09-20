@@ -12,7 +12,7 @@
   <main class="shell" aria-live="polite">
     <section id="admin-hero" class="card hero-card">
       <div class="admin-global-search-wrap">
-        <label class="admin-global-search" for="admin-global-search"><span aria-hidden="true">⌕</span><input id="admin-global-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск: люди, задачи, 50 последних материалов…"></label>
+        <label class="admin-global-search" for="admin-global-search" data-admin-icon="search"><span aria-hidden="true"></span><input id="admin-global-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск по материалам, участникам, подпискам…"></label>
         <section id="admin-search-results" class="admin-header-panel admin-search-results" aria-label="Результаты поиска" hidden></section>
       </div>
       <div class="admin-topbar-copy"><p class="eyebrow">Natalia_SoulFit</p><h1 id="title">Админ-панель</h1></div>
@@ -20,23 +20,31 @@
         <span id="status">Проверяем доступ…</span>
         <span id="identity" hidden> · ID <strong id="telegram-id"></strong><span id="username-row" hidden> · <span id="username"></span></span></span>
       </p>
-      <div class="admin-topbar-actions"><small id="fullscreen-message" class="fullscreen-message" role="status" hidden></small><button id="admin-fullscreen" class="admin-icon-button secondary" type="button" hidden><span aria-hidden="true">⛶</span><span>Развернуть</span></button><button id="open-club-global" class="secondary" type="button">Открыть клуб</button><button id="refresh" class="admin-icon-button secondary" type="button" hidden aria-label="Обновить">↻</button><button id="topbar-create-content" type="button"><span class="create-wide-label">+ Создать материал</span><span class="create-mobile-label">+ Материал</span></button><div class="admin-header-popover"><button id="admin-notifications" class="admin-icon-button secondary" type="button" aria-expanded="false" aria-controls="admin-notification-panel" aria-label="Уведомления"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z"/><path d="M10 21h4"/></svg></span><span id="topbar-attention" class="topbar-attention">0</span></button><section id="admin-notification-panel" class="admin-header-panel admin-notification-panel" aria-label="Уведомления" hidden></section></div><div class="admin-header-popover"><button id="admin-profile-toggle" class="admin-profile-toggle secondary" type="button" aria-expanded="false" aria-controls="admin-profile-panel"><span id="admin-topbar-avatar" class="admin-topbar-avatar" aria-hidden="true">A</span><span class="admin-profile-copy"><strong id="admin-profile-name">Администратор</strong><small>Администратор</small></span><span aria-hidden="true">⌄</span></button><section id="admin-profile-panel" class="admin-header-panel admin-profile-panel" aria-label="Профиль администратора" hidden><div class="admin-profile-heading"><span id="admin-profile-panel-avatar" class="admin-topbar-avatar" aria-hidden="true">A</span><div><strong id="admin-profile-panel-name">Администратор</strong><small>Администратор</small></div></div><span id="admin-profile-meta">Защищённая сесия Telegram</span></section></div></div>
+      <div class="admin-topbar-actions">
+        <small id="fullscreen-message" class="fullscreen-message" role="status" hidden></small>
+        <button id="admin-fullscreen" class="admin-icon-button secondary" type="button" hidden data-admin-icon="fullscreen"><span aria-hidden="true"></span><span>Развернуть</span></button>
+        <button id="open-club-global" class="secondary" type="button" data-admin-icon="external"><span aria-hidden="true"></span><span>Открыть клуб</span></button>
+        <button id="refresh" class="admin-icon-button secondary" type="button" hidden aria-label="Обновить" data-admin-icon="refresh"><span aria-hidden="true"></span><span>Обновить</span></button>
+        <button id="topbar-create-content" type="button" data-admin-icon="plus"><span aria-hidden="true"></span><span class="create-wide-label">Создать материал</span><span class="create-mobile-label">Материал</span></button>
+        <div class="admin-header-popover"><button id="admin-notifications" class="admin-icon-button secondary" type="button" aria-expanded="false" aria-controls="admin-notification-panel" aria-label="Уведомления" data-admin-icon="bell"><span aria-hidden="true"></span><span id="topbar-attention" class="topbar-attention">0</span></button><section id="admin-notification-panel" class="admin-header-panel admin-notification-panel" aria-label="Уведомления" hidden></section></div>
+        <div class="admin-header-popover"><button id="admin-profile-toggle" class="admin-profile-toggle secondary" type="button" aria-expanded="false" aria-controls="admin-profile-panel"><span id="admin-topbar-avatar" class="admin-topbar-avatar" aria-hidden="true">A</span><span class="admin-profile-copy"><strong id="admin-profile-name">Администратор</strong><small>Администратор</small></span><span aria-hidden="true">⌄</span></button><section id="admin-profile-panel" class="admin-header-panel admin-profile-panel" aria-label="Профиль администратора" hidden><div class="admin-profile-heading"><span id="admin-profile-panel-avatar" class="admin-topbar-avatar" aria-hidden="true">A</span><div><strong id="admin-profile-panel-name">Администратор</strong><small>Администратор</small></div></div><span id="admin-profile-meta">Защищённая сессия Telegram</span><button id="admin-profile-open" class="secondary" type="button">Мой профиль</button><button id="admin-settings-open" class="secondary" type="button">Настройки</button><button id="admin-session-exit" class="secondary" type="button">Выйти</button></section></div>
+      </div>
     </section>
     <section id="dashboard" class="dashboard screen admin-dashboard" data-screen="overview" hidden>
-      <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталия!</h1><p>Вместе мы делаем людей счастливее и здоровее 🌿</p></div><time id="dashboard-clock"></time></header>
+      <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталья!</h1><p>Вместе создаём пространство для здоровья и заботы о себе.</p></div><time id="dashboard-clock"></time></header>
       <div class="admin-kpi-row">
-        <article class="card admin-kpi"><span>○</span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
-        <article class="card admin-kpi"><span>▣</span><strong id="dashboard-published-count">—</strong><small>Опубликовано материалов</small></article>
-        <article class="card admin-kpi"><span>□</span><strong id="dashboard-schedule-count">—</strong><small>Ближайших расписаний</small></article>
-        <button id="dashboard-open-attention" class="card admin-kpi admin-kpi-danger" type="button"><span>!</span><strong id="dashboard-attention-count">—</strong><small>Требуют внимания</small></button>
+        <article class="card admin-kpi" data-admin-icon="users"><span aria-hidden="true"></span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
+        <article class="card admin-kpi" data-admin-icon="content"><span aria-hidden="true"></span><strong id="dashboard-published-count">—</strong><small>Опубликовано материалов</small></article>
+        <article class="card admin-kpi" data-admin-icon="calendar"><span aria-hidden="true"></span><strong id="dashboard-schedule-count">—</strong><small>Ближайших расписаний</small></article>
+        <button id="dashboard-open-attention" class="card admin-kpi admin-kpi-danger" type="button" data-admin-icon="warning"><span aria-hidden="true"></span><strong id="dashboard-attention-count">—</strong><small>Требуют внимания</small></button>
       </div>
       <div class="admin-dashboard-grid">
         <article class="card admin-overview-panel admin-content-overview"><header><div><h2>Контент</h2><small>Управление материалами клуба</small></div><button id="open-content" class="admin-text-action" type="button">Все материалы →</button></header><div id="dashboard-content-list" class="overview-content-grid"><p class="overview-empty">Загружаем материалы…</p></div><button id="open-member-preview" class="secondary admin-quiet-action" type="button">Посмотреть клуб</button></article>
-        <article class="card admin-overview-panel admin-users-overview"><header><div><h2>Пользователи</h2><small>Участники клуба</small></div><button id="dashboard-open-users" class="admin-text-action" type="button">Все пользователи →</button></header><div class="overview-table-head"><span>Пользователь</span><span>Telegram ID</span><span>Статус</span><span>Истекает</span></div><div id="dashboard-users-list" class="overview-table"><p class="overview-empty">Загружаем пользователей…</p></div></article>
+        <article class="card admin-overview-panel admin-users-overview"><header><div><h2>Участники</h2><small>Участники клуба</small></div><button id="dashboard-open-users" class="admin-text-action" type="button">Все участники →</button></header><div class="overview-table-head"><span>Участник</span><span>Telegram ID</span><span>Статус</span><span>Доступ до</span></div><div id="dashboard-users-list" class="overview-table"><p class="overview-empty">Загружаем участников…</p></div></article>
         <article class="card admin-overview-panel admin-subscriptions-overview"><header><div><h2>Подписки</h2><small>Оплаты и доступы</small></div><button id="open-subscriptions-mobile" class="admin-text-action" type="button">Все подписки →</button></header><div class="overview-metrics"><div><strong data-metric="users.active_access">—</strong><small>Активные</small></div><div><strong data-metric="billing.active_grace">—</strong><small>Льготный период</small></div><div><strong data-metric="billing.failed_payments">—</strong><small>Ошибки оплаты</small></div><div><strong data-metric="billing.auto_renew">—</strong><small>Автопродление</small></div></div></article>
         <article class="card admin-overview-panel admin-schedule-overview"><header><div><h2>Расписание</h2><small>Месячные расписания клуба</small></div><button id="open-schedule-mobile" class="admin-text-action" type="button">Все расписания →</button></header><div id="dashboard-schedule-list" class="overview-compact-list"><p class="overview-empty">Загружаем расписание…</p></div></article>
         <article class="card admin-overview-panel admin-gifts-overview"><header><div><h2>Подарки</h2><small>Подарочные доступы и сертификаты</small></div><button id="open-gifts" class="admin-text-action" type="button">Все подарки →</button></header><div id="dashboard-gifts-list" class="overview-compact-list"><p class="overview-empty">Загружаем подарки…</p></div></article>
-        <article class="card admin-overview-panel admin-failed-overview"><header><div><h2>⚠ Проблемы продления</h2><small>Неудачные попытки списания</small></div><button id="open-failed-subscriptions" class="admin-text-action" type="button">Все проблемы →</button></header><div id="dashboard-failed-list" class="overview-compact-list"><p class="overview-empty">Загружаем операции…</p></div></article>
+        <article class="card admin-overview-panel admin-failed-overview"><header><div><h2>Уведомления</h2><small>События, требующие внимания</small></div><button id="open-failed-subscriptions" class="admin-text-action" type="button">Все уведомления →</button></header><div id="dashboard-failed-list" class="overview-compact-list"><p class="overview-empty">Загружаем уведомления…</p></div></article>
         <article class="card admin-overview-panel admin-system-overview"><header><div><h2>Система</h2><small>Состояние и техническая информация</small></div><button id="dashboard-open-system" class="admin-text-action" type="button">Подробнее →</button></header><div class="overview-metrics overview-system-metrics"><div><strong>Online</strong><small>База данных</small></div><div><strong id="dashboard-migration-count">—</strong><small>Миграции</small></div><div><strong id="dashboard-scheduler-count">—</strong><small>Задачи планировщика</small></div><div><strong id="dashboard-job-errors">—</strong><small>Ошибки за 24 часа</small></div></div></article>
       </div>
     </section>
@@ -195,7 +203,7 @@
     </dialog>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
-        <h2>Пользователи</h2>
+        <h2>Участники</h2>
         <label class="search-label" for="users-search">Telegram ID или username</label>
         <input id="users-search" type="search" maxlength="64" autocomplete="off">
         <select id="users-status" aria-label="Статус пользователей">
@@ -203,8 +211,10 @@
           <option value="trial">Trial</option><option value="failed_payment">Ошибка оплаты</option>
           <option value="active_grace">Grace</option><option value="expired">Просроченные</option>
           <option value="auto_renew">Автопродление</option><option value="non_renewing">Без автопродления</option>
+          <option value="gift">Подарочные</option>
         </select>
       </article>
+      <div class="users-table-head" aria-hidden="true"><span>Участник</span><span>Статус</span><span>Подписка</span><span>Доступ до</span><span>Активность</span><span>Последний визит</span><span>Действия</span></div>
       <div id="users-list" class="user-list"></div>
       <button id="users-more" type="button" hidden>Показать ещё</button>
     </section>
@@ -387,6 +397,21 @@
         </div>
       </article>
     </section>
+    <section id="analytics-screen" class="screen page admin-insight-page" data-screen="analytics" hidden>
+      <header class="admin-page-heading"><div><p class="eyebrow">Реальные данные клуба</p><h1>Аналитика</h1><p>Показатели используют тот же источник расчётов, что и Telegram-отчёт.</p></div><select id="analytics-period" aria-label="Период аналитики"><option value="7">7 дней</option><option value="30" selected>30 дней</option><option value="90">3 месяца</option><option value="365">Год</option></select></header>
+      <div id="analytics-summary" class="admin-kpi-row"></div>
+      <div class="admin-dashboard-grid"><article class="card admin-overview-panel"><header><div><h2>Подписки и оплаты</h2><small>Сравнение с предыдущим периодом</small></div></header><div id="analytics-billing" class="analytics-bars"></div></article><article class="card admin-overview-panel"><header><div><h2>Активность контента</h2><small>Только измеряемые показатели</small></div></header><div id="analytics-tracking" class="analytics-tracking"></div></article></div>
+    </section>
+    <section id="notifications-screen" class="screen page admin-insight-page" data-screen="notifications" hidden>
+      <header class="admin-page-heading"><div><p class="eyebrow">Центр внимания</p><h1>Уведомления</h1><p>Прочтение не меняет статус исходной проблемы.</p></div></header>
+      <div class="summary-grid"><div><span>Требуют внимания</span><strong id="notifications-current">—</strong></div><div><span>Непрочитанные</span><strong id="notifications-unread">—</strong></div><div><span>Сегодня</span><strong id="notifications-today">—</strong></div><div><span>Решённые</span><strong title="История resolved пока не агрегируется">—</strong></div></div>
+      <div class="card notification-center-toolbar"><select id="notifications-category" aria-label="Тип уведомления"><option value="all">Все категории</option><option value="failed">Оплаты и продления</option><option value="delivery">Доставка сообщений</option><option value="gift">Подарки</option><option value="system">Система</option></select><select id="notifications-read-filter" aria-label="Статус прочтения"><option value="all">Все</option><option value="unread">Непрочитанные</option><option value="read">Прочитанные</option></select></div>
+      <div id="notifications-page-list" class="notification-center-list"></div><button id="notifications-page-more" type="button" hidden>Показать ещё</button>
+    </section>
+    <section id="settings-screen" class="screen page admin-insight-page" data-screen="settings" hidden>
+      <header class="admin-page-heading"><div><p class="eyebrow">Управление</p><h1>Настройки</h1><p>Профиль администратора и техническое состояние клуба.</p></div></header>
+      <div class="admin-dashboard-grid"><article class="card"><h2>Профиль</h2><div class="admin-profile-heading"><span id="admin-settings-avatar" class="admin-topbar-avatar" aria-hidden="true">A</span><div><strong id="admin-settings-name">Администратор</strong><small id="admin-settings-meta">Telegram</small></div></div><p class="hint">Аватар берётся из подтверждённого Telegram-профиля. Отдельное хранение файлов не используется.</p></article><article class="card"><h2>Клуб</h2><dl><dt>Название</dt><dd>Natalia_SoulFit</dd><dt>Режим</dt><dd>Telegram Mini App</dd></dl></article><article class="card"><h2>Уведомления</h2><p>Отметки прочтения сохраняются отдельно от бизнес-статусов.</p><button id="settings-open-notifications" class="secondary" type="button">Открыть уведомления</button></article><article class="card"><h2>Система</h2><p>База данных, миграции, scheduler, delivery queue и diagnostics.</p><button id="settings-open-system" type="button">Подробнее о системе</button></article></div>
+    </section>
     <section id="system-screen" class="screen page" data-screen="system" hidden>
       <article class="card">
         <h2>Система / Ошибки</h2>
@@ -423,12 +448,12 @@
     <section id="admin-more-screen" class="screen page admin-more-screen" data-screen="more" hidden>
       <header class="mobile-page-heading"><p class="eyebrow">Управление</p><h1>Ещё</h1></header>
       <nav class="card mobile-more-menu" aria-label="Дополнительные разделы">
-        <button id="more-subscriptions" type="button"><span aria-hidden="true">◇</span><strong>Подписки</strong><i>›</i></button>
-        <button id="more-schedule" type="button"><span aria-hidden="true">□</span><strong>Расписание</strong><i>›</i></button>
-        <button id="more-gifts" type="button"><span aria-hidden="true">♡</span><strong>Подарки</strong><i>›</i></button>
-        <button id="more-failed-subscriptions" type="button"><span aria-hidden="true">!</span><strong>Проблемы продления</strong><em id="more-attention">0</em><i>›</i></button>
-        <button id="more-system" type="button"><span aria-hidden="true">⚙</span><strong>Система</strong><i>›</i></button>
-        <button id="more-open-club" type="button"><span aria-hidden="true">⌂</span><strong>Открыть клуб</strong><i>›</i></button>
+        <button id="more-subscriptions" type="button" data-admin-icon="subscriptions"><span aria-hidden="true"></span><strong>Подписки</strong><i>›</i></button>
+        <button id="more-schedule" type="button" data-admin-icon="calendar"><span aria-hidden="true"></span><strong>Расписание</strong><i>›</i></button>
+        <button id="more-gifts" type="button" data-admin-icon="gift"><span aria-hidden="true"></span><strong>Подарки</strong><i>›</i></button>
+        <button id="more-failed-subscriptions" type="button" data-admin-icon="bell"><span aria-hidden="true"></span><strong>Уведомления</strong><em id="more-attention">0</em><i>›</i></button>
+        <button id="more-system" type="button" data-admin-icon="settings"><span aria-hidden="true"></span><strong>Настройки</strong><i>›</i></button>
+        <button id="more-open-club" type="button" data-admin-icon="external"><span aria-hidden="true"></span><strong>Открыть клуб</strong><i>›</i></button>
       </nav>
       <article class="card mobile-admin-profile"><span class="admin-topbar-avatar" aria-hidden="true">N</span><div><strong>Natalia_SoulFit</strong><small>Администратор · технические сведения доступны в разделе «Система»</small></div></article>
     </section>
@@ -493,22 +518,24 @@
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
-    <div class="admin-nav-brand" aria-hidden="true"><span class="admin-brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 20c-4-2-7-6-7-10 4 0 6 2 7 5 1-3 3-5 7-5 0 4-3 8-7 10Z"/><path d="M12 15c-2-3-2-7 0-11 2 4 2 8 0 11Z"/></svg></span><strong>Tariso Fit</strong><small>Админ-панель</small></div>
+    <div class="admin-nav-brand" aria-hidden="true"><span class="admin-brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 20c-4-2-7-6-7-10 4 0 6 2 7 5 1-3 3-5 7-5 0 4-3 8-7 10Z"/><path d="M12 15c-2-3-2-7 0-11 2 4 2 8 0 11Z"/></svg></span><strong>Natalia_SoulFit</strong><small>Админ-панель</small></div>
     <button type="button" data-nav="overview" data-admin-icon="home"><span aria-hidden="true"></span><small>Обзор</small></button>
     <div class="admin-nav-accordion">
-      <button id="admin-content-nav" type="button" data-nav="content" data-admin-icon="content" aria-expanded="true" aria-controls="admin-content-subnav"><span aria-hidden="true"></span><small>Контент</small><i aria-hidden="true">⌄</i></button>
+      <button id="admin-content-nav" type="button" data-nav="content" data-admin-icon="content" aria-expanded="true" aria-controls="admin-content-subnav"><span aria-hidden="true"></span><small>Контент</small><i class="admin-chevron" aria-hidden="true"></i></button>
       <div id="admin-content-subnav" class="admin-content-subnav">
         <button class="active" type="button" data-content-nav="all">Все материалы</button><button type="button" data-content-nav="recipe">Рецепты</button><button type="button" data-content-nav="lesson">Тренировки</button><button type="button" data-content-nav="meditation">Медитации</button><button type="button" data-content-nav="nutrition_material">Другое</button>
       </div>
     </div>
-    <button type="button" data-nav="users" data-admin-icon="users"><span aria-hidden="true"></span><small>Пользователи</small></button>
+    <button type="button" data-nav="users" data-admin-icon="users"><span aria-hidden="true"></span><small>Участники</small></button>
     <button type="button" data-nav="subscriptions" data-admin-icon="subscriptions"><span aria-hidden="true"></span><small>Подписки</small></button>
     <button type="button" data-nav="schedule" data-admin-icon="calendar"><span aria-hidden="true"></span><small>Расписание</small></button>
     <button id="nav-gifts" type="button" data-admin-icon="gift"><span aria-hidden="true"></span><small>Подарки</small></button>
-    <button id="nav-failed-subscriptions" type="button" data-admin-icon="renewal"><span aria-hidden="true"></span><small>Проблемы продления</small><span id="sidebar-attention" class="sidebar-attention">0</span></button>
-    <button type="button" data-nav="system" data-admin-icon="settings" class="desktop-system-nav"><span aria-hidden="true"></span><small>Система</small></button>
-    <button type="button" data-nav="more" class="admin-more-nav"><span aria-hidden="true">•••</span><small>Ещё</small></button>
-    <button id="sidebar-open-club" class="admin-sidebar-club" type="button"><span aria-hidden="true">↗</span><small>Открыть клуб</small></button>
+    <button type="button" data-nav="analytics" data-admin-icon="analytics"><span aria-hidden="true"></span><small>Аналитика</small></button>
+    <button id="nav-notifications" type="button" data-nav="notifications" data-admin-icon="bell"><span aria-hidden="true"></span><small>Уведомления</small><span id="sidebar-attention" class="sidebar-attention">0</span></button>
+    <button type="button" data-nav="settings" data-admin-icon="settings" class="desktop-system-nav"><span aria-hidden="true"></span><small>Настройки</small></button>
+    <button type="button" data-nav="more" data-admin-icon="more" class="admin-more-nav"><span aria-hidden="true"></span><small>Ещё</small></button>
+    <div class="admin-sidebar-branding" aria-hidden="true"><span class="admin-botanical-placeholder"></span><q>Забота о себе меняет мир</q><small>Natalia_SoulFit</small></div>
+    <button id="sidebar-open-club" class="admin-sidebar-club" type="button" data-admin-icon="external"><span aria-hidden="true"></span><small>Открыть клуб</small></button>
   </nav>
   <nav id="member-bottom-nav" class="member-bottom-nav" aria-label="Разделы клуба" hidden>
     <button type="button" data-member-nav="member-home"><span aria-hidden="true">⌂</span><small>Главная</small></button>
