@@ -200,6 +200,18 @@ class DbMigrationTests(unittest.TestCase):
         self.assertIn("PRIMARY KEY (admin_telegram_id, notification_key)", sql)
         self.assertIn("CHECK (char_length(notification_key) BETWEEN 1 AND 200)", sql)
 
+    def test_notification_state_and_bookable_class_migrations_are_additive(self):
+        self.assertIn("0033_admin_notification_state", MIGRATION_BASELINE_REQUIREMENTS)
+        self.assertIn("0034_bookable_zoom_classes", MIGRATION_BASELINE_REQUIREMENTS)
+        root = Path(__file__).resolve().parents[1]
+        state_sql = (root / "migrations" / "0033_admin_notification_state.sql").read_text()
+        class_sql = (root / "migrations" / "0034_bookable_zoom_classes.sql").read_text()
+        for sql_text in (state_sql, class_sql):
+            for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
+                self.assertNotIn(destructive, sql_text.upper())
+        self.assertIn("class_bookings_identity_unique", class_sql)
+        self.assertIn("UNIQUE REFERENCES class_bookings", class_sql)
+
     def test_message_delivery_due_indexes_migration_has_exact_sql(self):
         root = Path(__file__).resolve().parents[1]
         migration_sql = (root / "migrations" / "0010_message_delivery_due_indexes.sql").read_text()

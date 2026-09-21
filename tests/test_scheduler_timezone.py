@@ -67,10 +67,10 @@ class SchedulerTimezoneTests(unittest.TestCase):
             main.register_scheduler_jobs_once()
         return scheduler
 
-    def test_scheduler_and_all_cron_timezones_are_explicit_and_job_count_is_eleven(self):
+    def test_scheduler_and_all_cron_timezones_are_explicit_and_job_count_is_twelve(self):
         scheduler = self.registered_scheduler()
         jobs = scheduler.get_jobs()
-        self.assertEqual(len(jobs), 11)
+        self.assertEqual(len(jobs), 12)
         self.assertEqual(str(scheduler.timezone), "UTC")
         by_func = {job.func: job for job in jobs}
         self.assertEqual(str(by_func[main.send_weekly_admin_report].trigger.timezone), "Europe/Moscow")
@@ -131,6 +131,7 @@ class SchedulerTimezoneTests(unittest.TestCase):
             main.scheduled_process_message_deliveries: "minute='*/5'",
             main.scheduled_enqueue_first_purchase_recovery_reminders: "minute='45'",
             main.scheduled_apply_reserved_gifts: "minute='20'",
+            main.scheduled_process_bookable_class_deadlines: "minute='*/5'",
             main.scheduled_cleanup_stale_postgres_fsm_storage: "hour='4', minute='10'",
             main.send_weekly_admin_report: "day_of_week='mon', hour='10', minute='0'",
         }

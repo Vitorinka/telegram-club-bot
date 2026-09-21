@@ -108,7 +108,7 @@
       <nav id="content-editor-menu" class="card studio-editor-menu" aria-label="Действия с материалом" hidden><button id="content-menu-preview" type="button">Предпросмотр</button><button id="content-menu-history" type="button">История изменений</button><button id="content-menu-technical" type="button">Техническая информация</button></nav>
       <div id="content-details-content" class="dashboard"></div>
       <div id="content-studio-tabs" class="studio-mobile-tabs"><button class="active" data-studio-panel="editor" type="button">Редактор</button><button data-studio-panel="preview" type="button">Предпросмотр</button></div>
-      <div id="content-studio-workspace" class="studio-workspace"><article id="content-edit-card" class="card studio-editor" hidden>
+      <div id="content-studio-workspace" class="studio-workspace"><aside id="content-editor-library" class="card studio-editor-library"><header><strong>Материалы</strong><button id="content-editor-new" class="secondary" type="button">+</button></header><div id="content-editor-library-list" class="studio-editor-library-list"></div></aside><article id="content-edit-card" class="card studio-editor" hidden>
         <h2>Редактировать черновик</h2>
         <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
         <input id="content-edit-category" type="hidden">
@@ -121,7 +121,7 @@
         </label>
         <p id="content-edit-message" class="hint"></p>
         <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button></div>
-      </article><aside id="content-live-preview" class="card studio-preview"><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
+      </article><aside id="content-live-preview" class="card studio-preview"><nav id="content-preview-modes" class="studio-preview-modes"><button class="active" type="button" data-preview-mode="lesson">Страница урока</button><button type="button" data-preview-mode="club">В клубе</button><button type="button" data-preview-mode="library">В библиотеке</button><button type="button" data-preview-mode="mobile">На мобильном</button></nav><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
       <button id="content-create-revision" type="button" hidden>Редактировать</button>
       <article id="content-recipe-card" class="card" hidden>
         <h2>Рецепт</h2>
@@ -298,6 +298,20 @@
       <div id="failed-subscription-details-content" class="dashboard"></div>
     </section>
     <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
+      <article class="card class-calendar-admin">
+        <header class="section-heading"><div><p class="eyebrow">Живой календарь</p><h2>Zoom-занятия</h2></div><button id="class-create-toggle" type="button">+ Создать занятие</button></header>
+        <form id="class-create-form" class="class-create-form" hidden>
+          <label>Название <input id="class-title" maxlength="120" required></label>
+          <label>Описание <textarea id="class-description" maxlength="5000"></textarea></label>
+          <div class="class-form-grid"><label>Дата и время <input id="class-start" type="datetime-local" required></label><label>Длительность, мин <input id="class-duration" type="number" min="5" max="480" value="60" required></label></div>
+          <label>Zoom URL <input id="class-zoom-url" type="url" inputmode="url" placeholder="https://zoom.us/j/…" required></label>
+          <div class="class-form-grid"><label>Цена, € <input id="class-price" type="number" min="1" step="0.01" value="10.00" required></label><label>Мест <input id="class-capacity" type="number" min="1" max="500" value="12" required></label><label>Минимум участников <input id="class-minimum" type="number" min="1" value="3" required></label></div>
+          <label>Бронирование до <input id="class-deadline" type="datetime-local" required></label>
+          <p id="class-create-message" class="hint">Занятие создаётся как черновик. Оплата — отдельный one-time Stripe Checkout.</p>
+          <div class="action-row"><button type="submit">Сохранить черновик</button><button id="class-create-cancel" class="secondary" type="button">Отмена</button></div>
+        </form>
+        <div id="class-calendar-list" class="class-calendar-list"></div>
+      </article>
       <article class="card schedule-toolbar">
         <h2 id="schedule-heading">Расписание</h2>
         <p class="hint">В проекте расписание хранится как одна опубликованная картинка на месяц.</p>
@@ -404,8 +418,8 @@
     </section>
     <section id="notifications-screen" class="screen page admin-insight-page" data-screen="notifications" hidden>
       <header class="admin-page-heading"><div><p class="eyebrow">Центр внимания</p><h1>Уведомления</h1><p>Прочтение не меняет статус исходной проблемы.</p></div></header>
-      <div class="summary-grid"><div><span>Требуют внимания</span><strong id="notifications-current">—</strong></div><div><span>Непрочитанные</span><strong id="notifications-unread">—</strong></div><div><span>Сегодня</span><strong id="notifications-today">—</strong></div><div><span>Решённые</span><strong title="История resolved пока не агрегируется">—</strong></div></div>
-      <div class="card notification-center-toolbar"><select id="notifications-category" aria-label="Тип уведомления"><option value="all">Все категории</option><option value="failed">Оплаты и продления</option><option value="delivery">Доставка сообщений</option><option value="gift">Подарки</option><option value="system">Система</option></select><select id="notifications-read-filter" aria-label="Статус прочтения"><option value="all">Все</option><option value="unread">Непрочитанные</option><option value="read">Прочитанные</option></select></div>
+      <div class="summary-grid"><div><span>Требуют внимания</span><strong id="notifications-current">—</strong></div><div><span>Непрочитанные</span><strong id="notifications-unread">—</strong></div><div><span>Сегодня</span><strong id="notifications-today">—</strong></div><div><span>Решённые</span><strong id="notifications-resolved">—</strong></div></div>
+      <div class="card notification-center-toolbar"><select id="notifications-category" aria-label="Тип уведомления"><option value="all">Все категории</option><option value="failed">Оплаты и продления</option><option value="delivery">Доставка сообщений</option><option value="gift">Подарки</option><option value="system">Система</option></select><select id="notifications-read-filter" aria-label="Статус прочтения"><option value="all">Все</option><option value="unread">Непрочитанные</option><option value="read">Прочитанные</option></select><select id="notifications-resolution-filter" aria-label="Статус решения"><option value="unresolved">Нерешённые</option><option value="resolved">Решённые</option><option value="all">Все</option></select><button id="notifications-mark-all-read" class="secondary" type="button">Прочитать все</button></div>
       <div id="notifications-page-list" class="notification-center-list"></div><button id="notifications-page-more" type="button" hidden>Показать ещё</button>
     </section>
     <section id="settings-screen" class="screen page admin-insight-page" data-screen="settings" hidden>

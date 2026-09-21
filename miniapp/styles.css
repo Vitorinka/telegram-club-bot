@@ -659,6 +659,36 @@ body.member-preview-mode .member-admin-create[hidden] { display: none; }
   .dashboard-more { display: block; }
 }
 
+/* Product pass: compact bookable calendar and notification workflows. */
+.notification-center-item { display:grid; grid-template-columns:minmax(0,1fr) repeat(3,auto); gap:8px; align-items:center; }
+.notification-center-item.read { background:#f7f8f5; }
+.class-calendar-admin { position:relative; overflow:hidden; }
+.class-calendar-admin::after { content:""; position:absolute; right:-32px; top:-42px; width:130px; height:160px; opacity:.055; background:linear-gradient(65deg,transparent 48%,#165f55 49% 51%,transparent 52%); pointer-events:none; }
+.class-create-form { display:grid; gap:12px; margin:14px 0; padding:15px; border:1px solid #e2e7e2; border-radius:12px; background:#fbfcf9; }
+.class-form-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+.class-calendar-list { display:grid; gap:8px; margin-top:12px; }
+.class-calendar-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:9px; align-items:center; padding:10px 11px; border:1px solid #e4e8e4; border-radius:10px; background:#fff; }
+.class-calendar-row div { display:grid; gap:3px; }.class-calendar-row small { color:#687471; }
+.member-class-card { display:grid; gap:12px; }.member-class-card .badges { display:flex; flex-wrap:wrap; gap:6px; }
+.studio-editor-library { display:none; min-width:0; padding:10px; }
+.studio-editor-library > header { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.studio-editor-library-list { display:grid; gap:4px; max-height:calc(100vh - 180px); overflow:auto; }
+.studio-editor-library-item { min-height:52px; display:grid; gap:3px; margin:0; padding:8px 9px; border:1px solid transparent; border-radius:9px; background:transparent; color:#20302e; text-align:left; }
+.studio-editor-library-item small { color:#73807d; font-size:10px; }.studio-editor-library-item.active { border-color:#bdd8d2; background:#eef7f4; }
+.studio-preview-modes { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:3px; margin:-4px -4px 10px; }
+.studio-preview-modes button { min-height:34px; margin:0; padding:5px; border-radius:7px; background:#f4f5f2; color:#63706d; font-size:9px; }
+.studio-preview-modes button.active { background:#dff0eb; color:#0b625d; }
+@media (min-width:1180px) {
+  body:not(.member-preview-mode) .studio-workspace { grid-template-columns:minmax(190px,240px) minmax(430px,1fr) minmax(320px,390px); align-items:start; }
+  body:not(.member-preview-mode) .studio-editor-library { display:block; position:sticky; top:22px; }
+}
+@media (max-width:720px) {
+  .class-form-grid { grid-template-columns:1fr; }
+  .class-calendar-row { grid-template-columns:1fr auto; }
+  .notification-center-item { grid-template-columns:1fr 1fr; }
+  .notification-center-item .admin-notification-open { grid-column:1/-1; }
+}
+
 /* Natalia_SoulFit admin information architecture */
 body:not(.member-preview-mode) .admin-page-heading {
   display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 18px;

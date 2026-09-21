@@ -69,6 +69,7 @@ from admin_notification_acknowledgements import (
     AdminNotificationAcknowledgementError,
     acknowledge_admin_notification,
     list_admin_notification_acknowledgements,
+    update_admin_notification_state,
 )
 from admin_analytics import (
     AdminAnalyticsQueryError,
@@ -104,6 +105,17 @@ from db_backup_stream import (
     create_streaming_encrypted_backup,
     redact_backup_process_error,
     verify_pg_dump_without_file,
+)
+from bookable_classes import (
+    BookableClassError,
+    apply_booking_checkout_completed,
+    cancel_underfilled_classes,
+    create_admin_class,
+    list_admin_classes,
+    list_member_classes,
+    mark_booking_checkout_open,
+    prepare_class_booking,
+    update_admin_class_status,
 )
 from failed_subscription_termination import (
     RETRYABLE_STATUSES as FAILED_TERMINATION_RETRYABLE_STATUSES,
@@ -16994,6 +17006,32 @@ async def stripe_webhook(request):
         if event_type == 'checkout.session.completed':
             session = event_object
             gift_metadata = stripe_value(session, "metadata") or {}
+            if stripe_value(gift_metadata, "payment_kind") == "class_booking":
+                booking_conn = get_db_conn(); booking_cur = booking_conn.cursor()
+                try:
+                    normalized_session = {
+                        "id": stripe_value(session, "id"),
+                        "metadata": gift_metadata,
+                        "amount_total": stripe_value(session, "amount_total"),
+                        "currency": stripe_value(session, "currency"),
+                        "payment_status": stripe_value(session, "payment_status"),
+                        "payment_intent": stripe_object_id(stripe_value(session, "payment_intent")),
+                    }
+                    apply_booking_checkout_completed(booking_cur, normalized_session)
+                    booking_conn.commit()
+                except Exception:
+                    booking_conn.rollback()
+                    await release_event_processing(event_id, claim_generation)
+                    logging.exception(
+                        "CLASS_BOOKING_CHECKOUT_FAILED: event_id=%s booking=%s",
+                        safe_log_id(event_id),
+                        safe_log_id(stripe_value(gift_metadata, "booking_id")),
+                    )
+                    return web.Response(status=500)
+                finally:
+                    booking_cur.close(); booking_conn.close()
+                await mark_event_processed(event_id, claim_generation)
+                return web.Response(status=200)
             if stripe_value(gift_metadata, "payment_kind") == GIFT_PAYMENT_KIND:
                 gift_id = stripe_value(gift_metadata, "gift_id")
                 session_id = stripe_value(session, "id")
@@ -19962,6 +20000,89 @@ async def stripe_webhook(request):
 
         elif event_type in ("charge.refunded", "refund.created", "refund.updated"):
             refund_object = event_object
+            refund_metadata = stripe_value(refund_object, "metadata") or {}
+            if (
+                event_type in ("refund.created", "refund.updated")
+                and stripe_value(refund_metadata, "payment_kind") == "class_booking_refund"
+            ):
+                class_refund_conn = get_db_conn()
+                class_refund_cur = class_refund_conn.cursor()
+                try:
+                    booking_id = str(uuid.UUID(str(
+                        stripe_value(refund_metadata, "booking_id")
+                    )))
+                    refund_id = stripe_value(refund_object, "id")
+                    payment_intent_id = stripe_object_id(
+                        stripe_value(refund_object, "payment_intent")
+                    )
+                    refund_status = stripe_value(refund_object, "status")
+                    class_refund_cur.execute(
+                        """
+                        SELECT operation_id,stripe_payment_intent_id,status
+                        FROM class_refund_operations
+                        WHERE booking_id=%s FOR UPDATE
+                        """, (booking_id,),
+                    )
+                    refund_operation = class_refund_cur.fetchone()
+                    if (
+                        not refund_operation
+                        or not refund_id
+                        or not payment_intent_id
+                        or payment_intent_id != refund_operation[1]
+                    ):
+                        raise ValueError("class_booking_refund_identity_mismatch")
+                    if refund_status == "succeeded":
+                        class_refund_cur.execute(
+                            """
+                            UPDATE class_refund_operations
+                            SET status='completed',stripe_refund_id=%s,
+                                completed_at=COALESCE(completed_at,NOW()),
+                                owner_id=NULL,lease_until=NULL,last_error=NULL,
+                                updated_at=NOW()
+                            WHERE operation_id=%s
+                            """, (refund_id, refund_operation[0]),
+                        )
+                        class_refund_cur.execute(
+                            """
+                            UPDATE class_bookings
+                            SET status='refunded',refunded_at=COALESCE(refunded_at,NOW()),
+                                updated_at=NOW()
+                            WHERE booking_id=%s
+                              AND status IN ('paid','manual_review')
+                            """, (booking_id,),
+                        )
+                    elif refund_status == "failed":
+                        class_refund_cur.execute(
+                            """
+                            UPDATE class_refund_operations
+                            SET status='manual_review',stripe_refund_id=%s,
+                                owner_id=NULL,lease_until=NULL,
+                                last_error='stripe_refund_failed',updated_at=NOW()
+                            WHERE operation_id=%s AND status<>'completed'
+                            """, (refund_id, refund_operation[0]),
+                        )
+                    else:
+                        class_refund_cur.execute(
+                            """
+                            UPDATE class_refund_operations
+                            SET stripe_refund_id=COALESCE(stripe_refund_id,%s),
+                                updated_at=NOW()
+                            WHERE operation_id=%s AND status<>'completed'
+                            """, (refund_id, refund_operation[0]),
+                        )
+                    class_refund_conn.commit()
+                except Exception:
+                    class_refund_conn.rollback()
+                    await release_event_processing(event_id, claim_generation)
+                    logging.exception(
+                        "CLASS_BOOKING_REFUND_WEBHOOK_FAILED: event_id=%s",
+                        safe_log_id(event_id),
+                    )
+                    return web.Response(status=500)
+                finally:
+                    class_refund_cur.close(); class_refund_conn.close()
+                await mark_event_processed(event_id, claim_generation)
+                return web.Response(status=200)
             payment_intent = gift_refund_amount_from_event(event_type, refund_object)[0]
             if payment_intent:
                 conn = get_db_conn()
@@ -20068,6 +20189,41 @@ async def stripe_webhook(request):
         elif event_type in ('checkout.session.expired', 'checkout.session.async_payment_failed'):
             session = event_object
             gift_metadata = stripe_value(session, "metadata") or {}
+            if stripe_value(gift_metadata, "payment_kind") == "class_booking":
+                class_checkout_conn = get_db_conn()
+                class_checkout_cur = class_checkout_conn.cursor()
+                try:
+                    booking_id = str(uuid.UUID(str(
+                        stripe_value(gift_metadata, "booking_id")
+                    )))
+                    session_id = stripe_value(session, "id")
+                    if not session_id:
+                        raise ValueError("class_booking_session_missing")
+                    class_checkout_cur.execute(
+                        """
+                        UPDATE class_bookings
+                        SET status='pending',stripe_checkout_session_id=NULL,
+                            checkout_url=NULL,checkout_expires_at=NULL,
+                            checkout_generation=checkout_generation+1,
+                            updated_at=NOW()
+                        WHERE booking_id=%s AND status='checkout_open'
+                          AND stripe_checkout_session_id=%s
+                        RETURNING booking_id
+                        """, (booking_id, session_id),
+                    )
+                    class_checkout_conn.commit()
+                except Exception:
+                    class_checkout_conn.rollback()
+                    await release_event_processing(event_id, claim_generation)
+                    logging.exception(
+                        "CLASS_BOOKING_CHECKOUT_TERMINAL_FAILED: event_id=%s",
+                        safe_log_id(event_id),
+                    )
+                    return web.Response(status=500)
+                finally:
+                    class_checkout_cur.close(); class_checkout_conn.close()
+                await mark_event_processed(event_id, claim_generation)
+                return web.Response(status=200)
             if stripe_value(gift_metadata, "payment_kind") == GIFT_PAYMENT_KIND:
                 gift_id = stripe_value(gift_metadata, "gift_id")
                 session_id = stripe_value(session, "id")
@@ -23327,6 +23483,100 @@ async def scheduled_apply_reserved_gifts():
     )
 
 
+async def process_bookable_class_deadlines(limit=50):
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        enqueued = cancel_underfilled_classes(cur)
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+    processed = 0; retryable = 0
+    for _index in range(max(1, min(int(limit), 100))):
+        claim_conn = get_db_conn(); claim_cur = claim_conn.cursor()
+        try:
+            claim_cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT operation_id FROM class_refund_operations
+                    WHERE status IN ('pending','retryable_failed')
+                       OR (status='processing' AND lease_until <= NOW())
+                    ORDER BY created_at,operation_id
+                    FOR UPDATE SKIP LOCKED LIMIT 1
+                )
+                UPDATE class_refund_operations operation
+                SET status='processing',owner_id=%s,lease_until=NOW()+INTERVAL '10 minutes',
+                    claim_generation=claim_generation+1,attempt_count=attempt_count+1,
+                    updated_at=NOW()
+                FROM candidate WHERE operation.operation_id=candidate.operation_id
+                RETURNING operation.operation_id,operation.booking_id,
+                          operation.stripe_payment_intent_id,operation.claim_generation
+                """, (OWNER_ID,),
+            )
+            claimed = claim_cur.fetchone(); claim_conn.commit()
+        except Exception:
+            claim_conn.rollback(); raise
+        finally:
+            claim_cur.close(); claim_conn.close()
+        if not claimed: break
+        operation_id, booking_id, payment_intent_id, generation = claimed
+        try:
+            refund = await asyncio.to_thread(
+                stripe.Refund.create,
+                payment_intent=payment_intent_id,
+                idempotency_key=f"class-booking-refund:{booking_id}",
+                metadata={"payment_kind":"class_booking_refund","booking_id":str(booking_id)},
+            )
+            if stripe_value(refund, "status") != "succeeded":
+                raise RuntimeError("class_booking_refund_not_succeeded")
+            finish_conn = get_db_conn(); finish_cur = finish_conn.cursor()
+            try:
+                finish_cur.execute(
+                    """
+                    UPDATE class_refund_operations SET status='completed',
+                        stripe_refund_id=%s,completed_at=NOW(),updated_at=NOW(),
+                        owner_id=NULL,lease_until=NULL,last_error=NULL
+                    WHERE operation_id=%s AND owner_id=%s AND claim_generation=%s
+                      AND status='processing'
+                    """, (stripe_value(refund,"id"),operation_id,OWNER_ID,generation),
+                )
+                if finish_cur.rowcount != 1:
+                    finish_conn.rollback(); continue
+                finish_cur.execute(
+                    """
+                    UPDATE class_bookings SET status='refunded',refunded_at=NOW(),updated_at=NOW()
+                    WHERE booking_id=%s AND status='paid'
+                    """, (booking_id,),
+                )
+                finish_conn.commit(); processed += 1
+            finally:
+                finish_cur.close(); finish_conn.close()
+        except Exception as error:
+            fail_conn = get_db_conn(); fail_cur = fail_conn.cursor()
+            try:
+                fail_cur.execute(
+                    """
+                    UPDATE class_refund_operations SET status='retryable_failed',
+                        owner_id=NULL,lease_until=NULL,last_error=%s,updated_at=NOW()
+                    WHERE operation_id=%s AND owner_id=%s AND claim_generation=%s
+                      AND status='processing'
+                    """, (mask_secret_text(str(error))[:500],operation_id,OWNER_ID,generation),
+                )
+                fail_conn.commit(); retryable += 1
+            finally:
+                fail_cur.close(); fail_conn.close()
+    return {"classes_cancelled": len(enqueued), "refunds_completed": processed, "refunds_retryable": retryable}
+
+
+async def scheduled_process_bookable_class_deadlines():
+    return await run_scheduled_with_lock(
+        "process_bookable_class_deadlines", five_minute_schedule_slot(),
+        process_bookable_class_deadlines, lease_minutes=20,
+    )
+
+
 def register_scheduler_jobs_once():
     global SCHEDULER_JOBS_REGISTERED
     if SCHEDULER_JOBS_REGISTERED:
@@ -23413,6 +23663,12 @@ def register_scheduler_jobs_once():
         misfire_grace_time=300,
         coalesce=True,
         max_instances=1
+    )
+
+    scheduler.add_job(
+        scheduled_process_bookable_class_deadlines,
+        'cron', minute='*/5', misfire_grace_time=300,
+        coalesce=True, max_instances=1,
     )
 
     scheduler.add_job(
@@ -23654,7 +23910,67 @@ async def miniapp_member_schedule(request):
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SELECT EXISTS(SELECT 1 FROM club_schedules WHERE schedule_month=%s)",(month,)); exists=bool(cur.fetchone()[0]); conn.rollback()
     finally: cur.close(); conn.close()
-    return apply_miniapp_security_headers(web.json_response({"schedule_month":month,"has_schedule":exists,"join_url":None}))
+    classes = list_member_classes(
+        get_db_conn, request["miniapp_member"].telegram_id
+    )
+    return apply_miniapp_security_headers(web.json_response({
+        "schedule_month":month,"has_schedule":exists,"join_url":None,
+        "classes": classes["items"],
+    }))
+
+
+def bookable_class_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status,
+    ))
+
+
+async def miniapp_member_class_booking(request):
+    session = request["miniapp_member"]
+    try:
+        booking = prepare_class_booking(
+            get_db_conn, session.telegram_id, request.match_info.get("class_id")
+        )
+        if (
+            booking.get("status") == "checkout_open"
+            and booking.get("checkout_url")
+            and booking.get("checkout_expires_at")
+            and datetime.fromisoformat(booking["checkout_expires_at"]) > datetime.utcnow()
+        ):
+            return apply_miniapp_security_headers(web.json_response(booking))
+        checkout = await asyncio.to_thread(
+            stripe.checkout.Session.create,
+            idempotency_key=(
+                f"class-booking:{booking['booking_id']}:"
+                f"{booking['checkout_generation']}"
+            ),
+            mode="payment",
+            payment_method_types=["card"],
+            line_items=[{"price_data": {
+                "currency": booking["currency"],
+                "unit_amount": booking["amount"],
+                "product_data": {"name": "Natalia_SoulFit · Zoom-занятие"},
+            }, "quantity": 1}],
+            success_url="https://t.me/Natalia_SoulFit_bot",
+            cancel_url="https://t.me/Natalia_SoulFit_bot",
+            client_reference_id=str(session.telegram_id),
+            metadata={
+                "payment_kind": "class_booking",
+                "booking_id": booking["booking_id"],
+                "class_id": str(request.match_info.get("class_id")),
+                "telegram_id": str(session.telegram_id),
+            },
+        )
+        mark_booking_checkout_open(
+            get_db_conn, booking["booking_id"], checkout.id, checkout.url,
+            datetime.utcfromtimestamp(int(checkout.expires_at))
+            if getattr(checkout, "expires_at", None) else None,
+        )
+        return apply_miniapp_security_headers(web.json_response({
+            **booking, "status": "checkout_open", "checkout_url": checkout.url,
+        }, status=201))
+    except BookableClassError as error:
+        return bookable_class_error_response(error)
 
 async def miniapp_member_media(request):
     session=request["miniapp_member"]
@@ -23747,9 +24063,16 @@ async def miniapp_admin_notification_acknowledge(request):
         body = await request.json()
         if not isinstance(body, dict):
             raise AdminNotificationAcknowledgementError("invalid_request")
-        result = acknowledge_admin_notification(
-            get_db_conn, session.telegram_id, body.get("notification_key")
-        )
+        action = body.get("action", "read")
+        if action == "read":
+            result = acknowledge_admin_notification(
+                get_db_conn, session.telegram_id, body.get("notification_key")
+            )
+        else:
+            result = update_admin_notification_state(
+                get_db_conn, session.telegram_id,
+                body.get("notification_key"), action,
+            )
     except (json.JSONDecodeError, UnicodeDecodeError, AdminNotificationAcknowledgementError) as error:
         category = getattr(error, "category", "invalid_request")
         status_code = getattr(error, "status", 400)
@@ -25026,6 +25349,38 @@ async def miniapp_admin_schedule(request):
     return apply_miniapp_security_headers(web.json_response(result))
 
 
+async def miniapp_admin_classes(request):
+    if request.method == "GET":
+        return apply_miniapp_security_headers(web.json_response(
+            list_admin_classes(get_db_conn)
+        ))
+    try:
+        payload = await request.json()
+        result = create_admin_class(
+            get_db_conn, request["miniapp_admin"].telegram_id, payload
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return bookable_class_error_response(BookableClassError("invalid_request"))
+    except BookableClassError as error:
+        return bookable_class_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
+async def miniapp_admin_class_status(request):
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise BookableClassError("invalid_request")
+        result = update_admin_class_status(
+            get_db_conn, request.match_info.get("class_id"), payload.get("status")
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return bookable_class_error_response(BookableClassError("invalid_request"))
+    except BookableClassError as error:
+        return bookable_class_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_schedule_details(request):
     try:
         details = get_admin_schedule_details(
@@ -25671,6 +26026,8 @@ def create_app():
         app.router.add_get('/api/member/categories',miniapp_member_categories)
     if not _route_exists(app,"GET","/api/member/schedule"):
         app.router.add_get('/api/member/schedule',miniapp_member_schedule)
+    if not _route_exists(app,"POST","/api/member/classes/{class_id}/book"):
+        app.router.add_post('/api/member/classes/{class_id}/book',miniapp_member_class_booking)
     if not _route_exists(app,"GET","/api/member/content"):
         app.router.add_get('/api/member/content',miniapp_member_content_list)
     if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
@@ -25845,6 +26202,12 @@ def create_app():
         )
     if not _route_exists(app, "GET", "/api/admin/schedule"):
         app.router.add_get('/api/admin/schedule', miniapp_admin_schedule)
+    if not _route_exists(app, "GET", "/api/admin/classes"):
+        app.router.add_get('/api/admin/classes', miniapp_admin_classes)
+    if not _route_exists(app, "POST", "/api/admin/classes"):
+        app.router.add_post('/api/admin/classes', miniapp_admin_classes)
+    if not _route_exists(app, "PATCH", "/api/admin/classes/{class_id}/status"):
+        app.router.add_patch('/api/admin/classes/{class_id}/status', miniapp_admin_class_status)
     if not _route_exists(app, "POST", "/api/admin/schedule/upload-preview"):
         app.router.add_post(
             '/api/admin/schedule/upload-preview',

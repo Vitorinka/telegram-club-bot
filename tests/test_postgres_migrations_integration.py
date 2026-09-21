@@ -62,6 +62,16 @@ from admin_content import list_admin_content
 from admin_notification_acknowledgements import (
     acknowledge_admin_notification,
     list_admin_notification_acknowledgements,
+    update_admin_notification_state,
+)
+from bookable_classes import (
+    apply_booking_checkout_completed,
+    cancel_underfilled_classes,
+    create_admin_class,
+    list_admin_classes,
+    list_member_classes,
+    mark_booking_checkout_open,
+    prepare_class_booking,
 )
 from content_cms import (
     ContentCmsError,
@@ -357,14 +367,21 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.query_one("SELECT COUNT(*) FROM admin_notification_acknowledgements")[0], 2
         )
-        self.assertEqual(
-            list_admin_notification_acknowledgements(self.get_conn, 101),
-            {"notification_keys": ["failed:operation-1"]},
-        )
-        self.assertEqual(
-            list_admin_notification_acknowledgements(self.get_conn, 202),
-            {"notification_keys": ["failed:operation-1"]},
-        )
+        for admin_id in (101, 202):
+            acknowledgement = list_admin_notification_acknowledgements(
+                self.get_conn, admin_id
+            )
+            self.assertEqual(
+                acknowledgement["notification_keys"], ["failed:operation-1"]
+            )
+            self.assertEqual(len(acknowledgement["states"]), 1)
+            self.assertEqual(
+                acknowledgement["states"][0]["notification_key"],
+                "failed:operation-1",
+            )
+            self.assertIsNotNone(acknowledgement["states"][0]["read_at"])
+            self.assertIsNone(acknowledgement["states"][0]["resolved_at"])
+            self.assertIsNone(acknowledgement["states"][0]["archived_at"])
         self.assertEqual(
             self.query_one("SELECT paid, auto_renew FROM users WHERE telegram_id=91001"), before
         )
@@ -830,8 +847,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 33,
-            "latest": "0032_admin_notification_acknowledgements",
+            "count": 35,
+            "latest": "0034_bookable_zoom_classes",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2315,7 +2332,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 33)
+        self.assertEqual(len(migrations), 35)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -12944,10 +12961,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         removal_incident = system["removals"]["latest_retryable_incident"]
         self.assertTrue(removal_incident.startswith("removal:"))
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 33)
+        self.assertEqual(system["migrations"]["count"], 35)
         self.assertEqual(
             system["migrations"]["latest"],
-            "0032_admin_notification_acknowledgements",
+            "0034_bookable_zoom_classes",
         )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
@@ -13958,6 +13975,137 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (Path(tmp) / "0001_drop.sql").write_text("DROP TABLE users;", encoding="utf-8")
             with self.assertRaisesRegex(MigrationError, "Destructive SQL"):
                 run_migrations(self.get_conn, migrations_dir=tmp)
+
+    def test_notification_read_resolve_reopen_archive_are_orthogonal_real_postgres(self):
+        run_migrations(self.get_conn)
+        key = "system:scheduler:test-run-state"
+        resolved = update_admin_notification_state(self.get_conn, 101, key, "resolve")
+        self.assertIsNotNone(resolved["read_at"])
+        self.assertIsNotNone(resolved["resolved_at"])
+        self.assertIsNone(resolved["archived_at"])
+        reopened = update_admin_notification_state(self.get_conn, 101, key, "reopen")
+        self.assertIsNotNone(reopened["read_at"])
+        self.assertIsNone(reopened["resolved_at"])
+        archived = update_admin_notification_state(self.get_conn, 101, key, "archive")
+        self.assertIsNotNone(archived["archived_at"])
+        state = list_admin_notification_acknowledgements(self.get_conn, 101)
+        projected = next(item for item in state["states"] if item["notification_key"] == key)
+        self.assertIsNone(projected["resolved_at"])
+        self.assertIsNotNone(projected["archived_at"])
+
+    def test_bookable_class_payment_confirmation_and_underfilled_refund_queue_real_postgres(self):
+        run_migrations(self.get_conn)
+        for telegram_id in (91001, 91002, 91003, 91004, 91005, 91006):
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE) ON CONFLICT DO NOTHING", (telegram_id,))
+                conn.commit()
+            finally:
+                conn.close()
+        now = datetime.utcnow()
+        created = create_admin_class(self.get_conn, 101, {
+            "title":"Zoom test", "description":"Safe one-time booking",
+            "starts_at":(now+timedelta(days=2)).isoformat(),
+            "booking_deadline":(now+timedelta(days=1)).isoformat(),
+            "duration_minutes":60, "zoom_url":"https://zoom.us/j/123",
+            "price_amount":1000, "capacity":3, "minimum_participants":3,
+        })
+        class_id = created["class_id"]
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bookable_classes SET status='open' WHERE class_id=%s", (class_id,))
+            conn.commit()
+        finally: conn.close()
+        bookings = [
+            prepare_class_booking(self.get_conn, telegram_id, class_id)
+            for telegram_id in (91001, 91002, 91003, 91004)
+        ]
+        for index, booking in enumerate(bookings, start=1):
+            session_id = f"cs_class_{index}"
+            mark_booking_checkout_open(self.get_conn, booking["booking_id"], session_id, "https://checkout.stripe.test", now+timedelta(hours=1))
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur:
+                    result = apply_booking_checkout_completed(cur, {
+                        "id":session_id,"metadata":{"payment_kind":"class_booking","booking_id":booking["booking_id"]},
+                        "amount_total":1000,"currency":"eur","payment_status":"paid","payment_intent":f"pi_class_{index}",
+                    })
+                conn.commit()
+            finally: conn.close()
+            self.assertEqual(result["status"], "paid" if index <= 3 else "refund_pending")
+        admin_item = next(item for item in list_admin_classes(self.get_conn)["items"] if item["class_id"] == class_id)
+        self.assertEqual(admin_item["status"], "confirmed")
+        member_item = next(item for item in list_member_classes(self.get_conn, 91001)["items"] if item["class_id"] == class_id)
+        self.assertEqual(member_item["zoom_url"], "https://zoom.us/j/123")
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM class_bookings WHERE class_id=%s AND status='paid'",
+            (class_id,),
+        )[0], 3)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM class_refund_operations operation "
+            "JOIN class_bookings booking ON booking.booking_id=operation.booking_id "
+            "WHERE booking.class_id=%s AND operation.status='pending'",
+            (class_id,),
+        )[0], 1)
+
+        underfilled = create_admin_class(self.get_conn, 101, {
+            "title":"Underfilled", "starts_at":(now+timedelta(hours=2)).isoformat(),
+            "booking_deadline":(now+timedelta(hours=1)).isoformat(),
+            "duration_minutes":60, "zoom_url":"https://zoom.us/j/456",
+            "price_amount":1000, "capacity":10, "minimum_participants":3,
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bookable_classes SET status='open' WHERE class_id=%s", (underfilled["class_id"],))
+            conn.commit()
+        finally: conn.close()
+        underfilled_booking = prepare_class_booking(self.get_conn, 91005, underfilled["class_id"])
+        mark_booking_checkout_open(
+            self.get_conn, underfilled_booking["booking_id"], "cs_underfilled",
+            "https://checkout.stripe.test/underfilled", now+timedelta(hours=1),
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                apply_booking_checkout_completed(cur, {
+                    "id":"cs_underfilled","metadata":{"payment_kind":"class_booking","booking_id":underfilled_booking["booking_id"]},
+                    "amount_total":1000,"currency":"eur","payment_status":"paid","payment_intent":"pi_underfilled",
+                })
+                cur.execute(
+                    "UPDATE bookable_classes SET booking_deadline=NOW()-INTERVAL '1 minute' WHERE class_id=%s",
+                    (underfilled["class_id"],),
+                )
+                queued = cancel_underfilled_classes(cur)
+            conn.commit()
+        finally: conn.close()
+        self.assertEqual(queued, [underfilled_booking["booking_id"]])
+        self.assertEqual(self.query_one("SELECT status FROM bookable_classes WHERE class_id=%s", (underfilled["class_id"],))[0], "cancelled")
+
+        retry_class = create_admin_class(self.get_conn, 101, {
+            "title":"Checkout retry", "starts_at":(now+timedelta(days=3)).isoformat(),
+            "booking_deadline":(now+timedelta(days=2)).isoformat(),
+            "duration_minutes":60, "zoom_url":"https://zoom.us/j/789",
+            "price_amount":1000, "capacity":10, "minimum_participants":3,
+        })
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE bookable_classes SET status='open' WHERE class_id=%s", (retry_class["class_id"],))
+            conn.commit()
+        finally: conn.close()
+        first_attempt = prepare_class_booking(self.get_conn, 91006, retry_class["class_id"])
+        mark_booking_checkout_open(
+            self.get_conn, first_attempt["booking_id"], "cs_expired",
+            "https://checkout.stripe.test/expired", now-timedelta(minutes=1),
+        )
+        second_attempt = prepare_class_booking(self.get_conn, 91006, retry_class["class_id"])
+        self.assertEqual(second_attempt["booking_id"], first_attempt["booking_id"])
+        self.assertEqual(second_attempt["checkout_generation"], first_attempt["checkout_generation"] + 1)
+        self.assertEqual(second_attempt["status"], "pending")
+        self.assertIsNone(second_attempt["stripe_checkout_session_id"])
 
 
 if __name__ == "__main__":
