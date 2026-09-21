@@ -24,7 +24,10 @@ class FakeCursor:
             self.fetchone_row = (self.database[(admin_id, key)],)
         elif "SELECT notification_key" in query:
             admin_id = params[0]
-            self.rows = [(key,) for owner, key in sorted(self.database) if owner == admin_id]
+            self.rows = [
+                (key, self.database[(owner, key)], None, None)
+                for owner, key in sorted(self.database) if owner == admin_id
+            ]
 
     def fetchone(self): return self.fetchone_row
     def fetchall(self): return list(self.rows)
@@ -60,11 +63,21 @@ class AdminNotificationAcknowledgementTests(unittest.TestCase):
         self.assertEqual(len(self.database), 2)
         self.assertEqual(
             list_admin_notification_acknowledgements(self.get_connection, 10),
-            {"notification_keys": ["failed:operation-1"]},
+            {"notification_keys": ["failed:operation-1"], "states": [{
+                "notification_key": "failed:operation-1",
+                "read_at": "2026-09-19T12:00:00",
+                "resolved_at": None,
+                "archived_at": None,
+            }]},
         )
         self.assertEqual(
             list_admin_notification_acknowledgements(self.get_connection, 20),
-            {"notification_keys": ["failed:operation-1"]},
+            {"notification_keys": ["failed:operation-1"], "states": [{
+                "notification_key": "failed:operation-1",
+                "read_at": "2026-09-19T12:00:00",
+                "resolved_at": None,
+                "archived_at": None,
+            }]},
         )
 
     def test_notification_key_validation_is_bounded_and_structured(self):

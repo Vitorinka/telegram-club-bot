@@ -181,6 +181,8 @@
   const scheduleMore = document.getElementById("schedule-more");
   const scheduleDetailsContent = document.getElementById("schedule-details-content");
   const scheduleMetricNodes = document.querySelectorAll("[data-schedule-metric]");
+  const classCalendarList = document.getElementById("class-calendar-list");
+  const classCreateForm = document.getElementById("class-create-form");
   const scheduleUploadMonth = document.getElementById("schedule-upload-month");
   const scheduleUploadFile = document.getElementById("schedule-upload-file");
   const scheduleUploadPreview = document.getElementById("schedule-upload-preview");
@@ -353,6 +355,7 @@
   let memberRecipeItems = [];
   let memberNutritionItems = [];
   let cmsContentStatus = "all";
+  let cmsContentItems = [];
   let studioCoverUrls = [];
   let studioCoverObserver = null;
   let studioCoverGeneration = 0;
@@ -373,6 +376,8 @@
   let adminNotificationDisplayLimit = MAX_NOTIFICATION_PANEL_ITEMS;
   let adminNotificationPageLimit = MAX_NOTIFICATION_PANEL_ITEMS;
   const adminNotificationReadState = new Set();
+  const adminNotificationResolvedState = new Set();
+  const adminNotificationArchivedState = new Set();
   const adminNotificationAckPending = new Set();
   let adminNotificationAckError = "";
 
@@ -957,8 +962,18 @@
     if (realMemberMode) {
       return api("/api/member/schedule").then((data) => {
         clearScheduleImages();
-        renderMemberScheduleEmpty();
-        if (data.has_schedule) {
+        memberScheduleContent.replaceChildren();
+        (data.classes || []).forEach((item) => {
+          const card=document.createElement("article"); card.className="member-card member-class-card";
+          card.append(text("p",new Date(item.starts_at).toLocaleString("ru-RU",{dateStyle:"long",timeStyle:"short"}),"member-kicker"),text("h2",item.title),text("p",item.description || "Онлайн-занятие в Zoom"));
+          const meta=document.createElement("div"); meta.className="badges"; meta.append(text("span",`${item.duration_minutes} мин`,"badge"),text("span",`€${(item.price_amount/100).toFixed(2)}`,"badge"),text("span",`${item.paid_bookings}/${item.capacity} мест`,"badge")); card.append(meta);
+          if(item.zoom_url){ const join=text("a","Открыть Zoom","member-button"); join.href=item.zoom_url; join.rel="noopener noreferrer"; card.append(join); }
+          else if(item.viewer_booking_status === "paid") card.append(text("p",item.status === "confirmed" ? "Ссылка появится перед занятием." : "Ожидаем подтверждения группы.","hint"));
+          else { const book=text("button","Забронировать","member-button"); book.type="button"; book.addEventListener("click",()=>writeMemberJson("POST",`/api/member/classes/${encodeURIComponent(item.class_id)}/book`,{}).then((result)=>{ if(result.checkout_url) webApp.openLink(result.checkout_url); }).catch(showApiError)); card.append(book); }
+          memberScheduleContent.append(card);
+        });
+        if (!(data.classes || []).length) renderMemberScheduleEmpty();
+        if (data.has_schedule && !(data.classes || []).length) {
           memberScheduleContent.querySelector("p").textContent =
             "Расписание на текущий месяц доступно в основном меню бота.";
         }
@@ -1123,6 +1138,17 @@
     return data;
   });
   const writeAdminJson = (method, path, body) => fetch(path, {
+    method,
+    headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
+    body: JSON.stringify(body), cache: "no-store", credentials: "omit",
+  }).then(async (response) => {
+    if (response.status === 401) throw new Error("session_ended");
+    if (response.status === 403) throw new Error("access_revoked");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "api_failed");
+    return data;
+  });
+  const writeMemberJson = (method, path, body) => fetch(path, {
     method,
     headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
     body: JSON.stringify(body), cache: "no-store", credentials: "omit",
@@ -1718,7 +1744,7 @@
   };
   const loadSchedule = (append = false) => {
     status.textContent = "Загружаем расписание…";
-    return api(`/api/admin/schedule?${scheduleParams(append).toString()}`).then((data) => {
+    return Promise.all([api(`/api/admin/schedule?${scheduleParams(append).toString()}`),api("/api/admin/classes")]).then(([data,classes]) => {
       if (!append) {
         clearScheduleImages();
         scheduleList.replaceChildren();
@@ -1736,11 +1762,24 @@
       scheduleMetricNodes.forEach((node) => {
         node.textContent = String(data.summary[node.dataset.scheduleMetric] ?? "—");
       });
+      renderAdminClasses(classes.items || []);
       showScreen("schedule");
       status.textContent = data.items.length
         ? (archive ? "Архив расписаний" : "Расписание клуба")
         : scheduleEmpty.textContent;
     });
+  };
+  const renderAdminClasses = (items) => {
+    classCalendarList.replaceChildren();
+    items.forEach((item)=>{
+      const row=document.createElement("article"); row.className="class-calendar-row";
+      const copy=document.createElement("div"); copy.append(text("strong",item.title),text("small",`${new Date(item.starts_at).toLocaleString("ru-RU")} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`));
+      const state=text("span",({draft:"Черновик",open:"Открыта запись",confirmed:"Подтверждено",cancelled:"Отменено",completed:"Завершено"}[item.status] || item.status),`badge class-${item.status}`); row.append(copy,state);
+      if(item.status === "draft"){ const open=text("button","Открыть запись","secondary"); open.type="button"; open.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"open"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(open); }
+      if(["draft","open","confirmed"].includes(item.status)){ const cancel=text("button","Отменить","secondary"); cancel.type="button"; cancel.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"cancelled"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(cancel); }
+      classCalendarList.append(row);
+    });
+    if(!items.length) classCalendarList.append(text("p","Создайте первое бронируемое Zoom-занятие.","hint"));
   };
   function loadScheduleDetails(scheduleId) {
     status.textContent = "Загружаем расписание…";
@@ -2015,6 +2054,7 @@
       api(`/api/admin/content?${params.toString()}`),
       api(`/api/admin/content/cms?status=${encodeURIComponent(cmsContentStatus)}&limit=50`),
     ]).then(([data, cms]) => {
+      cmsContentItems = cms.items || [];
       contentList.replaceChildren();
       data.items.forEach((item) => contentList.append(contentCard(item)));
       contentEmpty.hidden = data.items.length !== 0;
@@ -2040,6 +2080,15 @@
       cmsContentEmpty.hidden = items.length !== 0;
       showScreen("content");
       status.textContent = `Материалов: ${items.length}`;
+    });
+  };
+  const renderEditorLibrary = () => {
+    const host=document.getElementById("content-editor-library-list"); host.replaceChildren();
+    cmsContentItems.forEach((item)=>{
+      const button=document.createElement("button"); button.type="button"; button.className=`studio-editor-library-item${currentCmsContent && currentCmsContent.content_id === item.content_id ? " active" : ""}`;
+      button.append(text("strong",item.title),text("small",`${cmsTypeLabel(item.content_type)} · ${cmsStatusLabel(item.status)}`));
+      button.addEventListener("click",()=>guardContentNavigation(()=>loadCmsContentDetails(item.content_id)));
+      host.append(button);
     });
   };
   function loadContentDetails(contentId) {
@@ -2326,6 +2375,7 @@
     status.textContent = "Загружаем черновик…";
     return api(`/api/admin/content/cms/${encodeURIComponent(contentId)}`).then((item) => {
       currentCmsContent = item;
+      renderEditorLibrary();
       contentEditorTitle.textContent = item.title;
       contentEditorStatus.textContent = cmsStatusLabel(item.status);
       contentEditorStatus.className = `badge studio-status ${item.status}`;
@@ -2773,9 +2823,16 @@
   const adminNotificationReadKeys = () => adminNotificationReadState;
   const loadAdminNotificationAcknowledgements = () => api("/api/admin/notification-acknowledgements").then((data) => {
     hydrateAdminNotificationReadState(adminNotificationReadState,data.notification_keys);
+    adminNotificationResolvedState.clear(); adminNotificationArchivedState.clear();
+    (data.states || []).forEach((state)=>{
+      if(state.resolved_at) adminNotificationResolvedState.add(state.notification_key);
+      if(state.archived_at) adminNotificationArchivedState.add(state.notification_key);
+    });
     adminNotificationAckError="";
   }).catch((error)=>{
     adminNotificationReadState.clear();
+    adminNotificationResolvedState.clear();
+    adminNotificationArchivedState.clear();
     adminNotificationAckError="Не удалось загрузить отметки. Уведомления считаются непрочитанными.";
     if (error.message === "session_ended" || error.message === "access_revoked") throw error;
   });
@@ -2790,6 +2847,16 @@
       if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
     }).finally(()=>{ adminNotificationAckPending.delete(key); renderAdminNotificationPanel(); renderNotificationCenter(); });
   };
+  const updateAdminNotificationLifecycle = (key,action) => {
+    if(adminNotificationAckPending.has(key)) return Promise.resolve();
+    adminNotificationAckPending.add(key);
+    return writeAdminJson("PUT","/api/admin/notification-acknowledgements",{notification_key:key,action}).then((state)=>{
+      if(state.read_at) adminNotificationReadState.add(key);
+      if(state.resolved_at) adminNotificationResolvedState.add(key); else adminNotificationResolvedState.delete(key);
+      if(state.archived_at) adminNotificationArchivedState.add(key); else adminNotificationArchivedState.delete(key);
+      renderAdminNotificationPanel(); renderNotificationCenter(); updateAdminNotificationBadge();
+    }).catch(showApiError).finally(()=>adminNotificationAckPending.delete(key));
+  };
   const buildAdminNotificationItems = (failed,gifts,deliveries,system) => [
     ...failed.map((item)=>({key:`failed:${item.operation_id}`,category:"failed",timestamp:item.updated_at,title:item.username ? `Проблема продления · @${item.username}` : "Проблема продления",meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status} · ${formatDate(item.updated_at)}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)})),
     ...deliveries.map((item)=>({key:`delivery:${item.delivery_id}`,category:"delivery",timestamp:item.updated_at || item.next_attempt_at,title:item.delivery_label,meta:`${item.explanation || item.status} · ${formatDate(item.updated_at || item.next_attempt_at)}`,open:()=>loadDeliveryDetails(item.delivery_id)})),
@@ -2799,7 +2866,7 @@
   ];
   const updateAdminNotificationBadge = () => {
     const read=adminNotificationReadKeys();
-    const unread=[...adminCurrentNotificationKeys].filter((key)=>!read.has(key)).length+adminNotificationUnknownUnreadCount;
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!read.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
     document.getElementById("topbar-attention").textContent=String(unread);
     adminNotifications.classList.toggle("has-unread",unread>0);
   };
@@ -2807,7 +2874,7 @@
     const read=adminNotificationReadKeys();
     const heading=document.createElement("header"); heading.append(text("strong","Уведомления"),text("small","Просмотр не означает решение проблемы"));
     const items=document.createElement("div"); items.className="admin-notification-items";
-    const page=adminNotificationPanelPage(adminNotificationItems,adminNotificationDisplayLimit);
+    const page=adminNotificationPanelPage(adminNotificationItems.filter((item)=>!adminNotificationArchivedState.has(item.key)),adminNotificationDisplayLimit);
     page.visible.forEach((item)=>{
       const row=document.createElement("article"); row.className=`admin-notification-item${read.has(item.key) ? " read" : ""}`;
       const open=document.createElement("button"); open.type="button"; open.className="admin-notification-open"; open.append(text("strong",item.title),text("small",item.meta));
@@ -2828,19 +2895,25 @@
   const notificationCenterFilteredItems = () => {
     const category=document.getElementById("notifications-category").value;
     const readFilter=document.getElementById("notifications-read-filter").value;
+    const resolutionFilter=document.getElementById("notifications-resolution-filter").value;
     return adminNotificationItems.filter((item)=>{
       const isRead=adminNotificationReadState.has(item.key);
+      const isResolved=adminNotificationResolvedState.has(item.key);
       return (category === "all" || item.category === category)
-        && (readFilter === "all" || (readFilter === "read") === isRead);
+        && !adminNotificationArchivedState.has(item.key)
+        && (readFilter === "all" || (readFilter === "read") === isRead)
+        && (resolutionFilter === "all" || (resolutionFilter === "resolved") === isResolved);
     });
   };
   const renderNotificationCenter = () => {
     const host=document.getElementById("notifications-page-list");
     if (!host) return;
     const filtered=notificationCenterFilteredItems(); const page=adminNotificationPanelPage(filtered,adminNotificationPageLimit);
-    const unread=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key)).length+adminNotificationUnknownUnreadCount;
-    document.getElementById("notifications-current").textContent=String(adminCurrentNotificationKeys.size+adminNotificationUnknownUnreadCount);
+    const unresolved=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key));
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
+    document.getElementById("notifications-current").textContent=String(unresolved.length+adminNotificationUnknownUnreadCount);
     document.getElementById("notifications-unread").textContent=String(unread);
+    document.getElementById("notifications-resolved").textContent=String([...adminCurrentNotificationKeys].filter((key)=>adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key)).length);
     const today=new Date().toDateString();
     document.getElementById("notifications-today").textContent=String(adminNotificationItems.filter((item)=>item.timestamp && new Date(item.timestamp).toDateString() === today).length);
     const rows=page.visible.map((item)=>{
@@ -2848,7 +2921,9 @@
       const copy=document.createElement("button"); copy.type="button"; copy.className="admin-notification-open"; copy.append(text("strong",item.title),text("small",item.meta));
       copy.addEventListener("click",()=>{ markAdminNotificationRead(item.key); item.open(); });
       const mark=document.createElement("button"); mark.type="button"; mark.className="admin-notification-mark"; mark.textContent=adminNotificationReadState.has(item.key) ? "Прочитано" : "Отметить прочитанным"; mark.disabled=adminNotificationReadState.has(item.key); mark.addEventListener("click",()=>markAdminNotificationRead(item.key));
-      row.append(copy,mark); return row;
+      const resolve=document.createElement("button"); resolve.type="button"; resolve.className="admin-notification-mark"; const isResolved=adminNotificationResolvedState.has(item.key); resolve.textContent=isResolved ? "Открыть снова" : "Решено"; resolve.addEventListener("click",()=>updateAdminNotificationLifecycle(item.key,isResolved ? "reopen" : "resolve"));
+      const archive=document.createElement("button"); archive.type="button"; archive.className="admin-notification-mark"; archive.textContent="Архив"; archive.addEventListener("click",()=>updateAdminNotificationLifecycle(item.key,"archive"));
+      row.append(copy,mark,resolve,archive); return row;
     });
     if (!rows.length) rows.push(text("p","Уведомлений по выбранному фильтру нет.","card admin-panel-state"));
     if (adminNotificationPaginationIncomplete) rows.push(text("p","Не все уведомления удалось загрузить.","card admin-panel-state warning"));
@@ -3039,6 +3114,10 @@
   document.getElementById("analytics-period").addEventListener("change", () => loadAnalytics().catch(showApiError));
   document.getElementById("notifications-category").addEventListener("change", () => { adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
   document.getElementById("notifications-read-filter").addEventListener("change", () => { adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
+  document.getElementById("notifications-resolution-filter").addEventListener("change", () => { adminNotificationPageLimit=MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
+  document.getElementById("notifications-mark-all-read").addEventListener("click", () => Promise.all(
+    [...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key)).map(markAdminNotificationRead)
+  ).then(renderNotificationCenter));
   document.getElementById("notifications-page-more").addEventListener("click", () => { adminNotificationPageLimit += MAX_NOTIFICATION_PANEL_ITEMS; renderNotificationCenter(); });
   document.getElementById("settings-open-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
   document.getElementById("settings-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
@@ -3069,6 +3148,14 @@
   memberNutritionSearch.addEventListener("input", renderMemberNutrition);
   memberRecipeSearch.addEventListener("input", renderMemberRecipes);
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
+  document.getElementById("class-create-toggle").addEventListener("click",()=>{ classCreateForm.hidden=!classCreateForm.hidden; });
+  document.getElementById("class-create-cancel").addEventListener("click",()=>{ classCreateForm.hidden=true; classCreateForm.reset(); });
+  classCreateForm.addEventListener("submit",(event)=>{
+    event.preventDefault();
+    const price=Math.round(Number(document.getElementById("class-price").value)*100);
+    const payload={title:document.getElementById("class-title").value,description:document.getElementById("class-description").value,starts_at:new Date(document.getElementById("class-start").value).toISOString(),duration_minutes:Number(document.getElementById("class-duration").value),zoom_url:document.getElementById("class-zoom-url").value,price_amount:price,capacity:Number(document.getElementById("class-capacity").value),minimum_participants:Number(document.getElementById("class-minimum").value),booking_deadline:new Date(document.getElementById("class-deadline").value).toISOString()};
+    writeAdminJson("POST","/api/admin/classes",payload).then(()=>{ classCreateForm.hidden=true; classCreateForm.reset(); return loadSchedule(false); }).catch((error)=>{ document.getElementById("class-create-message").textContent=`Не удалось сохранить: ${error.message}`; });
+  });
   document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
     button.addEventListener("click", () => loadMemberLibrary(button.dataset.memberCategoryNav).catch(showApiError));
@@ -3086,6 +3173,11 @@
     });
   });
   document.getElementById("content-create-open").addEventListener("click", () => { showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); });
+  document.getElementById("content-editor-new").addEventListener("click", () => guardContentNavigation(()=>{ showScreen("content-create"); loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError); }));
+  document.querySelectorAll("[data-preview-mode]").forEach((button)=>button.addEventListener("click",()=>{
+    document.querySelectorAll("[data-preview-mode]").forEach((candidate)=>candidate.classList.toggle("active",candidate===button));
+    contentLivePreview.dataset.previewMode=button.dataset.previewMode;
+  }));
   document.getElementById("content-create-back").addEventListener("click", () => loadContent().catch(showApiError));
   document.getElementById("content-create-submit").addEventListener("click", createCmsDraft);
   document.getElementById("content-create-publish").addEventListener("click", () => {

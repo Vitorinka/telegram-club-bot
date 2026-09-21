@@ -894,6 +894,43 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0033_admin_notification_state": {
+        "tables": ("admin_notification_acknowledgements",),
+        "columns": {
+            "admin_notification_acknowledgements": (
+                "admin_telegram_id", "notification_key", "read_at",
+                "resolved_at", "archived_at", "updated_at",
+            ),
+        },
+        "indexes": (
+            "admin_notification_acknowledgements_resolved_idx",
+            "admin_notification_acknowledgements_archived_idx",
+        ),
+    },
+    "0034_bookable_zoom_classes": {
+        "tables": ("bookable_classes", "class_bookings", "class_refund_operations"),
+        "columns": {
+            "bookable_classes": (
+                "class_id", "title", "starts_at", "duration_minutes", "zoom_url",
+                "price_amount", "capacity", "minimum_participants",
+                "booking_deadline", "status",
+            ),
+            "class_bookings": (
+                "booking_id", "class_id", "telegram_id", "status", "amount",
+                "stripe_checkout_session_id", "stripe_payment_intent_id",
+                "checkout_generation",
+            ),
+            "class_refund_operations": (
+                "operation_id", "booking_id", "status", "claim_generation",
+                "stripe_refund_id",
+            ),
+        },
+        "indexes": (
+            "bookable_classes_status_start_idx",
+            "class_bookings_class_status_idx",
+            "class_refund_operations_due_idx",
+        ),
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

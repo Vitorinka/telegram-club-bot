@@ -7547,8 +7547,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for call in set_webhook.await_args_list:
             self.assertEqual(call.kwargs["secret_token"], TEST_ENV["WEBHOOK_SECRET"])
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 11)
+        self.assertEqual(len(fake_scheduler.jobs), 12)
         self.assertTrue(hasattr(self.main, "scheduled_apply_reserved_gifts"))
+        self.assertTrue(hasattr(self.main, "scheduled_process_bookable_class_deadlines"))
         self.assertEqual(fake_scheduler.start_calls, 1)
 
     async def test_telegram_webhook_uses_same_validated_secret_for_setup_and_handler(self):
@@ -9907,6 +9908,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             ("GET", "/api/member/content"),
             ("GET", "/api/member/categories"),
             ("GET", "/api/member/schedule"),
+            ("POST", "/api/member/classes/{class_id}/book"),
             ("GET", "/api/member/content/{content_id}"),
             ("GET", "/api/member/content/{content_id}/media/{media_id}"),
         )
