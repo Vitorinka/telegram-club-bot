@@ -68,10 +68,14 @@ from bookable_classes import (
     apply_booking_checkout_completed,
     cancel_underfilled_classes,
     create_admin_class,
+    list_admin_class_bookings,
     list_admin_classes,
+    list_member_bookings,
     list_member_classes,
     mark_booking_checkout_open,
     prepare_class_booking,
+    update_admin_class,
+    update_admin_class_status,
 )
 from content_cms import (
     ContentCmsError,
@@ -12862,11 +12866,11 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(ids("expired_grace"), [9704])
         self.assertEqual(set(ids("failed_payment")), {9703, 9704})
         self.assertIn(9702, ids("non_renewing"))
-        self.assertIn(9706, ids("no_stripe"))
+        self.assertNotIn(9706, ids("no_stripe"))
         self.assertEqual(ids("removal_retry"), [9707])
         self.assertEqual(ids("completed"), [9708])
         self.assertEqual(ids("all", "9701"), [9701])
-        self.assertEqual(ids("all", "percent%"), [9709])
+        self.assertEqual(ids("all", "percent%"), [])
 
         first = list_admin_subscriptions(self.get_conn, limit=3)
         second = list_admin_subscriptions(
@@ -14106,6 +14110,47 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(second_attempt["checkout_generation"], first_attempt["checkout_generation"] + 1)
         self.assertEqual(second_attempt["status"], "pending")
         self.assertIsNone(second_attempt["stripe_checkout_session_id"])
+
+    def test_phase_one_class_transitions_attendees_and_member_profile_real_postgres(self):
+        run_migrations(self.get_conn)
+        telegram_id = 91991
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (telegram_id,username,first_name,paid) VALUES (%s,'phase_one','Phase',FALSE) ON CONFLICT (telegram_id) DO UPDATE SET username=EXCLUDED.username", (telegram_id,))
+            conn.commit()
+        finally: conn.close()
+        now = datetime.utcnow()
+        payload = {"title":"Phase one class","description":"Visible member class","starts_at":(now+timedelta(days=3)).isoformat(),"booking_deadline":(now+timedelta(days=2)).isoformat(),"duration_minutes":60,"zoom_url":"https://zoom.us/j/phase-one","price_amount":1000,"capacity":5,"minimum_participants":3}
+        created = create_admin_class(self.get_conn, 101, payload)
+        self.assertNotIn(created["class_id"], {item["class_id"] for item in list_member_classes(self.get_conn, telegram_id)["items"]})
+        update_admin_class(self.get_conn, created["class_id"], {**payload, "title":"Edited class"})
+        update_admin_class_status(self.get_conn, created["class_id"], "open")
+        self.assertIn(created["class_id"], {item["class_id"] for item in list_member_classes(self.get_conn, telegram_id)["items"]})
+        update_admin_class_status(self.get_conn, created["class_id"], "draft")
+        update_admin_class_status(self.get_conn, created["class_id"], "open")
+        booking = prepare_class_booking(self.get_conn, telegram_id, created["class_id"])
+        with self.assertRaisesRegex(Exception, "class_edit_conflict"):
+            update_admin_class(self.get_conn, created["class_id"], {**payload, "title":"Unsafe late edit"})
+        attendees = list_admin_class_bookings(self.get_conn, created["class_id"])["items"]
+        self.assertEqual([(item["telegram_id"], item["status"]) for item in attendees], [(telegram_id, "pending")])
+        mine = list_member_bookings(self.get_conn, telegram_id)
+        self.assertEqual(mine["upcoming"][0]["viewer_booking_status"], "pending")
+        mark_booking_checkout_open(self.get_conn, booking["booking_id"], "cs_phase_one", "https://checkout.stripe.test/phase-one", now+timedelta(hours=1))
+        with self.assertRaisesRegex(Exception, "class_transition_conflict"):
+            update_admin_class_status(self.get_conn, created["class_id"], "draft")
+
+    def test_club_directory_excludes_unrelated_bot_users_real_postgres(self):
+        run_migrations(self.get_conn)
+        unrelated, member = 91992, 91993
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (telegram_id,username,paid) VALUES (%s,'unrelated_phase_one',FALSE),(%s,'club_phase_one',TRUE) ON CONFLICT (telegram_id) DO UPDATE SET paid=EXCLUDED.paid", (unrelated, member))
+            conn.commit()
+        finally: conn.close()
+        items = list_admin_subscriptions(self.get_conn, limit=50, query="phase_one", state="all")["items"]
+        self.assertEqual({item["telegram_id"] for item in items}, {member})
 
 
 if __name__ == "__main__":

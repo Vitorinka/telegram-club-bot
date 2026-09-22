@@ -88,6 +88,24 @@ ACTIVE_ACCESS_SQL = f"""(
 )"""
 REMOVAL_RETRY_SQL = "r.status IN ('pending', 'processing', 'stripe_canceled', 'telegram_failed', 'telegram_removed')"
 
+# A Club row must have evidence of a current or historical access/payment
+# relationship.  The general Users directory intentionally has no such filter.
+CLUB_RELATIONSHIP_SQL = """(
+    u.paid IS TRUE
+    OR u.expiry_date IS NOT NULL
+    OR u.payment_failed IS TRUE
+    OR u.trial_used IS TRUE
+    OR u.first_payment_done IS TRUE
+    OR u.stripe_customer_id IS NOT NULL
+    OR u.stripe_subscription_id IS NOT NULL
+    OR r.telegram_id IS NOT NULL
+    OR EXISTS (SELECT 1 FROM access_events ae WHERE ae.telegram_id = u.telegram_id)
+    OR EXISTS (
+        SELECT 1 FROM gift_access_grants gift
+        WHERE gift.recipient_telegram_id = u.telegram_id
+    )
+)"""
+
 
 STATE_SQL = {
     "all": None,
@@ -193,7 +211,7 @@ def list_admin_subscriptions(
     if state not in SUBSCRIPTION_STATES:
         raise AdminSubscriptionsQueryError("invalid_state")
     cursor_id = decode_subscriptions_cursor(cursor)
-    clauses = []
+    clauses = [CLUB_RELATIONSHIP_SQL]
     params = []
     if STATE_SQL[state]:
         clauses.append(STATE_SQL[state])
@@ -228,6 +246,7 @@ def list_admin_subscriptions(
                 )
             FROM users u
             LEFT JOIN subscription_removal_events r ON r.telegram_id = u.telegram_id
+            WHERE {CLUB_RELATIONSHIP_SQL}
         """)
         summary_row = cur.fetchone()
         conn.rollback()

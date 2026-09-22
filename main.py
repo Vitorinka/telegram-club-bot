@@ -111,10 +111,13 @@ from bookable_classes import (
     apply_booking_checkout_completed,
     cancel_underfilled_classes,
     create_admin_class,
+    list_admin_class_bookings,
     list_admin_classes,
+    list_member_bookings,
     list_member_classes,
     mark_booking_checkout_open,
     prepare_class_booking,
+    update_admin_class,
     update_admin_class_status,
 )
 from failed_subscription_termination import (
@@ -23881,6 +23884,12 @@ async def miniapp_member_me(request):
     access=member_access(get_db_conn,request["miniapp_member"].telegram_id)
     return apply_miniapp_security_headers(web.json_response({"profile":{"first_name":request["miniapp_member"].first_name},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}}))
 
+
+async def miniapp_member_bookings(request):
+    return apply_miniapp_security_headers(web.json_response(
+        list_member_bookings(get_db_conn, request["miniapp_member"].telegram_id)
+    ))
+
 async def miniapp_member_content_list(request):
     try:
         result=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"))
@@ -24037,14 +24046,23 @@ async def miniapp_admin_session_create(request):
         "token": raw_token,
         "expires_at": session.expires_at.isoformat(),
         "telegram_id": session.telegram_id,
+        "profile": {"first_name": identity.first_name, "username": identity.username},
     }, status=201))
 
 
 async def miniapp_admin_me(request):
     session = request["miniapp_admin"]
+    conn = get_db_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("SELECT first_name,username FROM users WHERE telegram_id=%s", (session.telegram_id,))
+        row = cur.fetchone(); conn.rollback()
+    finally:
+        cur.close(); conn.close()
     payload = {
         "telegram_id": session.telegram_id,
         "is_admin": True,
+        "profile": {"first_name": row[0] if row else None, "username": row[1] if row else None},
     }
     return apply_miniapp_security_headers(web.json_response(payload))
 
@@ -25366,6 +25384,28 @@ async def miniapp_admin_classes(request):
     return apply_miniapp_security_headers(web.json_response(result, status=201))
 
 
+async def miniapp_admin_class_update(request):
+    try:
+        result = update_admin_class(
+            get_db_conn, request.match_info.get("class_id"), await request.json()
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return bookable_class_error_response(BookableClassError("invalid_request"))
+    except BookableClassError as error:
+        return bookable_class_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_admin_class_bookings(request):
+    try:
+        result = list_admin_class_bookings(
+            get_db_conn, request.match_info.get("class_id")
+        )
+    except BookableClassError as error:
+        return bookable_class_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_class_status(request):
     try:
         payload = await request.json()
@@ -26028,6 +26068,8 @@ def create_app():
         app.router.add_get('/api/member/schedule',miniapp_member_schedule)
     if not _route_exists(app,"POST","/api/member/classes/{class_id}/book"):
         app.router.add_post('/api/member/classes/{class_id}/book',miniapp_member_class_booking)
+    if not _route_exists(app,"GET","/api/member/classes"):
+        app.router.add_get('/api/member/classes',miniapp_member_bookings)
     if not _route_exists(app,"GET","/api/member/content"):
         app.router.add_get('/api/member/content',miniapp_member_content_list)
     if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
@@ -26206,6 +26248,10 @@ def create_app():
         app.router.add_get('/api/admin/classes', miniapp_admin_classes)
     if not _route_exists(app, "POST", "/api/admin/classes"):
         app.router.add_post('/api/admin/classes', miniapp_admin_classes)
+    if not _route_exists(app, "PUT", "/api/admin/classes/{class_id}"):
+        app.router.add_put('/api/admin/classes/{class_id}', miniapp_admin_class_update)
+    if not _route_exists(app, "GET", "/api/admin/classes/{class_id}/bookings"):
+        app.router.add_get('/api/admin/classes/{class_id}/bookings', miniapp_admin_class_bookings)
     if not _route_exists(app, "PATCH", "/api/admin/classes/{class_id}/status"):
         app.router.add_patch('/api/admin/classes/{class_id}/status', miniapp_admin_class_status)
     if not _route_exists(app, "POST", "/api/admin/schedule/upload-preview"):

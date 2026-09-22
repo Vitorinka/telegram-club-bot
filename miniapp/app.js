@@ -183,6 +183,7 @@
   const scheduleMetricNodes = document.querySelectorAll("[data-schedule-metric]");
   const classCalendarList = document.getElementById("class-calendar-list");
   const classCreateForm = document.getElementById("class-create-form");
+  let editingClassId = null;
   const scheduleUploadMonth = document.getElementById("schedule-upload-month");
   const scheduleUploadFile = document.getElementById("schedule-upload-file");
   const scheduleUploadPreview = document.getElementById("schedule-upload-preview");
@@ -958,6 +959,25 @@
     empty.append(icon, text("h2", "Расписание клуба"), text("p", "Информация о ближайших встречах появится здесь."));
     memberScheduleContent.replaceChildren(empty);
   };
+  const memberBookingCard = (item) => {
+    const card=document.createElement("article"); card.className="member-class-row";
+    card.append(text("strong",item.title),text("small",new Date(item.starts_at).toLocaleString("ru-RU",{dateStyle:"medium",timeStyle:"short"})),text("span",item.viewer_booking_status || item.status,"badge"));
+    if(item.zoom_url){ const join=text("a","Открыть Zoom","member-button"); join.href=item.zoom_url; join.rel="noopener noreferrer"; card.append(join); }
+    else if(item.viewer_booking_status === "checkout_open" && item.checkout_url){ const pay=text("a","Продолжить оплату","member-button"); pay.href=item.checkout_url; pay.rel="noopener noreferrer"; card.append(pay); }
+    return card;
+  };
+  const loadMemberProfile = () => {
+    showMemberScreen("member-profile");
+    if(!realMemberMode) return Promise.resolve();
+    return Promise.all([api("/api/member/me"),api("/api/member/classes")]).then(([profile,bookings])=>{
+      syncMemberAccess(profile.access);
+      document.getElementById("member-profile-name").textContent=profile.profile.first_name || (profile.profile.username ? `@${profile.profile.username}` : "Профиль");
+      const upcoming=document.getElementById("member-upcoming-classes"); const history=document.getElementById("member-class-history");
+      upcoming.replaceChildren(...((bookings.upcoming || []).map(memberBookingCard))); history.replaceChildren(...((bookings.history || []).map(memberBookingCard)));
+      if(!upcoming.children.length) upcoming.append(text("p","Предстоящих занятий нет.","member-empty"));
+      if(!history.children.length) history.append(text("p","Истории пока нет.","member-empty"));
+    });
+  };
   const loadMemberSchedule = () => {
     if (realMemberMode) {
       return api("/api/member/schedule").then((data) => {
@@ -968,8 +988,9 @@
           card.append(text("p",new Date(item.starts_at).toLocaleString("ru-RU",{dateStyle:"long",timeStyle:"short"}),"member-kicker"),text("h2",item.title),text("p",item.description || "Онлайн-занятие в Zoom"));
           const meta=document.createElement("div"); meta.className="badges"; meta.append(text("span",`${item.duration_minutes} мин`,"badge"),text("span",`€${(item.price_amount/100).toFixed(2)}`,"badge"),text("span",`${item.paid_bookings}/${item.capacity} мест`,"badge")); card.append(meta);
           if(item.zoom_url){ const join=text("a","Открыть Zoom","member-button"); join.href=item.zoom_url; join.rel="noopener noreferrer"; card.append(join); }
-          else if(item.viewer_booking_status === "paid") card.append(text("p",item.status === "confirmed" ? "Ссылка появится перед занятием." : "Ожидаем подтверждения группы.","hint"));
-          else { const book=text("button","Забронировать","member-button"); book.type="button"; book.addEventListener("click",()=>writeMemberJson("POST",`/api/member/classes/${encodeURIComponent(item.class_id)}/book`,{}).then((result)=>{ if(result.checkout_url) webApp.openLink(result.checkout_url); }).catch(showApiError)); card.append(book); }
+          else if(item.viewer_booking_status === "paid") card.append(text("p",item.status === "confirmed" ? "Вы записаны. Ссылка появится после подтверждения занятия." : "Вы записаны. Ожидаем подтверждения группы.","hint"));
+          else if(item.viewer_booking_status === "checkout_open") { const book=text("button","Продолжить оплату","member-button"); book.type="button"; book.addEventListener("click",()=>writeMemberJson("POST",`/api/member/classes/${encodeURIComponent(item.class_id)}/book`,{}).then((result)=>{ if(result.checkout_url) webApp.openLink(result.checkout_url); }).catch(showApiError)); card.append(book); }
+          else { card.append(text("p",`Запись оплачивается сейчас. При отмене или недоборе ${item.minimum_participants} участников платёж будет возвращён.`,"hint")); const full=Number(item.paid_bookings)>=Number(item.capacity); const closed=new Date(item.booking_deadline)<=new Date(); const book=text("button",full ? "Мест нет" : closed ? "Запись закрыта" : "Записаться","member-button"); book.type="button"; book.disabled=full || closed; book.addEventListener("click",()=>writeMemberJson("POST",`/api/member/classes/${encodeURIComponent(item.class_id)}/book`,{}).then((result)=>{ if(result.checkout_url) webApp.openLink(result.checkout_url); }).catch(showApiError)); card.append(book); }
           memberScheduleContent.append(card);
         });
         if (!(data.classes || []).length) renderMemberScheduleEmpty();
@@ -1206,10 +1227,10 @@
     data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
   };
   const setAttentionCount = (count) => {
-    document.getElementById("dashboard-attention-count").textContent=String(count);
-    document.getElementById("topbar-attention").textContent=String(count);
-    document.getElementById("sidebar-attention").textContent=String(count);
-    document.getElementById("more-attention").textContent=String(count);
+    ["dashboard-attention-count","topbar-attention","sidebar-attention","more-attention"].forEach((id)=>{
+      const node=document.getElementById(id); node.textContent=String(count); node.hidden=count===0;
+    });
+    document.getElementById("dashboard-open-attention").hidden=count===0;
   };
   const notificationPageUrl = (path,cursor) => `${path}&cursor=${encodeURIComponent(cursor)}`;
   const refreshAttentionCount = () => Promise.all([
@@ -1218,10 +1239,6 @@
     api("/api/admin/deliveries?status=permanently_failed&limit=50"),
     api("/api/admin/system"),
   ]).then(([failed,gifts,deliveries,system]) => {
-    const total = Number(failed.summary.attention || 0)+Number(gifts.summary.requires_attention || 0)
-      +Number(system.deliveries.permanently_failed || 0)+Number(system.scheduler.failed_last_24h || 0)
-      +Number(system.removals.retryable || 0);
-    setAttentionCount(total);
     const systemItems=buildAdminNotificationItems([],[],[],system);
     return Promise.all([
       collectAdminNotificationKeys({firstPage:failed,aggregate:failed.summary.attention,keyFor:(item)=>`failed:${item.operation_id}`,fetchNext:(cursor)=>api(notificationPageUrl("/api/admin/failed-subscriptions?state=attention&limit=50",cursor))}),
@@ -1245,8 +1262,6 @@
     document.getElementById("dashboard-clock").textContent = today.toLocaleString("ru-RU", {weekday:"long",day:"numeric",month:"long",hour:"2-digit",minute:"2-digit"});
     return api("/api/admin/dashboard").then((data) => {
       metricNodes.forEach((node) => { node.textContent = String(valueAtPath(data, node.dataset.metric) ?? "—"); });
-      const attention = Number(data.deliveries.failed || 0) + Number(data.deliveries.permanently_failed || 0) + Number(data.billing.failed_payments || 0);
-      setAttentionCount(attention);
       document.getElementById("dashboard-migration-count").textContent = String(data.system.migrations.count);
       document.getElementById("dashboard-scheduler-count").textContent = String(data.system.scheduler.known_jobs);
       document.getElementById("dashboard-job-errors").textContent = String(data.system.scheduler.failed_last_24h);
@@ -1268,9 +1283,8 @@
     const badges = document.createElement("div");
     badges.className = "badges";
     badges.append(text("span", statusLabels[user.access_status] || user.access_status, "badge"));
-    badges.append(text("span", typeLabels[user.access_type] || user.access_type, "badge"));
-    if (user.auto_renew) badges.append(text("span", "Автопродление", "badge"));
-    if (user.payment_failed) badges.append(text("span", "Ошибка оплаты", "badge"));
+    if (user.payment_failed) badges.replaceChildren(text("span", "Проблема оплаты", "badge attention-label"));
+    else if (user.access_type === "gift") badges.replaceChildren(text("span", "Подарочный доступ", "badge"));
     container.append(badges);
   };
   const userCard = (user) => {
@@ -1282,11 +1296,11 @@
     const identityCopy=document.createElement("div"); identityCopy.append(text("h2",user.first_name || (user.username ? `@${user.username}` : "Участник")),text("small",user.username ? `@${user.username}` : "Без username"));
     identityCell.append(text("span", (user.first_name || user.username || "?").slice(0, 1).toUpperCase(), "user-avatar"),identityCopy);
     const access = document.createElement("div"); access.className = "user-access-cell"; addBadges(access, user);
-    const subscription = text("p", user.auto_renew ? "Автопродление" : "Без автопродления", "user-subscription-cell");
+    const subscription = text("p", user.auto_renew ? "Продлевается" : "", "user-subscription-cell");
     const expiry = text("p", user.expiry_date || "—", "user-expiry-cell");
     identityCopy.append(text("small", `Telegram ID ${user.telegram_id}`, "user-telegram-cell"));
-    const activity = text("p", "Нет данных", "user-activity-cell");
-    const lastVisit = text("p", "Нет данных", "user-last-visit-cell");
+    const activity = text("p", "", "user-activity-cell");
+    const lastVisit = text("p", "", "user-last-visit-cell");
     const action = text("span", "Открыть →", "user-action-cell");
     button.append(identityCell, access, subscription, expiry, activity, lastVisit, action);
     button.addEventListener("click", () => loadUserDetails(user.telegram_id));
@@ -1294,7 +1308,7 @@
     return article;
   };
   const loadUsers = (append = false) => {
-    status.textContent = "Загружаем участников…";
+    status.textContent = "Загружаем пользователей…";
     const params = new URLSearchParams({limit: "25", status: usersStatus.value});
     if (usersSearch.value.trim()) params.set("q", usersSearch.value.trim());
     if (append && usersCursor) params.set("cursor", usersCursor);
@@ -1304,7 +1318,7 @@
       usersCursor = data.next_cursor;
       usersMore.hidden = !data.has_more;
       showScreen("users");
-      status.textContent = `Участников показано: ${usersList.children.length}`;
+      status.textContent = `Пользователей показано: ${usersList.children.length}`;
     });
   };
   const detailCard = (title, pairs) => {
@@ -1319,6 +1333,29 @@
     });
     article.append(list);
     return article;
+  };
+  const userSectionCard = (section, title, pairs) => {
+    const card = detailCard(title, pairs);
+    card.dataset.userSection = section;
+    return card;
+  };
+  const emptyUserSection = (section, message) => {
+    const article = document.createElement("article");
+    article.className = "card empty-state";
+    article.dataset.userSection = section;
+    article.append(text("p", message));
+    return article;
+  };
+  const selectUserProfileTab = (section) => {
+    document.querySelectorAll("[data-user-tab]").forEach((tab) => {
+      const selected = tab.dataset.userTab === section;
+      tab.classList.toggle("active", selected);
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+    });
+    detailsContent.querySelectorAll("[data-user-section]").forEach((node) => {
+      node.hidden = node.dataset.userSection !== section;
+    });
+    manualAccessCard.hidden = section !== "club" || !manualAccessUserId;
   };
   const resetManualAccess = () => {
     manualAccessActionId = null;
@@ -1392,7 +1429,7 @@
       status.textContent = "Не удалось отменить запрос. Обновите данные.";
     });
   };
-  function loadUserDetails(userId) {
+  function loadUserDetails(userId, initialTab = "overview") {
     status.textContent = "Загружаем профиль…";
     return api(`/api/admin/users/${encodeURIComponent(userId)}`).then((user) => {
       detailsContent.replaceChildren();
@@ -1400,17 +1437,20 @@
       const profile=document.createElement("article"); profile.className="card participant-profile-hero";
       profile.append(text("span",displayName.slice(0,1).toUpperCase(),"participant-avatar"));
       const profileCopy=document.createElement("div"); profileCopy.append(text("h1",displayName),text("p",user.username ? `@${user.username}` : "Без username"),text("small",`Telegram ID ${user.telegram_id}`));
+      profile.dataset.userSection="overview";
       profile.append(profileCopy,text("span",statusLabels[user.access_status] || user.access_status,"badge"));
       detailsContent.append(
         profile,
-        detailCard("Подписка", [["Статус", statusLabels[user.access_status]], ["Источник доступа", typeLabels[user.access_type]], ["Доступ до", user.expiry_date], ["Автопродление", user.auto_renew ? "Включено" : "Выключено"], ["Trial использован", user.trial_used ? "Да" : "Нет"]]),
-        detailCard("Оплата", [["Оплаченный доступ", user.paid ? "Да" : "Нет"], ["Ошибка оплаты", user.payment_failed ? "Да" : "Нет"], ["Grace до", user.grace_period_end], ["Customer", user.stripe.customer_id], ["Subscription", user.stripe.subscription_id]]),
-        detailCard("Активность", [["Последняя активность", "Нет данных"], ["Тренировки", "Не отслеживаются"], ["Медитации", "Не отслеживаются"], ["Минуты", "Не отслеживаются"]]),
-        detailCard("Прогресс · 30 дней", [["График активности", "Нет данных"], ["Completion rate", "Не отслеживается"]]),
-        detailCard("Удаление", user.removal ? [["Статус", user.removal.status], ["Причина", user.removal.reason], ["Access expiry", user.removal.access_expiry], ["Обновлено", user.removal.updated_at]] : [["Статус", "Нет операции"]]),
-        detailCard("История", user.access_history.length ? user.access_history.map((event) => [event.event_type, `${event.source}: ${event.old_expiry || "—"} → ${event.new_expiry || "—"}`]) : [["События", "Нет"]])
+        userSectionCard("club", "Клуб", [["Статус", statusLabels[user.access_status]], ["Источник доступа", typeLabels[user.access_type]], ["Доступ до", user.expiry_date], ["Автопродление", user.auto_renew ? "Включено" : "Выключено"], ["Trial использован", user.trial_used ? "Да" : "Нет"]]),
+        userSectionCard("payments", "Платежи", [["Оплаченный доступ", user.paid ? "Да" : "Нет"], ["Ошибка оплаты", user.payment_failed ? "Да" : "Нет"], ["Grace до", user.grace_period_end], ["Customer", user.stripe.customer_id], ["Subscription", user.stripe.subscription_id]]),
+        emptyUserSection("gifts", "Связанные подарки отсутствуют в текущих данных профиля."),
+        emptyUserSection("classes", "Связанные занятия отсутствуют в текущих данных профиля."),
+        emptyUserSection("activity", "Авторитетные данные активности пока не собираются."),
+        userSectionCard("diagnostics", "Диагностика удаления", user.removal ? [["Статус", user.removal.status], ["Причина", user.removal.reason], ["Access expiry", user.removal.access_expiry], ["Обновлено", user.removal.updated_at]] : [["Статус", "Нет операции"]]),
+        userSectionCard("history", "История доступа", user.access_history.length ? user.access_history.map((event) => [event.event_type, `${event.source}: ${event.old_expiry || "—"} → ${event.new_expiry || "—"}`]) : [["События", "Нет"]])
       );
       configureManualAccess(user);
+      selectUserProfileTab(initialTab);
       showScreen("user-details");
       status.textContent = "Профиль пользователя";
     }).catch(showApiError);
@@ -1438,7 +1478,7 @@
     if (subscription.grace_period_end) badges.append(text("span", `Grace до ${formatDate(subscription.grace_period_end)}`, "badge"));
     if (subscription.needs_attention) badges.append(text("span", "⚠️ Требует внимания", "badge attention-label"));
     button.append(badges);
-    button.addEventListener("click", () => loadSubscriptionDetails(subscription.telegram_id));
+    button.addEventListener("click", () => loadUserDetails(subscription.telegram_id, "club"));
     article.append(button);
     return article;
   };
@@ -1775,7 +1815,11 @@
       const row=document.createElement("article"); row.className="class-calendar-row";
       const copy=document.createElement("div"); copy.append(text("strong",item.title),text("small",`${new Date(item.starts_at).toLocaleString("ru-RU")} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`));
       const state=text("span",({draft:"Черновик",open:"Открыта запись",confirmed:"Подтверждено",cancelled:"Отменено",completed:"Завершено"}[item.status] || item.status),`badge class-${item.status}`); row.append(copy,state);
+      if(["draft","open"].includes(item.status)){ const edit=text("button","Редактировать","secondary"); edit.type="button"; edit.addEventListener("click",()=>{ editingClassId=item.class_id; classCreateForm.hidden=false; document.getElementById("class-title").value=item.title; document.getElementById("class-description").value=item.description || ""; document.getElementById("class-start").value=new Date(new Date(item.starts_at).getTime()-new Date(item.starts_at).getTimezoneOffset()*60000).toISOString().slice(0,16); document.getElementById("class-duration").value=String(item.duration_minutes); document.getElementById("class-zoom-url").value=item.zoom_url; document.getElementById("class-price").value=(item.price_amount/100).toFixed(2); document.getElementById("class-capacity").value=String(item.capacity); document.getElementById("class-minimum").value=String(item.minimum_participants); document.getElementById("class-deadline").value=new Date(new Date(item.booking_deadline).getTime()-new Date(item.booking_deadline).getTimezoneOffset()*60000).toISOString().slice(0,16); document.getElementById("class-create-message").textContent="Редактирование доступно до появления оплаченных бронирований."; classCreateForm.scrollIntoView({behavior:"smooth",block:"start"}); }); row.append(edit); }
       if(item.status === "draft"){ const open=text("button","Открыть запись","secondary"); open.type="button"; open.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"open"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(open); }
+      if(item.status === "open"){ const unpublish=text("button","В черновик","secondary"); unpublish.type="button"; unpublish.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"draft"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(unpublish); }
+      if(item.status === "confirmed"){ const complete=text("button","Завершить","secondary"); complete.type="button"; complete.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"completed"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(complete); }
+      const attendees=text("button","Записавшиеся","secondary"); attendees.type="button"; attendees.addEventListener("click",()=>api(`/api/admin/classes/${encodeURIComponent(item.class_id)}/bookings`).then((data)=>{ const list=document.createElement("div"); list.className="class-booking-list"; if(!data.items.length) list.append(text("p","Записей пока нет.","hint")); data.items.forEach((booking)=>list.append(detailCard(booking.first_name || (booking.username ? `@${booking.username}` : `ID ${booking.telegram_id}`),[["Статус оплаты",booking.status],["Сумма",`${(booking.amount/100).toFixed(2)} ${booking.currency.toUpperCase()}`],["Создано",formatDate(booking.created_at)]]))); row.append(list); attendees.disabled=true; }).catch(showApiError)); row.append(attendees);
       if(["draft","open","confirmed"].includes(item.status)){ const cancel=text("button","Отменить","secondary"); cancel.type="button"; cancel.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"cancelled"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(cancel); }
       classCalendarList.append(row);
     });
@@ -2866,8 +2910,8 @@
   ];
   const updateAdminNotificationBadge = () => {
     const read=adminNotificationReadKeys();
-    const unread=[...adminCurrentNotificationKeys].filter((key)=>!read.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
-    document.getElementById("topbar-attention").textContent=String(unread);
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!read.has(key) && !adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
+    setAttentionCount(unread);
     adminNotifications.classList.toggle("has-unread",unread>0);
   };
   const renderAdminNotificationPanel = () => {
@@ -2910,7 +2954,7 @@
     if (!host) return;
     const filtered=notificationCenterFilteredItems(); const page=adminNotificationPanelPage(filtered,adminNotificationPageLimit);
     const unresolved=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key));
-    const unread=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
+    const unread=[...adminCurrentNotificationKeys].filter((key)=>!adminNotificationReadState.has(key) && !adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key)).length+adminNotificationUnknownUnreadCount;
     document.getElementById("notifications-current").textContent=String(unresolved.length+adminNotificationUnknownUnreadCount);
     document.getElementById("notifications-unread").textContent=String(unread);
     document.getElementById("notifications-resolved").textContent=String([...adminCurrentNotificationKeys].filter((key)=>adminNotificationResolvedState.has(key) && !adminNotificationArchivedState.has(key)).length);
@@ -2956,7 +3000,8 @@
   };
   const configureAdminProfile = (identityData) => {
     const telegramUser = webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user : {};
-    const profile = adminProfilePresentation(telegramUser);
+    const confirmedProfile = identityData.profile || {};
+    const profile = adminProfilePresentation({...telegramUser,first_name:confirmedProfile.first_name || telegramUser.first_name,username:confirmedProfile.username || telegramUser.username});
     const renderAvatar = (element) => {
       if (!element) return;
       element.replaceChildren(); element.textContent=profile.initials;
@@ -2966,13 +3011,14 @@
       image.src=profile.photoUrl; element.replaceChildren(image);
     };
     const displayName = profile.displayName;
+    document.getElementById("admin-dashboard-greeting").textContent=`Добрый день, ${displayName}!`;
     document.getElementById("admin-profile-name").textContent=displayName;
     document.getElementById("admin-profile-panel-name").textContent=displayName;
     renderAvatar(document.getElementById("admin-topbar-avatar"));
     renderAvatar(document.getElementById("admin-profile-panel-avatar"));
-    document.getElementById("admin-profile-meta").textContent=telegramUser.username ? `@${telegramUser.username}` : `Telegram ID ${identityData.telegram_id}`;
+    document.getElementById("admin-profile-meta").textContent=confirmedProfile.username ? `@${confirmedProfile.username}` : `Telegram ID ${identityData.telegram_id}`;
     document.getElementById("admin-settings-name").textContent=displayName;
-    document.getElementById("admin-settings-meta").textContent=telegramUser.username ? `@${telegramUser.username}` : `Telegram ID ${identityData.telegram_id}`;
+    document.getElementById("admin-settings-meta").textContent=confirmedProfile.username ? `@${confirmedProfile.username}` : `Telegram ID ${identityData.telegram_id}`;
     renderAvatar(document.getElementById("admin-settings-avatar"));
   };
   installAdminIcons();
@@ -3148,13 +3194,14 @@
   memberNutritionSearch.addEventListener("input", renderMemberNutrition);
   memberRecipeSearch.addEventListener("input", renderMemberRecipes);
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
-  document.getElementById("class-create-toggle").addEventListener("click",()=>{ classCreateForm.hidden=!classCreateForm.hidden; });
-  document.getElementById("class-create-cancel").addEventListener("click",()=>{ classCreateForm.hidden=true; classCreateForm.reset(); });
+  document.getElementById("class-create-toggle").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=!classCreateForm.hidden; if(!classCreateForm.hidden) classCreateForm.reset(); });
+  document.getElementById("class-create-cancel").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=true; classCreateForm.reset(); });
   classCreateForm.addEventListener("submit",(event)=>{
     event.preventDefault();
     const price=Math.round(Number(document.getElementById("class-price").value)*100);
     const payload={title:document.getElementById("class-title").value,description:document.getElementById("class-description").value,starts_at:new Date(document.getElementById("class-start").value).toISOString(),duration_minutes:Number(document.getElementById("class-duration").value),zoom_url:document.getElementById("class-zoom-url").value,price_amount:price,capacity:Number(document.getElementById("class-capacity").value),minimum_participants:Number(document.getElementById("class-minimum").value),booking_deadline:new Date(document.getElementById("class-deadline").value).toISOString()};
-    writeAdminJson("POST","/api/admin/classes",payload).then(()=>{ classCreateForm.hidden=true; classCreateForm.reset(); return loadSchedule(false); }).catch((error)=>{ document.getElementById("class-create-message").textContent=`Не удалось сохранить: ${error.message}`; });
+    const method=editingClassId ? "PUT" : "POST"; const path=editingClassId ? `/api/admin/classes/${encodeURIComponent(editingClassId)}` : "/api/admin/classes";
+    writeAdminJson(method,path,payload).then(()=>{ editingClassId=null; classCreateForm.hidden=true; classCreateForm.reset(); return loadSchedule(false); }).catch((error)=>{ document.getElementById("class-create-message").textContent=`Не удалось сохранить: ${error.message}`; });
   });
   document.getElementById("member-library-empty-home").addEventListener("click", () => loadMemberHome().catch(showApiError));
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
@@ -3169,6 +3216,7 @@
       if (button.dataset.memberNav === "member-home") loadMemberHome().catch(showApiError);
       else if (button.dataset.memberNav === "member-library") loadMemberLibrary().catch(showApiError);
       else if (button.dataset.memberNav === "member-schedule") loadMemberSchedule().catch(showApiError);
+      else if (button.dataset.memberNav === "member-profile") loadMemberProfile().catch(showApiError);
       else showMemberScreen(button.dataset.memberNav);
     });
   });
@@ -3243,6 +3291,9 @@
     searchTimer = window.setTimeout(() => loadUsers().catch(showApiError), 300);
   });
   document.getElementById("users-back").addEventListener("click", () => showScreen("users"));
+  document.querySelectorAll("[data-user-tab]").forEach((tab) => {
+    tab.addEventListener("click", () => selectUserProfileTab(tab.dataset.userTab));
+  });
   subscriptionsMore.addEventListener("click", () => loadSubscriptions(true).catch(showApiError));
   subscriptionsState.addEventListener("change", () => loadSubscriptions().catch(showApiError));
   subscriptionsSearch.addEventListener("input", () => {
