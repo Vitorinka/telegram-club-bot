@@ -75,11 +75,13 @@ def signed_header(payload, secret, timestamp=None):
     return f"t={timestamp},v1={signature}"
 
 
-def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=None, username=None):
+def signed_miniapp_init_data(user_id, token=TEST_ENV["BOT_TOKEN"], auth_date=None, username=None, first_name=None):
     auth_date = int(time.time()) if auth_date is None else int(auth_date)
     user = {"id": int(user_id)}
     if username:
         user["username"] = username
+    if first_name:
+        user["first_name"] = first_name
     fields = {
         "auth_date": str(auth_date),
         "query_id": "bootstrap-query",
@@ -9097,6 +9099,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "token": "opaque-token",
             "expires_at": "2026-08-21T00:00:00+00:00",
             "telegram_id": 1,
+            "profile": {"first_name": None, "username": "owner"},
         })
         create_session.assert_called_once_with(self.main.get_db_conn, 1)
         for response in (missing, accepted):
@@ -9117,6 +9120,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             FakeMiniAppRequest(app, "tma stale"), handler
         )
         with patch.object(self.main, "load_miniapp_admin_session", return_value=session), patch.object(
+            self.main, "get_db_conn", return_value=FakeConnection(fetches=[("Наталья", "natalia")])
+        ), patch.object(
             self.main.stripe.Subscription,
             "retrieve",
             side_effect=AssertionError("Stripe must not be used"),
@@ -9128,7 +9133,19 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status, 401)
         self.assertEqual(malformed.status, 401)
         self.assertEqual(response.status, 200)
-        self.assertEqual(json.loads(response.text), {"telegram_id": 1, "is_admin": True})
+        self.assertEqual(json.loads(response.text), {"telegram_id": 1, "is_admin": True, "profile": {"first_name": "Наталья", "username": "natalia"}})
+
+    async def test_miniapp_admin_identity_is_server_confirmed_per_admin(self):
+        app = self.main.create_app(); handler = self.route_handler(app, "GET", "/api/admin/me")
+        results = []
+        for admin_id, name in ((1, "Наталья"), (2, "Виктория")):
+            session = SimpleNamespace(telegram_id=admin_id, session_id=f"session-{admin_id}")
+            with patch.object(self.main, "load_miniapp_admin_session", return_value=session), patch.object(
+                self.main, "get_db_conn", return_value=FakeConnection(fetches=[(name, None)])
+            ):
+                response = await self.main.miniapp_admin_auth_middleware(FakeMiniAppRequest(app, "Bearer token"), handler)
+            results.append(json.loads(response.text)["profile"]["first_name"])
+        self.assertEqual(results, ["Наталья", "Виктория"])
 
     async def test_miniapp_removed_admin_is_forbidden_without_logging_token(self):
         app = self.main.create_app()
@@ -10655,7 +10672,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bearer ${sessionToken}", javascript)
         self.assertIn("loadDashboard", javascript)
         self.assertIn("data-nav=", index)
-        self.assertIn("Участники", index)
+        self.assertIn("Пользователи", index)
+        self.assertIn("Участники клуба", index)
+        self.assertNotIn("Добрый день, Наталья!", index)
+        self.assertIn('id="admin-dashboard-greeting"', index)
+        self.assertIn('id="user-profile-tabs"', index)
+        self.assertIn('tab.addEventListener("click", () => selectUserProfileTab', javascript)
+        self.assertNotIn('detailCard("Прогресс · 30 дней"', javascript)
+        self.assertNotIn('["Тренировки", "Не отслеживаются"]', javascript)
+        self.assertIn('id="member-upcoming-classes"', index)
+        self.assertIn("/api/member/classes", javascript)
+        self.assertIn("setAttentionCount(unread)", javascript)
+        self.assertIsNotNone(self.route_handler(app, "GET", "/api/member/classes"))
+        self.assertIsNotNone(self.route_handler(app, "PUT", "/api/admin/classes/{class_id}"))
+        self.assertIsNotNone(self.route_handler(app, "GET", "/api/admin/classes/{class_id}/bookings"))
         self.assertIn("Требуют внимания", index)
         self.assertIn("subscriptions-search", index)
         self.assertIn("Система / Ошибки", index)

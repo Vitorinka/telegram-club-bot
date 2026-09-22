@@ -31,7 +31,7 @@
       </div>
     </section>
     <section id="dashboard" class="dashboard screen admin-dashboard" data-screen="overview" hidden>
-      <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1>Добрый день, Наталья!</h1><p>Вместе создаём пространство для здоровья и заботы о себе.</p></div><time id="dashboard-clock"></time></header>
+      <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1 id="admin-dashboard-greeting">Добрый день!</h1><p>Вместе создаём пространство для здоровья и заботы о себе.</p></div><time id="dashboard-clock"></time></header>
       <div class="admin-kpi-row">
         <article class="card admin-kpi" data-admin-icon="users"><span aria-hidden="true"></span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
         <article class="card admin-kpi" data-admin-icon="content"><span aria-hidden="true"></span><strong id="dashboard-published-count">—</strong><small>Опубликовано материалов</small></article>
@@ -40,8 +40,8 @@
       </div>
       <div class="admin-dashboard-grid">
         <article class="card admin-overview-panel admin-content-overview"><header><div><h2>Контент</h2><small>Управление материалами клуба</small></div><button id="open-content" class="admin-text-action" type="button">Все материалы →</button></header><div id="dashboard-content-list" class="overview-content-grid"><p class="overview-empty">Загружаем материалы…</p></div><button id="open-member-preview" class="secondary admin-quiet-action" type="button">Посмотреть клуб</button></article>
-        <article class="card admin-overview-panel admin-users-overview"><header><div><h2>Участники</h2><small>Участники клуба</small></div><button id="dashboard-open-users" class="admin-text-action" type="button">Все участники →</button></header><div class="overview-table-head"><span>Участник</span><span>Telegram ID</span><span>Статус</span><span>Доступ до</span></div><div id="dashboard-users-list" class="overview-table"><p class="overview-empty">Загружаем участников…</p></div></article>
-        <article class="card admin-overview-panel admin-subscriptions-overview"><header><div><h2>Подписки</h2><small>Оплаты и доступы</small></div><button id="open-subscriptions-mobile" class="admin-text-action" type="button">Все подписки →</button></header><div class="overview-metrics"><div><strong data-metric="users.active_access">—</strong><small>Активные</small></div><div><strong data-metric="billing.active_grace">—</strong><small>Льготный период</small></div><div><strong data-metric="billing.failed_payments">—</strong><small>Ошибки оплаты</small></div><div><strong data-metric="billing.auto_renew">—</strong><small>Автопродление</small></div></div></article>
+        <article class="card admin-overview-panel admin-users-overview"><header><div><h2>Пользователи</h2><small>Все известные системе люди</small></div><button id="dashboard-open-users" class="admin-text-action" type="button">Все пользователи →</button></header><div class="overview-table-head"><span>Пользователь</span><span>Telegram ID</span><span>Статус</span><span>Доступ до</span></div><div id="dashboard-users-list" class="overview-table"><p class="overview-empty">Загружаем пользователей…</p></div></article>
+        <article class="card admin-overview-panel admin-subscriptions-overview"><header><div><h2>Клуб</h2><small>Участники, оплаты и доступы</small></div><button id="open-subscriptions-mobile" class="admin-text-action" type="button">Участники клуба →</button></header><div class="overview-metrics"><div><strong data-metric="users.active_access">—</strong><small>Активные</small></div><div><strong data-metric="billing.active_grace">—</strong><small>Льготный период</small></div><div><strong data-metric="billing.failed_payments">—</strong><small>Ошибки оплаты</small></div><div><strong data-metric="billing.auto_renew">—</strong><small>Автопродление</small></div></div></article>
         <article class="card admin-overview-panel admin-schedule-overview"><header><div><h2>Расписание</h2><small>Месячные расписания клуба</small></div><button id="open-schedule-mobile" class="admin-text-action" type="button">Все расписания →</button></header><div id="dashboard-schedule-list" class="overview-compact-list"><p class="overview-empty">Загружаем расписание…</p></div></article>
         <article class="card admin-overview-panel admin-gifts-overview"><header><div><h2>Подарки</h2><small>Подарочные доступы и сертификаты</small></div><button id="open-gifts" class="admin-text-action" type="button">Все подарки →</button></header><div id="dashboard-gifts-list" class="overview-compact-list"><p class="overview-empty">Загружаем подарки…</p></div></article>
         <article class="card admin-overview-panel admin-failed-overview"><header><div><h2>Уведомления</h2><small>События, требующие внимания</small></div><button id="open-failed-subscriptions" class="admin-text-action" type="button">Все уведомления →</button></header><div id="dashboard-failed-list" class="overview-compact-list"><p class="overview-empty">Загружаем уведомления…</p></div></article>
@@ -203,7 +203,7 @@
     </dialog>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
       <article class="card">
-        <h2>Участники</h2>
+        <h2>Пользователи</h2>
         <label class="search-label" for="users-search">Telegram ID или username</label>
         <input id="users-search" type="search" maxlength="64" autocomplete="off">
         <select id="users-status" aria-label="Статус пользователей">
@@ -220,7 +220,8 @@
     </section>
     <section id="user-details" class="screen page" data-screen="user-details" hidden>
       <button id="users-back" class="secondary" type="button">← К пользователям</button>
-      <div id="user-details-content" class="dashboard"></div>
+      <nav id="user-profile-tabs" class="profile-tabs" aria-label="Разделы профиля"><button class="active" data-user-tab="overview" type="button">Обзор</button><button data-user-tab="club" type="button">Клуб</button><button data-user-tab="payments" type="button">Платежи</button><button data-user-tab="gifts" type="button">Подарки</button><button data-user-tab="classes" type="button">Занятия</button><button data-user-tab="activity" type="button">Активность</button><button data-user-tab="history" type="button">История</button><button data-user-tab="diagnostics" type="button">Диагностика</button></nav>
+      <div id="user-details-content" class="dashboard canonical-user-profile"></div>
       <article id="manual-access-card" class="card" hidden>
         <h2>Действия</h2>
         <div id="manual-access-controls">
@@ -245,7 +246,7 @@
     </section>
     <section id="subscriptions-screen" class="screen page" data-screen="subscriptions" hidden>
       <article class="card subscriptions-toolbar">
-        <h2>Подписки</h2>
+        <h2>Участники клуба</h2>
         <div id="subscriptions-summary" class="summary-grid" aria-label="Сводка подписок">
           <div><span>Активные</span><strong data-subscription-metric="active">—</strong></div>
           <div><span>Grace</span><strong data-subscription-metric="grace">—</strong></div>
@@ -268,7 +269,7 @@
       <button id="subscriptions-more" type="button" hidden>Показать ещё</button>
     </section>
     <section id="subscription-details" class="screen page" data-screen="subscription-details" hidden>
-      <button id="subscriptions-back" class="secondary" type="button">← К подпискам</button>
+      <button id="subscriptions-back" class="secondary" type="button">← К участникам клуба</button>
       <div id="subscription-details-content" class="dashboard"></div>
     </section>
     <section id="failed-subscriptions-screen" class="screen page" data-screen="failed-subscriptions" hidden>
@@ -528,7 +529,7 @@
     <section id="member-recipes" class="screen member-page" data-screen="member-recipes" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Рецепты</h1><p>Полезные и вкусные блюда для вашего баланса и энергии</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-recipe-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск рецептов"></label><div id="member-recipe-chips" class="member-chip-row"></div><div id="member-recipe-list" class="member-grid member-content-grid"></div><div id="member-recipe-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Рецепты появятся здесь</h2><p>Раздел пока не содержит реальных рецептов.</p></div></section>
     <section id="member-nutrition" class="screen member-page" data-screen="member-nutrition" hidden><header class="member-page-heading"><p class="member-kicker">Питание</p><h1>Материалы нутрициолога</h1><p>Статьи, гайды, рекомендации и чек-листы</p></header><label class="member-search"><span aria-hidden="true">⌕</span><input id="member-nutrition-search" type="search" maxlength="120" autocomplete="off" placeholder="Поиск материалов"></label><div id="member-nutrition-list" class="member-grid member-content-grid"></div><div id="member-nutrition-empty" class="member-card member-empty-state member-empty-art" hidden><span aria-hidden="true">◇</span><h2>Материалы появятся здесь</h2><p>Раздел пока не содержит реальных материалов нутрициолога.</p></div></section>
     <section id="member-schedule" class="screen member-page" data-screen="member-schedule" hidden><header class="member-page-heading"><p class="member-kicker">Zoom и встречи</p><h1>Расписание</h1><p>Актуальное расписание клуба</p></header><div id="member-schedule-content" class="member-schedule-shell"><article class="member-card member-empty-state member-empty-art"><span data-member-icon="calendar" aria-hidden="true"></span><h2>Расписание клуба</h2><p>Информация о ближайших встречах появится здесь.</p></article></div></section>
-    <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1 id="member-profile-name">Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span data-member-icon="subscription" aria-hidden="true"></span><div><small>Доступ</small><strong id="member-profile-access">Статус доступа будет отображаться здесь</strong></div></article><button class="member-exit member-button" type="button">Вернуться в бота</button></section>
+    <section id="member-profile" class="screen member-page" data-screen="member-profile" hidden><article class="member-card member-profile-card"><div class="member-avatar">N</div><h1 id="member-profile-name">Профиль</h1><p>Участник клуба</p></article><article class="member-card member-subscription-placeholder"><span data-member-icon="subscription" aria-hidden="true"></span><div><small>Доступ</small><strong id="member-profile-access">Статус доступа будет отображаться здесь</strong></div></article><article class="member-card"><h2>Мои занятия</h2><div id="member-upcoming-classes" class="member-class-list"><p class="member-empty">Загружаем занятия…</p></div><h3>История</h3><div id="member-class-history" class="member-class-list"><p class="member-empty">Истории пока нет.</p></div></article><button class="member-exit member-button" type="button">Вернуться в бота</button></section>
     <section id="member-lesson" class="screen member-page" data-screen="member-lesson" hidden><button id="member-lesson-back" class="member-back" type="button">← К библиотеке</button><article id="member-lesson-content" class="member-lesson-content"></article></section>
   </main>
   <nav id="bottom-nav" class="bottom-nav" aria-label="Разделы" hidden>
@@ -540,8 +541,8 @@
         <button class="active" type="button" data-content-nav="all">Все материалы</button><button type="button" data-content-nav="recipe">Рецепты</button><button type="button" data-content-nav="lesson">Тренировки</button><button type="button" data-content-nav="meditation">Медитации</button><button type="button" data-content-nav="nutrition_material">Другое</button>
       </div>
     </div>
-    <button type="button" data-nav="users" data-admin-icon="users"><span aria-hidden="true"></span><small>Участники</small></button>
-    <button type="button" data-nav="subscriptions" data-admin-icon="subscriptions"><span aria-hidden="true"></span><small>Подписки</small></button>
+    <button type="button" data-nav="users" data-admin-icon="users"><span aria-hidden="true"></span><small>Пользователи</small></button>
+    <button type="button" data-nav="subscriptions" data-admin-icon="subscriptions"><span aria-hidden="true"></span><small>Клуб</small></button>
     <button type="button" data-nav="schedule" data-admin-icon="calendar"><span aria-hidden="true"></span><small>Расписание</small></button>
     <button id="nav-gifts" type="button" data-admin-icon="gift"><span aria-hidden="true"></span><small>Подарки</small></button>
     <button type="button" data-nav="analytics" data-admin-icon="analytics"><span aria-hidden="true"></span><small>Аналитика</small></button>

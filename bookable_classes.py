@@ -141,6 +141,123 @@ def create_admin_class(get_connection, admin_id, payload):
         cur.close(); conn.close()
 
 
+def update_admin_class(get_connection, class_id, payload):
+    """Edit a future class while no captured booking makes it immutable."""
+    values = validate_class_payload(payload)
+    try:
+        class_uuid = uuid.UUID(str(class_id))
+    except ValueError:
+        raise BookableClassError("invalid_class_id") from None
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT status, starts_at,
+                   EXISTS (SELECT 1 FROM class_bookings b
+                           WHERE b.class_id=c.class_id)
+            FROM bookable_classes c WHERE class_id=%s FOR UPDATE
+            """, (str(class_uuid),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise BookableClassError("class_not_found", 404)
+        if row[0] not in ("draft", "open") or row[2]:
+            raise BookableClassError("class_edit_conflict", 409)
+        cur.execute(
+            """
+            UPDATE bookable_classes SET
+                title=%s,description=%s,starts_at=%s,duration_minutes=%s,
+                zoom_url=%s,price_amount=%s,currency=%s,capacity=%s,
+                minimum_participants=%s,booking_deadline=%s,updated_at=NOW()
+            WHERE class_id=%s
+            """,
+            (values["title"], values["description"], values["starts_at"],
+             values["duration_minutes"], values["zoom_url"], values["price_amount"],
+             values["currency"], values["capacity"], values["minimum_participants"],
+             values["booking_deadline"], str(class_uuid)),
+        )
+        conn.commit()
+        return {"class_id": str(class_uuid), "status": row[0]}
+    except BookableClassError:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+def list_admin_class_bookings(get_connection, class_id):
+    try:
+        class_uuid = uuid.UUID(str(class_id))
+    except ValueError:
+        raise BookableClassError("invalid_class_id") from None
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("SELECT 1 FROM bookable_classes WHERE class_id=%s", (str(class_uuid),))
+        if not cur.fetchone():
+            conn.rollback(); raise BookableClassError("class_not_found", 404)
+        cur.execute(
+            """
+            SELECT b.booking_id,b.telegram_id,u.username,u.first_name,b.status,
+                   b.amount,b.currency,b.created_at,b.paid_at,b.refunded_at
+            FROM class_bookings b
+            LEFT JOIN users u ON u.telegram_id=b.telegram_id
+            WHERE b.class_id=%s
+            ORDER BY b.created_at,b.booking_id
+            """, (str(class_uuid),),
+        )
+        items = [{
+            "booking_id": str(row[0]), "telegram_id": int(row[1]),
+            "username": row[2], "first_name": row[3], "status": row[4],
+            "amount": int(row[5]), "currency": row[6],
+            "created_at": _iso(row[7]), "paid_at": _iso(row[8]),
+            "refunded_at": _iso(row[9]),
+        } for row in cur.fetchall()]
+        conn.rollback()
+        return {"items": items}
+    except BookableClassError:
+        raise
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+def list_member_bookings(get_connection, telegram_id):
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute(
+            """
+            SELECT c.class_id,c.title,c.description,c.starts_at,c.duration_minutes,c.zoom_url,
+                   c.price_amount,c.currency,c.capacity,c.minimum_participants,
+                   c.booking_deadline,c.status,
+                   (SELECT COUNT(*) FROM class_bookings paid
+                    WHERE paid.class_id=c.class_id AND paid.status='paid'),
+                   c.created_at,c.updated_at,b.status,b.checkout_url,b.created_at,b.paid_at,b.refunded_at
+            FROM class_bookings b JOIN bookable_classes c ON c.class_id=b.class_id
+            WHERE b.telegram_id=%s
+            ORDER BY c.starts_at DESC,c.class_id
+            """, (int(telegram_id),),
+        )
+        items = []
+        for row in cur.fetchall():
+            item = _projection(row[:15], viewer_booking_status=row[15])
+            item.update({"checkout_url": row[16] if row[15] == "checkout_open" else None,
+                         "booking_created_at": _iso(row[17]), "paid_at": _iso(row[18]),
+                         "refunded_at": _iso(row[19])})
+            items.append(item)
+        conn.rollback()
+        now = datetime.utcnow()
+        return {"upcoming": [item for item in items if datetime.fromisoformat(item["starts_at"]) > now and item["status"] not in ("cancelled", "completed")],
+                "history": [item for item in items if datetime.fromisoformat(item["starts_at"]) <= now or item["status"] in ("cancelled", "completed")]}
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
 def update_admin_class_status(get_connection, class_id, target):
     if target not in CLASS_STATUSES - {"confirmed"}:
         raise BookableClassError("invalid_class_status")
@@ -148,10 +265,8 @@ def update_admin_class_status(get_connection, class_id, target):
     except ValueError: raise BookableClassError("invalid_class_id") from None
     transitions = {
         "open": ("draft",), "cancelled": ("draft", "open", "confirmed"),
-        "completed": ("confirmed",), "draft": (),
+        "completed": ("confirmed",), "draft": ("open",),
     }
-    if target == "draft":
-        raise BookableClassError("invalid_class_transition")
     conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute(
@@ -161,9 +276,12 @@ def update_admin_class_status(get_connection, class_id, target):
                 completed_at=CASE WHEN %s='completed' THEN NOW() ELSE completed_at END
             WHERE class_id=%s AND status=ANY(%s)
               AND (%s <> 'open' OR (booking_deadline > NOW() AND starts_at > NOW()))
+              AND (%s <> 'draft' OR NOT EXISTS (
+                    SELECT 1 FROM class_bookings b WHERE b.class_id=bookable_classes.class_id
+              ))
             RETURNING status
             """,
-            (target, target, target, str(class_uuid), list(transitions[target]), target),
+            (target, target, target, str(class_uuid), list(transitions[target]), target, target),
         )
         row = cur.fetchone()
         if not row:
