@@ -18,6 +18,7 @@ from psycopg2 import errors as psycopg2_errors
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -437,6 +438,26 @@ MINIAPP_SECURITY_HEADERS = {
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     ),
 }
+
+
+def miniapp_asset_version(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+
+
+MINIAPP_ASSET_VERSIONS = {
+    name: miniapp_asset_version(MINIAPP_ASSET_DIR / name)
+    for name in ("app.js", "styles.css")
+}
+
+
+def miniapp_versioned_index():
+    source = (MINIAPP_ASSET_DIR / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "styles.css"):
+        source = source.replace(
+            f'/miniapp/{name}',
+            f'/miniapp/{name}?v={MINIAPP_ASSET_VERSIONS[name]}',
+        )
+    return source
 
 
 class ScheduleImageTooLarge(Exception):
@@ -6281,166 +6302,55 @@ def _fetch_weekly_gifts(cur, period_start_utc, period_end_utc):
 
 
 def _fetch_weekly_metrics(cur, period_start_utc, period_end_utc):
-    metrics = {
-        "new_registrations": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE registered_at >= %s AND registered_at < %s",
-            (period_start_utc, period_end_utc),
-        ),
-        "free_lessons": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE video_sent_at >= %s AND video_sent_at < %s",
-            (period_start_utc, period_end_utc),
-        ),
-        "group_joins": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM access_events
-            WHERE event_type = 'group_member_joined'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "group_leaves": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM access_events
-            WHERE event_type = 'group_member_left'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "active_paid_now": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW()",
-        ),
-        "total_users_now": _fetch_single_count(cur, "SELECT COUNT(*) FROM users"),
-        "blocked_bot_now": _fetch_single_count(cur, "SELECT COUNT(*) FROM users WHERE blocked_bot = TRUE"),
-        "initial_purchases": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND payment_kind = 'initial_subscription'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "recurring_payments": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND payment_kind = 'recurring'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "trial_payments": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND payment_kind = 'trial'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "adjustment_payments": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND payment_kind IN ('adjustment', 'out_of_band', 'unknown')
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "successful_payments": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "unique_payers": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(DISTINCT telegram_id) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND telegram_id IS NOT NULL
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "failed_payments": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'failed'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "recovered_after_failure": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM payment_events
-            WHERE payment_status = 'succeeded'
-              AND recovered_after_failure = TRUE
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "auto_renew_disabled": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM access_events
-            WHERE event_type = 'subscription_auto_renew_disabled'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "access_closed": _fetch_single_count(
-            cur,
-            """
-            SELECT COUNT(*) FROM access_events
-            WHERE event_type = 'auto_access_closed_expired'
-              AND created_at >= %s
-              AND created_at < %s
-            """,
-            (period_start_utc, period_end_utc),
-        ),
-        "grace_period_now": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW()",
-        ),
-        "payment_failed_now": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE payment_failed = TRUE",
-        ),
-        "unlinked_stripe_events": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM unlinked_stripe_events WHERE resolved = FALSE",
-        ),
-        "expired_paid_now": _fetch_single_count(
-            cur,
-            "SELECT COUNT(*) FROM users WHERE paid = TRUE AND expiry_date IS NOT NULL AND expiry_date < NOW()",
-        ),
-    }
+    cur.execute("""
+        SELECT
+          COUNT(*) FILTER (WHERE registered_at >= %s AND registered_at < %s),
+          COUNT(*) FILTER (WHERE video_sent_at >= %s AND video_sent_at < %s),
+          COUNT(*) FILTER (WHERE paid=TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW()),
+          COUNT(*), COUNT(*) FILTER (WHERE blocked_bot=TRUE),
+          COUNT(*) FILTER (WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW()),
+          COUNT(*) FILTER (WHERE payment_failed=TRUE),
+          COUNT(*) FILTER (WHERE paid=TRUE AND expiry_date IS NOT NULL AND expiry_date < NOW())
+        FROM users
+    """, (period_start_utc, period_end_utc, period_start_utc, period_end_utc))
+    user_row = cur.fetchone()
+    cur.execute("""
+        SELECT
+          COUNT(*) FILTER (WHERE event_type='group_member_joined'),
+          COUNT(*) FILTER (WHERE event_type='group_member_left'),
+          COUNT(*) FILTER (WHERE event_type='subscription_auto_renew_disabled'),
+          COUNT(*) FILTER (WHERE event_type='auto_access_closed_expired')
+        FROM access_events WHERE created_at >= %s AND created_at < %s
+    """, (period_start_utc, period_end_utc))
+    access_row = cur.fetchone()
+    cur.execute("""
+        SELECT
+          COUNT(*) FILTER (WHERE payment_status='succeeded' AND payment_kind='initial_subscription'),
+          COUNT(*) FILTER (WHERE payment_status='succeeded' AND payment_kind='recurring'),
+          COUNT(*) FILTER (WHERE payment_status='succeeded' AND payment_kind='trial'),
+          COUNT(*) FILTER (WHERE payment_status='succeeded' AND payment_kind IN ('adjustment','out_of_band','unknown')),
+          COUNT(*) FILTER (WHERE payment_status='succeeded'),
+          COUNT(DISTINCT telegram_id) FILTER (WHERE payment_status='succeeded' AND telegram_id IS NOT NULL),
+          COUNT(*) FILTER (WHERE payment_status='failed'),
+          COUNT(*) FILTER (WHERE payment_status='succeeded' AND recovered_after_failure=TRUE)
+        FROM payment_events WHERE created_at >= %s AND created_at < %s
+    """, (period_start_utc, period_end_utc))
+    payment_row = cur.fetchone()
+    metrics = dict(zip(
+        ("new_registrations","free_lessons","active_paid_now","total_users_now","blocked_bot_now","grace_period_now","payment_failed_now","expired_paid_now"),
+        map(int, user_row),
+    ))
+    metrics.update(zip(
+        ("group_joins","group_leaves","auto_renew_disabled","access_closed"),
+        map(int, access_row),
+    ))
+    metrics.update(zip(
+        ("initial_purchases","recurring_payments","trial_payments","adjustment_payments","successful_payments","unique_payers","failed_payments","recovered_after_failure"),
+        map(int, payment_row),
+    ))
+    metrics["unlinked_stripe_events"] = _fetch_single_count(
+        cur, "SELECT COUNT(*) FROM unlinked_stripe_events WHERE resolved = FALSE"
+    )
     metrics["revenue_by_currency"] = _fetch_revenue_by_currency(cur, period_start_utc, period_end_utc)
     metrics["tariff_counts"] = _fetch_tariff_counts(cur, period_start_utc, period_end_utc)
     return metrics
@@ -23783,21 +23693,35 @@ def miniapp_auth_error_response(status):
 
 
 async def miniapp_index(request):
-    return apply_miniapp_security_headers(
-        web.FileResponse(MINIAPP_ASSET_DIR / "index.html")
-    )
+    response = apply_miniapp_security_headers(web.Response(
+        text=miniapp_versioned_index(), content_type="text/html",
+    ))
+    response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 async def miniapp_javascript(request):
-    return apply_miniapp_security_headers(
+    response = apply_miniapp_security_headers(
         web.FileResponse(MINIAPP_ASSET_DIR / "app.js")
     )
+    expected = MINIAPP_ASSET_VERSIONS["app.js"]
+    response.headers["Cache-Control"] = (
+        "public, max-age=31536000, immutable"
+        if request.query.get("v") == expected else "no-cache, must-revalidate"
+    )
+    return response
 
 
 async def miniapp_stylesheet(request):
-    return apply_miniapp_security_headers(
+    response = apply_miniapp_security_headers(
         web.FileResponse(MINIAPP_ASSET_DIR / "styles.css")
     )
+    expected = MINIAPP_ASSET_VERSIONS["styles.css"]
+    response.headers["Cache-Control"] = (
+        "public, max-age=31536000, immutable"
+        if request.query.get("v") == expected else "no-cache, must-revalidate"
+    )
+    return response
 
 
 def authenticate_miniapp_session(request):
@@ -23833,8 +23757,25 @@ def authenticate_member_session(request):
         raise MemberSessionError("member_unauthorized",401) from error
 
 
+def member_request_access(request):
+    if "member_access" not in request:
+        request["member_access"] = member_access(
+            get_db_conn, request["miniapp_member"].telegram_id
+        )
+    return request["member_access"]
+
+
+def miniapp_slow_request_threshold():
+    try:
+        return max(0.0, float(os.getenv("MINIAPP_SLOW_REQUEST_MS", "750")))
+    except (TypeError, ValueError):
+        return 750.0
+
+
 @web.middleware
 async def miniapp_admin_auth_middleware(request, handler):
+    started_at = time.perf_counter()
+    auth_started_at = started_at
     is_admin_api = request.path.startswith("/api/admin/")
     is_member_api = request.path.startswith("/api/member/")
     if is_admin_api and not (
@@ -23845,10 +23786,13 @@ async def miniapp_admin_auth_middleware(request, handler):
         except MiniAppSessionError as error:
             return miniapp_auth_error_response(error.status)
     if is_member_api and not (request.path == "/api/member/auth" and request.method == "POST"):
+        request.pop("member_access", None)
         try:
             request["miniapp_member"] = authenticate_member_session(request)
         except MemberSessionError as error:
             return miniapp_auth_error_response(error.status)
+    auth_ms = (time.perf_counter() - auth_started_at) * 1000
+    handler_started_at = time.perf_counter()
     try:
         response = await handler(request)
     except Exception:
@@ -23861,7 +23805,22 @@ async def miniapp_admin_auth_middleware(request, handler):
             miniapp_auth_error_reference(category),
         )
         response = web.json_response({"error": "internal_error"}, status=500)
-    return apply_miniapp_security_headers(response) if (is_admin_api or is_member_api) else response
+    response = apply_miniapp_security_headers(response) if (is_admin_api or is_member_api) else response
+    if is_admin_api or is_member_api:
+        total_ms = (time.perf_counter() - started_at) * 1000
+        handler_ms = (time.perf_counter() - handler_started_at) * 1000
+        route = getattr(getattr(request.match_info, "route", None), "resource", None)
+        route_name = getattr(route, "canonical", request.path)
+        response_bytes = response.content_length
+        threshold = miniapp_slow_request_threshold()
+        log = logging.warning if total_ms >= threshold else logging.info
+        log(
+            "MINIAPP_API_PERF method=%s route=%s status=%s auth_ms=%.1f db_ms=unavailable handler_ms=%.1f total_ms=%.1f query_count=unavailable response_bytes=%s source_latency_ms=%s",
+            request.method, route_name, response.status, auth_ms, handler_ms,
+            total_ms, response_bytes if response_bytes is not None else "unknown",
+            request.get("media_source_latency_ms", "unavailable"),
+        )
+    return response
 
 def member_error(error):
     return apply_miniapp_security_headers(web.json_response({"error":error.category},status=error.status))
@@ -23881,7 +23840,7 @@ async def miniapp_member_auth(request):
     return apply_miniapp_security_headers(web.json_response({"token":token,"expires_at":session.expires_at.isoformat(),"authenticated":True,"profile":{"first_name":identity.first_name,"username":identity.username},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}},status=201))
 
 async def miniapp_member_me(request):
-    access=member_access(get_db_conn,request["miniapp_member"].telegram_id)
+    access=member_request_access(request)
     return apply_miniapp_security_headers(web.json_response({"profile":{"first_name":request["miniapp_member"].first_name},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}}))
 
 
@@ -23892,24 +23851,25 @@ async def miniapp_member_bookings(request):
 
 async def miniapp_member_content_list(request):
     try:
-        result=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"))
+        result=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"),access=member_request_access(request))
     except MemberCatalogError as error: return member_error(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_content_details(request):
-    try: result=get_member_content(get_db_conn,request["miniapp_member"].telegram_id,request.match_info.get("content_id"))
+    try: result=get_member_content(get_db_conn,request["miniapp_member"].telegram_id,request.match_info.get("content_id"),access=member_request_access(request))
     except MemberCatalogError as error: return member_error(error)
     if result is None: return member_error(MemberCatalogError("content_not_found",404))
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_categories(request):
-    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"),request["miniapp_member"].telegram_id)
+    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"),request["miniapp_member"].telegram_id,access=member_request_access(request))
     except MemberCatalogError as error: return member_error(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_home(request):
-    lessons=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6)
-    categories=list_member_categories(get_db_conn,"lesson",request["miniapp_member"].telegram_id)
+    access = member_request_access(request)
+    lessons=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6,access=access)
+    categories=list_member_categories(get_db_conn,"lesson",request["miniapp_member"].telegram_id,access=access)
     free_lessons = [item for item in lessons["items"] if item.get("access_level") == "free"]
     return apply_miniapp_security_headers(web.json_response({"latest_lessons":lessons["items"],"free_lessons":free_lessons,"categories":categories["items"],"access":lessons["access"],"published_only":True}))
 
@@ -23996,9 +23956,11 @@ async def miniapp_member_media(request):
     if access_level is None:
         return member_error(MemberCatalogError("media_not_found",404))
     free_content = media.get("content_access_level") == "free"
-    if access_level == "premium" and not free_content and not member_access(get_db_conn,session.telegram_id)["has_active_access"]:
-        return member_error(MemberCatalogError("active_access_required",403))
+    if access_level == "premium" and not free_content:
+        if not member_request_access(request)["has_active_access"]:
+            return member_error(MemberCatalogError("active_access_required",403))
     limit={"cover":COVER_MAX_BYTES,"audio":AUDIO_MAX_BYTES,"video":VIDEO_MAX_BYTES}[media["media_type"]]
+    source_started_at = time.perf_counter()
     try:
         telegram_file=await bot.get_file(media["server_reference"]); file_path=getattr(telegram_file,"file_path",None)
         file_size=getattr(telegram_file,"file_size",None)
@@ -24012,6 +23974,8 @@ async def miniapp_member_media(request):
                 raise MemberCatalogError("media_unavailable",502)
     except MemberCatalogError as error: return member_error(error)
     except Exception: return member_error(MemberCatalogError("media_unavailable",503))
+    finally:
+        request["media_source_latency_ms"] = round((time.perf_counter() - source_started_at) * 1000, 1)
     try:
         current_media = get_member_media_reference(
             get_db_conn,
@@ -25369,9 +25333,15 @@ async def miniapp_admin_schedule(request):
 
 async def miniapp_admin_classes(request):
     if request.method == "GET":
-        return apply_miniapp_security_headers(web.json_response(
-            list_admin_classes(get_db_conn)
-        ))
+        try:
+            result = list_admin_classes(
+                get_db_conn,
+                limit=request.query.get("limit", "50"),
+                cursor=request.query.get("cursor"),
+            )
+        except BookableClassError as error:
+            return bookable_class_error_response(error)
+        return apply_miniapp_security_headers(web.json_response(result))
     try:
         payload = await request.json()
         result = create_admin_class(

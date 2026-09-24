@@ -10482,17 +10482,14 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_miniapp_static_routes_are_registered_with_secure_content(self):
         app = self.main.create_app()
-        expected = {
-            "/miniapp/": "index.html",
-            "/miniapp/app.js": "app.js",
-            "/miniapp/styles.css": "styles.css",
-        }
-        for route, filename in expected.items():
+        for route in ("/miniapp/", "/miniapp/app.js", "/miniapp/styles.css"):
             handler = self.route_handler(app, "GET", route)
-            response = await handler(SimpleNamespace())
-            self.assertEqual(Path(response._path).name, filename)
-            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            response = await handler(SimpleNamespace(query={}))
+            self.assertEqual(response.headers["Cache-Control"], "no-cache, must-revalidate")
             self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        index_response = await self.main.miniapp_index(SimpleNamespace(query={}))
+        self.assertRegex(index_response.text, r'/miniapp/app\.js\?v=[0-9a-f]{16}')
+        self.assertRegex(index_response.text, r'/miniapp/styles\.css\?v=[0-9a-f]{16}')
         index = (self.main.MINIAPP_ASSET_DIR / "index.html").read_text(encoding="utf-8")
         javascript = (self.main.MINIAPP_ASSET_DIR / "app.js").read_text(encoding="utf-8")
         stylesheet = (self.main.MINIAPP_ASSET_DIR / "styles.css").read_text(encoding="utf-8")
