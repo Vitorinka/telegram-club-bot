@@ -14140,6 +14140,117 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "class_transition_conflict"):
             update_admin_class_status(self.get_conn, created["class_id"], "draft")
 
+    def test_admin_classes_pagination_is_bounded_and_cursor_stable_real_postgres(self):
+        run_migrations(self.get_conn)
+        now = datetime.utcnow() + timedelta(days=1)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                for index in range(105):
+                    cur.execute(
+                        """
+                        INSERT INTO bookable_classes (
+                            class_id,title,starts_at,duration_minutes,zoom_url,
+                            price_amount,currency,capacity,minimum_participants,
+                            booking_deadline,status,created_by_telegram_id
+                        ) VALUES (%s,%s,%s,60,'https://zoom.us/j/perf',1000,'eur',10,3,%s,'draft',101)
+                        """,
+                        (str(uuid.uuid4()), f"Performance class {index}",
+                         now + timedelta(minutes=index), now - timedelta(hours=1)),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        first = list_admin_classes(self.get_conn, limit=100)
+        self.assertEqual(len(first["items"]), 100)
+        self.assertTrue(first["has_more"])
+        self.assertIsNotNone(first["next_cursor"])
+        second = list_admin_classes(
+            self.get_conn, limit=100, cursor=first["next_cursor"]
+        )
+        self.assertEqual(len(second["items"]), 5)
+        self.assertFalse(second["has_more"])
+        first_ids = {item["class_id"] for item in first["items"]}
+        self.assertTrue(first_ids.isdisjoint(
+            {item["class_id"] for item in second["items"]}
+        ))
+        with self.assertRaisesRegex(Exception, "invalid_cursor"):
+            list_admin_classes(self.get_conn, cursor="%%%")
+
+    def test_analytics_conditional_aggregates_match_reference_queries_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        start = datetime.utcnow() - timedelta(hours=1)
+        end = datetime.utcnow() + timedelta(hours=1)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO users (telegram_id,paid,expiry_date,registered_at,video_sent_at,blocked_bot,payment_failed,grace_period_end)
+                       VALUES (88001,TRUE,NOW()+INTERVAL '1 day',NOW(),NOW(),FALSE,FALSE,NULL),
+                              (88002,TRUE,NOW()-INTERVAL '1 day',NOW()-INTERVAL '2 days',NULL,TRUE,TRUE,NOW()+INTERVAL '1 day')"""
+                )
+                for event_type in (
+                    "group_member_joined", "group_member_left",
+                    "subscription_auto_renew_disabled", "auto_access_closed_expired",
+                ):
+                    cur.execute(
+                        "INSERT INTO access_events (telegram_id,event_type,created_at) VALUES (88001,%s,NOW())",
+                        (event_type,),
+                    )
+                payments = [
+                    ("initial_subscription", "succeeded", False, 1000, "eur", "1m"),
+                    ("recurring", "succeeded", True, 1200, "eur", "1m"),
+                    ("trial", "succeeded", False, 100, "eur", "trial"),
+                    ("unknown", "succeeded", False, 50, "usd", None),
+                    ("recurring", "failed", False, 0, "eur", "1m"),
+                ]
+                for index, row in enumerate(payments):
+                    cur.execute(
+                        """INSERT INTO payment_events
+                           (stripe_event_id,event_type,telegram_id,payment_status,payment_kind,recovered_after_failure,amount_paid,currency,tariff_code,created_at)
+                           VALUES (%s,'invoice',88001,%s,%s,%s,%s,%s,%s,NOW())""",
+                        (f"evt_perf_{index}", row[1], row[0], row[2], row[3], row[4], row[5]),
+                    )
+            conn.commit()
+            with conn.cursor() as cur:
+                optimized = main._fetch_weekly_metrics(cur, start, end)
+                reference = {}
+                specs = {
+                    "new_registrations": "SELECT COUNT(*) FROM users WHERE registered_at >= %s AND registered_at < %s",
+                    "free_lessons": "SELECT COUNT(*) FROM users WHERE video_sent_at >= %s AND video_sent_at < %s",
+                    "group_joins": "SELECT COUNT(*) FROM access_events WHERE event_type='group_member_joined' AND created_at >= %s AND created_at < %s",
+                    "group_leaves": "SELECT COUNT(*) FROM access_events WHERE event_type='group_member_left' AND created_at >= %s AND created_at < %s",
+                    "initial_purchases": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND payment_kind='initial_subscription' AND created_at >= %s AND created_at < %s",
+                    "recurring_payments": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND payment_kind='recurring' AND created_at >= %s AND created_at < %s",
+                    "trial_payments": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND payment_kind='trial' AND created_at >= %s AND created_at < %s",
+                    "adjustment_payments": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND payment_kind IN ('adjustment','out_of_band','unknown') AND created_at >= %s AND created_at < %s",
+                    "successful_payments": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND created_at >= %s AND created_at < %s",
+                    "unique_payers": "SELECT COUNT(DISTINCT telegram_id) FROM payment_events WHERE payment_status='succeeded' AND telegram_id IS NOT NULL AND created_at >= %s AND created_at < %s",
+                    "failed_payments": "SELECT COUNT(*) FROM payment_events WHERE payment_status='failed' AND created_at >= %s AND created_at < %s",
+                    "recovered_after_failure": "SELECT COUNT(*) FROM payment_events WHERE payment_status='succeeded' AND recovered_after_failure=TRUE AND created_at >= %s AND created_at < %s",
+                    "auto_renew_disabled": "SELECT COUNT(*) FROM access_events WHERE event_type='subscription_auto_renew_disabled' AND created_at >= %s AND created_at < %s",
+                    "access_closed": "SELECT COUNT(*) FROM access_events WHERE event_type='auto_access_closed_expired' AND created_at >= %s AND created_at < %s",
+                }
+                for key, query in specs.items():
+                    cur.execute(query, (start, end)); reference[key] = int(cur.fetchone()[0])
+                current_specs = {
+                    "active_paid_now": "SELECT COUNT(*) FROM users WHERE paid=TRUE AND expiry_date IS NOT NULL AND expiry_date > NOW()",
+                    "total_users_now": "SELECT COUNT(*) FROM users",
+                    "blocked_bot_now": "SELECT COUNT(*) FROM users WHERE blocked_bot=TRUE",
+                    "grace_period_now": "SELECT COUNT(*) FROM users WHERE grace_period_end IS NOT NULL AND grace_period_end > NOW()",
+                    "payment_failed_now": "SELECT COUNT(*) FROM users WHERE payment_failed=TRUE",
+                    "unlinked_stripe_events": "SELECT COUNT(*) FROM unlinked_stripe_events WHERE resolved=FALSE",
+                    "expired_paid_now": "SELECT COUNT(*) FROM users WHERE paid=TRUE AND expiry_date IS NOT NULL AND expiry_date < NOW()",
+                }
+                for key, query in current_specs.items():
+                    cur.execute(query); reference[key] = int(cur.fetchone()[0])
+                reference["revenue_by_currency"] = main._fetch_revenue_by_currency(cur, start, end)
+                reference["tariff_counts"] = main._fetch_tariff_counts(cur, start, end)
+        finally:
+            conn.rollback(); conn.close()
+        self.assertEqual(optimized, reference)
+
     def test_club_directory_excludes_unrelated_bot_users_real_postgres(self):
         run_migrations(self.get_conn)
         unrelated, member = 91992, 91993

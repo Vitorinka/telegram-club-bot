@@ -75,7 +75,7 @@ SELECT="""SELECT c.content_id,c.content_type,c.title,c.description,c.duration_se
 def _item(row,locked):
     return {"content_id":str(row[0]),"content_type":row[1],"title":row[2],"description":row[3],"duration_seconds":row[4],"sort_order":int(row[5]),"cover_media_id":str(row[6]) if row[6] else None,"video_media_id":str(row[7]) if row[7] else None,"audio_media_id":str(row[8]) if row[8] else None,"has_cover":bool(row[6]),"has_video":bool(row[7]),"has_audio":bool(row[8]),"categories":[{"slug":s,"title":t} for s,t in zip(row[9] or [],row[10] or [])],"locked":bool(locked),"access_level":row[11]}
 
-def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",category=None,query="",limit=50):
+def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",category=None,query="",limit=50, access=None):
     if content_type not in MEMBER_TYPES: raise MemberCatalogError("invalid_content_type")
     if category is not None and (not isinstance(category,str) or not SLUG.fullmatch(category)): raise MemberCatalogError("invalid_category")
     query=(query or "").strip()
@@ -86,7 +86,7 @@ def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",ca
         raise MemberCatalogError("invalid_limit") from None
     if limit < 1 or limit > 50:
         raise MemberCatalogError("invalid_limit")
-    access=member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
+    access=access or member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
         cur.execute(SELECT+""" WHERE c.status='published' AND c.deleted_at IS NULL AND c.content_type=%s
@@ -99,10 +99,10 @@ def list_member_catalog(get_connection, telegram_id, *, content_type="lesson",ca
         return {"items":items,"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]},"published_only":True}
     finally: cur.close(); conn.close()
 
-def get_member_content(get_connection,telegram_id,content_id):
+def get_member_content(get_connection,telegram_id,content_id, *, access=None):
     try: content_id=str(uuid.UUID(str(content_id)))
     except Exception: raise MemberCatalogError("invalid_content_id") from None
-    access=member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
+    access=access or member_access(get_connection,telegram_id); conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute(SELECT+" WHERE c.content_id=%s AND c.status='published' AND c.deleted_at IS NULL",(content_id,)); row=cur.fetchone()
         if not row: conn.rollback(); return None
@@ -118,9 +118,9 @@ def get_member_content(get_connection,telegram_id,content_id):
         conn.rollback(); return result
     finally: cur.close(); conn.close()
 
-def list_member_categories(get_connection,content_type,telegram_id):
+def list_member_categories(get_connection,content_type,telegram_id, *, access=None):
     if content_type not in MEMBER_TYPES: raise MemberCatalogError("invalid_content_type")
-    access = member_access(get_connection, telegram_id)
+    access = access or member_access(get_connection, telegram_id)
     conn=get_connection(); cur=conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("""SELECT cc.slug,cc.title,cc.group_slug,COUNT(c.content_id)

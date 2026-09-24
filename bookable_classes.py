@@ -1,4 +1,7 @@
 import uuid
+import base64
+import binascii
+import json
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -6,6 +9,8 @@ from urllib.parse import urlsplit
 CLASS_STATUSES = frozenset({"draft", "open", "confirmed", "cancelled", "completed"})
 TITLE_MAX = 120
 DESCRIPTION_MAX = 5000
+ADMIN_CLASSES_DEFAULT_LIMIT = 50
+ADMIN_CLASSES_MAX_LIMIT = 100
 
 
 class BookableClassError(ValueError):
@@ -103,13 +108,46 @@ CLASS_SELECT = """
 """
 
 
-def list_admin_classes(get_connection):
+def _admin_classes_cursor(value):
+    if not value:
+        return None
+    try:
+        encoded = str(value)
+        starts_at, class_id = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode())
+        return _datetime(starts_at, "invalid_cursor"), str(uuid.UUID(class_id))
+    except (ValueError, TypeError, binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        raise BookableClassError("invalid_cursor") from None
+
+
+def _encode_admin_classes_cursor(starts_at, class_id):
+    payload = json.dumps([_iso(starts_at), str(class_id)], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def list_admin_classes(get_connection, *, limit=ADMIN_CLASSES_DEFAULT_LIMIT, cursor=None):
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        raise BookableClassError("invalid_limit") from None
+    if limit < 1:
+        raise BookableClassError("invalid_limit")
+    limit = min(limit, ADMIN_CLASSES_MAX_LIMIT)
+    position = _admin_classes_cursor(cursor)
     conn = get_connection(); cur = conn.cursor()
     try:
         cur.execute("SET TRANSACTION READ ONLY")
-        cur.execute(CLASS_SELECT + " GROUP BY c.class_id ORDER BY c.starts_at,c.class_id")
+        where = ""
+        params = []
+        if position:
+            where = " WHERE (c.starts_at,c.class_id) > (%s,%s)"
+            params.extend(position)
+        params.append(limit + 1)
+        cur.execute(CLASS_SELECT + where + " GROUP BY c.class_id ORDER BY c.starts_at,c.class_id LIMIT %s", params)
         rows = cur.fetchall(); conn.rollback()
-        return {"items": [_projection(row, admin=True) for row in rows]}
+        has_more = len(rows) > limit
+        visible = rows[:limit]
+        next_cursor = _encode_admin_classes_cursor(visible[-1][3], visible[-1][0]) if has_more and visible else None
+        return {"items": [_projection(row, admin=True) for row in visible], "has_more": has_more, "next_cursor": next_cursor}
     except Exception:
         conn.rollback(); raise
     finally:

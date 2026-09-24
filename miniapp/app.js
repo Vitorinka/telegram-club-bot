@@ -72,6 +72,29 @@
   const adminNotificationPanelPage = (items, limit) => ({
     visible:items.slice(0,Math.max(0,limit)), remaining:Math.max(0,items.length-Math.max(0,limit)),
   });
+  const createBoundedTaskQueue = (limit = 4) => {
+    const waiting=[]; let active=0; let peak=0;
+    const drain=()=>{
+      while(active < limit && waiting.length){
+        const task=waiting.shift(); active+=1; peak=Math.max(peak,active);
+        Promise.resolve().then(task.run).then(task.resolve,task.reject).finally(()=>{ active-=1; drain(); });
+      }
+    };
+    return {
+      add:(run)=>new Promise((resolve,reject)=>{ waiting.push({run,resolve,reject}); drain(); }),
+      clear:()=>{ waiting.splice(0).forEach((task)=>task.reject(new DOMException("Cancelled","AbortError"))); },
+      stats:()=>({active,queued:waiting.length,peak}),
+    };
+  };
+  const getOrCreateCachedResource = ({cache,pending,key,load,store}) => {
+    if(cache.has(key)) return Promise.resolve(cache.get(key));
+    if(pending.has(key)) return pending.get(key);
+    let task;
+    task=Promise.resolve().then(load).then((value)=>{ store(key,value); return value; }).finally(()=>{
+      if(pending.get(key) === task) pending.delete(key);
+    });
+    pending.set(key,task); return task;
+  };
   const hydrateAdminNotificationReadState = (readState, keys) => {
     readState.clear();
     (keys || []).forEach((key)=>readState.add(key));
@@ -112,7 +135,7 @@
     });
   };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
     return;
   }
   const webApp = window.Telegram && window.Telegram.WebApp;
@@ -320,6 +343,7 @@
   let subscriptionsSearchTimer = null;
   let deliveriesCursor = null;
   let scheduleCursor = null;
+  let adminClassesCursor = null;
   let scheduleRange = "future";
   let scheduleImageGeneration = 0;
   const scheduleImageUrls = new Map();
@@ -351,6 +375,11 @@
   let memberVideoElement = null;
   let memberVideoUrl = null;
   const memberCoverUrls = new Map();
+  const memberCoverPending = new Map();
+  const memberCoverControllers = new Set();
+  const memberCoverQueue = createBoundedTaskQueue(4);
+  const MEMBER_COVER_CACHE_LIMIT = 64;
+  let memberCoverObserver = null;
   let memberLibraryItems = [];
   let memberMeditationItems = [];
   let memberRecipeItems = [];
@@ -370,6 +399,8 @@
   let memberLibraryCategory = "all";
   let adminSearchTimer = null;
   let adminSearchGeneration = 0;
+  let adminSearchController = null;
+  let memberSearchTimer = null;
   let adminNotificationItems = [];
   let adminCurrentNotificationKeys = new Set();
   let adminNotificationUnknownUnreadCount = 0;
@@ -458,9 +489,9 @@
       container.replaceChildren(memberIcon(container.dataset.memberIcon));
     });
   };
-  const api = (path) => fetch(path, {
+  const api = (path, options = {}) => fetch(path, {
     method: "GET", headers: {Authorization: `Bearer ${sessionToken}`},
-    cache: "no-store", credentials: "omit",
+    cache: "no-store", credentials: "omit", signal: options.signal,
   }).then((response) => {
     if (response.status === 401) throw new Error("session_ended");
     if (response.status === 403) throw new Error("access_revoked");
@@ -546,10 +577,41 @@
       appendInlineFormatting(element, line.replace(/^###\s+/, "")); container.append(element);
     });
   };
-  const clearMemberCoverUrls = () => {
+  const cancelMemberCoverWork = () => {
     memberCoverGeneration += 1;
+    if (memberCoverObserver) memberCoverObserver.disconnect();
+    memberCoverObserver = null;
+    memberCoverQueue.clear();
+    memberCoverControllers.forEach((controller)=>controller.abort());
+    memberCoverControllers.clear();
+    memberCoverPending.clear();
+  };
+  const clearMemberCoverUrls = () => {
+    cancelMemberCoverWork();
     memberCoverUrls.forEach((url) => URL.revokeObjectURL(url));
     memberCoverUrls.clear();
+  };
+  const cacheMemberCover = (key, url) => {
+    const old=memberCoverUrls.get(key);
+    if(old && old !== url) URL.revokeObjectURL(old);
+    memberCoverUrls.delete(key); memberCoverUrls.set(key,url);
+    while(memberCoverUrls.size > MEMBER_COVER_CACHE_LIMIT){
+      const [expiredKey,expiredUrl]=memberCoverUrls.entries().next().value;
+      memberCoverUrls.delete(expiredKey); URL.revokeObjectURL(expiredUrl);
+    }
+  };
+  const renderMemberCoverImage = (container,item,url) => {
+    const image=document.createElement("img"); image.src=url; image.alt=`Обложка: ${item.title}`;
+    container.replaceChildren(image);
+  };
+  const ensureMemberCoverObserver = () => {
+    if(memberCoverObserver || !("IntersectionObserver" in window)) return memberCoverObserver;
+    memberCoverObserver=new IntersectionObserver((entries,observer)=>entries.forEach((entry)=>{
+      if(!entry.isIntersecting) return;
+      observer.unobserve(entry.target); const load=entry.target._memberCoverLoad;
+      if(load) load();
+    }),{rootMargin:"300px 0px"});
+    return memberCoverObserver;
   };
   const clearMemberAudio = () => {
     memberAudioGeneration += 1;
@@ -575,33 +637,33 @@
   };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
+    const key=String(item.cover_media_id || "");
     const container = document.createElement("div");
     container.className = large ? "member-cover member-cover-large" : "member-cover";
     if (!item.has_cover || !item.cover_media_id) {
       container.append(text("span", "Материал клуба", "member-cover-placeholder"));
       return container;
     }
+    const cached=memberCoverUrls.get(key);
+    if(cached){ memberCoverUrls.delete(key); memberCoverUrls.set(key,cached); renderMemberCoverImage(container,item,cached); return container; }
     container.append(text("span", "Загружаем обложку…", "member-cover-placeholder"));
-    fetch(
-      memberPath(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`, `/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`),
-      {headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit"}
-    ).then((response) => {
-      if (!response.ok) throw new Error("cover_unavailable");
-      return response.blob();
-    }).then((blob) => {
-      if (generation !== memberCoverGeneration) return;
-      const url = URL.createObjectURL(blob);
-      const old = memberCoverUrls.get(item.cover_media_id);
-      if (old) URL.revokeObjectURL(old);
-      memberCoverUrls.set(item.cover_media_id, url);
-      const image = document.createElement("img");
-      image.src = url;
-      image.alt = `Обложка: ${item.title}`;
-      container.replaceChildren(image);
-    }).catch(() => {
-      if (generation !== memberCoverGeneration) return;
-      container.replaceChildren(text("span", "Обложка недоступна", "member-cover-placeholder"));
-    });
+    const load=()=>{
+      const pending=getOrCreateCachedResource({cache:memberCoverUrls,pending:memberCoverPending,key,store:cacheMemberCover,load:()=>{
+        const controller=new AbortController(); memberCoverControllers.add(controller);
+        return memberCoverQueue.add(()=>fetch(
+          memberPath(`/api/admin/content/cms/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`, `/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.cover_media_id)}`),
+          {headers:{Authorization:`Bearer ${sessionToken}`},cache:"no-store",credentials:"omit",signal:controller.signal}
+        ).then((response)=>{ if(!response.ok) throw new Error("cover_unavailable"); return response.blob(); })
+          .then((blob)=>URL.createObjectURL(blob))
+          .finally(()=>memberCoverControllers.delete(controller)));
+      }});
+      pending.then((url)=>{ if(generation===memberCoverGeneration && container.isConnected) renderMemberCoverImage(container,item,url); }).catch((error)=>{
+        if(generation===memberCoverGeneration && error.name!=="AbortError" && container.isConnected) container.replaceChildren(text("span","Обложка недоступна","member-cover-placeholder"));
+      });
+    };
+    container._memberCoverLoad=load;
+    const observer=ensureMemberCoverObserver();
+    if(observer) observer.observe(container); else load();
     return container;
   };
   const memberContentCard = (item) => {
@@ -673,7 +735,7 @@
   const loadMemberHome = () => {
     return api(memberPath("/api/admin/member-preview/home", "/api/member/home")).then((data) => {
       syncMemberAccess(data.access);
-      clearMemberCoverUrls();
+      cancelMemberCoverWork();
       memberHomeLessons.replaceChildren();
       const regularLessons = data.latest_lessons.filter((item) => item.access_level !== "free");
       regularLessons.forEach((item) => memberHomeLessons.append(memberContentCard(item)));
@@ -702,7 +764,7 @@
         || (item.categories || []).some((entry) => entry.slug === memberLibraryCategory);
       return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
     });
-    clearMemberCoverUrls();
+    cancelMemberCoverWork();
     memberTrainingList.replaceChildren();
     items.forEach((item) => memberTrainingList.append(memberContentCard(item)));
     memberTrainingEmpty.hidden = items.length !== 0;
@@ -740,7 +802,7 @@
   };
   const loadMemberLesson = (contentId, contentType = "lesson") => {
     return api(memberPath(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`, `/api/member/content/${encodeURIComponent(contentId)}`)).then((item) => {
-      clearMemberCoverUrls();
+      cancelMemberCoverWork();
       clearMemberAudio();
       clearMemberVideo();
       memberDetailContentType = contentType;
@@ -892,7 +954,7 @@
   const renderMemberMeditations = () => {
     const query = memberMeditationSearch.value.trim().toLocaleLowerCase("ru");
     const items = memberMeditationItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
-    clearMemberCoverUrls();
+    cancelMemberCoverWork();
     memberMeditationList.replaceChildren();
     items.forEach((item) => memberMeditationList.append(memberContentCard(item)));
     memberMeditationEmpty.hidden = items.length !== 0;
@@ -909,7 +971,7 @@
       const categoryMatches = memberRecipeCategory === "all" || (item.categories || []).some((entry) => entry.slug === memberRecipeCategory);
       return categoryMatches && (!query || item.title.toLocaleLowerCase("ru").includes(query));
     });
-    clearMemberCoverUrls();
+    cancelMemberCoverWork();
     memberRecipeList.replaceChildren();
     items.forEach((item) => memberRecipeList.append(memberContentCard(item)));
     memberRecipeEmpty.hidden = items.length !== 0;
@@ -940,7 +1002,7 @@
   const renderMemberNutrition = () => {
     const query = memberNutritionSearch.value.trim().toLocaleLowerCase("ru");
     const items = memberNutritionItems.filter((item) => !query || item.title.toLocaleLowerCase("ru").includes(query));
-    clearMemberCoverUrls();
+    cancelMemberCoverWork();
     memberNutritionList.replaceChildren();
     items.forEach((item) => memberNutritionList.append(memberContentCard(item)));
     memberNutritionEmpty.hidden = items.length !== 0;
@@ -1031,7 +1093,7 @@
   const exitMemberPreview = () => {
     if (realMemberMode) { webApp.close(); return Promise.resolve(); }
     memberPreviewMode = false;
-    clearMemberCoverUrls();
+    cancelMemberCoverWork();
     clearMemberAudio();
     document.body.classList.remove("member-preview-mode");
     memberBottomNav.hidden = true;
@@ -1254,6 +1316,7 @@
         ...systemItems,
       ]);
       renderAdminNotificationPanel(); renderNotificationCenter(); updateAdminNotificationBadge();
+      return {failed,gifts,deliveries,system};
     });
   });
   const loadDashboard = () => {
@@ -1273,9 +1336,10 @@
         api("/api/admin/content/cms?status=all&limit=50").then(renderDashboardContent),
         api("/api/admin/users?limit=4&status=all").then(renderDashboardUsers),
         api(`/api/admin/schedule?${scheduleQuery.toString()}`).then(renderDashboardSchedules),
-        api("/api/admin/gifts?limit=4&status=all&duration=all").then(renderDashboardGifts),
-        api("/api/admin/failed-subscriptions?limit=4&state=attention").then(renderDashboardFailures),
-        refreshAttentionCount(),
+        refreshAttentionCount().then(({failed,gifts})=>{
+          renderDashboardGifts({...gifts,items:(gifts.items || []).slice(0,4)});
+          renderDashboardFailures({...failed,items:(failed.items || []).slice(0,4)});
+        }),
       ]);
     });
   };
@@ -1784,7 +1848,7 @@
   };
   const loadSchedule = (append = false) => {
     status.textContent = "Загружаем расписание…";
-    return Promise.all([api(`/api/admin/schedule?${scheduleParams(append).toString()}`),api("/api/admin/classes")]).then(([data,classes]) => {
+    return Promise.all([api(`/api/admin/schedule?${scheduleParams(append).toString()}`),api("/api/admin/classes?limit=50")]).then(([data,classes]) => {
       if (!append) {
         clearScheduleImages();
         scheduleList.replaceChildren();
@@ -1802,15 +1866,16 @@
       scheduleMetricNodes.forEach((node) => {
         node.textContent = String(data.summary[node.dataset.scheduleMetric] ?? "—");
       });
-      renderAdminClasses(classes.items || []);
+      renderAdminClasses(classes.items || [],false,classes);
       showScreen("schedule");
       status.textContent = data.items.length
         ? (archive ? "Архив расписаний" : "Расписание клуба")
         : scheduleEmpty.textContent;
     });
   };
-  const renderAdminClasses = (items) => {
-    classCalendarList.replaceChildren();
+  const renderAdminClasses = (items,append=false,page={}) => {
+    if(!append) classCalendarList.replaceChildren();
+    classCalendarList.querySelector(".admin-classes-more")?.remove();
     items.forEach((item)=>{
       const row=document.createElement("article"); row.className="class-calendar-row";
       const copy=document.createElement("div"); copy.append(text("strong",item.title),text("small",`${new Date(item.starts_at).toLocaleString("ru-RU")} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`));
@@ -1823,7 +1888,16 @@
       if(["draft","open","confirmed"].includes(item.status)){ const cancel=text("button","Отменить","secondary"); cancel.type="button"; cancel.addEventListener("click",()=>writeAdminJson("PATCH",`/api/admin/classes/${encodeURIComponent(item.class_id)}/status`,{status:"cancelled"}).then(()=>loadSchedule(false)).catch(showApiError)); row.append(cancel); }
       classCalendarList.append(row);
     });
-    if(!items.length) classCalendarList.append(text("p","Создайте первое бронируемое Zoom-занятие.","hint"));
+    adminClassesCursor=page.next_cursor || null;
+    if(!items.length && !append) classCalendarList.append(text("p","Создайте первое бронируемое Zoom-занятие.","hint"));
+    if(page.has_more && adminClassesCursor){
+      const more=text("button","Показать ещё занятия","secondary admin-classes-more"); more.type="button";
+      more.addEventListener("click",()=>{
+        more.disabled=true;
+        api(`/api/admin/classes?limit=50&cursor=${encodeURIComponent(adminClassesCursor)}`).then((next)=>renderAdminClasses(next.items || [],true,next)).catch(showApiError);
+      });
+      classCalendarList.append(more);
+    }
   };
   function loadScheduleDetails(scheduleId) {
     status.textContent = "Загружаем расписание…";
@@ -2837,6 +2911,9 @@
   const runAdminGlobalSearch = () => {
     const query = adminGlobalSearch.value.trim();
     const generation = ++adminSearchGeneration;
+    if(adminSearchController) adminSearchController.abort();
+    adminSearchController=new AbortController();
+    const signal=adminSearchController.signal;
     adminSearchResults.hidden = false;
     closeAdminHeaderPanels(adminSearchResults);
     if (query.length < 2) {
@@ -2846,9 +2923,9 @@
     adminSearchResults.replaceChildren(text("p", "Ищем…", "admin-panel-state"));
     const userParams = new URLSearchParams({limit:"6",status:"all",q:query});
     return Promise.all([
-      api(`/api/admin/users?${userParams.toString()}`),
-      api("/api/admin/content/cms?status=all&limit=50"),
-      api("/api/admin/failed-subscriptions?state=attention&limit=12"),
+      api(`/api/admin/users?${userParams.toString()}`,{signal}),
+      api("/api/admin/content/cms?status=all&limit=50",{signal}),
+      api("/api/admin/failed-subscriptions?state=attention&limit=12",{signal}),
     ]).then(([users,content,failed]) => {
       if (generation !== adminSearchGeneration) return;
       const contentLabels = {lesson:"Тренировка",meditation:"Медитация",recipe:"Рецепт",nutrition_material:"Материал"};
@@ -2860,6 +2937,7 @@
       if (taskMatches.length) groups.push(adminResultGroup("Задачи", taskMatches.map((item)=>({title:item.username ? `@${item.username}` : (item.first_name || "Проблема продления"),meta:`${item.reason_label} · ${failedStatusLabels[item.status] || item.status}`,open:()=>loadFailedSubscriptionDetails(item.operation_id)}))));
       adminSearchResults.replaceChildren(...(groups.length ? groups : [text("p", "Ничего не найдено.", "admin-panel-state")]));
     }).catch((error) => {
+      if(error.name === "AbortError") return;
       if (generation === adminSearchGeneration) adminSearchResults.replaceChildren(text("p", "Поиск временно недоступен.", "admin-panel-state"));
       if (error.message === "session_ended" || error.message === "access_revoked") showApiError(error);
     });
@@ -3188,11 +3266,15 @@
     target.catch(showApiError);
   });
   document.getElementById("member-open-meditations").addEventListener("click", () => loadMemberMeditations().catch(showApiError));
-  memberMeditationSearch.addEventListener("input", renderMemberMeditations);
+  const debounceMemberRender=(render)=>()=>{
+    window.clearTimeout(memberSearchTimer);
+    memberSearchTimer=window.setTimeout(render,200);
+  };
+  memberMeditationSearch.addEventListener("input", debounceMemberRender(renderMemberMeditations));
   document.getElementById("member-open-recipes").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
   document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberNutrition().catch(showApiError));
-  memberNutritionSearch.addEventListener("input", renderMemberNutrition);
-  memberRecipeSearch.addEventListener("input", renderMemberRecipes);
+  memberNutritionSearch.addEventListener("input", debounceMemberRender(renderMemberNutrition));
+  memberRecipeSearch.addEventListener("input", debounceMemberRender(renderMemberRecipes));
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
   document.getElementById("class-create-toggle").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=!classCreateForm.hidden; if(!classCreateForm.hidden) classCreateForm.reset(); });
   document.getElementById("class-create-cancel").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=true; classCreateForm.reset(); });
@@ -3207,7 +3289,8 @@
   document.querySelectorAll("[data-member-category-nav]").forEach((button) => {
     button.addEventListener("click", () => loadMemberLibrary(button.dataset.memberCategoryNav).catch(showApiError));
   });
-  memberLibrarySearch.addEventListener("input", renderMemberLibrary);
+  memberLibrarySearch.addEventListener("input", debounceMemberRender(renderMemberLibrary));
+  window.addEventListener("pagehide", clearMemberCoverUrls, {once:true});
   document.querySelectorAll(".member-exit").forEach((button) => {
     button.addEventListener("click", () => exitMemberPreview().catch(showApiError));
   });
@@ -3411,7 +3494,12 @@
       requestFullscreenSupported: typeof webApp.requestFullscreen === "function",
     });
     telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false;
-    return loadAdminNotificationAcknowledgements().then(loadDashboard);
+    return Promise.allSettled([
+      loadDashboard(),
+      loadAdminNotificationAcknowledgements().then(()=>{
+        renderAdminNotificationPanel(); renderNotificationCenter(); updateAdminNotificationBadge();
+      }),
+    ]);
   }).catch((error) => {
     if (error.message === "member_rollout_disabled") { status.textContent="Новая платформа пока доступна только участникам тестирования."; identity.hidden=true; return; }
     if (error.message === "telegram_session_expired") {
