@@ -310,48 +310,83 @@ def collect_admin_system(get_connection, db_pool_health, scheduler_job_count):
     try:
         _begin_read_only(cur)
         cur.execute("""
+            WITH delivery_summary AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                    COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE status = 'permanently_failed') AS permanent,
+                    COUNT(*) FILTER (
+                        WHERE status = 'sent'
+                          AND sent_at >= NOW() - INTERVAL '24 hours'
+                    ) AS sent_24h
+                FROM message_delivery_events
+            ), removal_summary AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                    COUNT(*) FILTER (
+                        WHERE status IN (
+                            'processing', 'stripe_canceled',
+                            'telegram_failed', 'telegram_removed'
+                        )
+                    ) AS retryable,
+                    COUNT(*) FILTER (
+                        WHERE status = 'db_finalized'
+                          AND db_finalized_at >= NOW() - INTERVAL '24 hours'
+                    ) AS finalized_24h
+                FROM subscription_removal_events
+            ), scheduler_summary AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'running') AS running,
+                    COUNT(*) FILTER (
+                        WHERE status = 'failed'
+                          AND updated_at >= NOW() - INTERVAL '24 hours'
+                    ) AS failed_24h,
+                    COUNT(*) FILTER (
+                        WHERE status = 'running'
+                          AND (lease_until IS NULL OR lease_until <= NOW())
+                    ) AS stale
+                FROM scheduled_job_runs
+            )
             SELECT
-                COUNT(*) FILTER (WHERE status = 'pending'),
-                COUNT(*) FILTER (WHERE status = 'processing'),
-                COUNT(*) FILTER (WHERE status = 'failed'),
-                COUNT(*) FILTER (WHERE status = 'permanently_failed'),
-                COUNT(*) FILTER (WHERE status = 'sent' AND sent_at >= NOW() - INTERVAL '24 hours')
-            FROM message_delivery_events
+                d.pending, d.processing, d.failed, d.permanent, d.sent_24h,
+                r.pending, r.retryable, r.finalized_24h,
+                (
+                    SELECT telegram_id
+                    FROM subscription_removal_events
+                    WHERE status IN (
+                        'processing', 'stripe_canceled',
+                        'telegram_failed', 'telegram_removed'
+                    )
+                    ORDER BY updated_at DESC, telegram_id DESC LIMIT 1
+                ),
+                (
+                    SELECT created_at
+                    FROM subscription_removal_events
+                    WHERE status IN (
+                        'processing', 'stripe_canceled',
+                        'telegram_failed', 'telegram_removed'
+                    )
+                    ORDER BY updated_at DESC, telegram_id DESC LIMIT 1
+                ),
+                s.running, s.failed_24h, s.stale,
+                (
+                    SELECT job_key
+                    FROM scheduled_job_runs
+                    WHERE status = 'failed'
+                      AND updated_at >= NOW() - INTERVAL '24 hours'
+                    ORDER BY updated_at DESC, job_key DESC LIMIT 1
+                )
+            FROM delivery_summary d, removal_summary r, scheduler_summary s
         """)
-        deliveries = cur.fetchone()
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'pending'),
-                COUNT(*) FILTER (WHERE status IN ('processing', 'stripe_canceled', 'telegram_failed', 'telegram_removed')),
-                COUNT(*) FILTER (WHERE status = 'db_finalized' AND db_finalized_at >= NOW() - INTERVAL '24 hours')
-            FROM subscription_removal_events
-        """)
-        removals = cur.fetchone()
-        cur.execute("""
-            SELECT telegram_id, created_at
-            FROM subscription_removal_events
-            WHERE status IN ('processing', 'stripe_canceled', 'telegram_failed', 'telegram_removed')
-            ORDER BY updated_at DESC, telegram_id DESC
-            LIMIT 1
-        """)
-        latest_retryable_removal = cur.fetchone()
-        cur.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'running'),
-                COUNT(*) FILTER (WHERE status = 'failed' AND updated_at >= NOW() - INTERVAL '24 hours'),
-                COUNT(*) FILTER (WHERE status = 'running' AND (lease_until IS NULL OR lease_until <= NOW()))
-            FROM scheduled_job_runs
-        """)
-        scheduler = cur.fetchone()
-        cur.execute("""
-            SELECT job_key
-            FROM scheduled_job_runs
-            WHERE status = 'failed'
-              AND updated_at >= NOW() - INTERVAL '24 hours'
-            ORDER BY updated_at DESC, job_key DESC
-            LIMIT 1
-        """)
-        latest_failed_job = cur.fetchone()
+        summary = cur.fetchone()
+        deliveries = summary[0:5]
+        removals = summary[5:8]
+        latest_retryable_removal = (
+            summary[8:10] if summary[8] is not None else None
+        )
+        scheduler = summary[10:13]
+        latest_failed_job = (summary[13],) if summary[13] is not None else None
         cur.execute("""
             SELECT job_key, job_name, status, started_at, completed_at,
                    updated_at, error_text, lease_until,
