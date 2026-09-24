@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import contextvars
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit, urlunsplit
@@ -581,6 +582,20 @@ DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
 DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "5"))
 DB_POOL = None
 DB_POOL_CONNECTION_ERRORS = 0
+MINIAPP_DB_METRICS = contextvars.ContextVar("miniapp_db_metrics", default=None)
+
+
+def _bounded_admin_session_cache_ttl():
+    try:
+        value = float(os.getenv("MINIAPP_ADMIN_SESSION_CACHE_TTL_SECONDS", "5"))
+    except (TypeError, ValueError):
+        value = 5.0
+    return max(0.0, min(30.0, value))
+
+
+MINIAPP_ADMIN_SESSION_CACHE_TTL_SECONDS = _bounded_admin_session_cache_ttl()
+MINIAPP_ADMIN_SESSION_CACHE = {}
+MINIAPP_ADMIN_SESSION_CACHE_LOCK = threading.Lock()
 checkout_session_cache = {}
 checkout_retry_state = {}
 checkout_session_cache_lock = asyncio.Lock()
@@ -684,7 +699,7 @@ class PooledDbConnection:
         self._closed = False
 
     def cursor(self, *args, **kwargs):
-        return self._raw_conn.cursor(*args, **kwargs)
+        return TrackedDbCursor(self._raw_conn.cursor(*args, **kwargs))
 
     def commit(self):
         return self._raw_conn.commit()
@@ -708,6 +723,43 @@ class PooledDbConnection:
         return getattr(self._raw_conn, name)
 
 
+class TrackedDbCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def _call(self, method, *args, **kwargs):
+        started_at = time.perf_counter()
+        try:
+            return getattr(self._cursor, method)(*args, **kwargs)
+        finally:
+            metrics = MINIAPP_DB_METRICS.get()
+            if metrics is not None:
+                metrics["db_ms"] += (time.perf_counter() - started_at) * 1000
+                metrics["query_count"] += 1
+
+    def execute(self, *args, **kwargs):
+        return self._call("execute", *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._call("executemany", *args, **kwargs)
+
+    def callproc(self, *args, **kwargs):
+        return self._call("callproc", *args, **kwargs)
+
+    def __enter__(self):
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._cursor.__exit__(*args)
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 def get_db_pool():
     global DB_POOL
     if DB_POOL is None:
@@ -724,7 +776,17 @@ def get_db_pool():
 
 def get_db_conn():
     pool = get_db_pool()
-    return PooledDbConnection(pool.getconn(), pool)
+    started_at = time.perf_counter()
+    try:
+        return PooledDbConnection(pool.getconn(), pool)
+    finally:
+        metrics = MINIAPP_DB_METRICS.get()
+        if metrics is not None:
+            metrics["db_ms"] += (time.perf_counter() - started_at) * 1000
+
+
+async def run_sync_db(function, *args, **kwargs):
+    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 def close_db_pool():
@@ -23724,10 +23786,46 @@ async def miniapp_stylesheet(request):
     return response
 
 
+def _cached_admin_session(raw_token):
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    now_monotonic = time.monotonic()
+    with MINIAPP_ADMIN_SESSION_CACHE_LOCK:
+        cached = MINIAPP_ADMIN_SESSION_CACHE.get(token_hash)
+        if cached and cached[0] > now_monotonic:
+            session = cached[1]
+            expires_at = getattr(session, "expires_at", None)
+            now = (
+                datetime.now(timezone.utc)
+                if expires_at is not None and expires_at.tzinfo is not None
+                else datetime.utcnow()
+            )
+            if expires_at is None or expires_at > now:
+                return session
+        MINIAPP_ADMIN_SESSION_CACHE.pop(token_hash, None)
+    session = load_miniapp_admin_session(get_db_conn, raw_token)
+    if getattr(session, "expires_at", None) is not None:
+        cache_until = now_monotonic + MINIAPP_ADMIN_SESSION_CACHE_TTL_SECONDS
+        with MINIAPP_ADMIN_SESSION_CACHE_LOCK:
+            MINIAPP_ADMIN_SESSION_CACHE[token_hash] = (cache_until, session)
+    return session
+
+
+def _invalidate_admin_session_cache(*, session_id=None, telegram_id=None):
+    with MINIAPP_ADMIN_SESSION_CACHE_LOCK:
+        stale = [
+            token_hash
+            for token_hash, (_deadline, session) in MINIAPP_ADMIN_SESSION_CACHE.items()
+            if (session_id is not None and session.session_id == session_id)
+            or (telegram_id is not None and session.telegram_id == telegram_id)
+        ]
+        for token_hash in stale:
+            MINIAPP_ADMIN_SESSION_CACHE.pop(token_hash, None)
+
+
 def authenticate_miniapp_session(request):
     try:
         raw_token = parse_bearer_authorization(request.headers.get("Authorization"))
-        session = load_miniapp_admin_session(get_db_conn, raw_token)
+        session = _cached_admin_session(raw_token)
     except MiniAppSessionError as error:
         log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
         raise
@@ -23765,6 +23863,15 @@ def member_request_access(request):
     return request["member_access"]
 
 
+async def async_member_request_access(request):
+    if "member_access" not in request:
+        request["member_access"] = await run_sync_db(
+            member_access, get_db_conn,
+            request["miniapp_member"].telegram_id,
+        )
+    return request["member_access"]
+
+
 def miniapp_slow_request_threshold():
     try:
         return max(0.0, float(os.getenv("MINIAPP_SLOW_REQUEST_MS", "750")))
@@ -23775,6 +23882,8 @@ def miniapp_slow_request_threshold():
 @web.middleware
 async def miniapp_admin_auth_middleware(request, handler):
     started_at = time.perf_counter()
+    db_metrics = {"db_ms": 0.0, "query_count": 0}
+    db_metrics_token = MINIAPP_DB_METRICS.set(db_metrics)
     auth_started_at = started_at
     is_admin_api = request.path.startswith("/api/admin/")
     is_member_api = request.path.startswith("/api/member/")
@@ -23782,14 +23891,20 @@ async def miniapp_admin_auth_middleware(request, handler):
         request.path == "/api/admin/session" and request.method == "POST"
     ):
         try:
-            request["miniapp_admin"] = authenticate_miniapp_session(request)
+            request["miniapp_admin"] = await run_sync_db(
+                authenticate_miniapp_session, request
+            )
         except MiniAppSessionError as error:
+            MINIAPP_DB_METRICS.reset(db_metrics_token)
             return miniapp_auth_error_response(error.status)
     if is_member_api and not (request.path == "/api/member/auth" and request.method == "POST"):
         request.pop("member_access", None)
         try:
-            request["miniapp_member"] = authenticate_member_session(request)
+            request["miniapp_member"] = await run_sync_db(
+                authenticate_member_session, request
+            )
         except MemberSessionError as error:
+            MINIAPP_DB_METRICS.reset(db_metrics_token)
             return miniapp_auth_error_response(error.status)
     auth_ms = (time.perf_counter() - auth_started_at) * 1000
     handler_started_at = time.perf_counter()
@@ -23815,11 +23930,14 @@ async def miniapp_admin_auth_middleware(request, handler):
         threshold = miniapp_slow_request_threshold()
         log = logging.warning if total_ms >= threshold else logging.info
         log(
-            "MINIAPP_API_PERF method=%s route=%s status=%s auth_ms=%.1f db_ms=unavailable handler_ms=%.1f total_ms=%.1f query_count=unavailable response_bytes=%s source_latency_ms=%s",
-            request.method, route_name, response.status, auth_ms, handler_ms,
-            total_ms, response_bytes if response_bytes is not None else "unknown",
+            "MINIAPP_API_PERF method=%s route=%s status=%s auth_ms=%.1f db_ms=%.1f handler_ms=%.1f total_ms=%.1f query_count=%s response_bytes=%s source_latency_ms=%s",
+            request.method, route_name, response.status, auth_ms,
+            db_metrics["db_ms"], handler_ms,
+            total_ms, db_metrics["query_count"],
+            response_bytes if response_bytes is not None else "unknown",
             request.get("media_source_latency_ms", "unavailable"),
         )
+    MINIAPP_DB_METRICS.reset(db_metrics_token)
     return response
 
 def member_error(error):
@@ -23840,36 +23958,44 @@ async def miniapp_member_auth(request):
     return apply_miniapp_security_headers(web.json_response({"token":token,"expires_at":session.expires_at.isoformat(),"authenticated":True,"profile":{"first_name":identity.first_name,"username":identity.username},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}},status=201))
 
 async def miniapp_member_me(request):
-    access=member_request_access(request)
+    access=await async_member_request_access(request)
     return apply_miniapp_security_headers(web.json_response({"profile":{"first_name":request["miniapp_member"].first_name},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}}))
 
 
 async def miniapp_member_bookings(request):
     return apply_miniapp_security_headers(web.json_response(
-        list_member_bookings(get_db_conn, request["miniapp_member"].telegram_id)
+        await run_sync_db(
+            list_member_bookings, get_db_conn,
+            request["miniapp_member"].telegram_id,
+        )
     ))
 
 async def miniapp_member_content_list(request):
+    access = await async_member_request_access(request)
     try:
-        result=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"),access=member_request_access(request))
+        result=await run_sync_db(list_member_catalog,get_db_conn,request["miniapp_member"].telegram_id,content_type=request.query.get("content_type","lesson"),category=request.query.get("category"),query=request.query.get("q",""),limit=request.query.get("limit","50"),access=access)
     except MemberCatalogError as error: return member_error(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_content_details(request):
-    try: result=get_member_content(get_db_conn,request["miniapp_member"].telegram_id,request.match_info.get("content_id"),access=member_request_access(request))
+    access = await async_member_request_access(request)
+    try: result=await run_sync_db(get_member_content,get_db_conn,request["miniapp_member"].telegram_id,request.match_info.get("content_id"),access=access)
     except MemberCatalogError as error: return member_error(error)
     if result is None: return member_error(MemberCatalogError("content_not_found",404))
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_categories(request):
-    try: result=list_member_categories(get_db_conn,request.query.get("content_type","lesson"),request["miniapp_member"].telegram_id,access=member_request_access(request))
+    access = await async_member_request_access(request)
+    try: result=await run_sync_db(list_member_categories,get_db_conn,request.query.get("content_type","lesson"),request["miniapp_member"].telegram_id,access=access)
     except MemberCatalogError as error: return member_error(error)
     return apply_miniapp_security_headers(web.json_response(result))
 
 async def miniapp_member_home(request):
-    access = member_request_access(request)
-    lessons=list_member_catalog(get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6,access=access)
-    categories=list_member_categories(get_db_conn,"lesson",request["miniapp_member"].telegram_id,access=access)
+    access = await async_member_request_access(request)
+    lessons, categories = await asyncio.gather(
+        run_sync_db(list_member_catalog,get_db_conn,request["miniapp_member"].telegram_id,content_type="lesson",limit=6,access=access),
+        run_sync_db(list_member_categories,get_db_conn,"lesson",request["miniapp_member"].telegram_id,access=access),
+    )
     free_lessons = [item for item in lessons["items"] if item.get("access_level") == "free"]
     return apply_miniapp_security_headers(web.json_response({"latest_lessons":lessons["items"],"free_lessons":free_lessons,"categories":categories["items"],"access":lessons["access"],"published_only":True}))
 
@@ -24003,9 +24129,16 @@ async def miniapp_admin_session_create(request):
     except MiniAppAuthError as error:
         log_miniapp_auth_failure(error.category, miniapp_auth_error_reference(error.category))
         return miniapp_auth_error_response(error.status)
-    raw_token, session = create_miniapp_admin_session(
-        get_db_conn, identity.telegram_id
+    raw_token, session = await run_sync_db(
+        create_miniapp_admin_session, get_db_conn, identity.telegram_id
     )
+    _invalidate_admin_session_cache(telegram_id=identity.telegram_id)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with MINIAPP_ADMIN_SESSION_CACHE_LOCK:
+        MINIAPP_ADMIN_SESSION_CACHE[token_hash] = (
+            time.monotonic() + MINIAPP_ADMIN_SESSION_CACHE_TTL_SECONDS,
+            session,
+        )
     return apply_miniapp_security_headers(web.json_response({
         "token": raw_token,
         "expires_at": session.expires_at.isoformat(),
@@ -24066,12 +24199,16 @@ async def miniapp_admin_notification_acknowledge(request):
 
 async def miniapp_admin_session_revoke(request):
     session = request["miniapp_admin"]
-    revoke_miniapp_admin_session(get_db_conn, session.session_id)
+    await run_sync_db(
+        revoke_miniapp_admin_session, get_db_conn, session.session_id
+    )
+    _invalidate_admin_session_cache(session_id=session.session_id)
     return apply_miniapp_security_headers(web.Response(status=204))
 
 
 async def miniapp_admin_dashboard(request):
-    dashboard = collect_admin_dashboard(
+    dashboard = await run_sync_db(
+        collect_admin_dashboard,
         get_db_conn,
         db_pool_health,
         len(scheduler.get_jobs()),
@@ -24087,20 +24224,27 @@ async def miniapp_admin_analytics(request):
         return apply_miniapp_security_headers(web.json_response(
             {"error": str(error)}, status=400
         ))
-    conn = get_db_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("SET TRANSACTION READ ONLY")
-        cur.execute("SET LOCAL statement_timeout = 5000")
-        metrics = _fetch_weekly_metrics(cur, start, end)
-        comparison = _fetch_weekly_metrics(cur, comparison_start, comparison_end)
-        conn.rollback()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
-        conn.close()
+    def load_analytics_period(period_start, period_end):
+        conn = get_db_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SET LOCAL statement_timeout = 5000")
+            metrics = _fetch_weekly_metrics(cur, period_start, period_end)
+            conn.rollback()
+            return metrics
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+    metrics, comparison = await asyncio.gather(
+        run_sync_db(load_analytics_period, start, end),
+        run_sync_db(
+            load_analytics_period, comparison_start, comparison_end
+        ),
+    )
     return apply_miniapp_security_headers(web.json_response(
         analytics_projection(days, start, end, metrics, comparison)
     ))
@@ -24161,7 +24305,8 @@ async def miniapp_admin_content_draft_create(request):
 
 async def miniapp_admin_cms_content(request):
     try:
-        result = list_cms_content_studio(
+        result = await run_sync_db(
+            list_cms_content_studio,
             get_db_conn,
             status=request.query.get("status", "all"),
             limit=request.query.get("limit", "25"),
@@ -24172,7 +24317,9 @@ async def miniapp_admin_cms_content(request):
 
 async def miniapp_admin_content_categories(request):
     try:
-        result = list_categories(get_db_conn, request.query.get("content_type"))
+        result = await run_sync_db(
+            list_categories, get_db_conn, request.query.get("content_type")
+        )
     except ContentCmsError as error:
         return content_cms_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result))
@@ -24565,7 +24712,8 @@ async def miniapp_admin_content_media_cancel(request):
 
 async def miniapp_admin_content_media_proxy(request):
     try:
-        media = get_media_reference(
+        media = await run_sync_db(
+            get_media_reference,
             get_db_conn, request.match_info.get("content_id"),
             request.match_info.get("media_id"),
         )
@@ -24591,7 +24739,8 @@ async def miniapp_admin_content_media_proxy(request):
             chunk_size=64 * 1024,
         )
         data = destination.getvalue()
-        if schedule_image_content_type(data) != media["mime_type"]:
+        detected_mime = schedule_image_content_type(data)
+        if detected_mime is None:
             raise ContentMediaError("content_media_unavailable", 502)
     except ContentMediaError as error:
         return content_media_error_response(error)
@@ -24602,7 +24751,7 @@ async def miniapp_admin_content_media_proxy(request):
         asyncio.TimeoutError, ScheduleImageTooLarge,
     ):
         return content_media_error_response(ContentMediaError("content_media_unavailable", 503))
-    response = web.Response(body=data, content_type=media["mime_type"])
+    response = web.Response(body=data, content_type=detected_mime)
     response.headers["Content-Disposition"] = "inline"
     apply_miniapp_security_headers(response)
     response.headers["Cache-Control"] = "private, no-store"
@@ -24704,7 +24853,7 @@ def member_preview_error_response(error):
 
 async def miniapp_admin_member_preview_home(request):
     try:
-        result = get_member_preview_home(get_db_conn)
+        result = await run_sync_db(get_member_preview_home, get_db_conn)
     except MemberPreviewError as error:
         return member_preview_error_response(error)
     return apply_miniapp_security_headers(web.json_response(result))
@@ -24712,7 +24861,8 @@ async def miniapp_admin_member_preview_home(request):
 
 async def miniapp_admin_member_preview_content(request):
     try:
-        result = list_member_preview_content(
+        result = await run_sync_db(
+            list_member_preview_content,
             get_db_conn, limit=request.query.get("limit", "50"),
             content_type=request.query.get("content_type", "lesson"),
             category=request.query.get("category"),
@@ -24724,7 +24874,8 @@ async def miniapp_admin_member_preview_content(request):
 
 async def miniapp_admin_member_preview_content_details(request):
     try:
-        result = get_member_preview_content(
+        result = await run_sync_db(
+            get_member_preview_content,
             get_db_conn, request.match_info.get("content_id"),
             content_type=request.query.get("content_type"),
         )
@@ -24740,7 +24891,8 @@ async def miniapp_admin_member_preview_content_details(request):
 async def miniapp_admin_users(request):
     try:
         limit = parse_users_limit(request.query.get("limit"))
-        result = list_admin_users(
+        result = await run_sync_db(
+            list_admin_users,
             get_db_conn,
             limit=limit,
             cursor=request.query.get("cursor"),
@@ -24757,7 +24909,8 @@ async def miniapp_admin_users(request):
 
 async def miniapp_admin_user_details(request):
     try:
-        details = get_admin_user_details(
+        details = await run_sync_db(
+            get_admin_user_details,
             get_db_conn, request.match_info.get("telegram_id")
         )
     except AdminUsersQueryError as error:
@@ -25138,7 +25291,8 @@ async def miniapp_admin_access_cancel(request):
 
 async def miniapp_admin_subscriptions(request):
     try:
-        result = list_admin_subscriptions(
+        result = await run_sync_db(
+            list_admin_subscriptions,
             get_db_conn,
             limit=parse_subscriptions_limit(request.query.get("limit")),
             cursor=request.query.get("cursor"),
@@ -25272,7 +25426,8 @@ async def miniapp_admin_subscription_details(request):
 
 
 async def miniapp_admin_system(request):
-    result = collect_admin_system(
+    result = await run_sync_db(
+        collect_admin_system,
         get_db_conn, db_pool_health, len(scheduler.get_jobs())
     )
     return apply_miniapp_security_headers(web.json_response(result))
@@ -25280,7 +25435,8 @@ async def miniapp_admin_system(request):
 
 async def miniapp_admin_deliveries(request):
     try:
-        result = list_admin_deliveries(
+        result = await run_sync_db(
+            list_admin_deliveries,
             get_db_conn,
             status=request.query.get("status", "all"),
             limit=parse_deliveries_limit(request.query.get("limit")),
@@ -25314,7 +25470,8 @@ async def miniapp_admin_delivery_details(request):
 
 async def miniapp_admin_schedule(request):
     try:
-        result = list_admin_schedule(
+        result = await run_sync_db(
+            list_admin_schedule,
             get_db_conn,
             from_value=request.query.get("from"),
             to_value=request.query.get("to"),
@@ -25334,7 +25491,8 @@ async def miniapp_admin_schedule(request):
 async def miniapp_admin_classes(request):
     if request.method == "GET":
         try:
-            result = list_admin_classes(
+            result = await run_sync_db(
+                list_admin_classes,
                 get_db_conn,
                 limit=request.query.get("limit", "50"),
                 cursor=request.query.get("cursor"),
@@ -25474,7 +25632,8 @@ async def miniapp_admin_schedule_image(request):
 
 async def miniapp_admin_gifts(request):
     try:
-        result = list_admin_gifts(
+        result = await run_sync_db(
+            list_admin_gifts,
             get_db_conn,
             limit=parse_gifts_limit(request.query.get("limit")),
             cursor=request.query.get("cursor"),
