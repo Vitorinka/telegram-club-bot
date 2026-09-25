@@ -686,6 +686,109 @@ body.member-preview-mode .member-admin-create[hidden] { display: none; }
   .dashboard-more { display: block; }
 }
 
+/* Reference-aligned Users directory and canonical profile. */
+body:not(.member-preview-mode) #users-screen,
+body:not(.member-preview-mode) #user-details { --users-accent: var(--soul-teal); color: #161d2d; }
+body:not(.member-preview-mode) .users-page-header,
+body:not(.member-preview-mode) .user-profile-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+body:not(.member-preview-mode) .users-page-header { padding:5px 2px 0; }
+body:not(.member-preview-mode) .users-page-header h1 { margin:0; color:#121929; font-family:inherit; font-size:clamp(26px,7vw,30px); font-weight:760; letter-spacing:-.035em; }
+body:not(.member-preview-mode) .users-eyebrow { margin:0 0 2px; color:#7b858b; font-size:10px; font-weight:650; text-transform:uppercase; letter-spacing:.08em; }
+body:not(.member-preview-mode) .users-icon-button { width:44px; height:44px; flex:0 0 44px; display:grid; place-items:center; margin:0; padding:0; border:0; border-radius:50%; background:transparent; color:#111827; }
+body:not(.member-preview-mode) .users-icon-button:not(:disabled):hover { background:#f1f5f4; }
+body:not(.member-preview-mode) .users-icon-button svg,
+body:not(.member-preview-mode) .users-search-box svg { width:22px; height:22px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+body:not(.member-preview-mode) .users-quick-filters { display:flex; gap:8px; margin-inline:-2px; padding:1px 2px 3px; overflow-x:auto; scrollbar-width:none; }
+body:not(.member-preview-mode) .users-quick-filters::-webkit-scrollbar,
+body:not(.member-preview-mode) .users-filter-strip::-webkit-scrollbar,
+body:not(.member-preview-mode) .profile-tabs::-webkit-scrollbar { display:none; }
+body:not(.member-preview-mode) .users-quick-filters button { width:auto; min-height:36px; flex:0 0 auto; margin:0; padding:7px 13px; border:0; border-radius:12px; background:#f1f3f4; color:#2b3441; box-shadow:none; font-size:13px; font-weight:600; white-space:nowrap; }
+body:not(.member-preview-mode) .users-quick-filters button.active { background:var(--users-accent); color:#fff; box-shadow:0 5px 13px rgb(8 115 111 / 18%); }
+body:not(.member-preview-mode) .users-search-box { min-height:46px; display:grid; grid-template-columns:22px minmax(0,1fr); align-items:center; gap:9px; padding:0 13px; border-radius:15px; background:#f2f4f5; color:#8a949c; }
+body:not(.member-preview-mode) .users-search-box:focus-within { box-shadow:0 0 0 2px rgb(8 115 111 / 15%); }
+body:not(.member-preview-mode) .users-search-box input { min-width:0; min-height:44px; margin:0; padding:0; border:0; background:transparent; color:#17202d; font-size:13px; box-shadow:none; }
+body:not(.member-preview-mode) .users-filter-strip { display:flex; gap:8px; overflow-x:auto; scrollbar-width:none; }
+body:not(.member-preview-mode) .users-filter-strip label { min-height:38px; flex:0 0 auto; display:flex; align-items:center; gap:4px; padding-left:12px; border:1px solid #dde3e5; border-radius:12px; background:#fff; }
+body:not(.member-preview-mode) .users-filter-strip label > span { font-size:12px; font-weight:650; }
+body:not(.member-preview-mode) .users-filter-strip select { width:auto; min-height:36px; margin:0; padding:5px 28px 5px 0; border:0; background-color:transparent; color:#3c4652; font-size:12px; box-shadow:none; }
+body:not(.member-preview-mode) #users-list.user-list { display:grid; gap:0; overflow:visible; border:0; border-radius:0; background:transparent; }
+body:not(.member-preview-mode) #users-list .user-card { margin:0; padding:0; border:0; border-radius:0; background:transparent !important; box-shadow:none !important; }
+body:not(.member-preview-mode) #users-list .user-card + .user-card { border-top:1px solid #e8ebed; }
+body:not(.member-preview-mode) #users-list .user-card > button { width:100%; min-height:74px; display:grid; grid-template-columns:minmax(0,1fr) auto auto; grid-template-rows:auto auto; align-items:center; gap:2px 9px; margin:0; padding:10px 2px; border:0; border-radius:0; background:transparent; color:#17202d !important; text-align:left; box-shadow:none; }
+body:not(.member-preview-mode) #users-list .user-card > button:hover { background:#f8faf9; }
+body:not(.member-preview-mode) #users-list .user-identity-cell { grid-column:1; grid-row:1 / 3; min-width:0; gap:11px; }
+body:not(.member-preview-mode) #users-list .user-avatar { width:46px; height:46px; flex-basis:46px; background:#e4f2ef; color:#096965; font-size:16px; }
+body:not(.member-preview-mode) #users-list .user-identity-cell h2 { margin:0; overflow:hidden; color:#161d2d; font-size:15px; font-weight:720; text-overflow:ellipsis; white-space:nowrap; }
+body:not(.member-preview-mode) #users-list .user-identity-cell small { margin:2px 0 0; overflow:hidden; color:#7c8791; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+body:not(.member-preview-mode) #users-list .user-telegram-cell { display:none; }
+body:not(.member-preview-mode) #users-list .user-access-cell { grid-column:2; grid-row:1; justify-self:end; }
+body:not(.member-preview-mode) #users-list .user-subscription-cell { grid-column:2; grid-row:2; justify-self:end; max-width:150px; margin:0; overflow:hidden; color:#78838d; font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
+body:not(.member-preview-mode) #users-list .user-expiry-cell,
+body:not(.member-preview-mode) #users-list .user-activity-cell,
+body:not(.member-preview-mode) #users-list .user-last-visit-cell { display:none; }
+body:not(.member-preview-mode) #users-list .user-action-cell { grid-column:3; grid-row:1 / 3; color:#9aa4ac; font-size:27px; font-weight:400; line-height:1; }
+body:not(.member-preview-mode) .user-status-badge { border:0; border-radius:9px; font-size:11px; font-weight:700; }
+body:not(.member-preview-mode) .user-status-badge.success { background:#dff5e7; color:#187b45; }
+body:not(.member-preview-mode) .user-status-badge.info { background:#e2f4f2; color:#08736f; }
+body:not(.member-preview-mode) .user-status-badge.warning { background:#fff0d5; color:#94620e; }
+body:not(.member-preview-mode) .user-status-badge.danger { background:#fde6e5; color:#ba3939; }
+body:not(.member-preview-mode) .user-status-badge.muted { background:#edf0f2; color:#63707a; }
+body:not(.member-preview-mode) .users-more-button { width:100%; min-height:44px; margin-top:4px; border-color:#dce3e3; background:#fff; color:var(--users-accent); }
+
+body:not(.member-preview-mode) .user-profile-toolbar { min-height:44px; }
+body:not(.member-preview-mode) .user-profile-toolbar > span { color:#6f7a83; font-size:12px; font-weight:650; }
+body:not(.member-preview-mode) #user-profile-header { padding:3px 2px 9px; }
+body:not(.member-preview-mode) .participant-profile-hero { display:grid; grid-template-columns:76px minmax(0,1fr); align-items:center; gap:14px; }
+body:not(.member-preview-mode) .participant-avatar { width:76px; height:76px; border:0; background:#e4f2ef; color:#096965; font-size:24px; font-weight:750; }
+body:not(.member-preview-mode) .participant-profile-copy { min-width:0; }
+body:not(.member-preview-mode) .participant-profile-copy h1 { margin:0; overflow:hidden; color:#111827; font-family:inherit; font-size:23px; font-weight:760; letter-spacing:-.03em; text-overflow:ellipsis; white-space:nowrap; }
+body:not(.member-preview-mode) .participant-profile-copy > p,
+body:not(.member-preview-mode) .participant-profile-copy > small { margin:2px 0 0; color:#7b8790; font-size:12px; }
+body:not(.member-preview-mode) .participant-profile-badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; }
+body:not(.member-preview-mode) .participant-profile-badges .badges { margin:0; }
+body:not(.member-preview-mode) .access-type-badge { border:0; background:#f5eddf; color:#82601f; font-size:11px; }
+body:not(.member-preview-mode) #user-profile-tabs.profile-tabs { display:flex; gap:25px; margin:0 -2px; padding:0 2px; overflow-x:auto; border-bottom:1px solid #e4e8e9; scrollbar-width:none; }
+body:not(.member-preview-mode) #user-profile-tabs button { width:auto; min-height:43px; flex:0 0 auto; margin:0; padding:9px 0 8px; border:0; border-bottom:2px solid transparent; border-radius:0; background:transparent; color:#586572; font-size:12px; font-weight:650; box-shadow:none; }
+body:not(.member-preview-mode) #user-profile-tabs button.active { border-bottom-color:var(--users-accent); color:var(--users-accent); }
+body:not(.member-preview-mode) #user-details-content.canonical-user-profile { display:block; }
+body:not(.member-preview-mode) #user-details-content > [data-user-section] { margin-top:14px; }
+body:not(.member-preview-mode) #user-details-content > .card { padding:14px; border-color:#e5e9ea; border-radius:15px; background:#fff; }
+body:not(.member-preview-mode) .user-profile-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+body:not(.member-preview-mode) .user-profile-metric { min-height:104px; display:grid; align-content:center; gap:4px; padding:13px; border:1px solid #e6eaeb; border-radius:15px; background:#fff; box-shadow:0 5px 18px rgb(25 50 65 / 4%); }
+body:not(.member-preview-mode) .user-profile-metric small,
+body:not(.member-preview-mode) .user-profile-metric span { color:#7b8790; font-size:11px; }
+body:not(.member-preview-mode) .user-profile-metric strong { color:#111827; font-size:18px; line-height:1.15; }
+body:not(.member-preview-mode) .user-recent-activity { margin-top:20px; }
+body:not(.member-preview-mode) .user-recent-activity h2 { margin:0 0 7px; color:#161d2d; font-size:17px; }
+body:not(.member-preview-mode) .user-activity-list { display:grid; }
+body:not(.member-preview-mode) .user-activity-list > div { min-height:55px; display:grid; grid-template-columns:36px minmax(0,1fr); grid-template-rows:auto auto; align-content:center; column-gap:10px; padding:7px 0; border-bottom:1px solid #eaedef; }
+body:not(.member-preview-mode) .user-activity-icon { width:34px; height:34px; grid-row:1 / 3; display:grid; place-items:center; border-radius:11px; background:#e5f4f1; color:var(--users-accent); font-size:17px; }
+body:not(.member-preview-mode) .user-activity-list strong { overflow:hidden; color:#202735; font-size:13px; font-weight:670; text-overflow:ellipsis; white-space:nowrap; }
+body:not(.member-preview-mode) .user-activity-list small { color:#7e8992; font-size:11px; }
+body:not(.member-preview-mode) .user-profile-actions { position:sticky; bottom:calc(58px + env(safe-area-inset-bottom)); display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; margin-top:14px; padding:10px 0; background:linear-gradient(transparent,#f8f5ef 18%); }
+body:not(.member-preview-mode) .user-profile-actions button { min-height:46px; margin:0; }
+body:not(.member-preview-mode) .user-profile-actions button:disabled { opacity:1; border-color:#dfe4e5; background:#edf0f0; color:#8a949b; }
+
+@media (max-width: 360px) {
+  body:not(.member-preview-mode) #users-list .user-card > button { gap:2px 6px; }
+  body:not(.member-preview-mode) #users-list .user-avatar { width:42px; height:42px; flex-basis:42px; }
+  body:not(.member-preview-mode) #users-list .user-subscription-cell { max-width:105px; }
+  body:not(.member-preview-mode) .participant-profile-hero { grid-template-columns:68px minmax(0,1fr); gap:11px; }
+  body:not(.member-preview-mode) .participant-avatar { width:68px; height:68px; }
+  body:not(.member-preview-mode) .user-profile-metric { min-height:98px; padding:11px; }
+}
+@media (min-width: 1024px) {
+  body:not(.member-preview-mode) #users-screen,
+  body:not(.member-preview-mode) #user-details { width:min(100%,1060px); margin-inline:auto; }
+  body:not(.member-preview-mode) #users-list .user-card > button { grid-template-columns:minmax(220px,1.5fr) minmax(120px,.7fr) minmax(190px,1fr) 30px; grid-template-rows:1fr; min-height:64px; padding:8px 12px; }
+  body:not(.member-preview-mode) #users-list .user-identity-cell { grid-column:1; grid-row:1; }
+  body:not(.member-preview-mode) #users-list .user-access-cell { grid-column:2; grid-row:1; justify-self:start; }
+  body:not(.member-preview-mode) #users-list .user-subscription-cell { grid-column:3; grid-row:1; justify-self:start; max-width:none; }
+  body:not(.member-preview-mode) #users-list .user-action-cell { grid-column:4; grid-row:1; }
+  body:not(.member-preview-mode) .users-table-head { display:none; }
+  body:not(.member-preview-mode) .user-profile-actions { bottom:0; }
+}
+
 /* Product pass: compact bookable calendar and notification workflows. */
 .notification-center-item { display:grid; grid-template-columns:minmax(0,1fr) repeat(3,auto); gap:8px; align-items:center; }
 .notification-center-item.read { background:#f7f8f5; }
