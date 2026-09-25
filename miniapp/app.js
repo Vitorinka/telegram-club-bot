@@ -167,6 +167,8 @@
   const dashboardScheduleList = document.getElementById("dashboard-schedule-list");
   const dashboardGiftsList = document.getElementById("dashboard-gifts-list");
   const dashboardFailedList = document.getElementById("dashboard-failed-list");
+  const mobileAttentionList = document.getElementById("mobile-attention-list");
+  const mobileUpcomingClasses = document.getElementById("mobile-upcoming-classes");
   const attentionList = document.getElementById("attention-list");
   const detailsContent = document.getElementById("user-details-content");
   const manualAccessCard = document.getElementById("manual-access-card");
@@ -1291,8 +1293,40 @@
     if (!data.items.length) return dashboardEmpty(dashboardFailedList, "Проблем продления нет.");
     data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
   };
+  const mobileOverviewRow = ({title,meta,count,tone="info",open}) => {
+    const button=document.createElement("button"); button.type="button"; button.className=`mobile-overview-row ${tone}`;
+    const icon=text("span",tone === "danger" ? "!" : tone === "warning" ? "⌕" : "↻","mobile-overview-row-icon");
+    const copy=document.createElement("span"); copy.className="mobile-overview-row-copy"; copy.append(text("strong",title),text("small",meta));
+    button.append(icon,copy);
+    if(count != null) button.append(text("b",String(count),"mobile-overview-count"));
+    button.append(text("i","›","mobile-overview-chevron"));
+    if(open) button.addEventListener("click",open);
+    return button;
+  };
+  const renderMobileAttention = (dashboard) => {
+    const rows=[];
+    const failed=Number(dashboard.billing.failed_payments || 0);
+    const removals=Number(dashboard.access.pending_removals || 0)+Number(dashboard.access.retryable_removals || 0);
+    const deliveries=Number(dashboard.deliveries.permanently_failed || 0);
+    if(failed) rows.push(mobileOverviewRow({title:"Платёж не прошёл",meta:"Пользователи с неудачной оплатой",count:failed,tone:"danger",open:()=>loadNotifications().catch(showApiError)}));
+    if(removals) rows.push(mobileOverviewRow({title:"Проблемы с удалением",meta:"Требуется повторная безопасная обработка",count:removals,tone:"warning",open:()=>loadNotifications().catch(showApiError)}));
+    if(deliveries) rows.push(mobileOverviewRow({title:"Не доставлено",meta:"Сообщения требуют проверки",count:deliveries,tone:"warning",open:()=>loadNotifications().catch(showApiError)}));
+    if(!rows.length) rows.push(text("p","Всё спокойно — задач, требующих внимания, нет.","mobile-overview-empty positive"));
+    mobileAttentionList.replaceChildren(...rows);
+  };
+  const renderMobileUpcomingClasses = (data) => {
+    const now=Date.now();
+    const items=(data.items || []).filter((item)=>Date.parse(item.starts_at)>now && !["cancelled","completed"].includes(item.status)).slice(0,2);
+    if(!items.length){ mobileUpcomingClasses.replaceChildren(text("p","Ближайших занятий пока нет.","mobile-overview-empty")); return; }
+    const labels={draft:"Черновик",open:"Открыта запись",confirmed:"Подтверждено"};
+    const rows=items.map((item)=>{
+      const when=new Date(item.starts_at).toLocaleString("ru-RU",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
+      return mobileOverviewRow({title:item.title,meta:`${when} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`,count:labels[item.status] || item.status,tone:item.status === "open" ? "success" : "info",open:()=>loadSchedule().catch(showApiError)});
+    });
+    mobileUpcomingClasses.replaceChildren(...rows);
+  };
   const setAttentionCount = (count) => {
-    ["dashboard-attention-count","topbar-attention","sidebar-attention","more-attention"].forEach((id)=>{
+    ["dashboard-attention-count","topbar-attention","sidebar-attention","more-attention","mobile-overview-attention"].forEach((id)=>{
       const node=document.getElementById(id); node.textContent=String(count); node.hidden=count===0;
     });
     document.getElementById("dashboard-open-attention").hidden=count===0;
@@ -1331,6 +1365,7 @@
       document.getElementById("dashboard-migration-count").textContent = String(data.system.migrations.count);
       document.getElementById("dashboard-scheduler-count").textContent = String(data.system.scheduler.known_jobs);
       document.getElementById("dashboard-job-errors").textContent = String(data.system.scheduler.failed_last_24h);
+      renderMobileAttention(data);
       showScreen("overview");
       refresh.hidden = false;
       status.textContent = "Доступ подтверждён";
@@ -3128,7 +3163,9 @@
       image.src=profile.photoUrl; element.replaceChildren(image);
     };
     const displayName = profile.displayName;
-    document.getElementById("admin-dashboard-greeting").textContent=`Добрый день, ${displayName}!`;
+    const hour=new Date().getHours(); const greeting=hour < 12 ? "Доброе утро" : hour < 18 ? "Добрый день" : "Добрый вечер";
+    document.getElementById("admin-dashboard-greeting").textContent=`${greeting}, ${displayName}!`;
+    document.getElementById("mobile-dashboard-greeting").textContent=`${greeting}, ${displayName}!`;
     document.getElementById("admin-profile-name").textContent=displayName;
     document.getElementById("admin-profile-panel-name").textContent=displayName;
     renderAvatar(document.getElementById("admin-topbar-avatar"));
@@ -3265,6 +3302,14 @@
   document.getElementById("dashboard-open-users").addEventListener("click", () => loadUsers().catch(showApiError));
   document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
   document.getElementById("dashboard-open-attention").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("mobile-overview-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("mobile-open-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("mobile-open-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
+  document.getElementById("mobile-create-content").addEventListener("click", () => document.getElementById("content-create-open").click());
+  document.getElementById("mobile-create-class").addEventListener("click", () => loadSchedule(false).then(() => {
+    editingClassId=null; classCreateForm.hidden=false; classCreateForm.reset();
+    document.getElementById("class-title").focus();
+  }).catch(showApiError));
   document.getElementById("more-subscriptions").addEventListener("click", () => loadSubscriptions().catch(showApiError));
   document.getElementById("more-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("more-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
@@ -3555,6 +3600,11 @@
             renderDashboardFailures({...failed,items:(failed.items || []).slice(0,4)});
           })
           .catch(showApiError);
+        if(window.matchMedia("(max-width: 1023px)").matches) {
+          api("/api/admin/classes?limit=20").then(renderMobileUpcomingClasses).catch(() => {
+            mobileUpcomingClasses.replaceChildren(text("p","Не удалось загрузить ближайшие занятия.","mobile-overview-empty"));
+          });
+        }
       }, 0);
     });
   }).catch((error) => {
