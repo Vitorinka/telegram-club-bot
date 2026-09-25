@@ -85,6 +85,25 @@ FROM scheduled_job_runs
 """
 
 
+DASHBOARD_METRICS_SQL = f"""
+WITH users_metrics AS ({USERS_METRICS_SQL}),
+removal_metrics AS ({REMOVAL_METRICS_SQL}),
+delivery_metrics AS ({DELIVERY_METRICS_SQL}),
+migration_metrics(migration_count, latest_version) AS ({MIGRATION_METRICS_SQL}),
+scheduler_metrics(failed_last_24h, running, stale) AS ({SCHEDULER_METRICS_SQL})
+SELECT
+    u.total, u.active_access, u.expired_paid, u.payment_failed,
+    u.active_grace, u.trial, u.stripe_linked, u.expired_grace,
+    u.auto_renew, u.non_renewing,
+    r.pending_removals, r.retryable_removals, r.finalized_removals_recent,
+    d.pending, d.processing, d.failed, d.permanently_failed, d.sent_last_24h,
+    m.migration_count, m.latest_version,
+    s.failed_last_24h, s.running, s.stale
+FROM users_metrics u, removal_metrics r, delivery_metrics d,
+     migration_metrics m, scheduler_metrics s
+"""
+
+
 def _integer_dict(names, row):
     return {name: int(value or 0) for name, value in zip(names, row)}
 
@@ -96,16 +115,13 @@ def collect_admin_dashboard(get_connection, db_pool_health, scheduler_job_count)
         cur.execute("SET TRANSACTION READ ONLY")
         cur.execute(f"SET LOCAL statement_timeout = {DASHBOARD_STATEMENT_TIMEOUT_MS}")
 
-        cur.execute(USERS_METRICS_SQL)
-        users_row = cur.fetchone()
-        cur.execute(REMOVAL_METRICS_SQL)
-        removal_row = cur.fetchone()
-        cur.execute(DELIVERY_METRICS_SQL)
-        delivery_row = cur.fetchone()
-        cur.execute(MIGRATION_METRICS_SQL)
-        migrations_row = cur.fetchone()
-        cur.execute(SCHEDULER_METRICS_SQL)
-        scheduler_row = cur.fetchone()
+        cur.execute(DASHBOARD_METRICS_SQL)
+        metrics_row = cur.fetchone()
+        users_row = metrics_row[0:10]
+        removal_row = metrics_row[10:13]
+        delivery_row = metrics_row[13:18]
+        migrations_row = metrics_row[18:20]
+        scheduler_row = metrics_row[20:23]
         conn.rollback()
     except Exception:
         conn.rollback()

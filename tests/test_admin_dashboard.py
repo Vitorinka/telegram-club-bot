@@ -7,11 +7,13 @@ class DashboardCursor:
     def __init__(self):
         self.queries = []
         self.rows = iter([
-            (10, 6, 2, 2, 1, 1, 4, 1, 3, 2),
-            (1, 2, 3),
-            (4, 1, 2, 1, 8),
-            (17, "0017_miniapp_admin_sessions"),
-            (1, 2, 1),
+            (
+                10, 6, 2, 2, 1, 1, 4, 1, 3, 2,
+                1, 2, 3,
+                4, 1, 2, 1, 8,
+                17, "0017_miniapp_admin_sessions",
+                1, 2, 1,
+            ),
         ])
 
     def execute(self, query, params=None):
@@ -63,6 +65,7 @@ class AdminDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard["system"]["migrations"]["count"], 17)
         self.assertEqual(dashboard["system"]["scheduler"]["known_jobs"], 9)
         self.assertNotIn("private", dashboard["system"]["db_pool"])
+        self.assertEqual(len(conn.cursor_obj.queries), 3)
 
 
 if __name__ == "__main__":

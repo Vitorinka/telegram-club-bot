@@ -79,9 +79,11 @@ class PerformancePhase1Tests(unittest.IsolatedAsyncioTestCase):
         dashboard = source[source.index("const loadDashboard ="):source.index("const addBadges =")]
         self.assertEqual(dashboard.count('/api/admin/gifts?'), 0)
         self.assertEqual(dashboard.count('/api/admin/failed-subscriptions?'), 0)
-        self.assertIn('refreshAttentionCount().then(({failed,gifts})=>', dashboard)
+        self.assertNotIn('/api/admin/content/cms?', dashboard)
+        self.assertNotIn('/api/admin/users?', dashboard)
+        self.assertNotIn('/api/admin/schedule?', dashboard)
         bootstrap = source[source.index('fetch("/api/admin/session"'):]
-        self.assertIn('Promise.allSettled([\n      loadDashboard(),', bootstrap)
+        self.assertIn('return loadDashboard().then(() => {', bootstrap)
 
     def test_telemetry_contract_does_not_log_credentials(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")
