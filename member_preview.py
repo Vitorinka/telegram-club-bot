@@ -74,6 +74,18 @@ MEMBER_CONTENT_SELECT = """
 """
 
 
+HOME_RANKED_CONTENT_SELECT = MEMBER_CONTENT_SELECT.replace(
+    "\n    FROM content_items c",
+    """,
+           ROW_NUMBER() OVER (
+               PARTITION BY c.content_type
+               ORDER BY c.updated_at DESC, c.content_id ASC
+           ) AS type_rank
+    FROM content_items c""",
+    1,
+)
+
+
 def _begin_read(cur):
     cur.execute("SET TRANSACTION READ ONLY")
     cur.execute("SET LOCAL statement_timeout = 5000")
@@ -160,14 +172,26 @@ def get_member_preview_home(get_connection):
     try:
         _begin_read(cur)
         cur.execute(
-            MEMBER_CONTENT_SELECT + """
-            WHERE c.content_type = 'lesson'
-              AND c.status IN ('draft', 'published', 'archived') AND c.deleted_at IS NULL
-            ORDER BY c.updated_at DESC, c.content_id ASC
-            LIMIT 6
+            "SELECT * FROM (" + HOME_RANKED_CONTENT_SELECT + """
+            WHERE c.content_type IN (
+                'lesson', 'meditation', 'recipe', 'nutrition_material'
+            )
+              AND c.status IN ('draft', 'published', 'archived')
+              AND c.deleted_at IS NULL
+            ) ranked
+            WHERE type_rank <= 6
+            ORDER BY content_type, type_rank
             """
         )
-        latest = [_item(row) for row in cur.fetchall()]
+        ranked_items = [_item(row[:14]) for row in cur.fetchall()]
+        grouped = {
+            content_type: [
+                item for item in ranked_items
+                if item["content_type"] == content_type
+            ]
+            for content_type in MEMBER_PREVIEW_CONTENT_TYPES
+        }
+        latest = grouped["lesson"]
         cur.execute(
             MEMBER_CONTENT_SELECT + """
             WHERE c.content_type = 'lesson' AND c.access_level = 'free'
@@ -177,33 +201,9 @@ def get_member_preview_home(get_connection):
             """
         )
         free_lessons = [_item(row) for row in cur.fetchall()]
-        cur.execute(
-            MEMBER_CONTENT_SELECT + """
-            WHERE c.content_type = 'meditation'
-              AND c.status IN ('draft', 'published', 'archived') AND c.deleted_at IS NULL
-            ORDER BY c.updated_at DESC, c.content_id ASC
-            LIMIT 6
-            """
-        )
-        latest_meditations = [_item(row) for row in cur.fetchall()]
-        cur.execute(
-            MEMBER_CONTENT_SELECT + """
-            WHERE c.content_type = 'recipe'
-              AND c.status IN ('draft', 'published', 'archived') AND c.deleted_at IS NULL
-            ORDER BY c.updated_at DESC, c.content_id ASC
-            LIMIT 6
-            """
-        )
-        latest_recipes = [_item(row) for row in cur.fetchall()]
-        cur.execute(
-            MEMBER_CONTENT_SELECT + """
-            WHERE c.content_type = 'nutrition_material'
-              AND c.status IN ('draft', 'published', 'archived') AND c.deleted_at IS NULL
-            ORDER BY c.updated_at DESC, c.content_id ASC
-            LIMIT 6
-            """
-        )
-        latest_nutrition_materials = [_item(row) for row in cur.fetchall()]
+        latest_meditations = grouped["meditation"]
+        latest_recipes = grouped["recipe"]
+        latest_nutrition_materials = grouped["nutrition_material"]
         cur.execute("""SELECT cc.slug,cc.title,COUNT(*) FROM content_categories cc
           JOIN content_item_categories cic USING(category_id) JOIN content_items c USING(content_id)
           WHERE cc.content_type='lesson' AND cc.is_active=TRUE AND c.status IN ('draft','published','archived') AND c.deleted_at IS NULL

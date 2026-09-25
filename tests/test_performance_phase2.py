@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -90,7 +91,10 @@ class PerformancePhase2Tests(unittest.IsolatedAsyncioTestCase):
             def execute(self, _sql, _params=None):
                 return self
 
-        metrics = {"db_ms": 0.0, "query_count": 0}
+        metrics = {
+            "pool_wait_ms": 0.0, "sql_ms": 0.0,
+            "query_count": 0, "lock": threading.Lock(),
+        }
         token = self.main.MINIAPP_DB_METRICS.set(metrics)
         try:
             cursor = self.main.TrackedDbCursor(Cursor())
@@ -98,7 +102,7 @@ class PerformancePhase2Tests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.main.MINIAPP_DB_METRICS.reset(token)
         self.assertEqual(metrics["query_count"], 1)
-        self.assertGreaterEqual(metrics["db_ms"], 0.0)
+        self.assertGreaterEqual(metrics["sql_ms"], 0.0)
 
     async def test_admin_cover_proxy_accepts_safe_telegram_reencoding(self):
         request = FakeMiniAppRequest(

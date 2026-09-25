@@ -1331,16 +1331,17 @@
       showScreen("overview");
       refresh.hidden = false;
       status.textContent = "Доступ подтверждён";
-      const scheduleQuery = new URLSearchParams({limit:"3",status:"upcoming",from:moscowDate(),to:addDays(moscowDate(),730)});
-      return Promise.allSettled([
-        api("/api/admin/content/cms?status=all&limit=50").then(renderDashboardContent),
-        api("/api/admin/users?limit=4&status=all").then(renderDashboardUsers),
-        api(`/api/admin/schedule?${scheduleQuery.toString()}`).then(renderDashboardSchedules),
-        refreshAttentionCount().then(({failed,gifts})=>{
-          renderDashboardGifts({...gifts,items:(gifts.items || []).slice(0,4)});
-          renderDashboardFailures({...failed,items:(failed.items || []).slice(0,4)});
-        }),
-      ]);
+      dashboardContentList.replaceChildren();
+      dashboardUsersList.replaceChildren();
+      dashboardScheduleList.replaceChildren();
+      dashboardGiftsList.replaceChildren();
+      dashboardFailedList.replaceChildren();
+      dashboardEmpty(dashboardContentList, "Материалы загружаются при открытии Контента.");
+      dashboardEmpty(dashboardUsersList, "Участники загружаются при открытии раздела.");
+      dashboardEmpty(dashboardScheduleList, "Расписание загружается при открытии раздела.");
+      dashboardEmpty(dashboardGiftsList, "Подарки загружаются при открытии раздела.");
+      dashboardEmpty(dashboardFailedList, "Уведомления загружаются отдельно.");
+      return data;
     });
   };
   const addBadges = (container, user) => {
@@ -3494,12 +3495,17 @@
       requestFullscreenSupported: typeof webApp.requestFullscreen === "function",
     });
     telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false;
-    return Promise.allSettled([
-      loadDashboard(),
-      loadAdminNotificationAcknowledgements().then(()=>{
-        renderAdminNotificationPanel(); renderNotificationCenter(); updateAdminNotificationBadge();
-      }),
-    ]);
+    return loadDashboard().then(() => {
+      window.setTimeout(() => {
+        loadAdminNotificationAcknowledgements()
+          .then(refreshAttentionCount)
+          .then(({failed,gifts}) => {
+            renderDashboardGifts({...gifts,items:(gifts.items || []).slice(0,4)});
+            renderDashboardFailures({...failed,items:(failed.items || []).slice(0,4)});
+          })
+          .catch(showApiError);
+      }, 0);
+    });
   }).catch((error) => {
     if (error.message === "member_rollout_disabled") { status.textContent="Новая платформа пока доступна только участникам тестирования."; identity.hidden=true; return; }
     if (error.message === "telegram_session_expired") {

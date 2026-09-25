@@ -734,8 +734,10 @@ class TrackedDbCursor:
         finally:
             metrics = MINIAPP_DB_METRICS.get()
             if metrics is not None:
-                metrics["db_ms"] += (time.perf_counter() - started_at) * 1000
-                metrics["query_count"] += 1
+                elapsed_ms = (time.perf_counter() - started_at) * 1000
+                with metrics["lock"]:
+                    metrics["sql_ms"] += elapsed_ms
+                    metrics["query_count"] += 1
 
     def execute(self, *args, **kwargs):
         return self._call("execute", *args, **kwargs)
@@ -782,7 +784,9 @@ def get_db_conn():
     finally:
         metrics = MINIAPP_DB_METRICS.get()
         if metrics is not None:
-            metrics["db_ms"] += (time.perf_counter() - started_at) * 1000
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            with metrics["lock"]:
+                metrics["pool_wait_ms"] += elapsed_ms
 
 
 async def run_sync_db(function, *args, **kwargs):
@@ -23882,7 +23886,10 @@ def miniapp_slow_request_threshold():
 @web.middleware
 async def miniapp_admin_auth_middleware(request, handler):
     started_at = time.perf_counter()
-    db_metrics = {"db_ms": 0.0, "query_count": 0}
+    db_metrics = {
+        "pool_wait_ms": 0.0, "sql_ms": 0.0,
+        "query_count": 0, "lock": threading.Lock(),
+    }
     db_metrics_token = MINIAPP_DB_METRICS.set(db_metrics)
     auth_started_at = started_at
     is_admin_api = request.path.startswith("/api/admin/")
@@ -23907,6 +23914,8 @@ async def miniapp_admin_auth_middleware(request, handler):
             MINIAPP_DB_METRICS.reset(db_metrics_token)
             return miniapp_auth_error_response(error.status)
     auth_ms = (time.perf_counter() - auth_started_at) * 1000
+    auth_pool_wait_ms = db_metrics["pool_wait_ms"]
+    auth_sql_ms = db_metrics["sql_ms"]
     handler_started_at = time.perf_counter()
     try:
         response = await handler(request)
@@ -23930,9 +23939,11 @@ async def miniapp_admin_auth_middleware(request, handler):
         threshold = miniapp_slow_request_threshold()
         log = logging.warning if total_ms >= threshold else logging.info
         log(
-            "MINIAPP_API_PERF method=%s route=%s status=%s auth_ms=%.1f db_ms=%.1f handler_ms=%.1f total_ms=%.1f query_count=%s response_bytes=%s source_latency_ms=%s",
+            "MINIAPP_API_PERF method=%s route=%s status=%s auth_ms=%.1f auth_pool_wait_ms=%.1f auth_sql_ms=%.1f pool_wait_ms=%.1f sql_ms=%.1f db_total_ms=%.1f handler_ms=%.1f total_ms=%.1f query_count=%s response_bytes=%s source_latency_ms=%s",
             request.method, route_name, response.status, auth_ms,
-            db_metrics["db_ms"], handler_ms,
+            auth_pool_wait_ms, auth_sql_ms,
+            db_metrics["pool_wait_ms"], db_metrics["sql_ms"],
+            db_metrics["pool_wait_ms"] + db_metrics["sql_ms"], handler_ms,
             total_ms, db_metrics["query_count"],
             response_bytes if response_bytes is not None else "unknown",
             request.get("media_source_latency_ms", "unavailable"),
