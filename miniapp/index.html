@@ -31,6 +31,18 @@
       </div>
     </section>
     <section id="dashboard" class="dashboard screen admin-dashboard" data-screen="overview" hidden>
+      <div class="mobile-admin-overview">
+        <header class="mobile-overview-greeting"><div><h1 id="mobile-dashboard-greeting">Добрый день!</h1><p>Вот что происходит в клубе сегодня</p></div><button id="mobile-overview-notifications" class="mobile-overview-bell" type="button" aria-label="Уведомления" data-admin-icon="bell"><span aria-hidden="true"></span><strong id="mobile-overview-attention" hidden>0</strong></button></header>
+        <div class="mobile-overview-kpis" aria-label="Ключевые показатели клуба">
+          <article data-admin-icon="users"><span aria-hidden="true"></span><small>В клубе</small><strong data-metric="users.active_access">—</strong></article>
+          <article data-admin-icon="plus"><span aria-hidden="true"></span><small>Всего</small><strong data-metric="users.total">—</strong></article>
+          <article data-admin-icon="subscriptions"><span aria-hidden="true"></span><small>Пробный</small><strong data-metric="users.trial">—</strong></article>
+          <article data-admin-icon="refresh"><span aria-hidden="true"></span><small>Продления</small><strong data-metric="billing.auto_renew">—</strong></article>
+        </div>
+        <section class="mobile-overview-section mobile-attention-section"><header><h2>Требует внимания</h2><button id="mobile-open-notifications" type="button">Все задачи →</button></header><div id="mobile-attention-list" class="mobile-overview-list"></div></section>
+        <section class="mobile-overview-section mobile-classes-section"><header><h2>Ближайшие занятия</h2><button id="mobile-open-schedule" type="button">Все занятия →</button></header><div id="mobile-upcoming-classes" class="mobile-overview-list"><p class="mobile-overview-empty">Занятия загружаются отдельно…</p></div></section>
+        <section class="mobile-overview-section mobile-quick-actions"><h2>Быстрые действия</h2><div><button id="mobile-create-class" type="button">＋ Создать занятие</button><button id="mobile-create-content" class="secondary" type="button">＋ Добавить материал</button></div></section>
+      </div>
       <header class="admin-dashboard-greeting"><div><p class="eyebrow">Сегодня в клубе</p><h1 id="admin-dashboard-greeting">Добрый день!</h1><p>Вместе создаём пространство для здоровья и заботы о себе.</p></div><time id="dashboard-clock"></time></header>
       <div class="admin-kpi-row">
         <article class="card admin-kpi" data-admin-icon="users"><span aria-hidden="true"></span><strong data-metric="users.active_access">—</strong><small>Активные участники</small></article>
