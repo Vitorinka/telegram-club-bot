@@ -161,6 +161,7 @@
   const usersStatus = document.getElementById("users-status");
   const usersList = document.getElementById("users-list");
   const usersMore = document.getElementById("users-more");
+  const userProfileHeader = document.getElementById("user-profile-header");
   const dashboardContentList = document.getElementById("dashboard-content-list");
   const dashboardUsersList = document.getElementById("dashboard-users-list");
   const dashboardScheduleList = document.getElementById("dashboard-schedule-list");
@@ -338,6 +339,8 @@
   let memberEntitled = false;
   let usersCursor = null;
   let searchTimer = null;
+  let usersRequestController = null;
+  let usersListScrollPosition = 0;
   let subscriptionsCursor = null;
   let failedSubscriptionsCursor = null;
   let subscriptionsSearchTimer = null;
@@ -1344,12 +1347,24 @@
       return data;
     });
   };
+  const userPrimaryStatus = (user) => {
+    if (user.payment_failed && user.access_status === "active_grace") return {label:"Grace",tone:"warning"};
+    if (user.payment_failed) return {label:"Проблема оплаты",tone:"danger"};
+    if (user.access_type === "trial" && user.access_status === "active") return {label:"Пробный",tone:"info"};
+    if (user.access_status === "active") return {label:"В клубе",tone:"success"};
+    if (user.access_status === "expired") return {label:"Нет доступа",tone:"muted"};
+    return {label:"Нет доступа",tone:"muted"};
+  };
+  const userAccessSummary = (user) => {
+    if (user.expiry_date) return `${user.auto_renew ? "Продлевается" : "Доступ"} · до ${formatDate(user.expiry_date)}`;
+    if (user.access_type === "unknown") return "История доступа отсутствует";
+    return typeLabels[user.access_type] || "Доступ не определён";
+  };
   const addBadges = (container, user) => {
     const badges = document.createElement("div");
     badges.className = "badges";
-    badges.append(text("span", statusLabels[user.access_status] || user.access_status, "badge"));
-    if (user.payment_failed) badges.replaceChildren(text("span", "Проблема оплаты", "badge attention-label"));
-    else if (user.access_type === "gift") badges.replaceChildren(text("span", "Подарочный доступ", "badge"));
+    const primary=userPrimaryStatus(user);
+    badges.append(text("span", primary.label, `badge user-status-badge ${primary.tone}`));
     container.append(badges);
   };
   const userCard = (user) => {
@@ -1358,15 +1373,15 @@
     const button = document.createElement("button");
     button.type = "button";
     const identityCell = document.createElement("div"); identityCell.className = "user-identity-cell";
-    const identityCopy=document.createElement("div"); identityCopy.append(text("h2",user.first_name || (user.username ? `@${user.username}` : "Участник")),text("small",user.username ? `@${user.username}` : "Без username"));
+    const identityCopy=document.createElement("div"); identityCopy.append(text("h2",user.first_name || (user.username ? `@${user.username}` : "Участник")),text("small",user.username ? `@${user.username}` : `ID ${user.telegram_id}`));
     identityCell.append(text("span", (user.first_name || user.username || "?").slice(0, 1).toUpperCase(), "user-avatar"),identityCopy);
     const access = document.createElement("div"); access.className = "user-access-cell"; addBadges(access, user);
-    const subscription = text("p", user.auto_renew ? "Продлевается" : "", "user-subscription-cell");
-    const expiry = text("p", user.expiry_date || "—", "user-expiry-cell");
-    identityCopy.append(text("small", `Telegram ID ${user.telegram_id}`, "user-telegram-cell"));
+    const subscription = text("p", userAccessSummary(user), "user-subscription-cell");
+    const expiry = text("p", user.expiry_date ? formatDate(user.expiry_date) : "—", "user-expiry-cell");
+    identityCopy.append(text("small", `ID ${user.telegram_id}`, "user-telegram-cell"));
     const activity = text("p", "", "user-activity-cell");
     const lastVisit = text("p", "", "user-last-visit-cell");
-    const action = text("span", "Открыть →", "user-action-cell");
+    const action = text("span", "›", "user-action-cell");
     button.append(identityCell, access, subscription, expiry, activity, lastVisit, action);
     button.addEventListener("click", () => loadUserDetails(user.telegram_id));
     article.append(button);
@@ -1377,13 +1392,23 @@
     const params = new URLSearchParams({limit: "25", status: usersStatus.value});
     if (usersSearch.value.trim()) params.set("q", usersSearch.value.trim());
     if (append && usersCursor) params.set("cursor", usersCursor);
-    return api(`/api/admin/users?${params.toString()}`).then((data) => {
+    if (!append && usersRequestController) usersRequestController.abort();
+    const controller = new AbortController();
+    if (!append) usersRequestController = controller;
+    return api(`/api/admin/users?${params.toString()}`, {signal:controller.signal}).then((data) => {
+      if (!append && usersRequestController !== controller) return data;
       if (!append) usersList.replaceChildren();
       data.items.forEach((user) => usersList.append(userCard(user)));
       usersCursor = data.next_cursor;
       usersMore.hidden = !data.has_more;
       showScreen("users");
       status.textContent = `Пользователей показано: ${usersList.children.length}`;
+      return data;
+    }).catch((error) => {
+      if (error && error.name === "AbortError") return null;
+      throw error;
+    }).finally(() => {
+      if (usersRequestController === controller) usersRequestController = null;
     });
   };
   const detailCard = (title, pairs) => {
@@ -1497,15 +1522,28 @@
   function loadUserDetails(userId, initialTab = "overview") {
     status.textContent = "Загружаем профиль…";
     return api(`/api/admin/users/${encodeURIComponent(userId)}`).then((user) => {
+      usersListScrollPosition = window.scrollY;
       detailsContent.replaceChildren();
+      userProfileHeader.replaceChildren();
       const displayName=[user.first_name,user.last_name].filter(Boolean).join(" ") || (user.username ? `@${user.username}` : "Участник");
-      const profile=document.createElement("article"); profile.className="card participant-profile-hero";
+      const profile=document.createElement("article"); profile.className="participant-profile-hero";
       profile.append(text("span",displayName.slice(0,1).toUpperCase(),"participant-avatar"));
-      const profileCopy=document.createElement("div"); profileCopy.append(text("h1",displayName),text("p",user.username ? `@${user.username}` : "Без username"),text("small",`Telegram ID ${user.telegram_id}`));
-      profile.dataset.userSection="overview";
-      profile.append(profileCopy,text("span",statusLabels[user.access_status] || user.access_status,"badge"));
+      const profileCopy=document.createElement("div"); profileCopy.className="participant-profile-copy"; profileCopy.append(text("h1",displayName),text("p",user.username ? `@${user.username}` : `ID ${user.telegram_id}`));
+      const profileBadges=document.createElement("div"); profileBadges.className="participant-profile-badges"; addBadges(profileBadges,user); profileBadges.append(text("span",typeLabels[user.access_type] || "Доступ не определён","badge access-type-badge"));
+      profileCopy.append(profileBadges,text("small",user.expiry_date ? `Доступ до ${formatDate(user.expiry_date)}` : "Действующий доступ не найден"));
+      profile.append(profileCopy);
+      userProfileHeader.append(profile);
+      const overview=document.createElement("section"); overview.className="user-overview-section"; overview.dataset.userSection="overview";
+      const metrics=document.createElement("div"); metrics.className="user-profile-metrics";
+      const accessMetric=document.createElement("article"); accessMetric.className="user-profile-metric"; accessMetric.append(text("small","Текущий доступ"),text("strong",typeLabels[user.access_type] || "Не определён"),text("span",user.expiry_date ? `до ${formatDate(user.expiry_date)}` : "Без активного срока"));
+      const state=userPrimaryStatus(user); const statusMetric=document.createElement("article"); statusMetric.className="user-profile-metric"; statusMetric.append(text("small","Статус"),text("strong",state.label),text("span",user.auto_renew ? "Автопродление включено" : "Без автопродления"));
+      metrics.append(accessMetric,statusMetric); overview.append(metrics);
+      const activity=document.createElement("section"); activity.className="user-recent-activity"; activity.append(text("h2","Последняя активность"));
+      if(user.access_history.length){ const list=document.createElement("div"); list.className="user-activity-list"; user.access_history.slice(0,4).forEach((event)=>{ const row=document.createElement("div"); row.append(text("span","↻","user-activity-icon"),text("strong",event.event_type.replaceAll("_"," ")),text("small",`${event.source} · ${formatDate(event.created_at)}`)); list.append(row); }); activity.append(list); }
+      else activity.append(text("p","Авторитетных событий доступа пока нет.","hint"));
+      overview.append(activity);
       detailsContent.append(
-        profile,
+        overview,
         userSectionCard("club", "Клуб", [["Статус", statusLabels[user.access_status]], ["Источник доступа", typeLabels[user.access_type]], ["Доступ до", user.expiry_date], ["Автопродление", user.auto_renew ? "Включено" : "Выключено"], ["Trial использован", user.trial_used ? "Да" : "Нет"]]),
         userSectionCard("payments", "Платежи", [["Оплаченный доступ", user.paid ? "Да" : "Нет"], ["Ошибка оплаты", user.payment_failed ? "Да" : "Нет"], ["Grace до", user.grace_period_end], ["Customer", user.stripe.customer_id], ["Subscription", user.stripe.subscription_id]]),
         emptyUserSection("gifts", "Связанные подарки отсутствуют в текущих данных профиля."),
@@ -3369,12 +3407,25 @@
   contentLifecycleConfirm.addEventListener("click", confirmContentLifecycle);
   contentLifecycleCancel.addEventListener("click", cancelContentLifecycle);
   usersMore.addEventListener("click", () => loadUsers(true).catch(showApiError));
-  usersStatus.addEventListener("change", () => loadUsers().catch(showApiError));
+  const syncUsersQuickFilters = () => document.querySelectorAll("[data-users-status]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.usersStatus === usersStatus.value);
+  });
+  usersStatus.addEventListener("change", () => { syncUsersQuickFilters(); loadUsers().catch(showApiError); });
+  document.querySelectorAll("[data-users-status]").forEach((button) => button.addEventListener("click", () => {
+    usersStatus.value = button.dataset.usersStatus;
+    syncUsersQuickFilters();
+    loadUsers().catch(showApiError);
+  }));
+  document.getElementById("users-search-focus").addEventListener("click", () => usersSearch.focus());
   usersSearch.addEventListener("input", () => {
     window.clearTimeout(searchTimer);
     searchTimer = window.setTimeout(() => loadUsers().catch(showApiError), 300);
   });
-  document.getElementById("users-back").addEventListener("click", () => showScreen("users"));
+  document.getElementById("users-back").addEventListener("click", () => {
+    showScreen("users");
+    window.requestAnimationFrame(() => window.scrollTo({top:usersListScrollPosition,behavior:"auto"}));
+  });
+  document.getElementById("user-more-actions").addEventListener("click", () => selectUserProfileTab("club"));
   document.querySelectorAll("[data-user-tab]").forEach((tab) => {
     tab.addEventListener("click", () => selectUserProfileTab(tab.dataset.userTab));
   });

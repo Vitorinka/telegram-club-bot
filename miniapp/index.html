@@ -202,24 +202,31 @@
       <div class="confirmation-actions"><button id="content-unsaved-save" type="button">Сохранить</button><button id="content-unsaved-discard" class="secondary" type="button">Выйти без сохранения</button><button id="content-unsaved-cancel" class="secondary" type="button">Отмена</button></div>
     </dialog>
     <section id="users-screen" class="screen page" data-screen="users" hidden>
-      <article class="card">
-        <h2>Пользователи</h2>
-        <label class="search-label" for="users-search">Telegram ID или username</label>
-        <input id="users-search" type="search" maxlength="64" autocomplete="off">
-        <select id="users-status" aria-label="Статус пользователей">
+      <header class="users-page-header"><div><p class="users-eyebrow">Управление клубом</p><h1>Пользователи</h1></div><button id="users-search-focus" class="users-icon-button" type="button" aria-label="Перейти к поиску"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg></button></header>
+      <nav class="users-quick-filters" aria-label="Быстрые фильтры пользователей">
+        <button class="active" type="button" data-users-status="all">Все</button>
+        <button type="button" data-users-status="active">Активные</button>
+        <button type="button" data-users-status="trial">Пробный</button>
+        <button type="button" data-users-status="failed_payment">Проблема оплаты</button>
+        <button type="button" data-users-status="expired">Нет доступа</button>
+      </nav>
+      <label class="users-search-box" for="users-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg><input id="users-search" type="search" maxlength="64" autocomplete="off" placeholder="Поиск по @username или Telegram ID"></label>
+      <div class="users-filter-strip">
+        <label><span>Доступ</span><select id="users-status" aria-label="Фильтр доступа пользователей">
           <option value="all">Все</option><option value="active">Активные</option>
-          <option value="trial">Trial</option><option value="failed_payment">Ошибка оплаты</option>
+          <option value="trial">Пробный</option><option value="failed_payment">Ошибка оплаты</option>
           <option value="active_grace">Grace</option><option value="expired">Просроченные</option>
           <option value="auto_renew">Автопродление</option><option value="non_renewing">Без автопродления</option>
           <option value="gift">Подарочные</option>
-        </select>
-      </article>
+        </select></label>
+      </div>
       <div class="users-table-head" aria-hidden="true"><span>Участник</span><span>Статус</span><span>Подписка</span><span>Доступ до</span><span>Активность</span><span>Последний визит</span><span>Действия</span></div>
       <div id="users-list" class="user-list"></div>
-      <button id="users-more" type="button" hidden>Показать ещё</button>
+      <button id="users-more" class="users-more-button" type="button" hidden>Показать ещё</button>
     </section>
     <section id="user-details" class="screen page" data-screen="user-details" hidden>
-      <button id="users-back" class="secondary" type="button">← К пользователям</button>
+      <header class="user-profile-toolbar"><button id="users-back" class="users-icon-button" type="button" aria-label="Вернуться к пользователям"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"></path></svg></button><span>Профиль пользователя</span><button class="users-icon-button" type="button" disabled aria-label="Дополнительные действия недоступны"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg></button></header>
+      <div id="user-profile-header"></div>
       <nav id="user-profile-tabs" class="profile-tabs" aria-label="Разделы профиля"><button class="active" data-user-tab="overview" type="button">Обзор</button><button data-user-tab="club" type="button">Клуб</button><button data-user-tab="payments" type="button">Платежи</button><button data-user-tab="gifts" type="button">Подарки</button><button data-user-tab="classes" type="button">Занятия</button><button data-user-tab="activity" type="button">Активность</button><button data-user-tab="history" type="button">История</button><button data-user-tab="diagnostics" type="button">Диагностика</button></nav>
       <div id="user-details-content" class="dashboard canonical-user-profile"></div>
       <article id="manual-access-card" class="card" hidden>
@@ -243,6 +250,7 @@
           </div>
         </div>
       </article>
+      <footer class="user-profile-actions"><button type="button" disabled title="Безопасная отправка сообщений пока не поддерживается">Написать сообщение</button><button id="user-more-actions" class="secondary" type="button">Ещё действия</button></footer>
     </section>
     <section id="subscriptions-screen" class="screen page" data-screen="subscriptions" hidden>
       <article class="card subscriptions-toolbar">
