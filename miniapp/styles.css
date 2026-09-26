@@ -894,6 +894,9 @@ body:not(.member-preview-mode) .user-profile-actions button:disabled { opacity:1
 .class-calendar-list { display:grid; gap:8px; margin-top:12px; }
 .class-calendar-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto auto; gap:9px; align-items:center; padding:10px 11px; border:1px solid #e4e8e4; border-radius:10px; background:#fff; }
 .class-calendar-row div { display:grid; gap:3px; }.class-calendar-row small { color:#687471; }
+.mobile-class-title,
+.mobile-nav-label,
+.mobile-class-tabs { display:none; }
 .member-class-card { display:grid; gap:12px; }.member-class-card .badges { display:flex; flex-wrap:wrap; gap:6px; }
 .studio-editor-library { display:none; min-width:0; padding:10px; }
 .studio-editor-library > header { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
@@ -912,6 +915,63 @@ body:not(.member-preview-mode) .user-profile-actions button:disabled { opacity:1
   .class-calendar-row { grid-template-columns:1fr auto; }
   .notification-center-item { grid-template-columns:1fr 1fr; }
   .notification-center-item .admin-notification-open { grid-column:1/-1; }
+}
+
+/* Mobile admin navigation and the existing bookable-classes presentation. */
+@media (max-width:1023px) {
+  html { background:#fff; }
+  body:not(.member-preview-mode),
+  body:not(.member-preview-mode) .shell,
+  body:not(.member-preview-mode) main,
+  body:not(.member-preview-mode) .screen.page { background:#fff; }
+
+  body:not(.member-preview-mode) #bottom-nav.bottom-nav {
+    grid-template-columns:repeat(5,minmax(0,1fr));
+    width:100%;
+    overflow:hidden;
+    background:#fff;
+  }
+  body:not(.member-preview-mode) #bottom-nav > [data-nav="overview"] { order:1; display:grid; }
+  body:not(.member-preview-mode) #bottom-nav > [data-nav="users"] { order:2; display:grid; }
+  body:not(.member-preview-mode) #bottom-nav > .admin-nav-accordion { order:3; display:contents; }
+  body:not(.member-preview-mode) #bottom-nav > [data-nav="schedule"] { order:4; display:grid; }
+  body:not(.member-preview-mode) #bottom-nav > [data-nav="analytics"] { order:5; display:grid; }
+  body:not(.member-preview-mode) #bottom-nav > [data-nav="subscriptions"],
+  body:not(.member-preview-mode) #bottom-nav > #nav-gifts,
+  body:not(.member-preview-mode) #bottom-nav > #nav-notifications,
+  body:not(.member-preview-mode) #bottom-nav > .desktop-system-nav,
+  body:not(.member-preview-mode) #bottom-nav > .admin-more-nav,
+  body:not(.member-preview-mode) #bottom-nav > .admin-sidebar-club { display:none; }
+  body:not(.member-preview-mode) #bottom-nav button { min-width:0; width:100%; overflow:hidden; }
+  body:not(.member-preview-mode) #bottom-nav button > small { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  body:not(.member-preview-mode) .desktop-nav-label,
+  body:not(.member-preview-mode) .desktop-class-title { display:none; }
+  body:not(.member-preview-mode) .mobile-nav-label,
+  body:not(.member-preview-mode) .mobile-class-title { display:inline; }
+
+  body:not(.member-preview-mode) #schedule-screen { max-width:720px; margin-inline:auto; }
+  body:not(.member-preview-mode) #schedule-screen > .schedule-toolbar,
+  body:not(.member-preview-mode) #schedule-screen > #schedule-list,
+  body:not(.member-preview-mode) #schedule-screen > #schedule-empty,
+  body:not(.member-preview-mode) #schedule-screen > #schedule-more { display:none !important; }
+  body:not(.member-preview-mode) .class-calendar-admin { padding:0; border:0; background:#fff; box-shadow:none; }
+  body:not(.member-preview-mode) .class-calendar-admin::after,
+  body:not(.member-preview-mode) .class-calendar-admin .eyebrow { display:none; }
+  body:not(.member-preview-mode) .class-calendar-admin > .section-heading { align-items:center; margin:0 0 14px; }
+  body:not(.member-preview-mode) .class-calendar-admin > .section-heading h2 { margin:0; color:#111827; font-family:inherit; font-size:28px; font-weight:760; letter-spacing:-.035em; }
+  body:not(.member-preview-mode) #class-create-toggle { min-height:44px; margin:0; padding:9px 13px; border-radius:12px; background:var(--soul-teal); color:#fff; }
+  body:not(.member-preview-mode) .mobile-class-tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px; margin:0 0 12px; padding:4px; border-radius:12px; background:#f2f5f4; }
+  body:not(.member-preview-mode) .mobile-class-tabs button { min-height:44px; margin:0; padding:7px 10px; border:0; border-radius:9px; background:transparent; color:#727e84; box-shadow:none; }
+  body:not(.member-preview-mode) .mobile-class-tabs button.active { background:#fff; color:var(--soul-teal); box-shadow:0 1px 5px rgb(20 64 61 / 9%); }
+  body:not(.member-preview-mode) .class-calendar-list { gap:8px; margin-top:0; }
+  body:not(.member-preview-mode) .class-calendar-row { grid-template-columns:minmax(0,1fr) auto; gap:7px; padding:11px; border-color:#e5eaea; border-radius:14px; box-shadow:none; }
+  body:not(.member-preview-mode) .class-calendar-row strong { color:#17202d; font-size:14px; }
+  body:not(.member-preview-mode) .class-calendar-row small { font-size:11px; line-height:1.35; }
+  body:not(.member-preview-mode) .class-calendar-row > button { min-height:44px; margin:0; padding:7px 9px; font-size:10px; }
+  body:not(.member-preview-mode) .class-calendar-row > .badge { justify-self:end; }
+  body:not(.member-preview-mode) .mobile-class-empty { display:grid; justify-items:start; gap:10px; padding:14px 2px; }
+  body:not(.member-preview-mode) .mobile-class-empty p { margin:0; }
+  body:not(.member-preview-mode) .mobile-class-empty button { min-height:44px; margin:0; }
 }
 
 /* Natalia_SoulFit admin information architecture */
