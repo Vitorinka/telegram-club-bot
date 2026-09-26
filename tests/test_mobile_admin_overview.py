@@ -35,6 +35,7 @@ class MobileAdminOverviewTests(unittest.TestCase):
         deferred = bootstrap.index("window.setTimeout")
         self.assertIn('api("/api/admin/classes?limit=20")', bootstrap[deferred:])
         self.assertGreater(bootstrap.index('api("/api/admin/classes?limit=20")'), deferred)
+        self.assertGreater(bootstrap.index("loadMobileOverviewSupplementary()"), deferred)
 
     def test_mobile_navigation_is_one_row_with_five_canonical_destinations(self):
         self.assertIn("grid-template-columns:repeat(5,minmax(0,1fr))", CSS)
@@ -42,6 +43,12 @@ class MobileAdminOverviewTests(unittest.TestCase):
             self.assertIn(f'[data-nav="{destination}"]', CSS)
         self.assertIn('#bottom-nav > #nav-notifications', CSS)
         self.assertIn('#bottom-nav > .admin-more-nav', CSS)
+        self.assertNotIn('id="mobile-open-club"', HTML[HTML.index('<nav id="bottom-nav"'):])
+
+    def test_open_club_is_in_overview_header_and_uses_existing_action(self):
+        mobile = HTML[HTML.index('class="mobile-admin-overview"'):HTML.index('class="admin-dashboard-greeting"')]
+        self.assertIn('id="mobile-open-club"', mobile)
+        self.assertIn('guardContentNavigation(openAdminClub)', JS)
 
     def test_mobile_old_placeholder_panels_are_hidden_and_quick_actions_are_real(self):
         self.assertIn("#dashboard > .admin-dashboard-grid { display:none; }", CSS)
@@ -50,11 +57,31 @@ class MobileAdminOverviewTests(unittest.TestCase):
         self.assertIn('document.getElementById("content-create-open").click()', JS)
         self.assertIn("loadSchedule(false).then", JS)
 
-    def test_no_fake_analytics_or_activity_feed_is_added(self):
+    def test_chart_and_activity_use_only_bounded_server_response(self):
         mobile = HTML[HTML.index('class="mobile-admin-overview"'):HTML.index('class="admin-dashboard-greeting"')]
-        self.assertNotIn("canvas", mobile)
-        self.assertNotIn("Последние события", mobile)
-        self.assertNotIn("Динамика за 7 дней", mobile)
+        self.assertIn("Динамика", mobile)
+        self.assertIn("Последние события", mobile)
+        self.assertIn('new URLSearchParams({days:mobileOverviewPeriod.value,limit:"12"})', JS)
+        self.assertIn("mobileOverviewEventItems=data.events || []", JS)
+        self.assertNotIn("fake", mobile.lower())
+
+    def test_chart_period_change_aborts_stale_request(self):
+        loader = JS[JS.index("const loadMobileOverviewSupplementary ="):JS.index("const setAttentionCount =")]
+        self.assertIn("mobileOverviewRequestController.abort()", loader)
+        self.assertIn("signal:controller.signal", loader)
+        self.assertIn('error.name === "AbortError"', loader)
+
+    def test_delivery_attention_uses_clock_semantic(self):
+        attention = JS[JS.index("const renderMobileAttention ="):JS.index("const renderMobileUpcomingClasses =")]
+        self.assertIn('title:"Не доставлено"', attention)
+        self.assertIn('icon:"clock"', attention)
+        self.assertNotIn('"⌕"', attention)
+
+    def test_desktop_presentation_remains_available(self):
+        self.assertIn('class="admin-dashboard-greeting"', HTML)
+        self.assertIn('@media (max-width: 1023px)', CSS)
+        before_mobile_media = CSS[:CSS.index('@media (max-width: 1023px)')]
+        self.assertNotIn('#dashboard > .admin-dashboard-grid { display:none; }', before_mobile_media)
 
     def test_responsive_hooks_cover_reference_widths_and_safe_area(self):
         self.assertIn("@media (max-width: 360px)", CSS)

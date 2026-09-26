@@ -156,6 +156,11 @@ from miniapp_sessions import (
     revoke_miniapp_admin_session,
 )
 from admin_dashboard import collect_admin_dashboard
+from admin_overview import (
+    AdminOverviewQueryError,
+    load_admin_overview_supplementary,
+    parse_overview_query,
+)
 from admin_users import (
     AdminUsersQueryError,
     get_admin_user_details,
@@ -24227,6 +24232,22 @@ async def miniapp_admin_dashboard(request):
     return apply_miniapp_security_headers(web.json_response(dashboard))
 
 
+async def miniapp_admin_overview_supplementary(request):
+    try:
+        days, limit = parse_overview_query(
+            request.query.get("days", "7"),
+            request.query.get("limit", "12"),
+        )
+    except AdminOverviewQueryError as error:
+        return apply_miniapp_security_headers(web.json_response(
+            {"error": str(error)}, status=400
+        ))
+    result = await run_sync_db(
+        load_admin_overview_supplementary, get_db_conn, days, limit
+    )
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
 async def miniapp_admin_analytics(request):
     try:
         days = request.query.get("days", "30")
@@ -26234,6 +26255,11 @@ def create_app():
         app.router.add_post('/api/admin/session/revoke', miniapp_admin_session_revoke)
     if not _route_exists(app, "GET", "/api/admin/dashboard"):
         app.router.add_get('/api/admin/dashboard', miniapp_admin_dashboard)
+    if not _route_exists(app, "GET", "/api/admin/overview-supplementary"):
+        app.router.add_get(
+            '/api/admin/overview-supplementary',
+            miniapp_admin_overview_supplementary,
+        )
     if not _route_exists(app, "GET", "/api/admin/analytics"):
         app.router.add_get('/api/admin/analytics', miniapp_admin_analytics)
     if not _route_exists(app, "GET", "/api/admin/content"):

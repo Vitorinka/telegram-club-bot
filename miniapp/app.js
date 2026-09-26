@@ -169,6 +169,10 @@
   const dashboardFailedList = document.getElementById("dashboard-failed-list");
   const mobileAttentionList = document.getElementById("mobile-attention-list");
   const mobileUpcomingClasses = document.getElementById("mobile-upcoming-classes");
+  const mobileOverviewChart = document.getElementById("mobile-overview-chart");
+  const mobileOverviewEvents = document.getElementById("mobile-overview-events");
+  const mobileOverviewEventsMore = document.getElementById("mobile-overview-events-more");
+  const mobileOverviewPeriod = document.getElementById("mobile-overview-period");
   const attentionList = document.getElementById("attention-list");
   const detailsContent = document.getElementById("user-details-content");
   const manualAccessCard = document.getElementById("manual-access-card");
@@ -1293,14 +1297,20 @@
     if (!data.items.length) return dashboardEmpty(dashboardFailedList, "Проблем продления нет.");
     data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
   };
-  const mobileOverviewRow = ({title,meta,count,tone="info",open}) => {
+  const mobileOverviewIcon = (name) => {
+    const paths={payment:"M3 6h18v12H3z M3 10h18 M7 15h4",warning:"M12 3 2 21h20L12 3z M12 9v5 M12 18h.01",clock:"M12 7v5l3 2 M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",refresh:"M20 7h-5V2 M4 17h5v5 M19 11a7 7 0 0 0-12-4L5 9 M5 13a7 7 0 0 0 12 4l2-2",class:"M4 6h16v12H4z M9 10l5 2-5 2z",user:"M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M4 21a8 8 0 0 1 16 0",gift:"M4 10h16v11H4z M2 6h20v4H2z M12 6v15 M12 6c-3 0-5-1-5-3 3-1 5 1 5 3 M12 6c3 0 5-1 5-3-3-1-5 1-5 3",access:"M5 12h14 M13 6l6 6-6 6"};
+    const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+    svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("aria-hidden","true");
+    const path=document.createElementNS(svg.namespaceURI,"path"); path.setAttribute("d",paths[name] || paths.refresh); svg.append(path); return svg;
+  };
+  const mobileOverviewRow = ({title,meta,count,tone="info",icon="refresh",open}) => {
     const button=document.createElement("button"); button.type="button"; button.className=`mobile-overview-row ${tone}`;
-    const icon=text("span",tone === "danger" ? "!" : tone === "warning" ? "⌕" : "↻","mobile-overview-row-icon");
+    const iconNode=text("span","","mobile-overview-row-icon"); iconNode.append(mobileOverviewIcon(icon));
     const copy=document.createElement("span"); copy.className="mobile-overview-row-copy"; copy.append(text("strong",title),text("small",meta));
-    button.append(icon,copy);
+    button.append(iconNode,copy);
     if(count != null) button.append(text("b",String(count),"mobile-overview-count"));
-    button.append(text("i","›","mobile-overview-chevron"));
-    if(open) button.addEventListener("click",open);
+    if(open) { button.append(text("i","›","mobile-overview-chevron")); button.addEventListener("click",open); }
+    else button.classList.add("static");
     return button;
   };
   const renderMobileAttention = (dashboard) => {
@@ -1308,9 +1318,9 @@
     const failed=Number(dashboard.billing.failed_payments || 0);
     const removals=Number(dashboard.access.pending_removals || 0)+Number(dashboard.access.retryable_removals || 0);
     const deliveries=Number(dashboard.deliveries.permanently_failed || 0);
-    if(failed) rows.push(mobileOverviewRow({title:"Платёж не прошёл",meta:"Пользователи с неудачной оплатой",count:failed,tone:"danger",open:()=>loadNotifications().catch(showApiError)}));
-    if(removals) rows.push(mobileOverviewRow({title:"Проблемы с удалением",meta:"Требуется повторная безопасная обработка",count:removals,tone:"warning",open:()=>loadNotifications().catch(showApiError)}));
-    if(deliveries) rows.push(mobileOverviewRow({title:"Не доставлено",meta:"Сообщения требуют проверки",count:deliveries,tone:"warning",open:()=>loadNotifications().catch(showApiError)}));
+    if(failed) rows.push(mobileOverviewRow({title:"Платёж не прошёл",meta:"Пользователи с неудачной оплатой",count:failed,tone:"danger",icon:"payment",open:()=>loadNotifications().catch(showApiError)}));
+    if(removals) rows.push(mobileOverviewRow({title:"Проблемы с удалением",meta:"Требуется повторная безопасная обработка",count:removals,tone:"warning",icon:"refresh",open:()=>loadNotifications().catch(showApiError)}));
+    if(deliveries) rows.push(mobileOverviewRow({title:"Не доставлено",meta:"Сообщения требуют проверки",count:deliveries,tone:"warning",icon:"clock",open:()=>loadNotifications().catch(showApiError)}));
     if(!rows.length) rows.push(text("p","Всё спокойно — задач, требующих внимания, нет.","mobile-overview-empty positive"));
     mobileAttentionList.replaceChildren(...rows);
   };
@@ -1321,9 +1331,48 @@
     const labels={draft:"Черновик",open:"Открыта запись",confirmed:"Подтверждено"};
     const rows=items.map((item)=>{
       const when=new Date(item.starts_at).toLocaleString("ru-RU",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
-      return mobileOverviewRow({title:item.title,meta:`${when} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`,count:labels[item.status] || item.status,tone:item.status === "open" ? "success" : "info",open:()=>loadSchedule().catch(showApiError)});
+      return mobileOverviewRow({title:item.title,meta:`${when} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`,count:labels[item.status] || item.status,tone:item.status === "open" ? "success" : "info",icon:"class",open:()=>loadSchedule().catch(showApiError)});
     });
     mobileUpcomingClasses.replaceChildren(...rows);
+  };
+  let mobileOverviewRequestController=null;
+  let mobileOverviewEventItems=[];
+  const renderMobileChart = (series) => {
+    mobileOverviewChart.replaceChildren();
+    const values=series.map((point)=>Number(point.value || 0));
+    const total=values.reduce((sum,value)=>sum+value,0);
+    document.getElementById("mobile-chart-total").textContent=String(total);
+    const width=320,height=142,padX=14,padY=14,max=Math.max(1,...values);
+    const points=values.map((value,index)=>{
+      const x=padX+(values.length === 1 ? 0 : index*(width-padX*2)/(values.length-1));
+      const y=height-padY-(value/max)*(height-padY*2); return [x,y];
+    });
+    const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+    svg.setAttribute("viewBox",`0 0 ${width} ${height}`); svg.setAttribute("preserveAspectRatio","none");
+    [0.25,0.5,0.75].forEach((ratio)=>{ const line=document.createElementNS(svg.namespaceURI,"line"); line.setAttribute("x1",padX); line.setAttribute("x2",width-padX); line.setAttribute("y1",String(height*ratio)); line.setAttribute("y2",String(height*ratio)); line.setAttribute("class","mobile-chart-grid"); svg.append(line); });
+    if(points.length){ const lastPoint=points[points.length-1]; const area=document.createElementNS(svg.namespaceURI,"path"); area.setAttribute("d",`M ${points[0][0]} ${height-padY} L ${points.map(([x,y])=>`${x} ${y}`).join(" L ")} L ${lastPoint[0]} ${height-padY} Z`); area.setAttribute("class","mobile-chart-area"); svg.append(area); const path=document.createElementNS(svg.namespaceURI,"polyline"); path.setAttribute("points",points.map(([x,y])=>`${x},${y}`).join(" ")); path.setAttribute("class","mobile-chart-line"); svg.append(path); points.forEach(([x,y])=>{ const point=document.createElementNS(svg.namespaceURI,"circle"); point.setAttribute("cx",x); point.setAttribute("cy",y); point.setAttribute("r","2.7"); point.setAttribute("class","mobile-chart-point"); svg.append(point); }); }
+    mobileOverviewChart.append(svg);
+  };
+  const renderMobileEvents = (expanded=false) => {
+    const visible=mobileOverviewEventItems.slice(0,expanded ? 12 : 6);
+    if(!visible.length){ mobileOverviewEvents.replaceChildren(text("p","Событий пока нет.","mobile-overview-empty")); mobileOverviewEventsMore.hidden=true; return; }
+    const rows=visible.map((item)=>{
+      const occurred=new Date(item.occurred_at);
+      const time=occurred.toLocaleDateString("ru-RU") === new Date().toLocaleDateString("ru-RU") ? occurred.toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}) : occurred.toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
+      return mobileOverviewRow({title:item.title,meta:item.secondary,count:time,tone:item.tone === "danger" ? "danger" : item.tone === "warning" ? "warning" : "info",icon:item.icon});
+    });
+    mobileOverviewEvents.replaceChildren(...rows); mobileOverviewEventsMore.hidden=mobileOverviewEventItems.length <= 6 || expanded;
+  };
+  const loadMobileOverviewSupplementary = () => {
+    if(!window.matchMedia("(max-width: 1023px)").matches) return Promise.resolve(null);
+    if(mobileOverviewRequestController) mobileOverviewRequestController.abort();
+    const controller=new AbortController(); mobileOverviewRequestController=controller;
+    mobileOverviewChart.replaceChildren(text("p","Загружаем динамику…","mobile-overview-empty"));
+    const params=new URLSearchParams({days:mobileOverviewPeriod.value,limit:"12"});
+    return api(`/api/admin/overview-supplementary?${params.toString()}`,{signal:controller.signal}).then((data)=>{
+      if(mobileOverviewRequestController !== controller) return null;
+      renderMobileChart(data.series || []); mobileOverviewEventItems=data.events || []; renderMobileEvents(); return data;
+    }).catch((error)=>{ if(error && error.name === "AbortError") return null; mobileOverviewChart.replaceChildren(text("p","Динамика временно недоступна.","mobile-overview-empty")); throw error; }).finally(()=>{ if(mobileOverviewRequestController === controller) mobileOverviewRequestController=null; });
   };
   const setAttentionCount = (count) => {
     ["dashboard-attention-count","topbar-attention","sidebar-attention","more-attention","mobile-overview-attention"].forEach((id)=>{
@@ -3303,6 +3352,7 @@
   document.getElementById("dashboard-open-system").addEventListener("click", () => loadSystem().catch(showApiError));
   document.getElementById("dashboard-open-attention").addEventListener("click", () => loadNotifications().catch(showApiError));
   document.getElementById("mobile-overview-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
+  document.getElementById("mobile-open-club").addEventListener("click", () => guardContentNavigation(openAdminClub));
   document.getElementById("mobile-open-notifications").addEventListener("click", () => loadNotifications().catch(showApiError));
   document.getElementById("mobile-open-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("mobile-create-content").addEventListener("click", () => document.getElementById("content-create-open").click());
@@ -3310,6 +3360,8 @@
     editingClassId=null; classCreateForm.hidden=false; classCreateForm.reset();
     document.getElementById("class-title").focus();
   }).catch(showApiError));
+  mobileOverviewPeriod.addEventListener("change",()=>loadMobileOverviewSupplementary().catch(showApiError));
+  mobileOverviewEventsMore.addEventListener("click",()=>renderMobileEvents(true));
   document.getElementById("more-subscriptions").addEventListener("click", () => loadSubscriptions().catch(showApiError));
   document.getElementById("more-schedule").addEventListener("click", () => loadSchedule().catch(showApiError));
   document.getElementById("more-gifts").addEventListener("click", () => loadGifts().catch(showApiError));
@@ -3603,7 +3655,7 @@
         if(window.matchMedia("(max-width: 1023px)").matches) {
           api("/api/admin/classes?limit=20").then(renderMobileUpcomingClasses).catch(() => {
             mobileUpcomingClasses.replaceChildren(text("p","Не удалось загрузить ближайшие занятия.","mobile-overview-empty"));
-          });
+          }).finally(()=>loadMobileOverviewSupplementary().catch(showApiError));
         }
       }, 0);
     });

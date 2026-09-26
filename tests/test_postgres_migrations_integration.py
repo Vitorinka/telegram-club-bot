@@ -164,6 +164,7 @@ from member_catalog import (
 )
 from member_sessions import create_member_session, load_member_session
 from admin_dashboard import collect_admin_dashboard
+from admin_overview import load_admin_overview_supplementary
 from admin_users import get_admin_user_details, list_admin_users
 
 
@@ -863,6 +864,78 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         serialized = json.dumps(dashboard)
         for forbidden in ("cus_private", "telegram_id", "stripe_customer_id", "payload_json"):
             self.assertNotIn(forbidden, serialized)
+
+    def test_mobile_admin_overview_uses_authoritative_series_and_bounded_events_real_postgres(self):
+        run_migrations(self.get_conn)
+        class_id = str(uuid.uuid4())
+        booking_id = str(uuid.uuid4())
+        gift_id = str(uuid.uuid4())
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (telegram_id, username, first_name, paid, registered_at)
+                    VALUES
+                      (98601, 'overview_one', 'Анна', FALSE, NOW() - INTERVAL '1 day'),
+                      (98602, 'overview_two', 'Мария', TRUE, NOW())
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO payment_events (
+                        stripe_event_id, event_type, telegram_id, payment_status,
+                        payment_kind, created_at
+                    ) VALUES ('evt_overview_paid', 'invoice.payment_succeeded', 98601,
+                              'succeeded', 'recurring', NOW() + INTERVAL '1 second')
+                    """
+                )
+                cur.execute(
+                    """
+                    INSERT INTO gift_access_events (
+                        gift_id, public_reference, telegram_id, event_type, created_at
+                    ) VALUES (%s, 'GIFT-OVERVIEW', 98602, 'gift_paid', NOW())
+                    """,
+                    (gift_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO bookable_classes (
+                        class_id, title, starts_at, duration_minutes, zoom_url,
+                        capacity, minimum_participants, booking_deadline,
+                        status, created_by_telegram_id
+                    ) VALUES (%s, 'Медитация', NOW() + INTERVAL '2 days', 45,
+                              'https://zoom.example/class', 10, 3,
+                              NOW() + INTERVAL '1 day', 'open', 1)
+                    """,
+                    (class_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO class_bookings (
+                        booking_id, class_id, telegram_id, status, amount,
+                        currency, paid_at
+                    ) VALUES (%s, %s, 98602, 'paid', 1000, 'eur', NOW())
+                    """,
+                    (booking_id, class_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = load_admin_overview_supplementary(self.get_conn, 7, 12)
+        self.assertEqual(len(result["series"]), 7)
+        self.assertEqual(result["metric"], "new_registrations")
+        self.assertEqual(sum(point["value"] for point in result["series"]), 2)
+        self.assertLessEqual(len(result["events"]), 12)
+        titles = [event["title"] for event in result["events"]]
+        self.assertTrue(any("подписка продлена" in title for title in titles))
+        self.assertTrue(any("записался на занятие" in title for title in titles))
+        self.assertTrue(any("подарочный сертификат" in title for title in titles))
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("evt_overview_paid", serialized)
+        self.assertNotIn(class_id, serialized)
+        self.assertNotIn(booking_id, serialized)
 
     def test_miniapp_users_filters_search_pagination_and_details_real_postgres(self):
         run_migrations(self.get_conn)
