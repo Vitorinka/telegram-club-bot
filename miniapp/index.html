@@ -322,7 +322,7 @@
     </section>
     <section id="schedule-screen" class="screen page" data-screen="schedule" hidden>
       <article class="card class-calendar-admin">
-        <header class="section-heading"><div><p class="eyebrow">Живой календарь</p><h2>Zoom-занятия</h2></div><button id="class-create-toggle" type="button">+ Создать занятие</button></header>
+        <header class="section-heading"><div><p class="eyebrow">Живой календарь</p><h2><span class="desktop-class-title">Zoom-занятия</span><span class="mobile-class-title">Занятия</span></h2></div><button id="class-create-toggle" type="button">+ Создать занятие</button></header>
         <form id="class-create-form" class="class-create-form" hidden>
           <label>Название <input id="class-title" maxlength="120" required></label>
           <label>Описание <textarea id="class-description" maxlength="5000"></textarea></label>
@@ -333,6 +333,10 @@
           <p id="class-create-message" class="hint">Занятие создаётся как черновик. Оплата — отдельный one-time Stripe Checkout.</p>
           <div class="action-row"><button type="submit">Сохранить черновик</button><button id="class-create-cancel" class="secondary" type="button">Отмена</button></div>
         </form>
+        <div class="mobile-class-tabs" role="group" aria-label="Период занятий">
+          <button class="active" type="button" data-class-range="future" aria-pressed="true">Предстоящие</button>
+          <button type="button" data-class-range="past" aria-pressed="false">Прошедшие</button>
+        </div>
         <div id="class-calendar-list" class="class-calendar-list"></div>
       </article>
       <article class="card schedule-toolbar">
@@ -565,7 +569,7 @@
     </div>
     <button type="button" data-nav="users" data-admin-icon="users"><span aria-hidden="true"></span><small>Пользователи</small></button>
     <button type="button" data-nav="subscriptions" data-admin-icon="subscriptions"><span aria-hidden="true"></span><small>Клуб</small></button>
-    <button type="button" data-nav="schedule" data-admin-icon="calendar"><span aria-hidden="true"></span><small>Расписание</small></button>
+    <button type="button" data-nav="schedule" data-admin-icon="calendar"><span aria-hidden="true"></span><small><span class="desktop-nav-label">Расписание</span><span class="mobile-nav-label">Занятия</span></small></button>
     <button id="nav-gifts" type="button" data-admin-icon="gift"><span aria-hidden="true"></span><small>Подарки</small></button>
     <button type="button" data-nav="analytics" data-admin-icon="analytics"><span aria-hidden="true"></span><small>Аналитика</small></button>
     <button id="nav-notifications" type="button" data-nav="notifications" data-admin-icon="bell"><span aria-hidden="true"></span><small>Уведомления</small><span id="sidebar-attention" class="sidebar-attention">0</span></button>

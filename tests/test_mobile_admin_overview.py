@@ -39,11 +39,33 @@ class MobileAdminOverviewTests(unittest.TestCase):
 
     def test_mobile_navigation_is_one_row_with_five_canonical_destinations(self):
         self.assertIn("grid-template-columns:repeat(5,minmax(0,1fr))", CSS)
-        for destination in ("overview", "users", "content", "subscriptions", "analytics"):
+        for destination in ("overview", "users", "content", "schedule", "analytics"):
             self.assertIn(f'[data-nav="{destination}"]', CSS)
+        mobile_nav_css = CSS[CSS.index("/* Mobile admin navigation and the existing bookable-classes presentation. */"):]
+        self.assertIn('#bottom-nav > [data-nav="subscriptions"]', mobile_nav_css)
+        self.assertIn("display:none", mobile_nav_css)
+        self.assertIn('class="mobile-nav-label">Занятия</span>', HTML)
         self.assertIn('#bottom-nav > #nav-notifications', CSS)
         self.assertIn('#bottom-nav > .admin-more-nav', CSS)
         self.assertNotIn('id="mobile-open-club"', HTML[HTML.index('<nav id="bottom-nav"'):])
+
+    def test_mobile_classes_reuse_existing_schedule_and_creation_flow(self):
+        schedule = HTML[HTML.index('id="schedule-screen"'):HTML.index('id="schedule-upload-screen"')]
+        self.assertIn('id="class-create-toggle"', schedule)
+        self.assertIn('id="class-create-form"', schedule)
+        self.assertIn('data-class-range="future"', schedule)
+        self.assertIn('data-class-range="past"', schedule)
+        self.assertIn('/api/admin/classes?limit=100', JS)
+        self.assertIn('document.getElementById("class-create-toggle").click()', JS)
+        self.assertIn("Ближайших занятий пока нет.", JS)
+
+    def test_mobile_canvas_is_white_without_hiding_desktop_schedule(self):
+        mobile_css = CSS[CSS.index("/* Mobile admin navigation and the existing bookable-classes presentation. */"):]
+        self.assertIn("html { background:#fff; }", mobile_css)
+        self.assertIn("body:not(.member-preview-mode) .screen.page { background:#fff; }", mobile_css)
+        self.assertIn("#schedule-screen > .schedule-toolbar", mobile_css)
+        self.assertIn("@media (max-width:1023px)", mobile_css)
+        self.assertIn('class="desktop-nav-label">Расписание</span>', HTML)
 
     def test_open_club_is_in_overview_header_and_uses_existing_action(self):
         mobile = HTML[HTML.index('class="mobile-admin-overview"'):HTML.index('class="admin-dashboard-greeting"')]
@@ -76,6 +98,9 @@ class MobileAdminOverviewTests(unittest.TestCase):
         self.assertIn('title:"Не доставлено"', attention)
         self.assertIn('icon:"clock"', attention)
         self.assertNotIn('"⌕"', attention)
+        icon_factory = JS[JS.index("const mobileOverviewIcon ="):JS.index("const mobileOverviewRow =")]
+        self.assertIn('clock:"M12 2a10 10', icon_factory)
+        self.assertNotIn("M10 2h4", icon_factory)
 
     def test_desktop_presentation_remains_available(self):
         self.assertIn('class="admin-dashboard-greeting"', HTML)

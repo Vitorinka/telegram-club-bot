@@ -353,6 +353,8 @@
   let deliveriesCursor = null;
   let scheduleCursor = null;
   let adminClassesCursor = null;
+  let adminClassItems = [];
+  let adminClassRange = "future";
   let scheduleRange = "future";
   let scheduleImageGeneration = 0;
   const scheduleImageUrls = new Map();
@@ -1298,7 +1300,7 @@
     data.items.slice(0, 4).forEach((item) => dashboardFailedList.append(dashboardRow(item.username ? `@${item.username}` : (item.first_name || `ID ${item.telegram_id}`), `${item.reason_label} · попыток ${item.attempt_count}`, failedStatusLabels[item.status] || item.status)));
   };
   const mobileOverviewIcon = (name) => {
-    const paths={payment:"M3 6h18v12H3z M3 10h18 M7 15h4",warning:"M12 3 2 21h20L12 3z M12 9v5 M12 18h.01",clock:"M12 7v5l3 2 M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",refresh:"M20 7h-5V2 M4 17h5v5 M19 11a7 7 0 0 0-12-4L5 9 M5 13a7 7 0 0 0 12 4l2-2",class:"M4 6h16v12H4z M9 10l5 2-5 2z",user:"M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M4 21a8 8 0 0 1 16 0",gift:"M4 10h16v11H4z M2 6h20v4H2z M12 6v15 M12 6c-3 0-5-1-5-3 3-1 5 1 5 3 M12 6c3 0 5-1 5-3-3-1-5 1-5 3",access:"M5 12h14 M13 6l6 6-6 6"};
+    const paths={payment:"M3 6h18v12H3z M3 10h18 M7 15h4",warning:"M12 3 2 21h20L12 3z M12 9v5 M12 18h.01",clock:"M12 2a10 10 0 1 1-10 10A10 10 0 0 1 12 2 M12 6v6l4 2",refresh:"M20 7h-5V2 M4 17h5v5 M19 11a7 7 0 0 0-12-4L5 9 M5 13a7 7 0 0 0 12 4l2-2",class:"M4 6h16v12H4z M9 10l5 2-5 2z",user:"M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M4 21a8 8 0 0 1 16 0",gift:"M4 10h16v11H4z M2 6h20v4H2z M12 6v15 M12 6c-3 0-5-1-5-3 3-1 5 1 5 3 M12 6c3 0 5-1 5-3-3-1-5 1-5 3",access:"M5 12h14 M13 6l6 6-6 6"};
     const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
     svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("aria-hidden","true");
     const path=document.createElementNS(svg.namespaceURI,"path"); path.setAttribute("d",paths[name] || paths.refresh); svg.append(path); return svg;
@@ -1971,7 +1973,11 @@
   };
   const loadSchedule = (append = false) => {
     status.textContent = "Загружаем расписание…";
-    return Promise.all([api(`/api/admin/schedule?${scheduleParams(append).toString()}`),api("/api/admin/classes?limit=50")]).then(([data,classes]) => {
+    const mobileClasses = window.matchMedia("(max-width: 1023px)").matches;
+    const classesRequest = append
+      ? Promise.resolve(null)
+      : (mobileClasses ? loadAllAdminClasses() : api("/api/admin/classes?limit=50"));
+    return Promise.all([api(`/api/admin/schedule?${scheduleParams(append).toString()}`),classesRequest]).then(([data,classes]) => {
       if (!append) {
         clearScheduleImages();
         scheduleList.replaceChildren();
@@ -1989,17 +1995,34 @@
       scheduleMetricNodes.forEach((node) => {
         node.textContent = String(data.summary[node.dataset.scheduleMetric] ?? "—");
       });
-      renderAdminClasses(classes.items || [],false,classes);
+      if (classes) {
+        adminClassItems = classes.items || [];
+        renderAdminClasses(adminClassItems,false,classes);
+      }
       showScreen("schedule");
       status.textContent = data.items.length
         ? (archive ? "Архив расписаний" : "Расписание клуба")
         : scheduleEmpty.textContent;
     });
   };
+  const loadAllAdminClasses = () => {
+    const items = [];
+    const loadPage = (cursor = null) => api(`/api/admin/classes?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`).then((page) => {
+      items.push(...(page.items || []));
+      return page.has_more && page.next_cursor ? loadPage(page.next_cursor) : {items,has_more:false,next_cursor:null};
+    });
+    return loadPage();
+  };
   const renderAdminClasses = (items,append=false,page={}) => {
+    const mobileClasses = window.matchMedia("(max-width: 1023px)").matches;
     if(!append) classCalendarList.replaceChildren();
     classCalendarList.querySelector(".admin-classes-more")?.remove();
-    items.forEach((item)=>{
+    const now = Date.now();
+    const visibleItems = mobileClasses ? items.filter((item) => adminClassRange === "past"
+      ? new Date(item.starts_at).getTime() < now
+      : new Date(item.starts_at).getTime() >= now) : items;
+    if (mobileClasses && adminClassRange === "past") visibleItems.reverse();
+    visibleItems.forEach((item)=>{
       const row=document.createElement("article"); row.className="class-calendar-row";
       const copy=document.createElement("div"); copy.append(text("strong",item.title),text("small",`${new Date(item.starts_at).toLocaleString("ru-RU")} · ${item.duration_minutes} мин · ${item.paid_bookings}/${item.capacity} оплачено`));
       const state=text("span",({draft:"Черновик",open:"Открыта запись",confirmed:"Подтверждено",cancelled:"Отменено",completed:"Завершено"}[item.status] || item.status),`badge class-${item.status}`); row.append(copy,state);
@@ -2012,8 +2035,17 @@
       classCalendarList.append(row);
     });
     adminClassesCursor=page.next_cursor || null;
-    if(!items.length && !append) classCalendarList.append(text("p","Создайте первое бронируемое Zoom-занятие.","hint"));
-    if(page.has_more && adminClassesCursor){
+    if(!visibleItems.length && !append){
+      const empty=document.createElement("div"); empty.className="mobile-class-empty";
+      empty.append(text("p",mobileClasses ? (adminClassRange === "past" ? "Прошедших занятий пока нет." : "Ближайших занятий пока нет.") : "Создайте первое бронируемое Zoom-занятие.","hint"));
+      if(mobileClasses){
+        const create=text("button","+ Создать занятие"); create.type="button";
+        create.addEventListener("click",()=>document.getElementById("class-create-toggle").click());
+        empty.append(create);
+      }
+      classCalendarList.append(empty);
+    }
+    if(!mobileClasses && page.has_more && adminClassesCursor){
       const more=text("button","Показать ещё занятия","secondary admin-classes-more"); more.type="button";
       more.addEventListener("click",()=>{
         more.disabled=true;
@@ -3541,6 +3573,17 @@
     button.addEventListener("click", () => {
       scheduleRange = button.dataset.scheduleRange;
       loadSchedule(false).catch(showApiError);
+    });
+  });
+  document.querySelectorAll("[data-class-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      adminClassRange = button.dataset.classRange;
+      document.querySelectorAll("[data-class-range]").forEach((candidate) => {
+        const active = candidate === button;
+        candidate.classList.toggle("active", active);
+        candidate.setAttribute("aria-pressed", String(active));
+      });
+      renderAdminClasses(adminClassItems,false,{has_more:false,next_cursor:null});
     });
   });
   document.getElementById("schedule-back").addEventListener("click", () => showScreen("schedule"));
