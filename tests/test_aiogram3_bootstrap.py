@@ -10426,9 +10426,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         presign.assert_not_called()
 
         media = {
-            "media_type": "cover", "mime_type": "image/png", "size_bytes": 8,
+            "media_type": "video", "mime_type": "video/mp4", "size_bytes": 8,
             "server_reference": "telegram-file-id", "content_type": "lesson",
-            "content_access_level": "free", "access_level": "preview",
+            "content_access_level": "paid", "access_level": "premium",
             "storage_kind": "telegram_file_id",
         }
         member_path = "/api/member/content/{content_id}/media/{media_id}"
@@ -10443,6 +10443,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             destination.write(b"telegram")
 
         with patch.object(self.main, "get_member_media_reference", return_value=media), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(self.main, "validate_media_bytes", return_value="video/mp4"), \
              patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="telegram-path", file_size=8))), \
              patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)), \
              patch.object(self.main.R2_STORAGE, "create_download_url") as signed:
@@ -10920,7 +10922,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("video_streaming_not_available", inspect.getsource(self.main))
         self.assertIn("memberVideoElement.pause()", javascript)
         self.assertIn("memberVideoElement.removeAttribute(\"src\")", javascript)
-        self.assertIn("URL.revokeObjectURL(memberVideoUrl)", javascript)
+        self.assertIn("URL.revokeObjectURL(memberVideoObjectUrl)", javascript)
         self.assertIn("video.controls = true", javascript)
         self.assertIn("video.playsInline = true", javascript)
         self.assertIn('["video/mp4", "video/webm"].includes(media.mime_type)', javascript)
@@ -10954,7 +10956,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", stylesheet)
         self.assertIn(".member-training-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }", stylesheet)
         self.assertIn("env(safe-area-inset-bottom)", stylesheet)
-        self.assertNotIn("telegram_file_id", javascript)
+        self.assertIn('media.storage_kind !== "telegram_file_id"', javascript)
         self.assertIn("id=\"content-screen\"", index)
         self.assertIn("loadContent", javascript)
         self.assertIn("content-create-submit", index)

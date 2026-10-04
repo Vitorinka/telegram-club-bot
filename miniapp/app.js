@@ -134,8 +134,32 @@
       return openDraft(draft).then(() => ({status, error, draft}));
     });
   };
+  const memberVideoSource = async ({media, sessionToken, fetchMedia = fetch, createObjectUrl = URL.createObjectURL}) => {
+    if (!media || !media.url) throw new Error("video_unavailable");
+    if (media.storage_kind === "r2") {
+      if (!["video/mp4", "video/webm"].includes(media.mime_type)) throw new Error("video_unavailable");
+      let signedUrl;
+      try { signedUrl = new URL(media.url); }
+      catch (_error) { throw new Error("video_unavailable"); }
+      if (signedUrl.protocol !== "https:") throw new Error("video_unavailable");
+      return {src:media.url, objectUrl:null};
+    }
+    if (media.storage_kind !== "telegram_file_id" || media.mime_type !== "video/mp4") throw new Error("video_unavailable");
+    const response = await fetchMedia(media.url, {
+      headers:{Authorization:`Bearer ${sessionToken}`}, cache:"no-store", credentials:"omit",
+    });
+    if (!response.ok) {
+      const error = new Error("video_unavailable");
+      error.status = response.status;
+      throw error;
+    }
+    const blob = await response.blob();
+    if (blob.type !== "video/mp4") throw new Error("video_unavailable");
+    const objectUrl = createObjectUrl(blob);
+    return {src:objectUrl, objectUrl};
+  };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft, memberVideoSource};
     return;
   }
   const webApp = window.Telegram && window.Telegram.WebApp;
@@ -388,6 +412,7 @@
   let memberVideoGeneration = 0;
   let memberVideoElement = null;
   let memberVideoUrl = null;
+  let memberVideoObjectUrl = null;
   const memberCoverUrls = new Map();
   const memberCoverPending = new Map();
   const memberCoverControllers = new Set();
@@ -646,8 +671,9 @@
       memberVideoElement.load();
     }
     memberVideoElement = null;
-    if (memberVideoUrl) URL.revokeObjectURL(memberVideoUrl);
+    if (memberVideoObjectUrl) URL.revokeObjectURL(memberVideoObjectUrl);
     memberVideoUrl = null;
+    memberVideoObjectUrl = null;
   };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
@@ -930,16 +956,19 @@
             throw error;
           }
           return response.json();
-        }).then((media) => {
-          if (generation !== memberVideoGeneration) return;
-          if (!["video/mp4", "video/webm"].includes(media.mime_type) || !media.url) throw new Error("video_unavailable");
-          memberVideoUrl = media.url;
+        }).then((media) => memberVideoSource({media, sessionToken})).then((source) => {
+          if (generation !== memberVideoGeneration) {
+            if (source.objectUrl) URL.revokeObjectURL(source.objectUrl);
+            return;
+          }
+          memberVideoUrl = source.src;
+          memberVideoObjectUrl = source.objectUrl;
           const video = document.createElement("video");
           video.className = "member-video-player";
           video.controls = true;
           video.playsInline = true;
           video.preload = "metadata";
-          video.src = media.url;
+          video.src = source.src;
           memberVideoElement = video;
           player.classList.remove("member-video-loading");
           player.replaceChildren(video);

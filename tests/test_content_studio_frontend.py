@@ -284,6 +284,70 @@ class ContentStudioFrontendTests(unittest.TestCase):
             "users": ["users"], "content": ["content"], "system": ["system"],
         })
 
+    def test_member_video_source_preserves_authenticated_telegram_and_direct_r2_paths(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          (async()=>{
+            const calls=[]; const created=[];
+            const telegram=await core.memberVideoSource({
+              media:{storage_kind:'telegram_file_id',mime_type:'video/mp4',url:'/api/member/content/c/media/m'},
+              sessionToken:'member-session',
+              fetchMedia:async(url,options)=>{
+                calls.push({url,options});
+                return {ok:true,status:200,blob:async()=>({type:'video/mp4',bytes:12})};
+              },
+              createObjectUrl:(blob)=>{created.push(blob);return 'blob:telegram-video';},
+            });
+            let r2Fetches=0;
+            const r2=await core.memberVideoSource({
+              media:{storage_kind:'r2',mime_type:'video/webm',url:'https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/private/signed'},
+              sessionToken:'member-session',
+              fetchMedia:async()=>{r2Fetches+=1;throw new Error('must_not_fetch');},
+              createObjectUrl:()=>{throw new Error('must_not_create_blob');},
+            });
+            console.log(JSON.stringify({telegram,r2,calls,createdType:created[0].type,r2Fetches}));
+          })();
+        """)
+        self.assertEqual(result["telegram"], {"src": "blob:telegram-video", "objectUrl": "blob:telegram-video"})
+        self.assertEqual(result["calls"], [{
+            "url": "/api/member/content/c/media/m",
+            "options": {
+                "headers": {"Authorization": "Bearer member-session"},
+                "cache": "no-store", "credentials": "omit",
+            },
+        }])
+        self.assertEqual(result["createdType"], "video/mp4")
+        self.assertEqual(result["r2"], {
+            "src": "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com/private/signed",
+            "objectUrl": None,
+        })
+        self.assertEqual(result["r2Fetches"], 0)
+
+    def test_member_video_source_rejects_unauthorized_telegram_media(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          (async()=>{
+            let blobs=0,objects=0,status=null;
+            try {
+              await core.memberVideoSource({
+                media:{storage_kind:'telegram_file_id',mime_type:'video/mp4',url:'/api/member/content/c/media/m'},
+                sessionToken:'member-session',
+                fetchMedia:async()=>({ok:false,status:403,blob:async()=>{blobs+=1;}}),
+                createObjectUrl:()=>{objects+=1;return 'blob:forbidden';},
+              });
+            } catch (error) { status=error.status; }
+            console.log(JSON.stringify({status,blobs,objects}));
+          })();
+        """)
+        self.assertEqual(result, {"status": 403, "blobs": 0, "objects": 0})
+
+    def test_member_video_cleanup_revokes_only_blob_object_urls(self):
+        source = APP_JS.read_text()
+        self.assertIn("if (memberVideoObjectUrl) URL.revokeObjectURL(memberVideoObjectUrl)", source)
+        self.assertIn("memberVideoObjectUrl = source.objectUrl", source)
+        self.assertNotIn("URL.revokeObjectURL(memberVideoUrl)", source)
+        self.assertIn("if (source.objectUrl) URL.revokeObjectURL(source.objectUrl)", source)
+
     def run_node(self, source):
         completed = subprocess.run(
             ["node", "-e", source],
