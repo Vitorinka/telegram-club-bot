@@ -212,6 +212,15 @@ class DbMigrationTests(unittest.TestCase):
         self.assertIn("class_bookings_identity_unique", class_sql)
         self.assertIn("UNIQUE REFERENCES class_bookings", class_sql)
 
+    def test_r2_content_media_migration_preserves_telegram_rows(self):
+        self.assertIn("0035_r2_content_media", MIGRATION_BASELINE_REQUIREMENTS)
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0035_r2_content_media.sql").read_text()
+        self.assertIn("storage_kind IN ('telegram_file_id', 'r2')", sql)
+        self.assertIn("2147483648", sql)
+        for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
+            self.assertNotIn(destructive, sql.upper())
+
     def test_message_delivery_due_indexes_migration_has_exact_sql(self):
         root = Path(__file__).resolve().parents[1]
         migration_sql = (root / "migrations" / "0010_message_delivery_due_indexes.sql").read_text()

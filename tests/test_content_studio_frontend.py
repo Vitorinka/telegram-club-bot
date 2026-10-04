@@ -299,7 +299,7 @@ class ContentStudioFrontendTests(unittest.TestCase):
           const core = require('./miniapp/app.js');
           (async () => {
             let creates = 0, opens = [], attaches = 0;
-            const oversized = {name:'lesson.mp4', type:'video/mp4', size:21*1024*1024};
+            const oversized = {name:'lesson.mp4', type:'video/mp4', size:2*1024*1024*1024+1};
             const blocked = await core.contentStudioCreateDraft({
               files:[['video', oversized]],
               createDraft:async()=>{ creates += 1; return {content_id:'unexpected'}; },

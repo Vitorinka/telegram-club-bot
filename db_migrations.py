@@ -931,6 +931,37 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             "class_refund_operations_due_idx",
         ),
     },
+    "0035_r2_content_media": {
+        "tables": ("content_media", "content_media_uploads"),
+        "columns": {
+            "content_media": (
+                "storage_kind", "server_reference", "original_filename",
+                "object_etag",
+            ),
+            "content_media_uploads": (
+                "storage_kind", "object_key", "original_filename",
+                "object_etag",
+            ),
+        },
+        "indexes": ("content_media_one_active_type_idx",),
+        "constraints": {
+            "content_media_storage_check": {
+                "table": "content_media",
+                "definition_contains": ("telegram_file_id", "r2"),
+                "validated": True,
+            },
+            "content_media_uploads_storage_check": {
+                "table": "content_media_uploads",
+                "definition_contains": ("telegram_file_id", "r2"),
+                "validated": True,
+            },
+            "content_media_uploads_object_key_check": {
+                "table": "content_media_uploads",
+                "definition_contains": ("object_key", "r2"),
+                "validated": True,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (
