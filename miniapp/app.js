@@ -10,12 +10,12 @@
       if (file.size > 10 * 1024 * 1024) return `Обложка слишком большая: ${megabytes} МБ. Текущий максимум — 10 МБ.`;
     }
     if (mediaType === "video") {
-      if (file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) return "Этот формат пока не поддерживается. Загрузите MP4.";
-      if (file.size > 20 * 1024 * 1024) return `Видео слишком большое: ${megabytes} МБ. Текущий максимум — 20 МБ.`;
+      if (!["video/mp4", "video/webm"].includes(file.type)) return "Загрузите MP4 или WebM с корректным MIME-типом.";
+      if (file.size > 2 * 1024 * 1024 * 1024) return `Видео слишком большое: ${megabytes} МБ. Текущий максимум — 2 ГБ.`;
     }
     if (mediaType === "audio") {
-      if (file.type !== "audio/mpeg" && !file.name.toLowerCase().endsWith(".mp3")) return "Этот формат пока не поддерживается. Загрузите MP3.";
-      if (file.size > 20 * 1024 * 1024) return `Аудио слишком большое: ${megabytes} МБ. Текущий максимум — 20 МБ.`;
+      if (!["audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg"].includes(file.type)) return "Загрузите MP3, M4A, WAV или OGG с корректным MIME-типом.";
+      if (file.size > 2 * 1024 * 1024 * 1024) return `Аудио слишком большое: ${megabytes} МБ. Текущий максимум — 2 ГБ.`;
     }
     return null;
   };
@@ -134,8 +134,32 @@
       return openDraft(draft).then(() => ({status, error, draft}));
     });
   };
+  const memberVideoSource = async ({media, sessionToken, fetchMedia = fetch, createObjectUrl = URL.createObjectURL}) => {
+    if (!media || !media.url) throw new Error("video_unavailable");
+    if (media.storage_kind === "r2") {
+      if (!["video/mp4", "video/webm"].includes(media.mime_type)) throw new Error("video_unavailable");
+      let signedUrl;
+      try { signedUrl = new URL(media.url); }
+      catch (_error) { throw new Error("video_unavailable"); }
+      if (signedUrl.protocol !== "https:") throw new Error("video_unavailable");
+      return {src:media.url, objectUrl:null};
+    }
+    if (media.storage_kind !== "telegram_file_id" || media.mime_type !== "video/mp4") throw new Error("video_unavailable");
+    const response = await fetchMedia(media.url, {
+      headers:{Authorization:`Bearer ${sessionToken}`}, cache:"no-store", credentials:"omit",
+    });
+    if (!response.ok) {
+      const error = new Error("video_unavailable");
+      error.status = response.status;
+      throw error;
+    }
+    const blob = await response.blob();
+    if (blob.type !== "video/mp4") throw new Error("video_unavailable");
+    const objectUrl = createObjectUrl(blob);
+    return {src:objectUrl, objectUrl};
+  };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft};
+    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft, memberVideoSource};
     return;
   }
   const webApp = window.Telegram && window.Telegram.WebApp;
@@ -370,6 +394,9 @@
   let contentSearchTimer = null;
   let currentCmsContent = null;
   let contentMediaUploadId = null;
+  let contentMediaPendingFile = null;
+  let contentMediaPendingType = null;
+  let objectStorageStatusPromise = null;
   let contentMediaLocalUrl = null;
   let contentMediaLocalType = null;
   let contentMediaServerUrl = null;
@@ -385,6 +412,7 @@
   let memberVideoGeneration = 0;
   let memberVideoElement = null;
   let memberVideoUrl = null;
+  let memberVideoObjectUrl = null;
   const memberCoverUrls = new Map();
   const memberCoverPending = new Map();
   const memberCoverControllers = new Set();
@@ -643,8 +671,9 @@
       memberVideoElement.load();
     }
     memberVideoElement = null;
-    if (memberVideoUrl) URL.revokeObjectURL(memberVideoUrl);
+    if (memberVideoObjectUrl) URL.revokeObjectURL(memberVideoObjectUrl);
     memberVideoUrl = null;
+    memberVideoObjectUrl = null;
   };
   const memberCover = (item, large = false) => {
     const generation = memberCoverGeneration;
@@ -916,7 +945,7 @@
         player.className = "member-card member-video-shell member-video-loading";
         player.append(text("strong", "Загружаем видео…"), text("p", "Урок откроется после безопасной проверки доступа."));
         memberLessonContent.append(player);
-        fetch(`/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.video_media_id)}`, {
+        fetch(`/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.video_media_id)}/url`, {
           headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
         }).then(async (response) => {
           if (!response.ok) {
@@ -926,17 +955,20 @@
             error.status = response.status;
             throw error;
           }
-          return response.blob();
-        }).then((blob) => {
-          if (generation !== memberVideoGeneration) return;
-          if (blob.type !== "video/mp4") throw new Error("video_unavailable");
-          memberVideoUrl = URL.createObjectURL(blob);
+          return response.json();
+        }).then((media) => memberVideoSource({media, sessionToken})).then((source) => {
+          if (generation !== memberVideoGeneration) {
+            if (source.objectUrl) URL.revokeObjectURL(source.objectUrl);
+            return;
+          }
+          memberVideoUrl = source.src;
+          memberVideoObjectUrl = source.objectUrl;
           const video = document.createElement("video");
           video.className = "member-video-player";
           video.controls = true;
           video.playsInline = true;
           video.preload = "metadata";
-          video.src = memberVideoUrl;
+          video.src = source.src;
           memberVideoElement = video;
           player.classList.remove("member-video-loading");
           player.replaceChildren(video);
@@ -1157,6 +1189,8 @@
     contentMediaLocalType = null;
     contentMediaServerUrl = null;
     contentMediaUploadId = null;
+    contentMediaPendingFile = null;
+    contentMediaPendingType = null;
     contentCoverFile.value = "";
     contentVideoFile.value = "";
     contentAudioFile.value = "";
@@ -1196,6 +1230,8 @@
     if (name !== "content-details") {
       clearContentMediaUrls();
       contentMediaUploadId = null;
+      contentMediaPendingFile = null;
+      contentMediaPendingType = null;
     }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = !adminScreenIsVisible(name, node.dataset.screen); });
     if (!name.startsWith("member-")) {
@@ -1242,6 +1278,32 @@
     if (!response.ok) throw new Error(data.error || "api_failed");
     return data;
   });
+  const getObjectStorageStatus = () => {
+    if (!objectStorageStatusPromise) {
+      objectStorageStatusPromise = fetch("/api/admin/storage/status", {
+        headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
+      }).then((response) => response.ok ? response.json() : {configured: false})
+        .catch(() => ({configured: false}));
+    }
+    return objectStorageStatusPromise;
+  };
+  const putDirectObject = (uploadUrl, requiredHeaders, file, onProgress) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", uploadUrl, true);
+    Object.entries(requiredHeaders || {}).forEach(([name, value]) => xhr.setRequestHeader(name, value));
+    xhr.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable && onProgress) onProgress(Math.round((event.loaded / event.total) * 100));
+    });
+    xhr.addEventListener("load", () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error("object_upload_failed")));
+    xhr.addEventListener("error", () => reject(new Error("object_upload_failed")));
+    xhr.addEventListener("abort", () => reject(new Error("object_upload_interrupted")));
+    xhr.send(file);
+  });
+  const uploadContentMediaDirect = (contentId, mediaType, file, onProgress) =>
+    writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(contentId)}/media/upload-intent`, {
+      media_type: mediaType, filename: file.name, content_type: file.type, size_bytes: file.size,
+    }).then((intent) => putDirectObject(intent.upload_url, intent.required_headers, file, onProgress).then(() => intent))
+      .then((intent) => writeAdminJson("POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize`, {}));
   const writeMemberJson = (method, path, body) => fetch(path, {
     method,
     headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
@@ -2791,21 +2853,29 @@
       contentMediaConfirmation.hidden = false;
       return Promise.resolve();
     }
-    if (mediaType === "video" && file.size > 20 * 1024 * 1024) {
-      contentMediaMessage.textContent = `Видео слишком большое: ${(file.size / 1024 / 1024).toFixed(1)} МБ. Текущий максимум — 20 МБ.`;
+    const preflightError = contentStudioMediaPreflightError(mediaType, file);
+    if (preflightError) {
+      contentMediaMessage.textContent = preflightError;
       contentMediaConfirmation.hidden = false;
       return Promise.resolve();
     }
-    if (mediaType === "video" && file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) {
-      contentMediaMessage.textContent = "Этот формат пока не поддерживается. Загрузите MP4.";
-      contentMediaConfirmation.hidden = false;
-      return Promise.resolve();
-    }
-    if (mediaType === "audio" && !file.name.toLowerCase().endsWith(".mp3")) {
-      contentMediaMessage.textContent = "Этот формат пока не поддерживается. Загрузите MP3.";
-      contentMediaConfirmation.hidden = false;
-      return Promise.resolve();
-    }
+    return getObjectStorageStatus().then((storage) => {
+      if (storage.provider === "r2" && !storage.configured) {
+        throw new Error("object_storage_configuration_invalid");
+      }
+      if (storage.configured) {
+        contentMediaUploadId = null;
+        contentMediaPendingFile = file;
+        contentMediaPendingType = mediaType;
+        contentMediaSummary.replaceChildren(
+          text("strong", currentCmsContent.title),
+          text("span", mediaType === "cover" ? "Обложка" : mediaType === "audio" ? "Аудио" : "Видео"),
+          text("span", `${file.type} · ${(file.size / 1024 / 1024).toFixed(1)} МиБ`)
+        );
+        contentMediaMessage.textContent = "Файл будет загружен напрямую в защищённое хранилище после подтверждения.";
+        contentMediaConfirmation.hidden = false;
+        return null;
+      }
     const form = new FormData();
     form.append("media_type", mediaType);
     form.append("file", file);
@@ -2840,16 +2910,24 @@
           : mediaType === "audio" ? "Этот формат пока не поддерживается. Загрузите MP3."
           : "Файл не прошёл безопасную проверку.";
       });
+    });
   };
   const confirmContentMedia = () => {
-    if (!contentMediaUploadId || !currentCmsContent) return Promise.resolve();
+    if ((!contentMediaUploadId && !contentMediaPendingFile) || !currentCmsContent) return Promise.resolve();
     if (!contentStudioCanStartMedia(contentEditorDirty)) {
       contentMediaMessage.textContent = "Сначала сохраните изменения материала, затем загрузите медиа.";
       return Promise.resolve();
     }
     contentMediaConfirm.disabled = true;
     contentMediaMessage.textContent = "Загружаем и прикрепляем…";
-    return postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`)
+    const operation = contentMediaPendingFile
+      ? uploadContentMediaDirect(
+          currentCmsContent.content_id, contentMediaPendingType,
+          contentMediaPendingFile,
+          (percent) => { contentMediaMessage.textContent = `Загружаем напрямую в хранилище… ${percent}%`; },
+        )
+      : postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`);
+    return operation
       .then((result) => {
         if (result.status !== "completed") throw new Error(result.failure_category || result.status);
         return loadCmsContentDetails(currentCmsContent.content_id);
@@ -2875,15 +2953,17 @@
   });
   const attachAuthoringMedia = (contentId, mediaType, file) => {
     if (!file) return Promise.resolve();
-    if (mediaType === "video" && file.size > 20 * 1024 * 1024) return Promise.reject(new Error("content_video_too_large"));
-    if (mediaType === "video" && file.type !== "video/mp4" && !file.name.toLowerCase().endsWith(".mp4")) return Promise.reject(new Error("unsupported_video_format"));
-    if (mediaType === "audio" && !file.name.toLowerCase().endsWith(".mp3")) {
-      return Promise.reject(new Error("unsupported_audio_format"));
-    }
-    const form = new FormData(); form.append("media_type", mediaType); form.append("file", file);
-    return postAdmin(`/api/admin/content/cms/${encodeURIComponent(contentId)}/media-preview`, form)
-      .then((upload) => postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(upload.upload_id)}/confirm`))
-      .then((result) => { if (result.status !== "completed") throw new Error(result.failure_category || result.status); });
+    const preflightError = contentStudioMediaPreflightError(mediaType, file);
+    if (preflightError) return Promise.reject(new Error(preflightError));
+    return getObjectStorageStatus().then((storage) => {
+      if (storage.provider === "r2" && !storage.configured) {
+        throw new Error("object_storage_configuration_invalid");
+      }
+      if (storage.configured) return uploadContentMediaDirect(contentId, mediaType, file);
+      const form = new FormData(); form.append("media_type", mediaType); form.append("file", file);
+      return postAdmin(`/api/admin/content/cms/${encodeURIComponent(contentId)}/media-preview`, form)
+        .then((upload) => postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(upload.upload_id)}/confirm`));
+    }).then((result) => { if (result.status !== "completed") throw new Error(result.failure_category || result.status); });
   };
   const createCmsDraft = () => {
     const files = [

@@ -96,11 +96,14 @@ from content_media import (
     apply_media_upload,
     cancel_media_upload,
     create_media_upload,
+    create_r2_media_upload,
     ensure_media_action,
     get_member_media_reference,
     get_media_reference,
     get_media_upload,
+    get_r2_media_upload,
     list_content_media,
+    finalize_r2_media_upload,
     prepare_media_execution,
     record_telegram_upload,
 )
@@ -852,8 +855,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 35,
-            "latest": "0034_bookable_zoom_classes",
+            "count": 36,
+            "latest": "0035_r2_content_media",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2409,7 +2412,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 35)
+        self.assertEqual(len(migrations), 36)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -2950,6 +2953,233 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             create_media_upload(
                 self.get_conn, 1, draft["content_id"], "cover", png
             )
+
+    def test_r2_media_finalize_is_atomic_private_and_idempotent_real_postgres(self):
+        run_migrations(self.get_conn)
+        draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "R2 lesson",
+            "category": "main_workout", "duration_seconds": 600,
+        })
+        upload_id = str(uuid.uuid4())
+        object_key = f"content/{draft['content_id']}/{uuid.uuid4()}.mp4"
+        created = create_r2_media_upload(
+            self.get_conn, 1, draft["content_id"], "video", "lesson.mp4",
+            "video/mp4", 512 * 1024 * 1024, object_key, upload_id,
+        )
+        self.assertEqual(created["upload_id"], upload_id)
+        self.assertIsNone(get_r2_media_upload(self.get_conn, upload_id, 2))
+        completed = finalize_r2_media_upload(
+            self.get_conn, upload_id, 1, "opaque-etag"
+        )
+        self.assertEqual(completed["status"], "completed")
+        duplicate = finalize_r2_media_upload(
+            self.get_conn, upload_id, 1, "different-etag"
+        )
+        self.assertEqual(duplicate["status"], "completed")
+        self.assertTrue(duplicate["idempotent"])
+        self.assertEqual(duplicate["media_id"], completed["media_id"])
+        row = self.query_one(
+            "SELECT storage_kind,server_reference,mime_type,size_bytes,sha256,"
+            "original_filename,object_etag FROM content_media WHERE media_id=%s",
+            (completed["media_id"],),
+        )
+        self.assertEqual(row, (
+            "r2", object_key, "video/mp4", 512 * 1024 * 1024, None,
+            "lesson.mp4", "opaque-etag",
+        ))
+        serialized = json.dumps(list_content_media(self.get_conn, draft["content_id"]))
+        self.assertNotIn(object_key, serialized)
+        self.assertNotIn("server_reference", serialized)
+
+    def test_r2_migration_preserves_existing_telegram_rows_and_storage_guarantees(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pre_r2_dir = Path(tmpdir)
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name < "0035_r2_content_media.sql":
+                    (pre_r2_dir / migration.name).write_bytes(migration.read_bytes())
+            run_migrations(self.get_conn, migrations_dir=pre_r2_dir)
+
+        draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "Existing Telegram media",
+            "category": "main_workout", "duration_seconds": 600,
+        })
+        media_ids = {kind: str(uuid.uuid4()) for kind in ("cover", "video", "audio")}
+        sha_values = {
+            "cover": "1" * 64, "video": "2" * 64, "audio": "3" * 64,
+        }
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                for media_type, mime_type, size_bytes in (
+                    ("cover", "image/png", 1024),
+                    ("video", "video/mp4", 20 * 1024 * 1024),
+                    ("audio", "audio/mpeg", 20 * 1024 * 1024),
+                ):
+                    cur.execute("""
+                        INSERT INTO content_media (
+                            media_id,content_id,media_type,storage_kind,server_reference,
+                            mime_type,size_bytes,sha256,sort_order,version,
+                            created_by_telegram_id,created_at,updated_at
+                        ) VALUES (%s,%s,%s,'telegram_file_id',%s,%s,%s,%s,0,1,1,NOW(),NOW())
+                    """, (
+                        media_ids[media_type], draft["content_id"], media_type,
+                        f"telegram-{media_type}", mime_type, size_bytes,
+                        sha_values[media_type],
+                    ))
+                active_upload_id = str(uuid.uuid4())
+                finalized_upload_id = str(uuid.uuid4())
+                active_bytes = b"\x89PNG\r\n\x1a\nactive"
+                cur.execute("""
+                    INSERT INTO content_media_uploads (
+                        upload_id,admin_telegram_id,content_id,expected_content_version,
+                        media_type,media_bytes,mime_type,byte_size,sha256,status,
+                        created_at,updated_at,expires_at
+                    ) VALUES (%s,1,%s,1,'cover',%s,'image/png',%s,%s,'pending',NOW(),NOW(),NOW()+INTERVAL '1 hour')
+                """, (
+                    active_upload_id, draft["content_id"], active_bytes,
+                    len(active_bytes), "4" * 64,
+                ))
+                cur.execute("""
+                    INSERT INTO content_media_uploads (
+                        upload_id,admin_telegram_id,content_id,expected_content_version,
+                        media_type,media_bytes,mime_type,byte_size,sha256,status,
+                        applied_media_id,applied_at,consumed_at,created_at,updated_at,expires_at
+                    ) VALUES (%s,1,%s,1,'cover',''::bytea,'image/png',0,%s,'applied',%s,NOW(),NOW(),NOW(),NOW(),NOW()+INTERVAL '1 hour')
+                """, (
+                    finalized_upload_id, draft["content_id"], "5" * 64,
+                    media_ids["cover"],
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+
+        media_before = self.query_all("""
+            SELECT media_id,content_id,media_type,storage_kind,server_reference,
+                   mime_type,size_bytes,sha256,sort_order,version,
+                   created_by_telegram_id,replaces_media_id,deleted_at
+            FROM content_media ORDER BY media_type
+        """)
+        uploads_before = self.query_all("""
+            SELECT upload_id,admin_telegram_id,content_id,expected_content_version,
+                   media_type,media_bytes,mime_type,byte_size,sha256,status,
+                   telegram_file_id,applied_media_id,failure_category
+            FROM content_media_uploads ORDER BY upload_id
+        """)
+
+        result = run_migrations(self.get_conn)
+        self.assertIn("0035_r2_content_media", result["applied"])
+        self.assertEqual(media_before, self.query_all("""
+            SELECT media_id,content_id,media_type,storage_kind,server_reference,
+                   mime_type,size_bytes,sha256,sort_order,version,
+                   created_by_telegram_id,replaces_media_id,deleted_at
+            FROM content_media ORDER BY media_type
+        """))
+        self.assertEqual(uploads_before, self.query_all("""
+            SELECT upload_id,admin_telegram_id,content_id,expected_content_version,
+                   media_type,media_bytes,mime_type,byte_size,sha256,status,
+                   telegram_file_id,applied_media_id,failure_category
+            FROM content_media_uploads ORDER BY upload_id
+        """))
+
+        def assert_media_rejected(values):
+            invalid_draft = create_content_draft(self.get_conn, 1, {
+                "content_type": "lesson", "title": "Invalid media probe",
+                "category": "main_workout", "duration_seconds": 600,
+            })
+            values = list(values)
+            values[1] = invalid_draft["content_id"]
+            rejected = self.get_conn()
+            try:
+                with rejected.cursor() as cur, self.assertRaises(psycopg2.errors.CheckViolation):
+                    cur.execute("""
+                        INSERT INTO content_media (
+                            media_id,content_id,media_type,storage_kind,server_reference,
+                            mime_type,size_bytes,sha256,sort_order,version,
+                            created_by_telegram_id,original_filename
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,1,1,%s)
+                    """, values)
+            finally:
+                rejected.rollback(); rejected.close()
+
+        assert_media_rejected((
+            str(uuid.uuid4()), draft["content_id"], "video", "telegram_file_id",
+            "telegram-null-sha", "video/mp4", 1024, None, None,
+        ))
+        assert_media_rejected((
+            str(uuid.uuid4()), draft["content_id"], "video", "telegram_file_id",
+            "telegram-oversized", "video/mp4", 20 * 1024 * 1024 + 1,
+            "6" * 64, None,
+        ))
+        assert_media_rejected((
+            str(uuid.uuid4()), draft["content_id"], "video", "telegram_file_id",
+            "telegram-invalid-mime", "video/webm", 1024, "7" * 64, None,
+        ))
+        assert_media_rejected((
+            str(uuid.uuid4()), draft["content_id"], "video", "r2",
+            "content/safe/malformed.webm", "video/webm", 1024, None, None,
+        ))
+
+        def assert_upload_rejected(storage_kind, sha256, object_key, original_filename):
+            invalid_draft = create_content_draft(self.get_conn, 1, {
+                "content_type": "lesson", "title": "Invalid upload probe",
+                "category": "main_workout", "duration_seconds": 600,
+            })
+            rejected = self.get_conn()
+            try:
+                with rejected.cursor() as cur, self.assertRaises(psycopg2.errors.CheckViolation):
+                    cur.execute("""
+                        INSERT INTO content_media_uploads (
+                            upload_id,admin_telegram_id,content_id,expected_content_version,
+                            media_type,media_bytes,mime_type,byte_size,sha256,status,
+                            created_at,updated_at,expires_at,storage_kind,object_key,
+                            original_filename
+                        ) VALUES (%s,1,%s,1,'video',''::bytea,'video/mp4',1024,%s,'uploading',NOW(),NOW(),NOW()+INTERVAL '1 day',%s,%s,%s)
+                    """, (
+                        str(uuid.uuid4()), invalid_draft["content_id"], sha256,
+                        storage_kind, object_key, original_filename,
+                    ))
+            finally:
+                rejected.rollback(); rejected.close()
+
+        assert_upload_rejected("telegram_file_id", None, None, None)
+        assert_upload_rejected("r2", None, None, "lesson.mp4")
+
+        r2_draft = create_content_draft(self.get_conn, 1, {
+            "content_type": "lesson", "title": "New R2 media",
+            "category": "main_workout", "duration_seconds": 600,
+        })
+        r2_media_id = str(uuid.uuid4())
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO content_media (
+                        media_id,content_id,media_type,storage_kind,server_reference,
+                        mime_type,size_bytes,sha256,sort_order,version,
+                        created_by_telegram_id,original_filename,object_etag
+                    ) VALUES (%s,%s,'video','r2',%s,'video/webm',2147483648,NULL,0,1,1,'lesson.webm','etag')
+                """, (
+                    r2_media_id, r2_draft["content_id"],
+                    f"content/{r2_draft['content_id']}/{uuid.uuid4()}.webm",
+                ))
+                cur.execute("""
+                    INSERT INTO content_media_uploads (
+                        upload_id,admin_telegram_id,content_id,expected_content_version,
+                        media_type,media_bytes,mime_type,byte_size,sha256,status,
+                        created_at,updated_at,expires_at,storage_kind,object_key,
+                        original_filename,object_etag
+                    ) VALUES (%s,1,%s,1,'audio',''::bytea,'audio/ogg',2147483648,NULL,'uploading',NOW(),NOW(),NOW()+INTERVAL '1 day','r2',%s,'lesson.ogg','etag')
+                """, (
+                    str(uuid.uuid4()), r2_draft["content_id"],
+                    f"content/{r2_draft['content_id']}/{uuid.uuid4()}.ogg",
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            self.query_one("SELECT storage_kind,sha256 FROM content_media WHERE media_id=%s", (r2_media_id,)),
+            ("r2", None),
+        )
 
     def test_member_media_lookup_requires_published_live_relationship_real_postgres(self):
         run_migrations(self.get_conn)
@@ -13038,10 +13268,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         removal_incident = system["removals"]["latest_retryable_incident"]
         self.assertTrue(removal_incident.startswith("removal:"))
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 35)
+        self.assertEqual(system["migrations"]["count"], 36)
         self.assertEqual(
             system["migrations"]["latest"],
-            "0034_bookable_zoom_classes",
+            "0035_r2_content_media",
         )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)

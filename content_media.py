@@ -13,6 +13,7 @@ CONTENT_MEDIA_INFLIGHT_SECONDS = 120
 COVER_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 20 * 1024 * 1024
 AUDIO_MAX_BYTES = 20 * 1024 * 1024
+R2_MEDIA_MAX_BYTES = 2 * 1024 * 1024 * 1024
 MEDIA_TYPES = frozenset({"cover", "video", "audio"})
 MEMBER_MEDIA_CONTENT_TYPES = frozenset({
     "lesson", "meditation", "recipe", "nutrition_material",
@@ -34,14 +35,20 @@ def member_media_access_level(media_type):
     return None
 
 
-def member_media_metadata_valid(content_type, media_type, mime_type, size_bytes):
+def member_media_metadata_valid(content_type, media_type, mime_type, size_bytes, storage_kind="telegram_file_id"):
     if content_type not in MEMBER_MEDIA_CONTENT_TYPES:
         return False
     if member_media_access_level(media_type) is None:
         return False
     if not media_allowed_for_content(content_type, media_type):
         return False
-    if mime_type not in MEMBER_MEDIA_MIME_TYPES[media_type]:
+    r2_mime_types = {
+        "cover": frozenset({"image/jpeg", "image/png", "image/webp"}),
+        "audio": frozenset({"audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg"}),
+        "video": frozenset({"video/mp4", "video/webm"}),
+    }
+    allowed_mime_types = r2_mime_types if storage_kind == "r2" else MEMBER_MEDIA_MIME_TYPES
+    if mime_type not in allowed_mime_types[media_type]:
         return False
     try:
         size_bytes = int(size_bytes)
@@ -49,8 +56,8 @@ def member_media_metadata_valid(content_type, media_type, mime_type, size_bytes)
         return False
     limit = {
         "cover": COVER_MAX_BYTES,
-        "audio": AUDIO_MAX_BYTES,
-        "video": VIDEO_MAX_BYTES,
+        "audio": R2_MEDIA_MAX_BYTES if storage_kind == "r2" else AUDIO_MAX_BYTES,
+        "video": R2_MEDIA_MAX_BYTES if storage_kind == "r2" else VIDEO_MAX_BYTES,
     }[media_type]
     return 0 < size_bytes <= limit
 
@@ -129,7 +136,7 @@ def _safe_upload(row):
         "upload_id": str(upload_id), "admin_telegram_id": int(admin_id),
         "content_id": str(content_id), "expected_content_version": int(expected_version),
         "media_type": media_type, "mime_type": mime_type,
-        "size_bytes": int(byte_size), "sha256_reference": sha256[:16],
+        "size_bytes": int(byte_size), "sha256_reference": sha256[:16] if sha256 else None,
         "existing_media": existing_id is not None, "status": status,
         "action_id": str(action_id) if action_id else None,
         "media_id": str(applied_media_id) if applied_media_id else None,
@@ -148,11 +155,14 @@ FROM content_media_uploads
 
 def _safe_media(row):
     (media_id, content_id, media_type, mime, size, sha256, sort_order, version,
-     created_by, replaces_id, created_at, updated_at) = row
+     created_by, replaces_id, created_at, updated_at, storage_kind,
+     original_filename) = row
     return {
         "media_id": str(media_id), "content_id": str(content_id),
         "media_type": media_type, "mime_type": mime, "size_bytes": int(size),
-        "sha256_reference": sha256[:16], "sort_order": int(sort_order),
+        "sha256_reference": sha256[:16] if sha256 else None,
+        "storage_kind": storage_kind, "original_filename": original_filename,
+        "sort_order": int(sort_order),
         "version": int(version), "created_by_telegram_id": int(created_by),
         "replaces_media_id": str(replaces_id) if replaces_id else None,
         "created_at": created_at.isoformat(), "updated_at": updated_at.isoformat(),
@@ -163,7 +173,7 @@ def _safe_media(row):
 MEDIA_SELECT = """
 SELECT media_id, content_id, media_type, mime_type, size_bytes, sha256,
        sort_order, version, created_by_telegram_id, replaces_media_id,
-       created_at, updated_at
+       created_at, updated_at, storage_kind, original_filename
 FROM content_media
 """
 
@@ -406,6 +416,166 @@ def apply_media_upload(get_connection, upload_id, action_id, admin_id):
         cur.close(); conn.close()
 
 
+def create_r2_media_upload(
+    get_connection, admin_id, content_id, media_type, original_filename,
+    mime_type, size_bytes, object_key, upload_id,
+):
+    content_id = validate_uuid(content_id, "invalid_content_id")
+    upload_id = validate_uuid(upload_id, "invalid_upload_id")
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SET LOCAL statement_timeout = 5000")
+        cur.execute(
+            "SELECT title,status,version,content_type FROM content_items "
+            "WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE",
+            (content_id,),
+        )
+        content = cur.fetchone()
+        if not content:
+            raise ContentMediaError("content_not_found", 404)
+        if content[1] != "draft":
+            raise ContentMediaError("content_not_editable", 409)
+        if not media_allowed_for_content(content[3], media_type):
+            raise ContentMediaError("invalid_content_media_type")
+        cur.execute(
+            "SELECT media_id FROM content_media WHERE content_id=%s "
+            "AND media_type=%s AND deleted_at IS NULL",
+            (content_id, media_type),
+        )
+        existing = cur.fetchone()
+        cur.execute(
+            """
+            INSERT INTO content_media_uploads (
+                upload_id,admin_telegram_id,content_id,expected_content_version,
+                media_type,media_bytes,mime_type,byte_size,sha256,
+                expected_existing_media_id,status,created_at,updated_at,expires_at,
+                storage_kind,object_key,original_filename
+            ) VALUES (%s,%s,%s,%s,%s,''::bytea,%s,%s,NULL,%s,'uploading',
+                      NOW(),NOW(),NOW() + interval '24 hours','r2',%s,%s)
+            """,
+            (
+                upload_id, int(admin_id), content_id, int(content[2]), media_type,
+                mime_type, int(size_bytes), existing[0] if existing else None,
+                object_key, original_filename,
+            ),
+        )
+        conn.commit()
+        return {
+            "upload_id": upload_id, "content_id": content_id,
+            "expected_content_version": int(content[2]), "media_type": media_type,
+        }
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+def get_r2_media_upload(get_connection, upload_id, admin_id):
+    upload_id = validate_uuid(upload_id, "invalid_upload_id")
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SET TRANSACTION READ ONLY")
+        cur.execute("""
+            SELECT content_id,media_type,mime_type,byte_size,object_key,
+                   original_filename,status,applied_media_id
+            FROM content_media_uploads
+            WHERE upload_id=%s AND admin_telegram_id=%s AND storage_kind='r2'
+        """, (upload_id, int(admin_id)))
+        row = cur.fetchone(); conn.rollback()
+        if not row:
+            return None
+        return {
+            "upload_id": upload_id, "content_id": str(row[0]), "media_type": row[1],
+            "mime_type": row[2], "size_bytes": int(row[3]), "object_key": row[4],
+            "original_filename": row[5], "status": row[6],
+            "media_id": str(row[7]) if row[7] else None,
+        }
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
+def finalize_r2_media_upload(get_connection, upload_id, admin_id, object_etag=None):
+    upload_id = validate_uuid(upload_id, "invalid_upload_id")
+    conn = get_connection(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"content-media-upload:{upload_id}",))
+        cur.execute("""
+            SELECT content_id,expected_content_version,media_type,mime_type,byte_size,
+                   expected_existing_media_id,status,object_key,original_filename,
+                   applied_media_id
+            FROM content_media_uploads
+            WHERE upload_id=%s AND admin_telegram_id=%s AND storage_kind='r2'
+            FOR UPDATE
+        """, (upload_id, int(admin_id)))
+        row = cur.fetchone()
+        if not row:
+            conn.rollback(); return None
+        (content_id, expected_version, media_type, mime_type, size_bytes,
+         expected_existing, status, object_key, original_filename, applied_id) = row
+        if status == "applied":
+            conn.commit()
+            return {"status": "completed", "media_id": str(applied_id), "idempotent": True}
+        if status != "uploading":
+            raise ContentMediaError("content_media_upload_not_ready", 409)
+        cur.execute(
+            "SELECT status,version,content_type FROM content_items "
+            "WHERE content_id=%s AND deleted_at IS NULL FOR UPDATE", (content_id,),
+        )
+        content = cur.fetchone()
+        cur.execute(
+            "SELECT media_id,version FROM content_media WHERE content_id=%s "
+            "AND media_type=%s AND deleted_at IS NULL FOR UPDATE",
+            (content_id, media_type),
+        )
+        current = cur.fetchone(); current_id = current[0] if current else None
+        if (not content or content[0] != "draft" or content[1] != expected_version
+                or not media_allowed_for_content(content[2], media_type)
+                or current_id != expected_existing):
+            cur.execute(
+                "UPDATE content_media_uploads SET status='failed',failure_category="
+                "'content_version_changed',updated_at=NOW() WHERE upload_id=%s",
+                (upload_id,),
+            )
+            conn.commit()
+            return {"status": "failed", "failure_category": "content_version_changed"}
+        media_id = str(uuid.uuid4()); next_version = current[1] + 1 if current else 1
+        if current:
+            cur.execute(
+                "UPDATE content_media SET deleted_at=NOW(),updated_at=NOW() "
+                "WHERE media_id=%s AND deleted_at IS NULL", (current_id,),
+            )
+        cur.execute("""
+            INSERT INTO content_media (
+                media_id,content_id,media_type,storage_kind,server_reference,
+                mime_type,size_bytes,sha256,sort_order,version,
+                created_by_telegram_id,replaces_media_id,created_at,updated_at,
+                original_filename,object_etag
+            ) VALUES (%s,%s,%s,'r2',%s,%s,%s,NULL,0,%s,%s,%s,NOW(),NOW(),%s,%s)
+        """, (
+            media_id, content_id, media_type, object_key, mime_type, size_bytes,
+            next_version, int(admin_id), current_id, original_filename, object_etag,
+        ))
+        cur.execute(
+            "UPDATE content_items SET version=version+1,updated_at=NOW() "
+            "WHERE content_id=%s AND version=%s", (content_id, expected_version),
+        )
+        if cur.rowcount != 1:
+            raise ContentMediaError("content_media_upload_state_conflict", 409)
+        cur.execute("""
+            UPDATE content_media_uploads SET status='applied',applied_media_id=%s,
+                applied_at=NOW(),consumed_at=NOW(),updated_at=NOW(),object_etag=%s
+            WHERE upload_id=%s AND status='uploading'
+        """, (media_id, object_etag, upload_id))
+        conn.commit()
+        return {"status": "completed", "media_id": media_id, "content_version": expected_version + 1}
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
 def list_content_media(get_connection, content_id):
     content_id = validate_uuid(content_id, "invalid_content_id")
     conn = get_connection(); cur = conn.cursor()
@@ -425,14 +595,15 @@ def get_media_reference(get_connection, content_id, media_id):
     try:
         cur.execute("SET TRANSACTION READ ONLY"); cur.execute("SET LOCAL statement_timeout=5000")
         cur.execute("""
-            SELECT m.media_type,m.mime_type,m.size_bytes,m.server_reference,c.content_type
+            SELECT m.media_type,m.mime_type,m.size_bytes,m.server_reference,c.content_type,
+                   m.storage_kind
             FROM content_media m JOIN content_items c ON c.content_id=m.content_id
             WHERE m.content_id=%s AND m.media_id=%s AND m.deleted_at IS NULL
               AND c.deleted_at IS NULL
         """, (content_id, media_id))
         row=cur.fetchone(); conn.rollback()
         if not row: return None
-        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3], "content_type":row[4]}
+        return {"media_type":row[0], "mime_type":row[1], "size_bytes":int(row[2]), "server_reference":row[3], "content_type":row[4], "storage_kind":row[5]}
     except Exception:
         conn.rollback(); raise
     finally:
@@ -450,14 +621,15 @@ def get_member_media_reference(get_connection, content_id, media_id):
         cur.execute(
             """
             SELECT m.media_type, m.mime_type, m.size_bytes,
-                   m.server_reference, c.content_type, c.access_level
+                   m.server_reference, c.content_type, c.access_level,
+                   m.storage_kind
             FROM content_items c
             JOIN content_media m ON m.content_id = c.content_id
             WHERE c.content_id = %s
               AND c.status = 'published'
               AND m.media_id = %s
               AND m.deleted_at IS NULL AND c.deleted_at IS NULL
-              AND m.storage_kind = 'telegram_file_id'
+              AND m.storage_kind IN ('telegram_file_id', 'r2')
             """,
             (content_id, media_id),
         )
@@ -465,7 +637,7 @@ def get_member_media_reference(get_connection, content_id, media_id):
         conn.rollback()
         if not row or not row[3]:
             return None
-        if not member_media_metadata_valid(row[4], row[0], row[1], row[2]):
+        if not member_media_metadata_valid(row[4], row[0], row[1], row[2], row[6]):
             return None
         return {
             "media_type": row[0],
@@ -474,6 +646,7 @@ def get_member_media_reference(get_connection, content_id, media_id):
             "server_reference": row[3],
             "content_type": row[4],
             "content_access_level": row[5],
+            "storage_kind": row[6],
             "access_level": member_media_access_level(row[0]),
         }
     except Exception:

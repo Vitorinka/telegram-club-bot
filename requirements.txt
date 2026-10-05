@@ -4,3 +4,4 @@ stripe==15.0.0
 psycopg2-binary==2.9.11
 apscheduler==3.10.4
 Pillow==12.3.0
+boto3==1.40.76

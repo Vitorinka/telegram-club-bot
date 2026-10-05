@@ -227,16 +227,26 @@ from content_media import (
     apply_media_upload,
     cancel_media_upload,
     create_media_upload,
+    create_r2_media_upload,
     ensure_media_action,
     fail_media_upload,
     get_member_media_reference,
     get_media_reference,
     get_media_upload,
+    get_r2_media_upload,
     list_content_media,
     member_media_access_level,
     prepare_media_execution,
+    finalize_r2_media_upload,
     record_telegram_upload,
     validate_media_bytes,
+)
+from object_storage import (
+    ObjectStorageConfig,
+    ObjectStorageError,
+    R2ObjectStorage,
+    generate_safe_object_key,
+    validate_object_upload,
 )
 from content_publish import (
     cancel_lifecycle,
@@ -429,21 +439,31 @@ def normalize_miniapp_base_url(value):
 MINIAPP_PUBLIC_URL = normalize_miniapp_base_url(os.getenv("MINIAPP_BASE_URL"))
 MINIAPP_ASSET_DIR = Path(__file__).resolve().parent / "miniapp"
 SCHEDULE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
-MINIAPP_SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": (
-        "default-src 'none'; "
-        "script-src 'self' https://telegram.org; "
-        "style-src 'self'; "
-        "connect-src 'self'; "
-        "img-src 'self' data: blob:; "
-        "media-src 'self' blob:; "
-        "base-uri 'none'; form-action 'none'; "
-        "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
-    ),
-}
+R2_CONFIG = ObjectStorageConfig.from_env()
+R2_STORAGE = R2ObjectStorage(R2_CONFIG)
+
+
+def build_miniapp_security_headers(r2_config):
+    r2_origin = r2_config.public_origin() if r2_config.enabled else None
+    r2_source = f" {r2_origin}" if r2_origin else ""
+    return {
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": (
+            "default-src 'none'; "
+            "script-src 'self' https://telegram.org; "
+            "style-src 'self'; "
+            f"connect-src 'self'{r2_source}; "
+            "img-src 'self' data: blob:; "
+            f"media-src 'self' blob:{r2_source}; "
+            "base-uri 'none'; form-action 'none'; "
+            "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+        ),
+    }
+
+
+MINIAPP_SECURITY_HEADERS = build_miniapp_security_headers(R2_CONFIG)
 
 
 def miniapp_asset_version(path):
@@ -23687,6 +23707,12 @@ def start_scheduler_once():
 
 
 async def on_startup(app):
+    missing_r2_fields = R2_CONFIG.missing_fields()
+    logging.info(
+        "Object storage configuration: enabled=%s configured=%s missing_fields=%s",
+        R2_CONFIG.enabled, R2_CONFIG.is_configured(),
+        ",".join(missing_r2_fields) if missing_r2_fields else "none",
+    )
     init_db()
 
     await bot.set_my_commands([
@@ -24101,6 +24127,28 @@ async def miniapp_member_media(request):
     if access_level == "premium" and not free_content:
         if not member_request_access(request)["has_active_access"]:
             return member_error(MemberCatalogError("active_access_required",403))
+    if media.get("storage_kind") == "r2":
+        try:
+            signed_url = await asyncio.to_thread(
+                R2_STORAGE.create_download_url, media["server_reference"]
+            )
+            current_media = await run_sync_db(
+                get_member_media_reference, get_db_conn,
+                request.match_info.get("content_id"), request.match_info.get("media_id"),
+            )
+            if current_media is None or current_media.get("storage_kind") != "r2":
+                raise MemberCatalogError("media_not_found", 404)
+            if (access_level == "premium"
+                    and current_media.get("content_access_level") != "free"
+                    and not member_access(get_db_conn,session.telegram_id)["has_active_access"]):
+                raise MemberCatalogError("active_access_required",403)
+        except MemberCatalogError as error:
+            return member_error(error)
+        except Exception:
+            return member_error(MemberCatalogError("media_unavailable",503))
+        response = web.HTTPFound(location=signed_url)
+        response.headers["Cache-Control"] = "private, no-store"
+        return apply_miniapp_security_headers(response)
     limit={"cover":COVER_MAX_BYTES,"audio":AUDIO_MAX_BYTES,"video":VIDEO_MAX_BYTES}[media["media_type"]]
     source_started_at = time.perf_counter()
     try:
@@ -24134,6 +24182,36 @@ async def miniapp_member_media(request):
     response.headers["Content-Disposition"]="inline"
     response.headers["Cache-Control"]="private, no-store"
     return apply_miniapp_security_headers(response)
+
+
+async def miniapp_member_media_url(request):
+    session = request["miniapp_member"]
+    try:
+        media = await run_sync_db(
+            get_member_media_reference, get_db_conn,
+            request.match_info.get("content_id"), request.match_info.get("media_id"),
+        )
+    except ContentMediaError:
+        media = None
+    if media is None:
+        return member_error(MemberCatalogError("media_not_found", 404))
+    access_level = member_media_access_level(media["media_type"])
+    if access_level == "premium" and media.get("content_access_level") != "free":
+        if not member_request_access(request)["has_active_access"]:
+            return member_error(MemberCatalogError("active_access_required", 403))
+    if media.get("storage_kind") == "telegram_file_id":
+        url = f"/api/member/content/{request.match_info.get('content_id')}/media/{request.match_info.get('media_id')}"
+    else:
+        try:
+            url = await asyncio.to_thread(
+                R2_STORAGE.create_download_url, media["server_reference"]
+            )
+        except Exception:
+            return member_error(MemberCatalogError("media_unavailable", 503))
+    return apply_miniapp_security_headers(web.json_response({
+        "url": url, "expires_in": R2_CONFIG.ttl_seconds if media.get("storage_kind") == "r2" else None,
+        "mime_type": media["mime_type"], "storage_kind": media["storage_kind"],
+    }))
 
 
 async def miniapp_admin_session_create(request):
@@ -24574,6 +24652,107 @@ def content_media_error_response(error):
     ))
 
 
+def object_storage_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status
+    ))
+
+
+async def miniapp_admin_storage_status(request):
+    payload = {
+        "provider": "r2" if R2_CONFIG.enabled else "telegram",
+        "configured": R2_CONFIG.is_configured(),
+        "r2_configured": R2_CONFIG.is_configured(),
+    }
+    if R2_CONFIG.is_configured():
+        payload["bucket"] = R2_CONFIG.bucket_name
+    return apply_miniapp_security_headers(web.json_response(payload))
+
+
+async def miniapp_admin_content_media_upload_intent(request):
+    session = request["miniapp_admin"]
+    try:
+        if not R2_CONFIG.enabled:
+            raise ObjectStorageError("object_storage_disabled", 503)
+        if not R2_CONFIG.is_configured():
+            raise ObjectStorageError("object_storage_configuration_invalid", 503)
+        try:
+            body = await request.json()
+        except Exception:
+            raise ObjectStorageError("invalid_json") from None
+        if not isinstance(body, dict):
+            raise ObjectStorageError("invalid_json")
+        content_id = request.match_info.get("content_id")
+        media_type = body.get("media_type")
+        filename, extension, size_bytes = validate_object_upload(
+            body.get("filename"), body.get("content_type"),
+            body.get("size_bytes"), media_type,
+        )
+        upload_id = str(uuid.uuid4())
+        object_key = generate_safe_object_key(content_id, extension)
+        signed = await asyncio.to_thread(
+            R2_STORAGE.create_upload_url, object_key,
+            body.get("content_type"), upload_id,
+        )
+        await run_sync_db(
+            create_r2_media_upload, get_db_conn, session.telegram_id,
+            content_id, media_type, filename, body.get("content_type"),
+            size_bytes, object_key, upload_id,
+        )
+        return apply_miniapp_security_headers(web.json_response({
+            "upload_id": upload_id, "object_key": object_key,
+            "upload_url": signed["url"], "expires_in": signed["expires_in"],
+            "required_headers": signed["required_headers"],
+        }, status=201))
+    except ObjectStorageError as error:
+        return object_storage_error_response(error)
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+
+
+async def miniapp_admin_content_media_r2_finalize(request):
+    session = request["miniapp_admin"]
+    try:
+        if not R2_CONFIG.is_configured():
+            raise ObjectStorageError("object_storage_configuration_invalid", 503)
+        upload = await run_sync_db(
+            get_r2_media_upload, get_db_conn,
+            request.match_info.get("upload_id"), session.telegram_id,
+        )
+        if upload is None:
+            raise ContentMediaError("content_media_upload_not_found", 404)
+        if upload["status"] == "applied":
+            return apply_miniapp_security_headers(web.json_response({
+                "status": "completed", "media_id": upload["media_id"],
+                "idempotent": True,
+            }))
+        try:
+            head = await asyncio.to_thread(R2_STORAGE.head_object, upload["object_key"])
+        except Exception as exc:
+            response = getattr(exc, "response", {}) or {}
+            error_code = str((response.get("Error") or {}).get("Code") or "")
+            http_status = int((response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+            category = "object_storage_object_missing" if http_status == 404 or error_code in {"404", "NoSuchKey", "NotFound"} else "object_storage_head_failed"
+            raise ObjectStorageError(category, 409 if category.endswith("missing") else 503) from None
+        actual_size = int(head.get("ContentLength", -1))
+        actual_type = str(head.get("ContentType") or "").split(";", 1)[0].strip().lower()
+        metadata = head.get("Metadata") or {}
+        if (actual_size != upload["size_bytes"] or actual_type != upload["mime_type"]
+                or str(metadata.get("upload-id") or "") != upload["upload_id"]):
+            raise ObjectStorageError("object_storage_metadata_mismatch", 409)
+        result = await run_sync_db(
+            finalize_r2_media_upload, get_db_conn, upload["upload_id"],
+            session.telegram_id, str(head.get("ETag") or "").strip('"') or None,
+        )
+        if result is None:
+            raise ContentMediaError("content_media_upload_not_found", 404)
+        return apply_miniapp_security_headers(web.json_response(result))
+    except ObjectStorageError as error:
+        return object_storage_error_response(error)
+    except ContentMediaError as error:
+        return content_media_error_response(error)
+
+
 async def read_bounded_content_media_multipart(request):
     if (
         request.content_length is not None
@@ -24759,6 +24938,15 @@ async def miniapp_admin_content_media_proxy(request):
         return content_media_error_response(
             ContentMediaError("video_preview_not_supported", 409)
         )
+    if media.get("storage_kind") == "r2":
+        try:
+            response = web.HTTPFound(location=await asyncio.to_thread(
+                R2_STORAGE.create_download_url, media["server_reference"]
+            ))
+            response.headers["Cache-Control"] = "private, no-store"
+            return apply_miniapp_security_headers(response)
+        except Exception:
+            return content_media_error_response(ContentMediaError("content_media_unavailable", 503))
     try:
         telegram_file = await bot.get_file(media["server_reference"])
         file_path = getattr(telegram_file, "file_path", None)
@@ -24828,6 +25016,12 @@ async def miniapp_admin_content_audio_proxy(request):
             raise ContentMediaError("content_media_not_found", 404)
         if media["media_type"] != "audio" or media["content_type"] != "meditation":
             raise ContentMediaError("content_media_not_found", 404)
+        if media.get("storage_kind") == "r2":
+            response = web.HTTPFound(location=await asyncio.to_thread(
+                R2_STORAGE.create_download_url, media["server_reference"]
+            ))
+            response.headers["Cache-Control"] = "private, no-store"
+            return apply_miniapp_security_headers(response)
         if media["mime_type"] != "audio/mpeg" or media["size_bytes"] > AUDIO_MAX_BYTES:
             raise ContentMediaError("content_media_unavailable", 502)
         telegram_file = await bot.get_file(media["server_reference"])
@@ -26235,6 +26429,8 @@ def create_app():
         app.router.add_get('/api/member/content',miniapp_member_content_list)
     if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
         app.router.add_get('/api/member/content/{content_id}/media/{media_id}',miniapp_member_media)
+    if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}/url"):
+        app.router.add_get('/api/member/content/{content_id}/media/{media_id}/url',miniapp_member_media_url)
     if not _route_exists(app,"GET","/api/member/content/{content_id}"):
         app.router.add_get('/api/member/content/{content_id}',miniapp_member_content_details)
     if not _route_exists(app, "GET", "/api/admin/me"):
@@ -26291,6 +26487,12 @@ def create_app():
         app.router.add_get('/api/admin/content/categories', miniapp_admin_content_categories)
     if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/media-preview"):
         app.router.add_post('/api/admin/content/cms/{content_id}/media-preview', miniapp_admin_content_media_preview)
+    if not _route_exists(app, "GET", "/api/admin/storage/status"):
+        app.router.add_get('/api/admin/storage/status', miniapp_admin_storage_status)
+    if not _route_exists(app, "POST", "/api/admin/content/cms/{content_id}/media/upload-intent"):
+        app.router.add_post('/api/admin/content/cms/{content_id}/media/upload-intent', miniapp_admin_content_media_upload_intent)
+    if not _route_exists(app, "POST", "/api/admin/content/media/uploads/{upload_id}/finalize"):
+        app.router.add_post('/api/admin/content/media/uploads/{upload_id}/finalize', miniapp_admin_content_media_r2_finalize)
     if not _route_exists(app, "GET", "/api/admin/content/media/uploads/{upload_id}/preview"):
         app.router.add_get('/api/admin/content/media/uploads/{upload_id}/preview', miniapp_admin_content_media_staged_preview)
     if not _route_exists(app, "POST", "/api/admin/content/media/uploads/{upload_id}/confirm"):

@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from aiohttp import web
 from aiogram.exceptions import TelegramNetworkError
@@ -10276,6 +10276,9 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         routes = (
             ("POST", "/api/admin/content/cms/{content_id}/revision"),
             ("POST", "/api/admin/content/cms/{content_id}/media-preview"),
+            ("GET", "/api/admin/storage/status"),
+            ("POST", "/api/admin/content/cms/{content_id}/media/upload-intent"),
+            ("POST", "/api/admin/content/media/uploads/{upload_id}/finalize"),
             ("GET", "/api/admin/content/media/uploads/{upload_id}/preview"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/confirm"),
             ("POST", "/api/admin/content/media/uploads/{upload_id}/cancel"),
@@ -10322,6 +10325,158 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ), handler,
             )
         self.assertEqual(response.status, 403)
+
+    async def test_r2_member_url_requires_entitlement_and_never_calls_telegram(self):
+        app = self.main.create_app()
+        path = "/api/member/content/{content_id}/media/{media_id}/url"
+        handler = self.route_handler(app, "GET", path)
+        request = FakeMiniAppRequest(
+            app, "Bearer member-token", path=path,
+            match_info={"content_id": "content-id", "media_id": "media-id"},
+        )
+        session = SimpleNamespace(telegram_id=42, first_name="Member", session_id="member")
+        media = {
+            "media_type": "video", "mime_type": "video/mp4", "size_bytes": 100,
+            "server_reference": "content/safe/object.mp4", "content_type": "lesson",
+            "content_access_level": "paid", "access_level": "premium", "storage_kind": "r2",
+        }
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=media), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": False}), \
+             patch.object(self.main.R2_STORAGE, "create_download_url") as signed, \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as telegram:
+            denied = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(denied.status, 403)
+        signed.assert_not_called(); telegram.assert_not_awaited()
+
+        with patch.object(self.main, "load_member_session", return_value=session), \
+             patch.object(self.main, "get_member_media_reference", return_value=media), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(self.main.R2_STORAGE, "create_download_url", return_value="https://r2.invalid/signed") as signed, \
+             patch.object(self.main.bot, "get_file", new_callable=AsyncMock) as telegram:
+            allowed = await self.main.miniapp_admin_auth_middleware(request, handler)
+        self.assertEqual(allowed.status, 200)
+        self.assertEqual(json.loads(allowed.text)["url"], "https://r2.invalid/signed")
+        signed.assert_called_once_with("content/safe/object.mp4")
+        telegram.assert_not_awaited()
+
+    async def test_r2_finalize_rejects_head_failures_and_metadata_mismatch_before_db_apply(self):
+        app = self.main.create_app()
+        path = "/api/admin/content/media/uploads/{upload_id}/finalize"
+        handler = self.route_handler(app, "POST", path)
+        upload = {
+            "upload_id": "00000000-0000-0000-0000-000000000010",
+            "content_id": "00000000-0000-0000-0000-000000000011",
+            "media_type": "video", "mime_type": "video/mp4",
+            "size_bytes": 1024, "object_key": "content/safe/object.mp4",
+            "original_filename": "lesson.mp4", "status": "uploading",
+            "media_id": None,
+        }
+
+        class MissingObject(Exception):
+            response = {
+                "Error": {"Code": "NoSuchKey"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            }
+
+        cases = (
+            ("missing", MissingObject(), 409),
+            ("timeout", TimeoutError("bounded head timeout"), 503),
+            ("wrong_size", {"ContentLength": 1025, "ContentType": "video/mp4", "Metadata": {"upload-id": upload["upload_id"]}}, 409),
+            ("wrong_mime", {"ContentLength": 1024, "ContentType": "video/webm", "Metadata": {"upload-id": upload["upload_id"]}}, 409),
+            ("wrong_upload_id", {"ContentLength": 1024, "ContentType": "video/mp4", "Metadata": {"upload-id": "other"}}, 409),
+        )
+        for label, head_result, expected_status in cases:
+            request = FakeMiniAppRequest(
+                app, path=path, method="POST",
+                match_info={"upload_id": upload["upload_id"]},
+            )
+            request["miniapp_admin"] = SimpleNamespace(telegram_id=1)
+            head = (
+                patch.object(self.main.R2_STORAGE, "head_object", side_effect=head_result)
+                if isinstance(head_result, BaseException)
+                else patch.object(self.main.R2_STORAGE, "head_object", return_value=head_result)
+            )
+            with self.subTest(case=label), \
+                 patch.object(self.main, "R2_CONFIG", SimpleNamespace(is_configured=lambda: True)), \
+                 patch.object(self.main, "get_r2_media_upload", return_value=upload), \
+                 head, \
+                 patch.object(self.main, "finalize_r2_media_upload") as finalize:
+                response = await handler(request)
+            self.assertEqual(response.status, expected_status)
+            finalize.assert_not_called()
+
+    async def test_r2_disabled_rejects_intent_without_affecting_telegram_member_proxy(self):
+        app = self.main.create_app()
+        intent_path = "/api/admin/content/cms/{content_id}/media/upload-intent"
+        intent = self.route_handler(app, "POST", intent_path)
+        request = FakeMiniAppRequest(
+            app, path=intent_path, method="POST",
+            match_info={"content_id": "00000000-0000-0000-0000-000000000001"},
+            json_data={
+                "media_type": "video", "filename": "lesson.mp4",
+                "content_type": "video/mp4", "size_bytes": 1024,
+            },
+        )
+        request["miniapp_admin"] = SimpleNamespace(telegram_id=1)
+        with patch.object(self.main, "R2_CONFIG", SimpleNamespace(enabled=False)), \
+             patch.object(self.main.R2_STORAGE, "create_upload_url") as presign:
+            response = await intent(request)
+        self.assertEqual(response.status, 503)
+        presign.assert_not_called()
+
+        media = {
+            "media_type": "video", "mime_type": "video/mp4", "size_bytes": 8,
+            "server_reference": "telegram-file-id", "content_type": "lesson",
+            "content_access_level": "paid", "access_level": "premium",
+            "storage_kind": "telegram_file_id",
+        }
+        member_path = "/api/member/content/{content_id}/media/{media_id}"
+        member = self.route_handler(app, "GET", member_path)
+        member_request = FakeMiniAppRequest(
+            app, path=member_path,
+            match_info={"content_id": "content", "media_id": "media"},
+        )
+        member_request["miniapp_member"] = SimpleNamespace(telegram_id=42)
+
+        async def download(_path, destination, **_kwargs):
+            destination.write(b"telegram")
+
+        with patch.object(self.main, "get_member_media_reference", return_value=media), \
+             patch.object(self.main, "member_access", return_value={"has_active_access": True}), \
+             patch.object(self.main, "validate_media_bytes", return_value="video/mp4"), \
+             patch.object(self.main.bot, "get_file", new=AsyncMock(return_value=SimpleNamespace(file_path="telegram-path", file_size=8))), \
+             patch.object(self.main.bot, "download_file", new=AsyncMock(side_effect=download)), \
+             patch.object(self.main.R2_STORAGE, "create_download_url") as signed:
+            member_response = await member(member_request)
+        self.assertEqual(member_response.status, 200)
+        self.assertEqual(member_response.body, b"telegram")
+        signed.assert_not_called()
+
+    def test_real_presigned_r2_origins_are_allowed_by_runtime_csp(self):
+        account_id = "0123456789abcdef0123456789abcdef"
+        config = self.main.ObjectStorageConfig.from_env({
+            "R2_ENABLED": "true", "R2_ACCOUNT_ID": account_id,
+            "R2_ACCESS_KEY_ID": "fake-access-key",
+            "R2_SECRET_ACCESS_KEY": "fake-secret-key",
+            "R2_BUCKET_NAME": "private-media",
+        })
+        storage = self.main.R2ObjectStorage(config)
+        upload = storage.create_upload_url(
+            "content/00000000-0000-0000-0000-000000000001/file.mp4",
+            "video/mp4", "upload-id",
+        )["url"]
+        download = storage.create_download_url(
+            "content/00000000-0000-0000-0000-000000000001/file.mp4"
+        )
+        csp = self.main.build_miniapp_security_headers(config)["Content-Security-Policy"]
+        for url in (upload, download):
+            parsed = urlsplit(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            self.assertEqual(origin, config.public_origin())
+            self.assertIn(f"connect-src 'self' {origin};", csp)
+            self.assertIn(f"media-src 'self' blob: {origin};", csp)
+        self.assertNotIn("*.r2.cloudflarestorage.com", csp)
 
     async def test_admin_audio_proxy_range_and_relationship_are_safe(self):
         app = self.main.create_app()
@@ -10516,8 +10671,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/media-preview", javascript)
         self.assertIn("/media/uploads/", javascript)
         self.assertIn("content-media-card", index)
-        self.assertIn('accept="video/mp4"', index)
-        self.assertIn('accept="audio/mpeg,.mp3"', index)
+        self.assertIn('accept="video/mp4,video/webm,.mp4,.webm"', index)
+        self.assertIn('accept="audio/mpeg,audio/mp4,audio/wav,audio/ogg,.mp3,.m4a,.wav,.ogg"', index)
         self.assertIn("content-audio-control", index)
         self.assertIn("has_audio", javascript)
         self.assertIn("memberAudioElement.pause()", javascript)
@@ -10558,8 +10713,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("appendRestrictedText", javascript)
         self.assertIn("document.createTextNode", javascript)
         self.assertIn("authoring-textarea", index)
-        self.assertIn("MP3 · до 20 МБ", index)
-        self.assertIn("Этот формат пока не поддерживается. Загрузите MP3.", javascript)
+        self.assertIn("MP3/M4A/WAV/OGG · до 2 ГБ", index)
+        self.assertIn("Загрузите MP3, M4A, WAV или OGG", javascript)
         self.assertIn("formatDuration", javascript)
         self.assertIn("Материал изменился. Обновите данные и повторите.", javascript)
         self.assertIn("Режим администратора", index)
@@ -10649,7 +10804,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("studioCoverGeneration", javascript)
         self.assertIn("contentMediaGeneration", javascript)
         self.assertIn("studio-card-actions", javascript)
-        self.assertIn("20 * 1024 * 1024", javascript)
+        self.assertIn("2 * 1024 * 1024 * 1024", javascript)
         self.assertIn("Видео слишком большое", javascript)
         self.assertIn("studio-publish-checklist", javascript)
         self.assertIn("grid-template-columns: repeat(6", stylesheet)
@@ -10767,10 +10922,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("video_streaming_not_available", inspect.getsource(self.main))
         self.assertIn("memberVideoElement.pause()", javascript)
         self.assertIn("memberVideoElement.removeAttribute(\"src\")", javascript)
-        self.assertIn("URL.revokeObjectURL(memberVideoUrl)", javascript)
+        self.assertIn("URL.revokeObjectURL(memberVideoObjectUrl)", javascript)
         self.assertIn("video.controls = true", javascript)
         self.assertIn("video.playsInline = true", javascript)
-        self.assertIn('blob.type !== "video/mp4"', javascript)
+        self.assertIn('["video/mp4", "video/webm"].includes(media.mime_type)', javascript)
         self.assertIn('item.has_video ? "Видео загружено" : "Видео появится позже"', javascript)
         self.assertIn('item.has_video ? "Воспроизведение доступно в режиме участника." : "К этому материалу видео пока не добавлено."', javascript)
         self.assertNotIn("member-training-group", javascript)
@@ -10801,7 +10956,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", stylesheet)
         self.assertIn(".member-training-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }", stylesheet)
         self.assertIn("env(safe-area-inset-bottom)", stylesheet)
-        self.assertNotIn("telegram_file_id", javascript)
+        self.assertIn('media.storage_kind !== "telegram_file_id"', javascript)
         self.assertIn("id=\"content-screen\"", index)
         self.assertIn("loadContent", javascript)
         self.assertIn("content-create-submit", index)
@@ -11044,6 +11199,25 @@ class ExpiredAccessHourlyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lifecycle.await_args_list[1].args, (505,))
         self.assertEqual(first["finalized"], 1)
         self.assertEqual(second["finalized"], 0)
+
+
+class R2MediaBootstrapContractTests(unittest.TestCase):
+    def test_r2_routes_and_entitlement_gate_are_registered(self):
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+        self.assertIn("/api/admin/storage/status", source)
+        self.assertIn("/api/admin/content/cms/{content_id}/media/upload-intent", source)
+        self.assertIn("/api/admin/content/media/uploads/{upload_id}/finalize", source)
+        self.assertIn("/api/member/content/{content_id}/media/{media_id}/url", source)
+        self.assertIn('member_request_access(request)["has_active_access"]', source)
+        self.assertIn("R2_STORAGE.create_download_url", source)
+
+    def test_r2_finalize_uses_head_and_never_accepts_client_object_key(self):
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+        function = source[source.index("async def miniapp_admin_content_media_r2_finalize"):]
+        function = function[:function.index("\n\nasync def ", 10)]
+        self.assertIn("R2_STORAGE.head_object", function)
+        self.assertIn('upload["object_key"]', function)
+        self.assertNotIn('body.get("object_key")', function)
 
 
 if __name__ == "__main__":

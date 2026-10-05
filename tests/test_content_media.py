@@ -94,6 +94,12 @@ class ContentMediaValidationTests(unittest.TestCase):
         self.assertFalse(member_media_metadata_valid(
             "lesson", "cover", "image/png", COVER_MAX_BYTES + 1
         ))
+        self.assertTrue(member_media_metadata_valid(
+            "lesson", "video", "video/webm", 2 * 1024 * 1024 * 1024, "r2"
+        ))
+        self.assertFalse(member_media_metadata_valid(
+            "lesson", "video", "video/webm", 2 * 1024 * 1024 * 1024 + 1, "r2"
+        ))
 
     def test_future_cms_content_type_is_not_implicitly_member_facing(self):
         with patch("content_media.CONTENT_TYPES", frozenset({
