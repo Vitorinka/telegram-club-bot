@@ -115,6 +115,9 @@ def claim_message_delivery(cur, delivery_key, telegram_id, delivery_type, now=No
             claim_generation = message_delivery_events.claim_generation + 1,
             last_error = NULL
         WHERE (
+                message_delivery_events.status = 'pending'
+              )
+           OR (
                 message_delivery_events.status = 'failed'
                 AND COALESCE(message_delivery_events.next_attempt_at, %s) <= %s
               )

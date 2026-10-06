@@ -12130,7 +12130,6 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
     continue_onboarding = bool(state_data.get("onboarding_free_lesson_pending"))
     await state.clear()
     user_id = int(message.from_user.id)
-    show_trial = True
     conn = get_db_conn()
     cur = conn.cursor()
     try:
@@ -12139,44 +12138,25 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
             VALUES (%s, FALSE)
             ON CONFLICT (telegram_id) DO NOTHING
         """, (user_id,))
-        cur.execute("""
-            SELECT video_sent, paid, trial_used
-            FROM users
-            WHERE telegram_id = %s
-        """, (user_id,))
-        row = cur.fetchone()
-        video_sent = row[0] if row else False
-        paid = row[1] if row else False
-        trial_used = row[2] if row else False
-        show_trial = not (paid or trial_used)
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
-    if video_sent:
-        if continue_onboarding:
-            await send_onboarding_description(message.chat.id, state)
-            return
-        await message.answer(
-            "✅ Вы уже получали бесплатный урок.\n\n"
-            "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:",
-            reply_markup=get_tariffs_keyboard(show_trial=show_trial)
-        )
-        return
-
     delivery_payload = {"variant": "manual"}
     if continue_onboarding:
         delivery_payload["onboarding"] = True
-        await run_sync_db(
-            enqueue_onboarding_free_lesson_delivery,
-            user_id,
-            delivery_payload,
-        )
+    delivery_key = manual_free_lesson_delivery_key(message, user_id)
+    await run_sync_db(
+        enqueue_manual_free_lesson_delivery,
+        delivery_key,
+        user_id,
+        delivery_payload,
+    )
 
     result = await process_claimed_delivery(
         get_db_conn,
-        f"free_lesson:{user_id}",
+        delivery_key,
         user_id,
         "free_lesson",
         lambda: send_free_lesson_delivery(user_id, delivery_payload),
@@ -12184,7 +12164,7 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
         classify_error_func=classify_delivery_error,
         log_failure_func=log_outbox_delivery_failure,
         terminal_error_callback=lambda error, decision, current_attempt_count: notify_terminal_free_lesson_delivery_error(
-            f"free_lesson:{user_id}",
+            delivery_key,
             "free_lesson",
             current_attempt_count,
             error,
@@ -12208,13 +12188,21 @@ def get_free_lesson_feedback_keyboard():
     ])
 
 
-def enqueue_onboarding_free_lesson_delivery(user_id, payload):
+def manual_free_lesson_delivery_key(message, user_id):
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        raise ValueError("manual free lesson requires Telegram chat_id and message_id")
+    return f"free_lesson:manual:{int(user_id)}:{int(chat_id)}:{int(message_id)}"
+
+
+def enqueue_manual_free_lesson_delivery(delivery_key, user_id, payload):
     conn = get_db_conn()
     cur = conn.cursor()
     try:
         created = enqueue_message_delivery(
             cur,
-            f"free_lesson:{int(user_id)}",
+            delivery_key,
             int(user_id),
             "free_lesson",
             payload,
@@ -12265,7 +12253,7 @@ def get_auto_free_lesson_caption():
 
 def get_free_lesson_join_keyboard():
     return inline_keyboard([[
-        InlineKeyboardButton(text="Хочу в клуб", callback_data="sub_trial")
+        InlineKeyboardButton(text="Попробовать неделю", callback_data="sub_trial")
     ]])
 
 
