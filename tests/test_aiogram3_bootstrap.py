@@ -149,7 +149,8 @@ class FakeStripeRequest:
 class FakeMessage:
     def __init__(self, user_id=123):
         self.from_user = SimpleNamespace(id=user_id)
-        self.chat = SimpleNamespace(type="private")
+        self.chat = SimpleNamespace(id=user_id, type="private")
+        self.message_id = 1001
         self.answers = []
         self.replies = []
         self.edits = []
@@ -285,7 +286,8 @@ def adapted_json_value(value):
 class FakeIncomingMessage:
     def __init__(self, user_id=123):
         self.from_user = SimpleNamespace(id=user_id)
-        self.chat = SimpleNamespace(type="private")
+        self.chat = SimpleNamespace(id=user_id, type="private")
+        self.message_id = 1001
         self.answers = []
         self.replies = []
 
@@ -3462,7 +3464,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         from aiogram.exceptions import TelegramForbiddenError
 
         connections = [
-            FakeConnection(fetches=[(False, False, False)]),
+            FakeConnection(),
+            FakeConnection(fetches=[("free_lesson:manual:123:123:1001",)]),
             FakeConnection(fetches=[("free_lesson:123",), (1,)]),
             FakeConnection(),
         ]
@@ -3470,6 +3473,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
              patch.object(self.main, "get_db_conn", side_effect=connections), \
+             patch.object(self.main, "run_sync_db", side_effect=lambda function, *args: function(*args)), \
              patch.object(self.main.bot, "send_video", AsyncMock(side_effect=TelegramForbiddenError(method=None, message="blocked"))), \
              patch.object(self.main, "notify_admins", AsyncMock()):
             await self.main.free_lesson_button(message, FakeState())
@@ -7675,9 +7679,15 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gift_state.states[-1], self.main.GiftPurchaseStates.tariff)
         self.assertIn("На какой срок подарить доступ", gift_message.answer.await_args.args[0])
 
-        lesson_message = SimpleNamespace(from_user=user, answer=AsyncMock())
+        lesson_message = SimpleNamespace(
+            from_user=user,
+            chat=SimpleNamespace(id=user.id),
+            message_id=1001,
+            answer=AsyncMock(),
+        )
         lesson_state = FakeState()
         with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+             patch.object(self.main, "run_sync_db", new_callable=AsyncMock), \
              patch.object(self.main, "process_claimed_delivery", AsyncMock(return_value="sent")) as delivery:
             await self.main.free_lesson_button(lesson_message, lesson_state)
         delivery.assert_awaited_once()
@@ -7740,7 +7750,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             await self.main.free_lesson_button(message, state)
         lesson.assert_awaited_once_with(123, {"variant": "manual", "onboarding": True})
         run_sync_db.assert_awaited_once_with(
-            self.main.enqueue_onboarding_free_lesson_delivery,
+            self.main.enqueue_manual_free_lesson_delivery,
+            "free_lesson:manual:123:123:1001",
             123,
             {"variant": "manual", "onboarding": True},
         )
@@ -7766,15 +7777,25 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             if result == "failed":
                 self.assertIn("Не удалось отправить бесплатный урок", message.answers[-1][0])
 
-    async def test_returning_user_keeps_existing_no_duplicate_free_lesson_behavior(self):
+    async def test_video_sent_does_not_block_new_onboarding_manual_replay(self):
         message = FakeMessage(); message.chat.id = 123
         state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
+        delivered = []
+
+        async def deliver(_get_conn, _key, _user_id, _delivery_type, send_func, **_kwargs):
+            await send_func()
+            delivered.append(_key)
+            return "sent"
+
         with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(True, False, False)])), \
-             patch.object(self.main, "process_claimed_delivery", new_callable=AsyncMock) as delivery, \
+             patch.object(self.main, "run_sync_db", new_callable=AsyncMock), \
+             patch.object(self.main, "process_claimed_delivery", new=AsyncMock(side_effect=deliver)), \
+             patch.object(self.main, "send_free_lesson_delivery", new_callable=AsyncMock) as lesson, \
              patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
             await self.main.free_lesson_button(message, state)
-        delivery.assert_not_awaited()
-        description.assert_awaited_once_with(123, state)
+        lesson.assert_awaited_once_with(123, {"variant": "manual", "onboarding": True})
+        self.assertEqual(delivered, ["free_lesson:manual:123:123:1001"])
+        description.assert_not_awaited()
         self.assertEqual(message.answers, [])
 
     async def test_onboarding_free_lesson_keyboard_is_context_specific(self):
@@ -7790,7 +7811,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
             await self.main.send_free_lesson_delivery(123, {"variant": "manual"})
             generic_button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
-            self.assertEqual((generic_button.text, generic_button.callback_data), ("Хочу в клуб", "sub_trial"))
+            self.assertEqual((generic_button.text, generic_button.callback_data), ("Попробовать неделю", "sub_trial"))
 
     async def test_free_lesson_delivery_without_payload_keeps_generic_keyboard(self):
         with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
@@ -7798,20 +7819,21 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             await self.main.send_free_lesson_delivery(123)
 
         generic_button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual((generic_button.text, generic_button.callback_data), ("Хочу в клуб", "sub_trial"))
+        self.assertEqual((generic_button.text, generic_button.callback_data), ("Попробовать неделю", "sub_trial"))
 
-    async def test_onboarding_delivery_enqueue_uses_single_sync_transaction_unit(self):
+    async def test_manual_delivery_enqueue_uses_single_sync_transaction_unit(self):
         connection = FakeConnection()
         payload = {"variant": "manual", "onboarding": True}
+        delivery_key = "free_lesson:manual:123:123:1001"
         with patch.object(self.main, "get_db_conn", return_value=connection), \
              patch.object(self.main, "enqueue_message_delivery", return_value=True) as enqueue, \
              patch.object(connection.cursor_obj, "close", wraps=connection.cursor_obj.close) as close_cursor:
-            created = self.main.enqueue_onboarding_free_lesson_delivery(123, payload)
+            created = self.main.enqueue_manual_free_lesson_delivery(delivery_key, 123, payload)
 
         self.assertTrue(created)
         enqueue.assert_called_once_with(
             connection.cursor_obj,
-            "free_lesson:123",
+            delivery_key,
             123,
             "free_lesson",
             payload,
@@ -7819,6 +7841,48 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection.commits, 1)
         close_cursor.assert_called_once_with()
         self.assertTrue(connection.closed)
+
+    async def test_new_manual_click_replays_but_same_telegram_update_is_idempotent(self):
+        seen = set()
+
+        async def deliver(_get_conn, key, _user_id, _delivery_type, send_func, **_kwargs):
+            if key in seen:
+                return "already_sent"
+            seen.add(key)
+            await send_func()
+            return "sent"
+
+        first = FakeMessage(); first.chat.id = 123; first.message_id = 501
+        second = FakeMessage(); second.chat.id = 123; second.message_id = 502
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection()), \
+             patch.object(self.main, "run_sync_db", new_callable=AsyncMock), \
+             patch.object(self.main, "process_claimed_delivery", new=AsyncMock(side_effect=deliver)), \
+             patch.object(self.main, "send_free_lesson_delivery", new_callable=AsyncMock) as lesson:
+            await self.main.free_lesson_button(first, FakeState())
+            await self.main.free_lesson_button(first, FakeState())
+            await self.main.free_lesson_button(second, FakeState())
+
+        self.assertEqual(lesson.await_count, 2)
+        self.assertEqual(
+            seen,
+            {
+                "free_lesson:manual:123:123:501",
+                "free_lesson:manual:123:123:502",
+            },
+        )
+
+    async def test_manual_replay_does_not_create_a_second_followup_identity(self):
+        keys = []
+
+        async def capture(_get_conn, key, *_args, **_kwargs):
+            keys.append(key)
+            return "already_sent"
+
+        with patch.object(self.main, "process_claimed_delivery", new=AsyncMock(side_effect=capture)):
+            await self.main.send_free_lesson_followup(123)
+            await self.main.send_free_lesson_followup(123)
+
+        self.assertEqual(keys, ["free_lesson_followup:123", "free_lesson_followup:123"])
 
     async def test_existing_club_description_content_and_callback_are_unchanged(self):
         state = FakeState()

@@ -762,6 +762,10 @@ class CriticalBotSafetyTests(unittest.TestCase):
         self.assertIn("SELECT status FROM message_delivery_events", cur.queries[1][0])
 
     def test_delivery_claim_due_failed_and_expired_processing_are_claimed(self):
+        pending = DeliveryCursor(claim_fetch=(2,))
+        self.assertEqual(claim_message_delivery(pending, "free_lesson:manual:1:1:10", 1, "free_lesson"), ("claimed", 2))
+        self.assertIn("message_delivery_events.status = 'pending'", pending.queries[0][0])
+
         due_failed = DeliveryCursor(claim_fetch=(3,))
         self.assertEqual(claim_message_delivery(due_failed, "free_lesson:1", 1, "free_lesson"), ("claimed", 3))
 
