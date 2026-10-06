@@ -12131,6 +12131,8 @@ async def feedback_think(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(F.text == "🧘 Бесплатный урок", StateFilter('*'))
 async def free_lesson_button(message: types.Message, state: FSMContext):
+    state_data = await state.get_data()
+    continue_onboarding = bool(state_data.get("onboarding_free_lesson_pending"))
     await state.clear()
     user_id = int(message.from_user.id)
     show_trial = True
@@ -12184,6 +12186,9 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
     )
     if result in ("already_sent", "already_processing"):
         logging.info("FREE_LESSON_DELIVERY_SKIPPED: user_id=%s, status=%s", safe_log_id(user_id), result)
+        return
+    if result == "sent" and continue_onboarding:
+        await send_onboarding_description(message.chat.id, state)
         return
     if result != "sent":
         await message.answer(
@@ -12767,6 +12772,19 @@ async def start(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "to_desc", StateFilter(RegistrationStates.intro))
 async def show_description(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(onboarding_free_lesson_pending=True)
+    await callback.message.answer(
+        "Я подготовила для вас бесплатный пробный урок, чтобы вы могли почувствовать формат и понять, подходит ли он вам.",
+        reply_markup=reply_keyboard(
+            [[KeyboardButton(text="🧘 Бесплатный урок")]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+    await callback.answer()
+
+
+async def send_onboarding_description(chat_id, state):
     await state.set_state(RegistrationStates.description)
     text = """<b>Внутри клуба вас ждёт:</b>
 
@@ -12791,13 +12809,12 @@ async def show_description(callback: types.CallbackQuery, state: FSMContext):
     VIDEO_DESCRIPTION = "BAACAgIAAxkBAAIGMmoS7DVlRexpNBTPxk0wPmGESaPYAAKzrgAC-F-YSKfL_HEbOt--OwQ"
 
     await bot.send_video(
-        chat_id=callback.message.chat.id,
+        chat_id=chat_id,
         video=VIDEO_DESCRIPTION,
         caption=text,
         reply_markup=kb,
         parse_mode="HTML"
     )
-    await callback.answer()
 
 @router.callback_query(F.data == "to_rules", StateFilter(RegistrationStates.description))
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):

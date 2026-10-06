@@ -7682,6 +7682,104 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('F.text == "🎁 Подарить доступ"', source)
         self.assertNotIn('F.text == "🆘 Правила клуба"', source)
 
+    async def test_onboarding_welcome_then_free_lesson_cta_precedes_club_description(self):
+        message = FakeMessage()
+        message.text = "/start"
+        message.chat.id = 123
+        message.from_user.username = "member"
+        message.from_user.full_name = "Member"
+        state = FakeState()
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection()), \
+             patch.object(self.main, "save_telegram_user_profile"), \
+             patch.object(self.main.bot, "send_photo", new_callable=AsyncMock) as send_photo:
+            await self.main.start(message, state)
+        welcome = """<b>Добро пожаловать в закрытый клуб Натальи Ребковец.</b>
+
+Здесь тренировки построены на современных знаниях о движении, нейрофизиологии и работе тела.
+
+Силовые тренировки, йога, пилатес, кинезиологические упражнения, работа с дыханием, мобильностью и двигательными паттернами — для сильного, здорового и функционального тела без перегрузки.
+
+<b>Готовы начать путь к здоровому и сильному телу? Тогда — поехали!</b>"""
+        self.assertEqual(send_photo.await_args.kwargs["caption"], welcome)
+        welcome_button = send_photo.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual((welcome_button.text, welcome_button.callback_data), ("➡️ Продолжить", "to_desc"))
+
+        callback = FakeCallback()
+        callback.message.chat.id = 123
+        with patch.object(self.main.bot, "send_video", new_callable=AsyncMock) as club_description:
+            await self.main.show_description(callback, state)
+        self.assertEqual(callback.message.answers[0][0],
+            "Я подготовила для вас бесплатный пробный урок, чтобы вы могли почувствовать формат и понять, подходит ли он вам.")
+        lesson_keyboard = callback.message.answers[0][1]["reply_markup"]
+        self.assertEqual([[button.text for button in row] for row in lesson_keyboard.keyboard], [["🧘 Бесплатный урок"]])
+        self.assertTrue(state.data["onboarding_free_lesson_pending"])
+        club_description.assert_not_awaited()
+
+    async def test_successful_onboarding_free_lesson_continues_existing_club_block(self):
+        events = []
+        message = FakeMessage(); message.chat.id = 123
+        state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
+
+        async def deliver(*_args, **_kwargs):
+            events.append("free_lesson")
+            return "sent"
+
+        async def continue_onboarding(*_args, **_kwargs):
+            events.append("club_description")
+
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+             patch.object(self.main, "process_claimed_delivery", new=AsyncMock(side_effect=deliver)), \
+             patch.object(self.main, "send_onboarding_description", new=AsyncMock(side_effect=continue_onboarding)) as description:
+            await self.main.free_lesson_button(message, state)
+        self.assertEqual(events, ["free_lesson", "club_description"])
+        description.assert_awaited_once_with(123, state)
+
+    async def test_failed_or_duplicate_free_lesson_does_not_false_continue_onboarding(self):
+        for result in ("failed", "already_processing"):
+            message = FakeMessage(); message.chat.id = 123
+            state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
+            with self.subTest(result=result), \
+                 patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+                 patch.object(self.main, "process_claimed_delivery", new=AsyncMock(return_value=result)), \
+                 patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
+                await self.main.free_lesson_button(message, state)
+            description.assert_not_awaited()
+            if result == "failed":
+                self.assertIn("Не удалось отправить бесплатный урок", message.answers[-1][0])
+
+    async def test_returning_user_keeps_existing_no_duplicate_free_lesson_behavior(self):
+        message = FakeMessage(); message.chat.id = 123
+        state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
+        with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(True, False, False)])), \
+             patch.object(self.main, "process_claimed_delivery", new_callable=AsyncMock) as delivery, \
+             patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
+            await self.main.free_lesson_button(message, state)
+        delivery.assert_not_awaited()
+        description.assert_not_awaited()
+        self.assertEqual(message.answers[-1][0],
+            "✅ Вы уже получали бесплатный урок.\n\n"
+            "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:")
+
+    async def test_existing_club_description_content_and_callback_are_unchanged(self):
+        state = FakeState()
+        with patch.object(self.main.bot, "send_video", new_callable=AsyncMock) as send_video:
+            await self.main.send_onboarding_description(123, state)
+        caption = send_video.await_args.kwargs["caption"]
+        self.assertTrue(caption.startswith("<b>Внутри клуба вас ждёт:</b>"))
+        for unchanged_text in (
+            "🧠 <b>Библиотека тренировок</b>",
+            "🔋 <b>Короткие зарядки</b>",
+            "🧘🏽‍♀️ <b>Медитации и дыхательные практики</b>",
+            "🩹 <b>Фитнес-аптечка</b>",
+            "🥗 <b>Раздел с рецептами</b>",
+            "👩🏽‍💻 <b>Живые Zoom-уроки 2–4 раза в месяц</b>",
+            "💬 <b>Закрытый чат поддержки,</b>",
+        ):
+            self.assertIn(unchanged_text, caption)
+        button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual((button.text, button.callback_data), ("➡️ Продолжить", "to_rules"))
+        self.assertEqual(state.states[-1], self.main.RegistrationStates.description)
+
     async def test_gift_certificate_name_step_accepts_name_or_without_name(self):
         callback = FakeCallback()
         callback.data = "gift_tariff:gift_1m"
