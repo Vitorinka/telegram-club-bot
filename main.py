@@ -6106,24 +6106,19 @@ def reset_checkout_retry_state_after_success(user_id, source):
 
 async def send_checkout_open_instruction(callback, checkout_url, user_id, session_id, sub_type, mode, reused=False):
     payment_keyboard = inline_keyboard([
-        [InlineKeyboardButton(text="💳 Перейти к оплате", url=checkout_url)],
+        [InlineKeyboardButton(text="Оплатить", url=checkout_url)],
         [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="back_to_tariffs")],
     ])
-    instruction_text = (
-        f"{CHECKOUT_OPEN_INSTRUCTION}\n\n"
-        f"Ссылка для оплаты:\n{checkout_url}"
+    await callback.message.answer(
+        "Всё готово. Осталось оформить оплату.",
+        reply_markup=payment_keyboard,
     )
-    await callback.message.answer(instruction_text, reply_markup=payment_keyboard)
     logging.info(
         f"Payment button sent: user_id={user_id}, session_id={safe_log_id(session_id)}, "
         f"sub_type={sub_type}, mode={mode}, checkout_url_present={bool(checkout_url)}, reused={reused}"
     )
     logging.info(
         f"Checkout opened instruction sent: user_id={user_id}, session_id={safe_log_id(session_id)}, "
-        f"sub_type={sub_type}, reused={reused}"
-    )
-    logging.info(
-        f"Checkout external browser instruction sent: user_id={user_id}, session_id={safe_log_id(session_id)}, "
         f"sub_type={sub_type}, reused={reused}"
     )
 
@@ -12160,6 +12155,9 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
         conn.close()
 
     if video_sent:
+        if continue_onboarding:
+            await send_onboarding_description(message.chat.id, state)
+            return
         await message.answer(
             "✅ Вы уже получали бесплатный урок.\n\n"
             "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:",
@@ -12167,12 +12165,21 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
         )
         return
 
+    delivery_payload = {"variant": "manual"}
+    if continue_onboarding:
+        delivery_payload["onboarding"] = True
+        await run_sync_db(
+            enqueue_onboarding_free_lesson_delivery,
+            user_id,
+            delivery_payload,
+        )
+
     result = await process_claimed_delivery(
         get_db_conn,
         f"free_lesson:{user_id}",
         user_id,
         "free_lesson",
-        lambda: send_free_lesson_delivery(user_id, {"variant": "manual"}),
+        lambda: send_free_lesson_delivery(user_id, delivery_payload),
         blocked_exc=(TelegramForbiddenError,),
         classify_error_func=classify_delivery_error,
         log_failure_func=log_outbox_delivery_failure,
@@ -12187,9 +12194,6 @@ async def free_lesson_button(message: types.Message, state: FSMContext):
     if result in ("already_sent", "already_processing"):
         logging.info("FREE_LESSON_DELIVERY_SKIPPED: user_id=%s, status=%s", safe_log_id(user_id), result)
         return
-    if result == "sent" and continue_onboarding:
-        await send_onboarding_description(message.chat.id, state)
-        return
     if result != "sent":
         await message.answer(
             "❌ Не удалось отправить бесплатный урок. Попробуйте позже или напишите @re_tasha.",
@@ -12202,6 +12206,27 @@ def get_free_lesson_feedback_keyboard():
         [InlineKeyboardButton(text="Задать вопрос", callback_data="feedback_question")],
         [InlineKeyboardButton(text="Пока думаю", callback_data="feedback_think")],
     ])
+
+
+def enqueue_onboarding_free_lesson_delivery(user_id, payload):
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        created = enqueue_message_delivery(
+            cur,
+            f"free_lesson:{int(user_id)}",
+            int(user_id),
+            "free_lesson",
+            payload,
+        )
+        conn.commit()
+        return created
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 def get_manual_free_lesson_caption():
     return """<b>Чтобы почувствовать изменения в теле и самочувствии, не нужно усложнять.</b>
@@ -12244,6 +12269,15 @@ def get_free_lesson_join_keyboard():
     ]])
 
 
+def get_onboarding_free_lesson_keyboard():
+    return inline_keyboard([[
+        InlineKeyboardButton(
+            text="➡️ Продолжить",
+            callback_data="continue_onboarding_after_free_lesson",
+        )
+    ]])
+
+
 def get_free_lesson_followup_text():
     return (
         "Как ощущения после пробной тренировки?\n\n"
@@ -12264,7 +12298,11 @@ async def send_free_lesson_delivery(user_id, payload=None):
         chat_id=int(user_id),
         video=video_id,
         caption=caption,
-        reply_markup=get_free_lesson_join_keyboard(),
+        reply_markup=(
+            get_onboarding_free_lesson_keyboard()
+            if payload.get("onboarding")
+            else get_free_lesson_join_keyboard()
+        ),
         parse_mode="HTML",
     )
 
@@ -12815,6 +12853,13 @@ async def send_onboarding_description(chat_id, state):
         reply_markup=kb,
         parse_mode="HTML"
     )
+
+
+@router.callback_query(F.data == "continue_onboarding_after_free_lesson", StateFilter('*'))
+async def continue_onboarding_after_free_lesson(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await send_onboarding_description(callback.message.chat.id, state)
+    await callback.answer()
 
 @router.callback_query(F.data == "to_rules", StateFilter(RegistrationStates.description))
 async def show_rules(callback: types.CallbackQuery, state: FSMContext):

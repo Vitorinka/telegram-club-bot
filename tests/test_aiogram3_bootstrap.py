@@ -3157,7 +3157,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 78)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 41)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 42)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -3189,7 +3189,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_filters.append(text)
 
         self.assertEqual(len(message_handlers), 78)
-        self.assertEqual(len(callback_handlers), 41)
+        self.assertEqual(len(callback_handlers), 42)
         self.assertEqual(
             commands,
             [
@@ -3229,6 +3229,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "confirm_promo", "cancel_promo", "feedback_join", "feedback_question",
             "feedback_think", "to_desc", "to_rules", "to_choice", "retry_payment",
             "back_to_tariffs", "cancel_subscription", "show_renew_options",
+            "continue_onboarding_after_free_lesson",
         }
         prefix_covered = {"sub_trial", "sub_1", "sub_6", "sub_12", "admin_menu:back"}
         self.assertTrue(exact.issubset(callback_values))
@@ -4699,7 +4700,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         create_session.assert_called_once()
         reuse_alert.assert_not_awaited()
         error_alert.assert_not_awaited()
-        self.assertIn("https://checkout.stripe.test/first-create", callback.message.answers[-1][0])
+        payment_text, payment_kwargs = callback.message.answers[-1]
+        self.assertEqual(payment_text, "Всё готово. Осталось оформить оплату.")
+        self.assertNotIn("https://checkout.stripe.test/first-create", payment_text)
+        self.assertEqual(payment_kwargs["reply_markup"].inline_keyboard[0][0].url,
+                         "https://checkout.stripe.test/first-create")
         self.assertEqual(state.clear_calls, 1)
 
     async def test_checkout_second_reuse_sends_button_without_admin_alert_or_new_session(self):
@@ -4740,7 +4745,11 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         retrieve_session.assert_called_once_with("cs_reuse_second_full")
         create_session.assert_not_called()
         error_alert.assert_not_awaited()
-        self.assertIn("https://checkout.stripe.test/live-second", callback.message.answers[-1][0])
+        payment_text, payment_kwargs = callback.message.answers[-1]
+        self.assertEqual(payment_text, "Всё готово. Осталось оформить оплату.")
+        self.assertNotIn("https://checkout.stripe.test/live-second", payment_text)
+        self.assertEqual(payment_kwargs["reply_markup"].inline_keyboard[0][0].url,
+                         "https://checkout.stripe.test/live-second")
         log_output = "\n".join(logs.output)
         self.assertIn("CHECKOUT_REUSE_INFO", log_output)
         self.assertIn("alert_enqueued=False", log_output)
@@ -7715,24 +7724,33 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.data["onboarding_free_lesson_pending"])
         club_description.assert_not_awaited()
 
-    async def test_successful_onboarding_free_lesson_continues_existing_club_block(self):
-        events = []
+    async def test_successful_onboarding_free_lesson_uses_continue_before_club_block(self):
         message = FakeMessage(); message.chat.id = 123
         state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
 
-        async def deliver(*_args, **_kwargs):
-            events.append("free_lesson")
+        async def deliver(_get_conn, _key, _user_id, _delivery_type, send_func, **_kwargs):
+            await send_func()
             return "sent"
 
-        async def continue_onboarding(*_args, **_kwargs):
-            events.append("club_description")
-
         with patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+             patch.object(self.main, "run_sync_db", new_callable=AsyncMock) as run_sync_db, \
              patch.object(self.main, "process_claimed_delivery", new=AsyncMock(side_effect=deliver)), \
-             patch.object(self.main, "send_onboarding_description", new=AsyncMock(side_effect=continue_onboarding)) as description:
+             patch.object(self.main, "send_free_lesson_delivery", new_callable=AsyncMock) as lesson, \
+             patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
             await self.main.free_lesson_button(message, state)
-        self.assertEqual(events, ["free_lesson", "club_description"])
+        lesson.assert_awaited_once_with(123, {"variant": "manual", "onboarding": True})
+        run_sync_db.assert_awaited_once_with(
+            self.main.enqueue_onboarding_free_lesson_delivery,
+            123,
+            {"variant": "manual", "onboarding": True},
+        )
+        description.assert_not_awaited()
+
+        callback = FakeCallback(); callback.message.chat.id = 123
+        with patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
+            await self.main.continue_onboarding_after_free_lesson(callback, state)
         description.assert_awaited_once_with(123, state)
+        self.assertEqual(callback.answers, [(None, {})])
 
     async def test_failed_or_duplicate_free_lesson_does_not_false_continue_onboarding(self):
         for result in ("failed", "already_processing"):
@@ -7740,6 +7758,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             state = FakeState(); state.data["onboarding_free_lesson_pending"] = True
             with self.subTest(result=result), \
                  patch.object(self.main, "get_db_conn", return_value=FakeConnection(fetches=[(False, False, False)])), \
+                 patch.object(self.main, "run_sync_db", new_callable=AsyncMock), \
                  patch.object(self.main, "process_claimed_delivery", new=AsyncMock(return_value=result)), \
                  patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
                 await self.main.free_lesson_button(message, state)
@@ -7755,10 +7774,51 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.main, "send_onboarding_description", new_callable=AsyncMock) as description:
             await self.main.free_lesson_button(message, state)
         delivery.assert_not_awaited()
-        description.assert_not_awaited()
-        self.assertEqual(message.answers[-1][0],
-            "✅ Вы уже получали бесплатный урок.\n\n"
-            "Если вам понравился формат, вы можете оформить доступ к клубу и продолжить занятия:")
+        description.assert_awaited_once_with(123, state)
+        self.assertEqual(message.answers, [])
+
+    async def test_onboarding_free_lesson_keyboard_is_context_specific(self):
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main.bot, "send_video", new_callable=AsyncMock) as send_video:
+            await self.main.send_free_lesson_delivery(123, {"variant": "manual", "onboarding": True})
+            onboarding_button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(
+                (onboarding_button.text, onboarding_button.callback_data),
+                ("➡️ Продолжить", "continue_onboarding_after_free_lesson"),
+            )
+            self.assertNotEqual(onboarding_button.text, "Хочу в клуб")
+
+            await self.main.send_free_lesson_delivery(123, {"variant": "manual"})
+            generic_button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual((generic_button.text, generic_button.callback_data), ("Хочу в клуб", "sub_trial"))
+
+    async def test_free_lesson_delivery_without_payload_keeps_generic_keyboard(self):
+        with patch.dict(os.environ, {"FREE_LESSON_VIDEO_ID": "video_free_1"}), \
+             patch.object(self.main.bot, "send_video", new_callable=AsyncMock) as send_video:
+            await self.main.send_free_lesson_delivery(123)
+
+        generic_button = send_video.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual((generic_button.text, generic_button.callback_data), ("Хочу в клуб", "sub_trial"))
+
+    async def test_onboarding_delivery_enqueue_uses_single_sync_transaction_unit(self):
+        connection = FakeConnection()
+        payload = {"variant": "manual", "onboarding": True}
+        with patch.object(self.main, "get_db_conn", return_value=connection), \
+             patch.object(self.main, "enqueue_message_delivery", return_value=True) as enqueue, \
+             patch.object(connection.cursor_obj, "close", wraps=connection.cursor_obj.close) as close_cursor:
+            created = self.main.enqueue_onboarding_free_lesson_delivery(123, payload)
+
+        self.assertTrue(created)
+        enqueue.assert_called_once_with(
+            connection.cursor_obj,
+            "free_lesson:123",
+            123,
+            "free_lesson",
+            payload,
+        )
+        self.assertEqual(connection.commits, 1)
+        close_cursor.assert_called_once_with()
+        self.assertTrue(connection.closed)
 
     async def test_existing_club_description_content_and_callback_are_unchanged(self):
         state = FakeState()
@@ -8342,9 +8402,16 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             "sub_1",
             "subscription",
         )
-        payment_keyboard = callback.message.answers[-1][1]["reply_markup"]
+        payment_text, payment_kwargs = callback.message.answers[-1]
+        payment_keyboard = payment_kwargs["reply_markup"]
+        self.assertEqual(payment_text, "Всё готово. Осталось оформить оплату.")
+        self.assertNotIn("https://checkout.example/session", payment_text)
+        self.assertNotIn("Safari", payment_text)
+        self.assertNotIn("Chrome", payment_text)
+        self.assertEqual(payment_keyboard.inline_keyboard[0][0].text, "Оплатить")
         self.assertEqual(payment_keyboard.inline_keyboard[0][0].url, "https://checkout.example/session")
         self.assertEqual(payment_keyboard.inline_keyboard[1][0].callback_data, "back_to_tariffs")
+        self.assertIn("Safari или Chrome", self.main.CHECKOUT_OPEN_INSTRUCTION)
 
     async def test_telegram_webhook_request_passes_through_aiogram3_handler(self):
         app = self.main.create_app()
