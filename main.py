@@ -8205,6 +8205,285 @@ def stripe_invoice_period_end(invoice, expected_subscription_id):
     return max(period_ends) if period_ends else None
 
 
+STRIPE_RECURRING_PAYMENT_KINDS = frozenset({
+    "initial_subscription", "recurring", "adjustment", "subscription_adjustment",
+})
+STRIPE_ACCESS_OVERRIDE_EVENTS = frozenset({
+    "manual_set_expiry", "manual_restore_access", "manual_give_access",
+})
+STRIPE_ACTIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "trialing"})
+
+
+def stripe_subscription_projection(subscription):
+    def object_id(value):
+        return value if isinstance(value, str) else stripe_value(value, "id")
+
+    subscription_id = object_id(stripe_value(subscription, "id"))
+    customer_id = object_id(stripe_value(subscription, "customer"))
+    status = str(stripe_value(subscription, "status") or "")
+    current_period_end = stripe_value(subscription, "current_period_end")
+    period_end = (
+        datetime.utcfromtimestamp(int(current_period_end))
+        if current_period_end else None
+    )
+    items = stripe_value(subscription, "items", "data") or []
+    first_item = items[0] if items else None
+    price = stripe_value(first_item, "price")
+    recurring = stripe_value(price, "recurring")
+    latest_invoice = stripe_value(subscription, "latest_invoice")
+    latest_invoice_status = stripe_value(latest_invoice, "status")
+    return {
+        "subscription_id": subscription_id,
+        "customer_id": customer_id,
+        "status": status,
+        "period_end": period_end,
+        "current_period_end": current_period_end,
+        "cancel_at_period_end": bool(stripe_value(subscription, "cancel_at_period_end")),
+        "price_id": object_id(price),
+        "product_id": object_id(stripe_value(price, "product")),
+        "recurring_price": bool(recurring),
+        "latest_invoice_status": latest_invoice_status,
+        "live_recurring_proof": bool(
+            recurring
+            and (
+                latest_invoice_status == "paid"
+                or status == "trialing"
+            )
+        ),
+    }
+
+
+def _sync_stripe_subscription_state_db(
+    projection,
+    *,
+    source,
+    stripe_event_id=None,
+    requested_telegram_id=None,
+    requested_by_admin_id=None,
+):
+    subscription_id = projection.get("subscription_id")
+    if not subscription_id:
+        return {"status": "invalid_subscription", "updated": False}
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT telegram_id, expiry_date, stripe_customer_id,
+                   stripe_subscription_id, paid, auto_renew
+            FROM users
+            WHERE stripe_subscription_id = %s
+            FOR UPDATE
+        """, (subscription_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return {"status": "user_not_found", "updated": False}
+        telegram_id, local_expiry, local_customer_id, local_subscription_id, paid, old_auto_renew = row
+        if requested_telegram_id is not None and int(telegram_id) != int(requested_telegram_id):
+            conn.rollback()
+            return {"status": "identity_changed", "updated": False}
+        if local_subscription_id != subscription_id:
+            conn.rollback()
+            return {"status": "identity_changed", "updated": False}
+        customer_id = projection.get("customer_id")
+        if local_customer_id and customer_id and local_customer_id != customer_id:
+            conn.rollback()
+            return {"status": "customer_identity_changed", "updated": False}
+
+        period_end = projection.get("period_end")
+        status = projection.get("status") or "unknown"
+        auto_renew = bool(
+            status in {"active", "trialing", "past_due", "unpaid", "incomplete"}
+            and not projection.get("cancel_at_period_end")
+        )
+        cur.execute("""
+            SELECT created_at, period_end
+            FROM payment_events
+            WHERE telegram_id = %s
+              AND stripe_subscription_id = %s
+              AND payment_status = 'succeeded'
+              AND payment_kind = ANY(%s)
+              AND period_end IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """, (telegram_id, subscription_id, list(STRIPE_RECURRING_PAYMENT_KINDS)))
+        proof = cur.fetchone()
+
+        cur.execute("""
+            SELECT MAX(new_expiry)
+            FROM access_events
+            WHERE telegram_id = %s
+              AND event_type = ANY(%s)
+              AND new_expiry IS NOT NULL
+        """, (
+            telegram_id, list(STRIPE_ACCESS_OVERRIDE_EVENTS),
+        ))
+        manual_expiry = (cur.fetchone() or (None,))[0]
+        cur.execute("""
+            SELECT MAX(applied_expiry)
+            FROM gift_access_grants
+            WHERE recipient_telegram_id = %s
+              AND status = 'redeemed'
+              AND applied_expiry IS NOT NULL
+        """, (telegram_id,))
+        gift_expiry = (cur.fetchone() or (None,))[0]
+        cur.execute("""
+            SELECT MAX(period_end)
+            FROM payment_events
+            WHERE telegram_id = %s
+              AND payment_status = 'succeeded'
+              AND period_end IS NOT NULL
+              AND NOT (payment_kind = ANY(%s))
+        """, (
+            telegram_id, list(STRIPE_RECURRING_PAYMENT_KINDS),
+        ))
+        one_time_expiry = (cur.fetchone() or (None,))[0]
+        overrides = [value for value in (manual_expiry, gift_expiry, one_time_expiry) if value]
+        override_expiry = max(overrides) if overrides else None
+
+        effective_expiry = local_expiry
+        classification = "projection_only"
+        if status in STRIPE_ACTIVE_SUBSCRIPTION_STATUSES and period_end:
+            if local_expiry is None or local_expiry <= period_end:
+                effective_expiry = max([period_end] + overrides)
+                classification = "stripe_with_override" if override_expiry else "pure_stripe"
+            elif override_expiry and override_expiry >= local_expiry:
+                effective_expiry = max(period_end, override_expiry)
+                classification = "stripe_with_override"
+            elif proof or projection.get("live_recurring_proof"):
+                effective_expiry = period_end
+                classification = "pure_stripe" if proof else "pure_stripe_legacy"
+            else:
+                classification = "ambiguous"
+
+        upsert_stripe_link(
+            cur,
+            telegram_id,
+            stripe_customer_id=customer_id or local_customer_id,
+            stripe_subscription_id=subscription_id,
+            status=status,
+            current_period_end=projection.get("current_period_end"),
+            is_active=status in STRIPE_ACTIVE_SUBSCRIPTION_STATUSES,
+            source=source,
+        )
+        expiry_changed = effective_expiry != local_expiry
+        cur.execute("""
+            UPDATE users
+            SET expiry_date = %s,
+                auto_renew = %s,
+                stripe_customer_id = COALESCE(%s, stripe_customer_id)
+            WHERE telegram_id = %s
+              AND stripe_subscription_id = %s
+        """, (
+            effective_expiry, auto_renew, customer_id,
+            telegram_id, subscription_id,
+        ))
+        if (
+            source == "admin_command"
+            and status in STRIPE_ACTIVE_SUBSCRIPTION_STATUSES
+            and effective_expiry
+        ):
+            enqueue_automatic_membership_repair(
+                cur,
+                telegram_id,
+                effective_expiry,
+                ACCESS_RESTORE_SOURCE_AUTO_SYNC,
+                requested_by_admin_id=requested_by_admin_id,
+                reason="sync_stripe_user_active_period",
+            )
+        if expiry_changed or old_auto_renew != auto_renew or classification == "ambiguous":
+            record_access_event_cur(
+                cur,
+                telegram_id,
+                "stripe_subscription_state_synced",
+                source=source,
+                old_expiry=local_expiry,
+                new_expiry=effective_expiry,
+                stripe_event_id=stripe_event_id,
+                stripe_subscription_id=subscription_id,
+                notes=(
+                    f"status={status}; classification={classification}; "
+                    f"price={safe_log_id(projection.get('price_id'))}; "
+                    f"product={safe_log_id(projection.get('product_id'))}"
+                ),
+            )
+        conn.commit()
+        return {
+            "status": classification,
+            "updated": bool(expiry_changed or old_auto_renew != auto_renew),
+            "telegram_id": telegram_id,
+            "old_expiry": local_expiry,
+            "expiry_date": effective_expiry,
+            "stripe_expiry": period_end,
+            "auto_renew": auto_renew,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def sync_stripe_subscription_state(
+    subscription_id,
+    *,
+    source,
+    stripe_event_id=None,
+    requested_telegram_id=None,
+    requested_by_admin_id=None,
+    retrieved_subscription=None,
+    fallback_invoice=None,
+):
+    subscription = retrieved_subscription
+    if subscription is None:
+        subscription = await asyncio.to_thread(
+            stripe.Subscription.retrieve,
+            subscription_id,
+            expand=["items.data.price.product", "latest_invoice"],
+        )
+    projection = stripe_subscription_projection(subscription)
+    if projection["subscription_id"] != subscription_id:
+        return {"status": "identity_changed", "updated": False}
+    if projection["period_end"] is None:
+        invoices = [fallback_invoice] if fallback_invoice is not None else []
+        if not invoices:
+            invoice_list = await asyncio.to_thread(
+                stripe.Invoice.list,
+                subscription=subscription_id,
+                status="paid",
+                limit=5,
+            )
+            invoices = stripe_value(invoice_list, "data") or []
+        exact_periods = [
+            stripe_invoice_period_end(invoice, subscription_id)
+            for invoice in invoices
+        ]
+        exact_periods = [value for value in exact_periods if value]
+        if exact_periods:
+            projection["current_period_end"] = max(exact_periods)
+            projection["period_end"] = datetime.utcfromtimestamp(max(exact_periods))
+    if fallback_invoice is not None and stripe_value(fallback_invoice, "status") == "paid":
+        projection["live_recurring_proof"] = bool(projection.get("recurring_price"))
+    result = await run_sync_db(
+        _sync_stripe_subscription_state_db,
+        projection,
+        source=source,
+        stripe_event_id=stripe_event_id,
+        requested_telegram_id=requested_telegram_id,
+        requested_by_admin_id=requested_by_admin_id,
+    )
+    if not isinstance(result, dict):
+        return {"status": "sync_unavailable", "updated": False}
+    if result.get("status") == "ambiguous":
+        logging.warning(
+            "STRIPE_SUBSCRIPTION_SYNC_AMBIGUOUS: subscription_id=%s source=%s",
+            safe_log_id(subscription_id),
+            source,
+        )
+    return result
+
+
 async def refresh_active_stripe_subscription(
     telegram_id, stripe_subscription_id, cur=None, notify_on_failure=True,
 ):
@@ -14508,198 +14787,39 @@ async def sync_stripe_user_command(message: types.Message, command: CommandObjec
         return
 
     try:
-        subscription = await asyncio.to_thread(stripe.Subscription.retrieve, stripe_subscription_id)
+        result = await sync_stripe_subscription_state(
+            stripe_subscription_id,
+            source="admin_command",
+            requested_telegram_id=target_user_id,
+            requested_by_admin_id=message.from_user.id,
+        )
     except Exception as e:
-        logging.exception("SYNC_STRIPE_USER_SUBSCRIPTION_RETRIEVE_FAILED: telegram_id=%s", target_user_id)
-        error_ref = safe_admin_error_reference("sync_stripe_subscription_retrieve", e)
-        await message.reply(f"❌ Не удалось получить подписку из Stripe. ref: {error_ref}")
-        return
-
-    status = get_obj_value(subscription, 'status')
-    current_period_end = get_obj_value(subscription, 'current_period_end')
-    period_source = "subscription.current_period_end"
-    customer = get_obj_value(subscription, 'customer')
-    cancel_at_period_end = bool(get_obj_value(subscription, 'cancel_at_period_end'))
-    customer_id = customer if isinstance(customer, str) else get_obj_value(customer, 'id')
-    auto_renew = not cancel_at_period_end
-    period_end_text = "нет"
-
-    if not current_period_end:
-        try:
-            invoices = await asyncio.to_thread(
-                stripe.Invoice.list,
-                subscription=stripe_subscription_id,
-                limit=5
-            )
-            for invoice in (get_obj_value(invoices, 'data') or []):
-                if get_obj_value(invoice, 'status') != 'paid':
-                    continue
-                lines_data = get_obj_value(invoice, 'lines', 'data') or []
-                first_line = lines_data[0] if lines_data else None
-                period_end = get_obj_value(first_line, 'period', 'end')
-                if period_end:
-                    current_period_end = period_end
-                    period_source = "invoice.lines.data[0].period.end"
-                    break
-        except Exception as e:
-            logging.error(
-                "SYNC_STRIPE_USER_INVOICE_LIST_FAILED: telegram_id=%s, error_type=%s, error_ref=%s",
-                target_user_id,
-                type(e).__name__,
-                safe_admin_error_reference("sync_stripe_invoice_list", e),
-            )
-
-    if current_period_end:
-        period_end_dt = datetime.utcfromtimestamp(current_period_end)
-        period_end_text = period_end_dt.strftime("%d.%m.%Y %H:%M")
-
-    reply_text = None
-    write_conn = None
-    write_cur = None
-    try:
-        if status in ('active', 'trialing') and current_period_end:
-            new_expiry = datetime.utcfromtimestamp(current_period_end)
-            write_conn = get_db_conn()
-            write_cur = write_conn.cursor()
-            write_cur.execute("""
-                SELECT stripe_subscription_id, stripe_customer_id, expiry_date
-                FROM users
-                WHERE telegram_id = %s
-                FOR UPDATE
-            """, (target_user_id,))
-            current_row = write_cur.fetchone()
-            if not current_row:
-                write_conn.rollback()
-                reply_text = "❌ Пользователь не найден в базе."
-            else:
-                current_subscription_id, current_customer_id, current_old_expiry = current_row
-                if current_subscription_id != stripe_subscription_id:
-                    write_conn.rollback()
-                    reply_text = (
-                        "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
-                        f"telegram_id: {target_user_id}\n"
-                        "Данные пользователя не изменены. Повторите /sync_stripe_user, "
-                        "чтобы проверить текущую подписку."
-                    )
-                else:
-                    effective_expiry = non_decreasing_expiry(current_old_expiry, new_expiry)
-                    write_cur.execute("""
-                        UPDATE users
-                        SET paid = TRUE,
-                            expiry_date = %s,
-                            stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                            payment_failed = FALSE,
-                            payment_failed_at = NULL,
-                            last_payment_succeeded_at = NOW(),
-                            grace_period_end = NULL,
-                            reminder_sent = FALSE,
-                            auto_renew = %s,
-                            blocked_bot = FALSE
-                        WHERE telegram_id = %s
-                    """, (effective_expiry, customer_id, auto_renew, target_user_id))
-                    enqueue_automatic_membership_repair(
-                        write_cur,
-                        target_user_id,
-                        effective_expiry,
-                        ACCESS_RESTORE_SOURCE_AUTO_SYNC,
-                        requested_by_admin_id=message.from_user.id,
-                        reason="sync_stripe_user_active_period",
-                    )
-                    record_access_event_cur(
-                        write_cur,
-                        target_user_id,
-                        "manual_stripe_sync",
-                        source="admin_command",
-                        old_expiry=current_old_expiry,
-                        new_expiry=effective_expiry,
-                        stripe_subscription_id=current_subscription_id,
-                        notes=f"status={status}; auto_renew={auto_renew}; period_source={period_source}; admin_id={message.from_user.id}"
-                    )
-                    write_conn.commit()
-                    reply_text = (
-                        "✅ Stripe-синхронизация выполнена\n\n"
-                        f"telegram_id: {target_user_id}\n"
-                        f"status: {status}\n"
-                        "paid: TRUE\n"
-                        f"expiry_date: {effective_expiry.strftime('%d.%m.%Y %H:%M')}\n"
-                        f"auto_renew: {auto_renew}\n"
-                        f"period_source: {period_source}\n"
-                        f"stripe_subscription_id: {safe_log_id(current_subscription_id) or 'нет'}\n"
-                        f"stripe_customer_id: {safe_log_id(customer_id or current_customer_id) or 'нет'}"
-                    )
-        elif status in ('active', 'trialing') and not current_period_end:
-            write_conn = get_db_conn()
-            write_cur = write_conn.cursor()
-            write_cur.execute("""
-                SELECT stripe_subscription_id, stripe_customer_id, expiry_date
-                FROM users
-                WHERE telegram_id = %s
-                FOR UPDATE
-            """, (target_user_id,))
-            current_row = write_cur.fetchone()
-            if not current_row:
-                write_conn.rollback()
-                reply_text = "❌ Пользователь не найден в базе."
-            else:
-                current_subscription_id, current_customer_id, current_old_expiry = current_row
-                if current_subscription_id != stripe_subscription_id:
-                    write_conn.rollback()
-                    reply_text = (
-                        "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
-                        f"telegram_id: {target_user_id}\n"
-                        "Данные пользователя не изменены. Повторите /sync_stripe_user, "
-                        "чтобы проверить текущую подписку."
-                    )
-                else:
-                    write_cur.execute("""
-                        UPDATE users
-                        SET stripe_subscription_id = %s,
-                            stripe_customer_id = COALESCE(%s, stripe_customer_id),
-                            auto_renew = %s,
-                            payment_failed = FALSE,
-                            payment_failed_at = NULL,
-                            last_payment_succeeded_at = NOW(),
-                            grace_period_end = NULL,
-                            reminder_sent = FALSE,
-                            blocked_bot = FALSE
-                        WHERE telegram_id = %s
-                    """, (current_subscription_id, customer_id, auto_renew, target_user_id))
-                    write_conn.commit()
-                    reply_text = (
-                        "⚠️ Подписка активна, customer_id обновлен, но current_period_end не найден. expiry_date не меняла.\n\n"
-                        f"telegram_id: {target_user_id}\n"
-                        f"status: {status}\n"
-                        f"auto_renew: {auto_renew}\n"
-                        f"stripe_subscription_id: {safe_log_id(current_subscription_id) or 'нет'}\n"
-                        f"stripe_customer_id: {safe_log_id(customer_id or current_customer_id) or 'нет'}"
-                    )
-        else:
-            reply_text = (
-                "⚠️ Подписка в Stripe не активна\n\n"
-                f"telegram_id: {target_user_id}\n"
-                f"status: {status}\n"
-                f"current_period_end: {period_end_text}\n"
-                f"cancel_at_period_end: {cancel_at_period_end}\n\n"
-                "БД автоматически не обновлена до paid=True."
-            )
-    except Exception as e:
-        if write_conn:
-            write_conn.rollback()
         error_ref = safe_admin_error_reference("sync_stripe_user", e)
-        logging.error(
+        logging.exception(
             "SYNC_STRIPE_USER_FAILED: telegram_id=%s, error_type=%s, error_ref=%s",
             target_user_id,
             type(e).__name__,
             error_ref,
         )
-        reply_text = f"❌ Ошибка синхронизации. ref: {error_ref}"
-    finally:
-        if write_cur:
-            write_cur.close()
-        if write_conn:
-            write_conn.close()
-
-    await message.reply(reply_text)
+        await message.reply(f"❌ Ошибка синхронизации. ref: {error_ref}")
+        return
+    expiry = result.get("expiry_date")
+    if result.get("status") in {"identity_changed", "customer_identity_changed"}:
+        await message.reply(
+            "⚠️ Stripe subscription пользователя изменилась во время проверки\n\n"
+            f"telegram_id: {target_user_id}\n"
+            "Данные пользователя не изменены. Повторите /sync_stripe_user, "
+            "чтобы проверить текущую подписку."
+        )
+        return
+    await message.reply(
+        "✅ Stripe-синхронизация завершена\n\n"
+        f"telegram_id: {target_user_id}\n"
+        f"result: {result.get('status')}\n"
+        f"expiry_date: {expiry.strftime('%d.%m.%Y %H:%M') if expiry else 'без изменения'}\n"
+        f"auto_renew: {result.get('auto_renew')}\n"
+        f"stripe_subscription_id: {safe_log_id(stripe_subscription_id)}"
+    )
 
 @router.message(Command('expired_users'), StateFilter('*'))
 @admin_private_only(ADMIN_IDS)
@@ -17963,11 +18083,9 @@ async def stripe_webhook(request):
                 period_source = "subscription.current_period_end"
 
                 if not current_period_end:
-                    lines_data = stripe_value(invoice, 'lines', 'data') or []
-                    first_line = lines_data[0] if lines_data else None
-                    current_period_end = stripe_value(first_line, 'period', 'end')
+                    current_period_end = stripe_invoice_period_end(invoice, sub_id)
                     if current_period_end:
-                        period_source = "invoice.lines.data[0].period.end"
+                        period_source = "invoice.exact_subscription_line.period.end"
 
                 if not current_period_end:
                     invoice_id = stripe_value(invoice, 'id') or "нет"
@@ -18118,9 +18236,7 @@ async def stripe_webhook(request):
                             )
 
                 if not row:
-                    lines_data = stripe_value(invoice, 'lines', 'data') or []
-                    first_line = lines_data[0] if lines_data else None
-                    period_end = current_period_end or stripe_value(first_line, 'period', 'end')
+                    period_end = current_period_end or stripe_invoice_period_end(invoice, sub_id)
                     save_unlinked_stripe_event(
                         cur,
                         event_id,
@@ -18307,6 +18423,14 @@ async def stripe_webhook(request):
                         )
                     conn.commit()
                     reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
+                    await sync_stripe_subscription_state(
+                        sub_id,
+                        source="invoice.payment_succeeded",
+                        stripe_event_id=event_id,
+                        requested_telegram_id=telegram_id,
+                        retrieved_subscription=subscription,
+                        fallback_invoice=invoice,
+                    )
                     await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
@@ -18331,6 +18455,14 @@ async def stripe_webhook(request):
                     )
                     conn.commit()
                     reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
+                    await sync_stripe_subscription_state(
+                        sub_id,
+                        source="invoice.payment_succeeded",
+                        stripe_event_id=event_id,
+                        requested_telegram_id=telegram_id,
+                        retrieved_subscription=subscription,
+                        fallback_invoice=invoice,
+                    )
                     await mark_event_processed(event_id, claim_generation)
                     return web.Response(status=200)
 
@@ -18379,6 +18511,14 @@ async def stripe_webhook(request):
                 )
                 conn.commit()
                 reset_checkout_retry_state_after_success(telegram_id, "invoice.payment_succeeded")
+                await sync_stripe_subscription_state(
+                    sub_id,
+                    source="invoice.payment_succeeded",
+                    stripe_event_id=event_id,
+                    requested_telegram_id=telegram_id,
+                    retrieved_subscription=subscription,
+                    fallback_invoice=invoice,
+                )
                 logging.info(
                     "%s_ENQUEUED: telegram_id=%s, invoice_id=%s, effective_expiry=%s",
                     notice_marker,
@@ -19787,6 +19927,13 @@ async def stripe_webhook(request):
                         cur.close()
                     if conn:
                         conn.close()
+                if status in ("active", "trialing"):
+                    await sync_stripe_subscription_state(
+                        sub_id,
+                        source="customer.subscription.updated",
+                        stripe_event_id=event_id,
+                        requested_telegram_id=row[0] if row else None,
+                    )
 
         elif event_type == 'checkout.session.async_payment_succeeded':
             session = event_object
