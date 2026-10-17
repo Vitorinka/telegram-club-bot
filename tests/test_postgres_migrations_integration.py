@@ -14566,6 +14566,189 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         items = list_admin_subscriptions(self.get_conn, limit=50, query="phase_one", state="all")["items"]
         self.assertEqual({item["telegram_id"] for item in items}, {member})
 
+    def test_stripe_subscription_sync_is_exact_and_source_aware_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        stripe_end = datetime(2026, 11, 30, 6, 34)
+
+        def seed(user_id, local_expiry, suffix, *, with_payment_proof=True):
+            conn = self.get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO users
+                           (telegram_id, paid, expiry_date, auto_renew,
+                            stripe_customer_id, stripe_subscription_id)
+                           VALUES (%s, TRUE, %s, TRUE, %s, %s)""",
+                        (user_id, local_expiry, f"cus_sync_{suffix}", f"sub_sync_{suffix}"),
+                    )
+                    if with_payment_proof:
+                        cur.execute(
+                            """INSERT INTO payment_events
+                           (stripe_event_id,event_type,telegram_id,invoice_id,
+                            stripe_customer_id,stripe_subscription_id,payment_status,
+                            payment_kind,amount_paid,period_end,created_at)
+                           VALUES (%s,'invoice.payment_succeeded',%s,%s,%s,%s,
+                                   'succeeded','recurring',1000,%s,NOW()-INTERVAL '1 hour')""",
+                            (f"evt_sync_{suffix}", user_id, f"in_sync_{suffix}",
+                             f"cus_sync_{suffix}", f"sub_sync_{suffix}", stripe_end),
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+
+        def projection(suffix, *, live_recurring_proof=False):
+            return {
+                "subscription_id": f"sub_sync_{suffix}",
+                "customer_id": f"cus_sync_{suffix}",
+                "status": "active",
+                "period_end": stripe_end,
+                "current_period_end": int(
+                    stripe_end.replace(tzinfo=ZoneInfo("UTC")).timestamp()
+                ),
+                "cancel_at_period_end": False,
+                "price_id": "price_sync",
+                "product_id": "prod_sync",
+                "live_recurring_proof": live_recurring_proof,
+            }
+
+        seed(991001, datetime(2026, 12, 27, 23, 59, 59), "earlier")
+        seed(991002, datetime(2026, 10, 30, 6, 34), "later")
+        seed(991003, datetime(2026, 12, 27, 23, 59, 59), "manual")
+        seed(991004, datetime(2026, 12, 27, 23, 59, 59), "ambiguous")
+        seed(991005, datetime(2026, 12, 27, 23, 59, 59), "gift")
+        seed(991006, datetime(2026, 12, 27, 23, 59, 59), "one_time")
+        seed(991007, datetime(2026, 12, 27, 23, 59, 59), "legacy",
+             with_payment_proof=False)
+        seed(991008, datetime(2026, 12, 27, 23, 59, 59), "legacy_gift",
+             with_payment_proof=False)
+        seed(991009, datetime(2026, 12, 27, 23, 59, 59), "rollback")
+        seed(991010, datetime(2026, 12, 27, 23, 59, 59), "legacy_manual",
+             with_payment_proof=False)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO access_events
+                       (telegram_id,event_type,source,old_expiry,new_expiry,created_at)
+                       VALUES (991003,'manual_give_access','miniapp_admin_action',%s,%s,NOW())""",
+                    (stripe_end, datetime(2026, 12, 27, 23, 59, 59)),
+                )
+                cur.execute(
+                    "DELETE FROM payment_events WHERE telegram_id = 991004"
+                )
+                cur.execute(
+                    """INSERT INTO gift_access_grants
+                       (id,public_reference,purchaser_telegram_id,recipient_telegram_id,
+                        tariff_code,duration_days,status,token_hash,applied_at,applied_expiry)
+                       VALUES (%s,'GIFT-SYNC',1,991005,'gift_1m',30,'redeemed',%s,NOW(),%s)""",
+                    (str(uuid.uuid4()), uuid.uuid4().hex,
+                     datetime(2026, 12, 27, 23, 59, 59)),
+                )
+                cur.execute(
+                    """INSERT INTO access_events
+                       (telegram_id,event_type,source,old_expiry,new_expiry,created_at)
+                       VALUES (991010,'manual_give_access','miniapp_admin_action',
+                               %s,%s,NOW())""",
+                    (stripe_end, datetime(2026, 12, 27, 23, 59, 59)),
+                )
+                cur.execute(
+                    """INSERT INTO payment_events
+                       (stripe_event_id,event_type,telegram_id,payment_status,payment_kind,
+                        amount_paid,period_end,created_at)
+                       VALUES ('evt_sync_one_time_override','checkout.session.completed',991006,
+                               'succeeded','trial',1000,%s,NOW())""",
+                    (datetime(2026, 12, 27, 23, 59, 59),),
+                )
+                cur.execute(
+                    """INSERT INTO gift_access_grants
+                       (id,public_reference,purchaser_telegram_id,recipient_telegram_id,
+                        tariff_code,duration_days,status,token_hash,applied_at,applied_expiry)
+                       VALUES (%s,'GIFT-SYNC-LEGACY',1,991008,'gift_1m',30,
+                               'redeemed',%s,NOW(),%s)""",
+                    (str(uuid.uuid4()), uuid.uuid4().hex,
+                     datetime(2026, 12, 27, 23, 59, 59)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            down = main._sync_stripe_subscription_state_db(
+                projection("earlier"), source="test")
+            up = main._sync_stripe_subscription_state_db(
+                projection("later"), source="test")
+            manual = main._sync_stripe_subscription_state_db(
+                projection("manual"), source="test")
+            ambiguous = main._sync_stripe_subscription_state_db(
+                projection("ambiguous"), source="test")
+            gift = main._sync_stripe_subscription_state_db(
+                projection("gift"), source="test")
+            one_time = main._sync_stripe_subscription_state_db(
+                projection("one_time"), source="test")
+            legacy = main._sync_stripe_subscription_state_db(
+                projection("legacy", live_recurring_proof=True), source="test")
+            legacy_gift = main._sync_stripe_subscription_state_db(
+                projection("legacy_gift", live_recurring_proof=True), source="test")
+            legacy_manual = main._sync_stripe_subscription_state_db(
+                projection("legacy_manual", live_recurring_proof=True), source="test")
+            identity_mismatch = main._sync_stripe_subscription_state_db(
+                projection("legacy", live_recurring_proof=True), source="test",
+                requested_telegram_id=991999)
+
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn), \
+             mock.patch.object(
+                 main, "record_access_event_cur",
+                 side_effect=RuntimeError("forced audit write failure"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "forced audit write failure"):
+                main._sync_stripe_subscription_state_db(
+                    projection("rollback"), source="test")
+
+        self.assertEqual(down["status"], "pure_stripe")
+        self.assertEqual(down["expiry_date"], stripe_end)
+        self.assertEqual(up["expiry_date"], stripe_end)
+        self.assertEqual(manual["status"], "stripe_with_override")
+        self.assertEqual(manual["expiry_date"], datetime(2026, 12, 27, 23, 59, 59))
+        self.assertEqual(ambiguous["status"], "ambiguous")
+        self.assertEqual(ambiguous["expiry_date"], datetime(2026, 12, 27, 23, 59, 59))
+        self.assertEqual(gift["status"], "stripe_with_override")
+        self.assertEqual(gift["expiry_date"], datetime(2026, 12, 27, 23, 59, 59))
+        self.assertEqual(one_time["status"], "stripe_with_override")
+        self.assertEqual(one_time["expiry_date"], datetime(2026, 12, 27, 23, 59, 59))
+        self.assertEqual(legacy["status"], "pure_stripe_legacy")
+        self.assertEqual(legacy["expiry_date"], stripe_end)
+        self.assertEqual(legacy_gift["status"], "stripe_with_override")
+        self.assertEqual(
+            legacy_gift["expiry_date"], datetime(2026, 12, 27, 23, 59, 59),
+        )
+        self.assertEqual(legacy_manual["status"], "stripe_with_override")
+        self.assertEqual(
+            legacy_manual["expiry_date"], datetime(2026, 12, 27, 23, 59, 59),
+        )
+        self.assertEqual(identity_mismatch["status"], "identity_changed")
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT status,current_period_end,is_active
+                       FROM stripe_links
+                       WHERE telegram_id=991007 AND stripe_subscription_id='sub_sync_legacy'"""
+                )
+                self.assertEqual(
+                    cur.fetchone(),
+                    ("active", stripe_end, True),
+                )
+                cur.execute(
+                    "SELECT expiry_date FROM users WHERE telegram_id=991009"
+                )
+                self.assertEqual(
+                    cur.fetchone()[0], datetime(2026, 12, 27, 23, 59, 59),
+                )
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

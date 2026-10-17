@@ -1575,73 +1575,93 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         fail_params = next(params for query, params in fail_conn.cursor_obj.queries if "UPDATE message_delivery_events" in query)
         self.assertEqual(fail_params[0], "failed")
 
-    async def test_sync_stripe_user_enqueues_auto_membership_repair_stable_key(self):
-        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        user = (False, None, "sub_123", "cus_old", False, None, False)
+    async def test_sync_stripe_user_delegates_to_canonical_source_aware_sync(self):
+        user = (True, datetime(2026, 12, 27), "sub_123", "cus_old", False, None, False)
         read_conn = FakeConnection(fetches=[user])
-        write_conn = FakeConnection(fetches=[("sub_123", "cus_old", None), ("access-restore:auto-sync:123:%s" % period_end,)])
         message = FakeIncomingMessage(user_id=1)
-        subscription = SimpleNamespace(
-            status="active",
-            current_period_end=period_end,
-            customer="cus_new",
-            cancel_at_period_end=False,
-        )
-
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)), \
-             patch.object(self.main, "log_access_event", AsyncMock()):
+        result = {
+            "status": "pure_stripe", "updated": True,
+            "expiry_date": datetime(2026, 11, 30, 6, 34), "auto_renew": True,
+        }
+        with patch.object(self.main, "get_db_conn", return_value=read_conn), \
+             patch.object(self.main, "sync_stripe_subscription_state", AsyncMock(return_value=result)) as sync:
             await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
-
-        delivery = self.delivery_inserts(write_conn)[0]
-        self.assertEqual(delivery[0], "access-restore:auto-sync:123:%s" % period_end)
-        self.assertEqual(delivery[2], self.main.ACCESS_RESTORE_DELIVERY_TYPE)
-        payload = json.loads(adapted_json_value(delivery[3]))
-        self.assertEqual(payload["telegram_id"], 123)
-        self.assertEqual(payload["source"], self.main.ACCESS_RESTORE_SOURCE_AUTO_SYNC)
-        self.assertEqual(payload["reason"], "sync_stripe_user_active_period")
-        self.assertTrue(any("manual_stripe_sync" in str(params) for _, params in write_conn.cursor_obj.queries))
+        sync.assert_awaited_once_with(
+            "sub_123", source="admin_command", requested_telegram_id=123,
+            requested_by_admin_id=1,
+        )
+        self.assertIn("30.11.2026 06:34", message.replies[0][0])
         self.assertTrue(read_conn.closed)
-        self.assertTrue(write_conn.closed)
 
-    async def test_sync_stripe_user_never_shortens_existing_expiry(self):
-        stripe_expiry = datetime(2026, 10, 1)
-        cases = (
-            (datetime(2026, 9, 1), stripe_expiry, "stripe_later"),
-            (datetime(2026, 12, 1), datetime(2026, 12, 1), "existing_later"),
-            (None, stripe_expiry, "existing_null"),
-            (datetime(2025, 1, 1), stripe_expiry, "existing_past"),
+    async def test_canonical_stripe_sync_retrieves_before_db_worker(self):
+        period_end = int(datetime(2026, 11, 30, 6, 34).timestamp())
+        subscription = SimpleNamespace(
+            id="sub_123", customer="cus_123", status="active",
+            current_period_end=period_end, cancel_at_period_end=False,
+            items=SimpleNamespace(data=[]), latest_invoice=None,
+        )
+        db_result = {
+            "status": "pure_stripe", "updated": True,
+            "expiry_date": datetime(2026, 11, 30, 6, 34),
+        }
+        with patch.object(
+            self.main.stripe.Subscription, "retrieve", return_value=subscription,
+        ) as retrieve, patch.object(
+            self.main, "run_sync_db", AsyncMock(return_value=db_result),
+        ) as run_db:
+            result = await self.main.sync_stripe_subscription_state(
+                "sub_123", source="test", requested_telegram_id=123,
+            )
+        retrieve.assert_called_once_with(
+            "sub_123", expand=["items.data.price.product", "latest_invoice"],
+        )
+        self.assertIs(run_db.await_args.args[0], self.main._sync_stripe_subscription_state_db)
+        self.assertEqual(result, db_result)
+
+    def test_stripe_subscription_projection_accepts_exact_live_legacy_payment_proof(self):
+        period_end = int(datetime(2026, 11, 30, 6, 34).timestamp())
+        subscription = SimpleNamespace(
+            id="sub_legacy", customer="cus_legacy", status="active",
+            current_period_end=period_end, cancel_at_period_end=False,
+            latest_invoice=SimpleNamespace(status="paid"),
+            items=SimpleNamespace(data=[SimpleNamespace(price=SimpleNamespace(
+                id="price_recurring", product="prod_recurring",
+                recurring=SimpleNamespace(interval="month"),
+            ))]),
         )
 
-        for existing_expiry, expected_expiry, label in cases:
-            with self.subTest(label=label):
-                period_end = int(stripe_expiry.replace(tzinfo=timezone.utc).timestamp())
-                user = (False, existing_expiry, "sub_123", "cus_old", True, datetime.utcnow(), True)
-                read_conn = FakeConnection(fetches=[user])
-                write_conn = FakeConnection(fetches=[
-                    ("sub_123", "cus_old", existing_expiry),
-                    (f"access-restore:auto-sync:123:{int(expected_expiry.timestamp())}",),
-                ])
-                message = FakeIncomingMessage(user_id=1)
-                subscription = SimpleNamespace(
-                    status="active",
-                    current_period_end=period_end,
-                    customer="cus_new",
-                    cancel_at_period_end=True,
-                )
+        projection = self.main.stripe_subscription_projection(subscription)
 
-                with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-                     patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)):
-                    await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
+        self.assertTrue(projection["recurring_price"])
+        self.assertEqual(projection["latest_invoice_status"], "paid")
+        self.assertTrue(projection["live_recurring_proof"])
 
-                update_params = next(
-                    params for query, params in write_conn.cursor_obj.queries
-                    if "UPDATE users" in query and "SET paid = TRUE" in query
-                )
-                self.assertEqual(update_params, (expected_expiry, "cus_new", False, 123))
-                self.assertIn(f"expiry_date: {expected_expiry.strftime('%d.%m.%Y %H:%M')}", message.replies[0][0])
-                self.assertIn("auto_renew: False", message.replies[0][0])
-                self.assertTrue(any("manual_stripe_sync" in str(params) for _, params in write_conn.cursor_obj.queries))
+    async def test_canonical_stripe_sync_fallback_uses_only_exact_invoice_line(self):
+        exact_end = int(datetime(2026, 11, 30, 6, 34, tzinfo=timezone.utc).timestamp())
+        unrelated_end = int(datetime(2027, 1, 30, 6, 34, tzinfo=timezone.utc).timestamp())
+        subscription = SimpleNamespace(
+            id="sub_exact", customer="cus_123", status="active",
+            current_period_end=None, cancel_at_period_end=False,
+            items=SimpleNamespace(data=[]),
+        )
+        invoice = {
+            "lines": {"data": [
+                {"subscription": "sub_other", "period": {"end": unrelated_end}},
+                {"subscription": "sub_exact", "period": {"end": exact_end}},
+            ]},
+        }
+        with patch.object(
+            self.main,
+            "run_sync_db",
+            AsyncMock(return_value={"status": "pure_stripe", "updated": True}),
+        ) as run_db:
+            await self.main.sync_stripe_subscription_state(
+                "sub_exact", source="test", retrieved_subscription=subscription,
+                fallback_invoice=invoice,
+            )
+        projection = run_db.await_args.args[1]
+        self.assertEqual(projection["current_period_end"], exact_end)
+        self.assertEqual(projection["period_end"], datetime(2026, 11, 30, 6, 34))
 
     def test_non_decreasing_expiry_handles_timezone_aware_values(self):
         stripe_expiry = datetime(2026, 9, 1)
@@ -1673,116 +1693,20 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("error_type=RuntimeError", output)
         self.assertIn("error_ref=", output)
 
-    async def test_sync_stripe_user_closes_db_during_stripe_and_reply(self):
-        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        user = (False, None, "sub_123", "cus_old", False, None, False)
+    async def test_sync_stripe_user_identity_change_is_reported_without_raw_ids(self):
+        user = (False, None, "sub_A", "cus_old", True, datetime.utcnow(), False)
         read_conn = FakeConnection(fetches=[user])
-        write_conn = FakeConnection(fetches=[("sub_123", "cus_old", None), ("access-restore:auto-sync:123:%s" % period_end,)])
         message = FakeIncomingMessage(user_id=1)
-        closed_during_retrieve = []
-        closed_during_reply = []
-
-        async def reply_after_close(text, **kwargs):
-            closed_during_reply.append(write_conn.closed)
-            message.replies.append((text, kwargs))
-
-        async def to_thread(func, *args, **kwargs):
-            closed_during_retrieve.append(read_conn.closed)
-            return SimpleNamespace(
-                status="active",
-                current_period_end=period_end,
-                customer="cus_new",
-                cancel_at_period_end=False,
-            )
-
-        message.reply = reply_after_close
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(side_effect=to_thread)):
+        with patch.object(self.main, "get_db_conn", return_value=read_conn), \
+             patch.object(
+                 self.main,
+                 "sync_stripe_subscription_state",
+                 AsyncMock(return_value={"status": "identity_changed", "updated": False}),
+             ):
             await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
-
-        self.assertEqual(closed_during_retrieve, [True])
-        self.assertEqual(closed_during_reply, [True])
-
-    async def test_sync_stripe_user_closes_db_during_invoice_fallback(self):
-        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        user = (False, None, "sub_123", "cus_old", False, None, False)
-        read_conn = FakeConnection(fetches=[user])
-        write_conn = FakeConnection(fetches=[("sub_123", "cus_old", None), ("access-restore:auto-sync:123:%s" % period_end,)])
-        closed_during_calls = []
-
-        async def to_thread(func, *args, **kwargs):
-            closed_during_calls.append(read_conn.closed)
-            if len(closed_during_calls) == 1:
-                return SimpleNamespace(status="active", current_period_end=None, customer="cus_new", cancel_at_period_end=False)
-            return SimpleNamespace(data=[
-                SimpleNamespace(status="paid", lines=SimpleNamespace(data=[
-                    SimpleNamespace(period=SimpleNamespace(end=period_end))
-                ]))
-            ])
-
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(side_effect=to_thread)):
-            await self.main.sync_stripe_user_command(FakeIncomingMessage(user_id=1), SimpleNamespace(args="123"))
-
-        self.assertEqual(closed_during_calls, [True, True])
-        self.assertTrue(any("manual_stripe_sync" in str(params) for _, params in write_conn.cursor_obj.queries))
-
-    async def test_sync_stripe_user_db_failure_rolls_back_atomic_update_event_and_delivery(self):
-        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        user = (False, None, "sub_123", "cus_old", False, None, False)
-        read_conn = FakeConnection(fetches=[user])
-        write_conn = ExecuteFailingConnection()
-        subscription = SimpleNamespace(status="active", current_period_end=period_end, customer="cus_new", cancel_at_period_end=False)
-
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)):
-            await self.main.sync_stripe_user_command(FakeIncomingMessage(user_id=1), SimpleNamespace(args="123"))
-
-        self.assertEqual(write_conn.rollbacks, 1)
-        self.assertEqual(write_conn.commits, 0)
-
-    async def test_sync_stripe_user_identity_changed_does_not_update_event_or_delivery(self):
-        period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        user = (False, None, "sub_A", "cus_old", False, None, False)
-        read_conn = FakeConnection(fetches=[user])
-        write_conn = FakeConnection(fetches=[("sub_B", "cus_newer", None)])
-        message = FakeIncomingMessage(user_id=1)
-        subscription = SimpleNamespace(status="active", current_period_end=period_end, customer="cus_A", cancel_at_period_end=False)
-
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(return_value=subscription)):
-            await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
-
-        reply = message.replies[0][0]
-        self.assertIn("Stripe subscription пользователя изменилась", reply)
-        self.assertIn("Повторите /sync_stripe_user", reply)
-        self.assertNotIn("sub_A", reply)
-        self.assertNotIn("sub_B", reply)
-        self.assertEqual(write_conn.rollbacks, 1)
-        self.assertEqual(write_conn.commits, 0)
-        self.assertFalse(any("UPDATE users" in query for query, _ in write_conn.cursor_obj.queries))
-        self.assertFalse(any("manual_stripe_sync" in str(params) for _, params in write_conn.cursor_obj.queries))
-        self.assertEqual(self.delivery_inserts(write_conn), [])
-
-    async def test_sync_stripe_user_identity_changed_active_without_period_does_not_clear_failure_state(self):
-        user = (False, None, "sub_A", "cus_old", True, datetime.utcnow() + timedelta(hours=1), False)
-        read_conn = FakeConnection(fetches=[user])
-        write_conn = FakeConnection(fetches=[("sub_B", "cus_newer", None)])
-        message = FakeIncomingMessage(user_id=1)
-        subscription = SimpleNamespace(status="active", current_period_end=None, customer="cus_A", cancel_at_period_end=False)
-        invoices = SimpleNamespace(data=[])
-
-        with patch.object(self.main, "get_db_conn", side_effect=[read_conn, write_conn]), \
-             patch.object(self.main.asyncio, "to_thread", AsyncMock(side_effect=[subscription, invoices])):
-            await self.main.sync_stripe_user_command(message, SimpleNamespace(args="123"))
-
         reply = message.replies[0][0]
         self.assertIn("Stripe subscription пользователя изменилась", reply)
         self.assertNotIn("sub_A", reply)
-        self.assertNotIn("sub_B", reply)
-        self.assertEqual(write_conn.rollbacks, 1)
-        self.assertEqual(write_conn.commits, 0)
-        self.assertFalse(any("UPDATE users" in query for query, _ in write_conn.cursor_obj.queries))
 
     async def test_restore_access_stripe_identity_changed_fails_without_delivery(self):
         period_end = int((datetime.utcnow() + timedelta(days=30)).timestamp())
