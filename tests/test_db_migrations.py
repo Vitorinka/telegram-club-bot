@@ -221,6 +221,57 @@ class DbMigrationTests(unittest.TestCase):
         for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
             self.assertNotIn(destructive, sql.upper())
 
+    def test_zoom_v2_migration_is_additive_and_registered(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0036_zoom_v2_access_gating"]
+        self.assertEqual(
+            migration["tables"],
+            (
+                "bookable_classes", "class_bookings", "class_refund_operations",
+                "class_payment_operations",
+            ),
+        )
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0036_zoom_v2_access_gating.sql").read_text()
+        self.assertIn("DEFAULT 'legacy_capture_now'", sql)
+        self.assertIn("CREATE TABLE IF NOT EXISTS class_payment_operations", sql)
+        self.assertIn("UNIQUE (booking_id, operation_type, payment_generation)", sql)
+        self.assertIn("stripe_event_id TEXT UNIQUE", sql)
+        for destructive in (
+            "DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM",
+            "ALTER COLUMN", "UPDATE CLASS_BOOKINGS", "UPDATE BOOKABLE_CLASSES",
+        ):
+            self.assertNotIn(destructive, sql.upper())
+
+    def test_zoom_v2_pending_booking_type_is_forward_constraint_migration(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS[
+            "0037_zoom_v2_pending_booking_type"
+        ]
+        self.assertEqual(migration["tables"], ("class_bookings",))
+        root = Path(__file__).resolve().parents[1]
+        sql = (
+            root / "migrations" / "0037_zoom_v2_pending_booking_type.sql"
+        ).read_text()
+        self.assertIn("booking_type IN ('pending', 'subscription', 'guest')", sql)
+        self.assertIn("VALIDATE CONSTRAINT class_bookings_v2_shape_check", sql)
+        for destructive in (
+            "DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM", "UPDATE ",
+        ):
+            self.assertNotIn(destructive, sql.upper())
+
+    def test_zoom_v2_authorization_durability_is_forward_only(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS[
+            "0038_zoom_v2_authorization_durability"
+        ]
+        self.assertEqual(migration["tables"], ("class_bookings", "class_payment_operations"))
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0038_zoom_v2_authorization_durability.sql").read_text()
+        self.assertIn("stripe_capture_before", sql)
+        self.assertIn("INTERVAL '24 hours'", sql)
+        self.assertIn("request_uncertain", sql)
+        self.assertNotIn("client_secret", sql)
+        for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM", "UPDATE "):
+            self.assertNotIn(destructive, sql.upper())
+
     def test_message_delivery_due_indexes_migration_has_exact_sql(self):
         root = Path(__file__).resolve().parents[1]
         migration_sql = (root / "migrations" / "0010_message_delivery_due_indexes.sql").read_text()

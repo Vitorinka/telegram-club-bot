@@ -122,6 +122,26 @@ from bookable_classes import (
     update_admin_class,
     update_admin_class_status,
 )
+from zoom_v2_service import (
+    ZoomV2ServiceError,
+    check_v2_zoom_access,
+    create_or_get_v2_booking,
+    create_v2_class,
+    list_v2_member_classes,
+    reconcile_v2_booking_access,
+)
+from zoom_v2_payments import (
+    PAYMENT_KIND as ZOOM_V2_PAYMENT_KIND,
+    ZoomV2PaymentError,
+    apply_stripe_authorization,
+    attach_payment_intent,
+    authorization_owner,
+    mark_request_uncertain,
+    payment_terms,
+    prepare_authorization,
+    prepare_cancel_operation,
+    finish_cancel_operation,
+)
 from failed_subscription_termination import (
     RETRYABLE_STATUSES as FAILED_TERMINATION_RETRYABLE_STATUSES,
     claim_termination as claim_failed_subscription_termination,
@@ -16624,6 +16644,44 @@ async def test_grace(message: types.Message, command: CommandObject):
     await message.reply(f"✅ Установлен grace period для {user_id} на 24 часа.")
     await bot.send_message(int(user_id), "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
 
+async def process_zoom_v2_payment_intent_event(event_object, event_id):
+    metadata = stripe_value(event_object, "metadata") or {}
+    if metadata.get("payment_kind") != ZOOM_V2_PAYMENT_KIND:
+        return False
+    intent_id = stripe_value(event_object, "id")
+    intent = await asyncio.to_thread(
+        stripe.PaymentIntent.retrieve, intent_id, expand=["latest_charge"],
+    )
+    result = await run_sync_db(
+        apply_stripe_authorization, get_db_conn, intent, event_id=event_id,
+    )
+    if result.get("cancel_required"):
+        booking_id = (stripe_value(intent, "metadata") or {}).get("booking_id")
+        generation = int((stripe_value(intent, "metadata") or {}).get("payment_generation", -1))
+        operation = await run_sync_db(
+            prepare_cancel_operation, get_db_conn, booking_id, generation,
+            result.get("status"),
+        )
+        if operation["status"] != "completed":
+            try:
+                await asyncio.to_thread(
+                    stripe.PaymentIntent.cancel, operation["payment_intent_id"],
+                    idempotency_key=operation["idempotency_key"],
+                )
+            except Exception as error:
+                await run_sync_db(
+                    finish_cancel_operation, get_db_conn,
+                    operation["operation_id"], success=False,
+                    error=error.__class__.__name__,
+                )
+                raise
+            await run_sync_db(
+                finish_cancel_operation, get_db_conn,
+                operation["operation_id"], success=True,
+            )
+    return True
+
+
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -16704,6 +16762,24 @@ async def stripe_webhook(request):
             claim_result,
         )
         return web.Response(status=200)
+
+    if event_type in (
+        "payment_intent.amount_capturable_updated",
+        "payment_intent.payment_failed",
+        "payment_intent.canceled",
+    ):
+        try:
+            handled = await process_zoom_v2_payment_intent_event(event_object, event_id)
+            if handled:
+                await mark_event_processed(event_id, claim_generation)
+                return web.Response(status=200)
+        except Exception:
+            await release_event_processing(event_id, claim_generation)
+            logging.exception(
+                "ZOOM_V2_PAYMENT_WEBHOOK_FAILED event_id=%s event_type=%s",
+                safe_log_id(event_id), event_type,
+            )
+            return web.Response(status=500)
 
     try:
 
@@ -24079,6 +24155,9 @@ def _member_test_ids():
 def member_rollout_allowed(telegram_id):
     return os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true" or int(telegram_id) in _member_test_ids()
 
+def zoom_v2_api_enabled():
+    return os.getenv("ZOOM_V2_API_ENABLED", "false").strip().lower() == "true"
+
 def authenticate_member_session(request):
     try:
         raw=parse_bearer_authorization(request.headers.get("Authorization"))
@@ -24257,6 +24336,121 @@ def bookable_class_error_response(error):
     return apply_miniapp_security_headers(web.json_response(
         {"error": error.category}, status=error.status,
     ))
+
+
+def zoom_v2_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status,
+    ))
+
+
+def zoom_v2_feature_response():
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": "zoom_v2_not_enabled"}, status=404,
+    ))
+
+
+async def miniapp_member_zoom_v2_classes(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            list_v2_member_classes, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            limit=request.query.get("limit", "50"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_book(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            create_or_get_v2_booking, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    status = 200 if result.get("idempotent") else 201
+    return apply_miniapp_security_headers(web.json_response(result, status=status))
+
+
+async def miniapp_member_zoom_v2_reconcile(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            reconcile_v2_booking_access, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_access(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            check_v2_zoom_access, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_payment_terms(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    return apply_miniapp_security_headers(web.json_response(payment_terms()))
+
+
+async def miniapp_member_zoom_v2_authorize(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    try:
+        body=await request.json(); session=request["miniapp_member"]
+        prepared=await run_sync_db(prepare_authorization,get_db_conn,session.telegram_id,
+            request.match_info.get("class_id"),consent_version=body.get("consent_version"),
+            consent_hash=body.get("terms_hash"),explicit_consent=body.get("explicit_consent"))
+        owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        if owner.get("payment_intent_id"):
+            intent=await asyncio.to_thread(stripe.PaymentIntent.retrieve,owner["payment_intent_id"])
+        else:
+            try:
+                intent=await asyncio.to_thread(stripe.PaymentIntent.create,
+                    amount=1000,currency="eur",capture_method="manual",payment_method_types=["card"],
+                    metadata={"payment_kind":ZOOM_V2_PAYMENT_KIND,"booking_id":prepared["booking_id"],
+                              "payment_generation":str(prepared.get("generation") or 1)},
+                    idempotency_key=prepared["idempotency_key"])
+            except Exception:
+                await run_sync_db(mark_request_uncertain,get_db_conn,prepared["operation_id"]); raise
+            await run_sync_db(attach_payment_intent,get_db_conn,prepared["operation_id"],intent.id,
+                              getattr(getattr(intent,"last_response",None),"request_id",None))
+        return apply_miniapp_security_headers(web.json_response({"status":intent.status,
+            "client_secret":intent.client_secret,"amount":1000,"currency":"eur"}))
+    except ZoomV2PaymentError as error:
+        return zoom_v2_error_response(error)
+
+
+async def miniapp_member_zoom_v2_authorization_state(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    try:
+        session=request["miniapp_member"]
+        owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        if owner.get("payment_intent_id"):
+            intent=await asyncio.to_thread(stripe.PaymentIntent.retrieve,owner["payment_intent_id"],expand=["latest_charge"])
+            await run_sync_db(apply_stripe_authorization,get_db_conn,intent)
+            owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        owner.pop("payment_intent_id",None)
+        return apply_miniapp_security_headers(web.json_response(owner))
+    except ZoomV2PaymentError as error: return zoom_v2_error_response(error)
 
 
 async def miniapp_member_class_booking(request):
@@ -25935,6 +26129,29 @@ async def miniapp_admin_classes(request):
     return apply_miniapp_security_headers(web.json_response(result, status=201))
 
 
+async def miniapp_admin_zoom_v2_class_create(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ZoomV2ServiceError("invalid_request")
+        result = await run_sync_db(
+            create_v2_class, get_db_conn,
+            request["miniapp_admin"].telegram_id,
+            title=payload.get("title"),
+            description=payload.get("description"),
+            starts_at=payload.get("starts_at"),
+            published_at=payload.get("published_at"),
+            zoom_url=payload.get("zoom_url"),
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return zoom_v2_error_response(ZoomV2ServiceError("invalid_request"))
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
 async def miniapp_admin_class_update(request):
     try:
         result = update_admin_class(
@@ -26622,6 +26839,20 @@ def create_app():
         app.router.add_post('/api/member/classes/{class_id}/book',miniapp_member_class_booking)
     if not _route_exists(app,"GET","/api/member/classes"):
         app.router.add_get('/api/member/classes',miniapp_member_bookings)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes"):
+        app.router.add_get('/api/member/zoom-v2/classes', miniapp_member_zoom_v2_classes)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/book"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/book', miniapp_member_zoom_v2_book)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/reconcile"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/reconcile', miniapp_member_zoom_v2_reconcile)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/access"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/access', miniapp_member_zoom_v2_access)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/payment-terms"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/payment-terms', miniapp_member_zoom_v2_payment_terms)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/authorize"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/authorize', miniapp_member_zoom_v2_authorize)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/authorization"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/authorization', miniapp_member_zoom_v2_authorization_state)
     if not _route_exists(app,"GET","/api/member/content"):
         app.router.add_get('/api/member/content',miniapp_member_content_list)
     if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
@@ -26813,6 +27044,8 @@ def create_app():
         app.router.add_get('/api/admin/classes', miniapp_admin_classes)
     if not _route_exists(app, "POST", "/api/admin/classes"):
         app.router.add_post('/api/admin/classes', miniapp_admin_classes)
+    if not _route_exists(app, "POST", "/api/admin/zoom-v2/classes"):
+        app.router.add_post('/api/admin/zoom-v2/classes', miniapp_admin_zoom_v2_class_create)
     if not _route_exists(app, "PUT", "/api/admin/classes/{class_id}"):
         app.router.add_put('/api/admin/classes/{class_id}', miniapp_admin_class_update)
     if not _route_exists(app, "GET", "/api/admin/classes/{class_id}/bookings"):
