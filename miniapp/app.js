@@ -486,6 +486,9 @@
     host.append(svg);
   });
   const memberIconPaths = {
+    home: ["M4 10.5 12 4l8 6.5V20h-5v-6H9v6H4Z"],
+    library: ["M4 5.5c3-1 5-.5 8 1.5v13c-3-2-5-2.5-8-1.5ZM20 5.5c-3-1-5-.5-8 1.5v13c3-2 5-2.5 8-1.5Z"],
+    profile: ["M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM4 21c1-5 4-7 8-7s7 2 8 7"],
     strength: ["M5 9v6M8 7v10M16 7v10M19 9v6M8 12h8"],
     flexibility: ["M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM12 6v6l-5 5M12 9l6 3M12 12l4 7"],
     glutes: ["M8 5c-2 3-3 6-2 10 1 3 3 5 6 5s5-2 6-5c1-4 0-7-2-10M12 6v14"],
@@ -528,7 +531,48 @@
       container.replaceChildren(memberIcon(container.dataset.memberIcon));
     });
   };
-  const api = (path, options = {}) => fetch(path, {
+  const localMemberPreview = ["127.0.0.1", "localhost"].includes(window.location.hostname)
+    && new URLSearchParams(window.location.search).get("preview") === "member";
+  const localPreviewLessons = [
+    {content_id:"preview-mobility",content_type:"lesson",title:"Мобилити для спины",description:"Плавная практика для подвижности спины. Тренируйтесь в комфортном темпе.",duration_seconds:2160,access_level:"premium",status:"published",has_cover:false,preview_cover_url:"/miniapp/assets/member-v3/hero.jpg",has_video:true,video_media_id:"preview-video",locked:false,categories:[{slug:"mobility",title:"Мобилити"}]},
+    {content_id:"preview-posture",content_type:"lesson",title:"Шея и осанка",description:"Мягкая тренировка без оборудования.",duration_seconds:1200,access_level:"premium",status:"published",has_cover:false,preview_cover_url:"/miniapp/assets/member-v3/meditation.jpg",has_video:false,locked:false,categories:[{slug:"posture",title:"Осанка"}]},
+  ];
+  const localPreviewPayload = (path) => {
+    const access={has_active_access:true};
+    if(path === "/api/member/home") return {access,latest_lessons:localPreviewLessons,free_lessons:[],categories:[{slug:"mobility",title:"Мобилити",count:1},{slug:"posture",title:"Осанка",count:1}]};
+    if(path === "/api/member/me") return {profile:{first_name:"Виктория",username:"local_preview"},access};
+    if(path === "/api/member/classes") return {upcoming:[],history:[]};
+    if(path === "/api/member/schedule") return {has_schedule:true,classes:[{class_id:"preview-class",title:"Дыхательные практики",description:"Онлайн-занятие в Zoom",starts_at:"2026-11-08T16:00:00Z",duration_minutes:60,price_amount:1000,paid_bookings:0,capacity:20,minimum_participants:3,booking_deadline:"2026-11-08T14:00:00Z",viewer_booking_status:null,zoom_url:null}]};
+    if(path.startsWith("/api/member/content?")) return {access,items:localPreviewLessons};
+    const match=path.match(/^\/api\/member\/content\/([^/?]+)$/);
+    if(match) return localPreviewLessons.find((item)=>item.content_id === decodeURIComponent(match[1])) || localPreviewLessons[0];
+    throw new Error("local_preview_route_missing");
+  };
+  const memberHeroPhoto = document.getElementById("member-hero-photo");
+  const memberLayoutToggle = document.getElementById("member-layout-toggle");
+  const memberSideNav = document.getElementById("member-side-nav");
+  let memberDesktopExpanded = false;
+  const setMemberHeroPhoto = (photoUrl) => {
+    const fallback = "/miniapp/assets/member-v3/hero.jpg";
+    memberHeroPhoto.style.backgroundImage = `url("${photoUrl || fallback}")`;
+    memberHeroPhoto.dataset.fallback = fallback;
+  };
+  const applyMemberDesktopLayout = () => {
+    const desktop = window.matchMedia("(min-width: 900px)").matches;
+    document.body.classList.toggle("member-desktop-expanded", desktop && memberDesktopExpanded);
+    document.body.classList.toggle("member-desktop-compact", desktop && !memberDesktopExpanded);
+    memberLayoutToggle.hidden = !desktop;
+    memberLayoutToggle.textContent = memberDesktopExpanded ? "Свернуть окно ↘" : "Открыть во весь экран ↗";
+    memberSideNav.hidden = !(desktop && memberDesktopExpanded);
+  };
+  memberLayoutToggle.addEventListener("click", () => {
+    memberDesktopExpanded = !memberDesktopExpanded;
+    applyMemberDesktopLayout();
+  });
+  window.addEventListener("resize", applyMemberDesktopLayout);
+  const api = (path, options = {}) => localMemberPreview && path.startsWith("/api/member/")
+    ? Promise.resolve(localPreviewPayload(path))
+    : fetch(path, {
     method: "GET", headers: {Authorization: `Bearer ${sessionToken}`},
     cache: "no-store", credentials: "omit", signal: options.signal,
   }).then((response) => {
@@ -542,7 +586,7 @@
     if (!realMemberMode || !access) return;
     memberEntitled = Boolean(access.has_active_access);
     document.getElementById("member-continue").textContent = memberEntitled
-      ? "Выбрать тренировку"
+      ? (localMemberPreview ? "Продолжить занятие →" : "Выбрать тренировку")
       : "Получить доступ";
     const statusLabel = document.getElementById("member-profile-access");
     if (statusLabel) {
@@ -680,6 +724,10 @@
     const key=String(item.cover_media_id || "");
     const container = document.createElement("div");
     container.className = large ? "member-cover member-cover-large" : "member-cover";
+    if (localMemberPreview && item.preview_cover_url) {
+      renderMemberCoverImage(container, item, item.preview_cover_url);
+      return container;
+    }
     if (!item.has_cover || !item.cover_media_id) {
       container.append(text("span", "Материал клуба", "member-cover-placeholder"));
       return container;
@@ -761,7 +809,9 @@
     bottomNav.hidden = true;
     memberBottomNav.hidden = false;
     memberShellHeader.hidden = false;
-    document.getElementById("member-mode-label").textContent = realMemberMode ? "Закрытый клуб" : "Режим администратора";
+    document.getElementById("member-mode-label").textContent = localMemberPreview
+      ? "Локальный preview · тестовые данные"
+      : (realMemberMode ? "Закрытый клуб" : "Режим администратора");
     document.querySelectorAll(".member-admin-create").forEach((button) => { button.hidden = realMemberMode; });
     showScreen(name);
     const navigationName = (
@@ -772,7 +822,27 @@
       button.classList.toggle("active", button.dataset.memberNav === navigationName);
     });
   };
+  const hydrateMemberHomeSchedule = () => {
+    if (!realMemberMode) return Promise.resolve();
+    const title = document.getElementById("member-next-zoom-title");
+    const meta = document.getElementById("member-next-zoom-meta");
+    return api("/api/member/schedule").then((data) => {
+      const nextClass = (data.classes || []).find((item) => new Date(item.starts_at) > new Date());
+      if (!nextClass) {
+        title.textContent = "Ближайших занятий пока нет";
+        meta.textContent = "Новое расписание появится здесь после публикации.";
+        return;
+      }
+      title.textContent = nextClass.title;
+      meta.textContent = `${new Date(nextClass.starts_at).toLocaleString("ru-RU", {dateStyle:"medium",timeStyle:"short"})} · ${nextClass.duration_minutes} мин`;
+    }).catch(() => {
+      title.textContent = "Расписание временно недоступно";
+      meta.textContent = "Попробуйте открыть раздел расписания позднее.";
+    });
+  };
   const loadMemberHome = () => {
+    showMemberScreen("member-home");
+    memberHomeLessons.replaceChildren(text("p", "Загружаем материалы…", "member-loading-state"));
     return api(memberPath("/api/admin/member-preview/home", "/api/member/home")).then((data) => {
       syncMemberAccess(data.access);
       cancelMemberCoverWork();
@@ -784,17 +854,20 @@
       const freeLesson = (data.free_lessons || []).find((item) => item.content_type === "lesson");
       memberFreeSection.hidden = !freeLesson;
       if (freeLesson) memberFreeLesson.append(memberContentCard(freeLesson));
-      memberHomeCategories.replaceChildren();
-      data.categories.forEach((entry) => {
-        const card = document.createElement("article");
-        card.className = "member-category-card";
-        card.append(
-          text("strong", entry.title || memberCategoryLabel(entry.slug || entry.category)),
-          text("span", `${entry.count} ${entry.count === 1 ? "материал" : "материалов"}`)
-        );
-        memberHomeCategories.append(card);
-      });
+      if (localMemberPreview && regularLessons[0]) {
+        const resumeSection = document.getElementById("member-resume-section");
+        const item = regularLessons[0];
+        resumeSection.hidden = false;
+        document.getElementById("member-resume-title").textContent = item.title;
+        document.getElementById("member-resume-meta").textContent = "Тренировка · 30 минут";
+        document.getElementById("member-resume-progress").style.width = "60%";
+        document.getElementById("member-resume-status").textContent = "18 из 30 минут · 60%";
+        document.getElementById("member-resume-card").onclick = () => loadMemberLesson(item.content_id, item.content_type).catch(showApiError);
+      } else {
+        document.getElementById("member-resume-section").hidden = true;
+      }
       showMemberScreen("member-home");
+      return hydrateMemberHomeSchedule();
     });
   };
   const renderMemberLibrary = () => {
@@ -829,6 +902,8 @@
       });
   };
   const loadMemberLibrary = (category = "all") => {
+    showMemberScreen("member-library");
+    memberTrainingList.replaceChildren(text("p", "Загружаем тренировки…", "member-loading-state"));
     return api(memberPath("/api/admin/member-preview/content?limit=50", "/api/member/content?content_type=lesson&limit=50")).then((data) => {
       syncMemberAccess(data.access);
       memberLibraryItems = data.items;
@@ -841,6 +916,8 @@
     });
   };
   const loadMemberLesson = (contentId, contentType = "lesson") => {
+    showMemberScreen("member-lesson");
+    memberLessonContent.replaceChildren(text("p", "Загружаем урок…", "member-loading-state"));
     return api(memberPath(`/api/admin/member-preview/content/${encodeURIComponent(contentId)}?content_type=${encodeURIComponent(contentType)}`, `/api/member/content/${encodeURIComponent(contentId)}`)).then((item) => {
       cancelMemberCoverWork();
       clearMemberAudio();
@@ -940,11 +1017,29 @@
         }).catch(() => { if (generation === memberAudioGeneration) player.replaceChildren(text("p", "Аудио временно недоступно.")); });
       }
       if (realMemberMode && !item.locked && item.content_type === "lesson" && item.has_video && item.video_media_id) {
-        const generation = memberVideoGeneration;
+        const startVideo = text("button", "Начать тренировку →", "member-button member-start-lesson");
+        startVideo.type = "button";
+        memberLessonContent.append(startVideo);
+        startVideo.addEventListener("click", () => {
+          const generation = memberVideoGeneration;
+          startVideo.disabled = true;
+          startVideo.textContent = "Загружаем видео…";
+          if (localMemberPreview) {
+            const previewPlayer=document.createElement("section");
+            previewPlayer.className="member-preview-player";
+            const canvas=document.createElement("div"); canvas.className="member-preview-player-canvas";
+            canvas.append(text("strong","ПАУЗА"),text("span","16:20"),text("span","36:00"));
+            const rail=document.createElement("div"); rail.className="member-preview-player-rail"; rail.append(document.createElement("i"));
+            previewPlayer.append(canvas,rail,text("h1",item.title),text("strong","Ваш прогресс сохранён","member-preview-progress"),text("p","Продолжите с 16:20, когда вернётесь"));
+            const stats=document.createElement("div"); stats.className="member-preview-player-stats"; stats.append(text("strong","Просмотрено 16 минут"),text("p","После завершения занятие появится в вашей истории и прогрессе."));
+            previewPlayer.append(stats,text("button","Завершить просмотр","member-button"));
+            startVideo.replaceWith(previewPlayer);
+            return;
+          }
         const player = document.createElement("section");
         player.className = "member-card member-video-shell member-video-loading";
         player.append(text("strong", "Загружаем видео…"), text("p", "Урок откроется после безопасной проверки доступа."));
-        memberLessonContent.append(player);
+          startVideo.replaceWith(player);
         fetch(`/api/member/content/${encodeURIComponent(item.content_id)}/media/${encodeURIComponent(item.video_media_id)}/url`, {
           headers: {Authorization: `Bearer ${sessionToken}`}, cache: "no-store", credentials: "omit",
         }).then(async (response) => {
@@ -983,6 +1078,7 @@
           player.classList.remove("member-video-loading");
           player.replaceChildren(text("strong", "Видео временно недоступно"), text("p", "Попробуйте открыть урок ещё раз позже."));
         });
+        }, {once: true});
       } else if (!item.locked && item.content_type !== "nutrition_material" && !(item.content_type === "meditation" && item.has_audio)) {
         const video = document.createElement("section");
         video.className = "member-video-shell";
@@ -3338,6 +3434,35 @@
   };
   installAdminIcons();
   installMemberAdminCreateActions();
+  if (localMemberPreview) {
+    realMemberMode=true;
+    memberEntitled=true;
+    sessionToken="local-preview-only";
+    document.body.classList.add("member-local-preview");
+    document.getElementById("member-greeting").textContent="Здравствуйте, Виктория!";
+    document.getElementById("member-mode-label").textContent="Локальный preview · тестовые данные";
+    setMemberHeroPhoto();
+    applyMemberDesktopLayout();
+    document.getElementById("member-home-all").addEventListener("click",()=>loadMemberLibrary().catch(showApiError));
+    document.getElementById("member-home-library").addEventListener("click",()=>loadMemberLibrary().catch(showApiError));
+    document.getElementById("member-open-meditations").addEventListener("click",()=>loadMemberMeditations().catch(showApiError));
+    document.getElementById("member-open-recipes").addEventListener("click",()=>loadMemberRecipes().catch(showApiError));
+    document.getElementById("member-open-zoom").addEventListener("click",()=>loadMemberSchedule().catch(showApiError));
+    document.getElementById("member-open-schedule").addEventListener("click",()=>loadMemberSchedule().catch(showApiError));
+    document.getElementById("member-continue").addEventListener("click",()=>loadMemberLesson("preview-mobility").catch(showApiError));
+    document.getElementById("member-lesson-back").addEventListener("click",()=>loadMemberLibrary(memberLibraryCategory).catch(showApiError));
+    document.getElementById("member-library-empty-home").addEventListener("click",()=>loadMemberHome().catch(showApiError));
+    document.querySelectorAll("[data-member-category-nav]").forEach((button)=>button.addEventListener("click",()=>loadMemberLibrary(button.dataset.memberCategoryNav).catch(showApiError)));
+    memberLibrarySearch.addEventListener("input",renderMemberLibrary);
+    document.querySelectorAll("[data-member-nav]").forEach((button)=>button.addEventListener("click",()=>{
+      if(button.dataset.memberNav === "member-home") loadMemberHome().catch(showApiError);
+      else if(button.dataset.memberNav === "member-library") loadMemberLibrary().catch(showApiError);
+      else showMemberScreen(button.dataset.memberNav);
+    }));
+    hydrateMemberIcons();
+    loadMemberHome().catch(showApiError);
+    return;
+  }
   if (!webApp || !webApp.initData) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
@@ -3520,10 +3645,12 @@
   };
   memberMeditationSearch.addEventListener("input", debounceMemberRender(renderMemberMeditations));
   document.getElementById("member-open-recipes").addEventListener("click", () => loadMemberRecipes().catch(showApiError));
-  document.getElementById("member-open-nutrition").addEventListener("click", () => loadMemberNutrition().catch(showApiError));
+  const memberOpenNutrition = document.getElementById("member-open-nutrition");
+  if (memberOpenNutrition) memberOpenNutrition.addEventListener("click", () => loadMemberNutrition().catch(showApiError));
   memberNutritionSearch.addEventListener("input", debounceMemberRender(renderMemberNutrition));
   memberRecipeSearch.addEventListener("input", debounceMemberRender(renderMemberRecipes));
   document.getElementById("member-open-schedule").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
+  document.getElementById("member-open-zoom").addEventListener("click", () => loadMemberSchedule().catch(showApiError));
   document.getElementById("class-create-toggle").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=!classCreateForm.hidden; if(!classCreateForm.hidden) classCreateForm.reset(); });
   document.getElementById("class-create-cancel").addEventListener("click",()=>{ editingClassId=null; classCreateForm.hidden=true; classCreateForm.reset(); });
   classCreateForm.addEventListener("submit",(event)=>{
@@ -3750,6 +3877,8 @@
     const profileName=document.getElementById("member-profile-name");
     if (profileName) profileName.textContent=session.profile && session.profile.first_name ? session.profile.first_name : "Профиль";
     syncMemberAccess(session.access);
+    setMemberHeroPhoto(webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user.photo_url : "");
+    applyMemberDesktopLayout();
     return {admin:false,identityData:null};
   }).then(({admin,identityData}) => {
     if (!admin) return loadMemberHome();

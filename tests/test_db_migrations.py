@@ -218,6 +218,17 @@ class DbMigrationTests(unittest.TestCase):
         sql = (root / "migrations" / "0035_r2_content_media.sql").read_text()
         self.assertIn("storage_kind IN ('telegram_file_id', 'r2')", sql)
         self.assertIn("2147483648", sql)
+
+    def test_renewal_notification_history_migration_is_additive(self):
+        migration = MIGRATION_BASELINE_REQUIREMENTS["0039_renewal_notification_history"]
+        self.assertEqual(migration["tables"], ("message_delivery_events",))
+        self.assertIn("telegram_message_id", migration["columns"]["message_delivery_events"])
+        root = Path(__file__).resolve().parents[1]
+        sql = (root / "migrations" / "0039_renewal_notification_history.sql").read_text()
+        for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
+            self.assertNotIn(destructive, sql.upper())
+        self.assertIn("renewal_warning_3d", sql)
+        self.assertIn("renewal_warning_1d", sql)
         for destructive in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
             self.assertNotIn(destructive, sql.upper())
 

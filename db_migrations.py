@@ -1071,6 +1071,28 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0039_renewal_notification_history": {
+        "tables": ("message_delivery_events",),
+        "columns": {
+            "message_delivery_events": (
+                "stripe_subscription_id", "billing_reference", "notification_kind",
+                "scheduled_for", "amount_minor", "currency", "telegram_message_id",
+            ),
+        },
+        "indexes": ("message_delivery_events_renewal_history_idx",),
+        "constraints": {
+            "message_delivery_events_renewal_kind_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("notification_kind", "renewal_warning_3d", "renewal_warning_1d"),
+                "validated": False,
+            },
+            "message_delivery_events_renewal_amount_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("amount_minor", ">=", "0"),
+                "validated": False,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

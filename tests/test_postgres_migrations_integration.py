@@ -323,6 +323,33 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
 
+    def test_renewal_warning_history_is_durable_and_idempotent_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        billing_at = datetime.utcnow() + timedelta(days=3)
+        snapshot = {
+            "stripe_subscription_id": "sub_renewal_history",
+            "billing_reference": "a" * 64,
+            "billing_at": billing_at,
+            "amount_minor": 4250,
+            "currency": "eur",
+        }
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertTrue(main.persist_renewal_warning(98001, snapshot, "renewal_warning_3d"))
+            self.assertFalse(main.persist_renewal_warning(98001, snapshot, "renewal_warning_3d"))
+        row = self.query_one(
+            """
+            SELECT COUNT(*), MIN(stripe_subscription_id), MIN(billing_reference),
+                   MIN(notification_kind), MIN(amount_minor), MIN(currency), MIN(status)
+            FROM message_delivery_events
+            WHERE telegram_id = 98001
+            """
+        )
+        self.assertEqual(
+            row,
+            (1, "sub_renewal_history", "a" * 64, "renewal_warning_3d", 4250, "eur", "pending"),
+        )
+
     def test_miniapp_admin_sessions_migration_is_idempotent_and_constrained(self):
         first = run_migrations(self.get_conn)
         second = run_migrations(self.get_conn)
@@ -864,8 +891,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 39,
-            "latest": "0038_zoom_v2_authorization_durability",
+            "count": 40,
+            "latest": "0039_renewal_notification_history",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2421,7 +2448,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 39)
+        self.assertEqual(len(migrations), 40)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -13973,10 +14000,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         removal_incident = system["removals"]["latest_retryable_incident"]
         self.assertTrue(removal_incident.startswith("removal:"))
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 39)
+        self.assertEqual(system["migrations"]["count"], 40)
         self.assertEqual(
             system["migrations"]["latest"],
-            "0038_zoom_v2_authorization_durability",
+            "0039_renewal_notification_history",
         )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)
