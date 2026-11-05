@@ -3370,7 +3370,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(stored_before, expected_0036)
 
         upgraded = run_migrations(self.get_conn)
-        self.assertEqual(upgraded["applied"][-1], "0038_zoom_v2_authorization_durability")
+        self.assertIn("0038_zoom_v2_authorization_durability", upgraded["applied"])
+        self.assertEqual(upgraded["applied"][-1], "0039_renewal_notification_history")
         self.assertEqual(self.query_one(
             "SELECT checksum FROM schema_migrations "
             "WHERE version='0036_zoom_v2_access_gating'"
@@ -3418,7 +3419,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             (legacy["class_id"],),
         )
         result = run_migrations(self.get_conn)
-        self.assertEqual(result["applied"][-1], "0038_zoom_v2_authorization_durability")
+        self.assertIn("0038_zoom_v2_authorization_durability", result["applied"])
+        self.assertEqual(result["applied"][-1], "0039_renewal_notification_history")
         self.assertEqual(self.query_one(
             "SELECT title,status,booking_model FROM bookable_classes WHERE class_id=%s",
             (legacy["class_id"],),
