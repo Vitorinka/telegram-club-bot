@@ -118,6 +118,7 @@
     if (preflightError) return Promise.resolve({status: "preflight_failed", error: preflightError, draft: null});
     let draft;
     let stage = "create";
+    let activeMedia = null;
     return createDraft().then((created) => {
       draft = created;
       stage = "domain";
@@ -125,13 +126,16 @@
     }).then(() => {
       stage = "media";
       return files.reduce(
-        (chain, [mediaType, file]) => chain.then(() => attachMedia(draft, mediaType, file)),
+        (chain, [mediaType, file]) => chain.then(() => {
+          activeMedia = file ? {mediaType, file} : null;
+          return attachMedia(draft, mediaType, file);
+        }),
         Promise.resolve(),
       );
     }).then(() => ({status: "completed", draft})).catch((error) => {
       if (!draft) throw error;
       const status = stage === "domain" ? "domain_failed" : "media_failed";
-      return openDraft(draft).then(() => ({status, error, draft}));
+      return openDraft(draft).then(() => ({status, error, draft, failedMedia: status === "media_failed" ? activeMedia : null}));
     });
   };
   const memberVideoSource = async ({media, sessionToken, fetchMedia = fetch, createObjectUrl = URL.createObjectURL}) => {
@@ -162,7 +166,7 @@
     module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft, memberVideoSource};
     return;
   }
-  const webApp = window.Telegram && window.Telegram.WebApp;
+  const webApp = (window.Telegram && window.Telegram.WebApp) || {};
   const status = document.getElementById("status");
   const identity = document.getElementById("identity");
   const telegramId = document.getElementById("telegram-id");
@@ -282,6 +286,7 @@
   const contentCreateSteps = document.getElementById("content-create-steps");
   const contentCreateCoverFile = document.getElementById("content-create-cover-file");
   const contentCreateVideoFile = document.getElementById("content-create-video-file");
+  const contentCreateVideoSelection = document.getElementById("content-create-video-selection");
   const contentCreateAudioFile = document.getElementById("content-create-audio-file");
   const contentCreateVideoLabel = document.getElementById("content-create-video-label");
   const contentCreateAudioLabel = document.getElementById("content-create-audio-label");
@@ -316,11 +321,13 @@
   const contentAudioCurrent = document.getElementById("content-audio-current");
   const contentCoverFile = document.getElementById("content-cover-file");
   const contentVideoFile = document.getElementById("content-video-file");
+  const contentVideoSelection = document.getElementById("content-video-selection");
   const contentAudioFile = document.getElementById("content-audio-file");
   const contentMediaConfirmation = document.getElementById("content-media-confirmation");
   const contentMediaPreview = document.getElementById("content-media-preview");
   const contentMediaSummary = document.getElementById("content-media-summary");
   const contentMediaMessage = document.getElementById("content-media-message");
+  const contentMediaProgress = document.getElementById("content-media-progress");
   const contentMediaConfirm = document.getElementById("content-media-confirm");
   const contentMediaCancel = document.getElementById("content-media-cancel");
   const contentLifecycleCard = document.getElementById("content-lifecycle-card");
@@ -396,6 +403,8 @@
   let contentMediaUploadId = null;
   let contentMediaPendingFile = null;
   let contentMediaPendingType = null;
+  let contentMediaUploadInFlight = false;
+  let contentCreateInFlight = false;
   let objectStorageStatusPromise = null;
   let contentMediaLocalUrl = null;
   let contentMediaLocalType = null;
@@ -533,6 +542,22 @@
   };
   const localMemberPreview = ["127.0.0.1", "localhost"].includes(window.location.hostname)
     && new URLSearchParams(window.location.search).get("preview") === "member";
+  const localAdminContentPreview = ["127.0.0.1", "localhost"].includes(window.location.hostname)
+    && new URLSearchParams(window.location.search).get("preview") === "admin-content";
+  const localAdminPreviewItems = [
+    {content_id:"preview-draft",content_type:"lesson",title:"Мобилити для спины",description:"Мягкая практика для здоровой и подвижной спины.",duration_seconds:2160,access_level:"paid",status:"draft",version:3,revision_number:1,sort_order:10,category:null,categories:[{id:"mobility",title:"Мобилити"}],media:[],media_ready:false,updated_at:"2026-11-05T09:10:00Z"},
+    {content_id:"preview-published",content_type:"lesson",title:"Дыхательные практики",description:"Практика для восстановления и спокойствия.",duration_seconds:1200,access_level:"paid",status:"published",version:2,revision_number:1,sort_order:20,category:null,categories:[{id:"recovery",title:"Восстановление"}],media:[{media_id:"cover-1",media_type:"cover",size_bytes:420000,version:1},{media_id:"video-1",media_type:"video",size_bytes:48200000,version:1}],media_ready:true,updated_at:"2026-11-04T17:20:00Z"},
+    {content_id:"preview-archived",content_type:"meditation",title:"Медитация перед сном",description:"Короткая вечерняя практика.",duration_seconds:900,access_level:"free",status:"archived",version:4,revision_number:2,sort_order:30,category:null,categories:[{id:"recovery",title:"Восстановление"}],media:[{media_id:"audio-1",media_type:"audio",size_bytes:8100000,version:1}],media_ready:true,updated_at:"2026-10-28T12:00:00Z"},
+  ];
+  const localAdminPreviewPayload = (path) => {
+    if (path.startsWith("/api/admin/content/cms?")) return {items:localAdminPreviewItems};
+    if (path.startsWith("/api/admin/content?")) return {items:[]};
+    if (path.startsWith("/api/admin/content/categories?")) return {items:[{id:"mobility",title:"Мобилити",group:"workout"},{id:"recovery",title:"Восстановление",group:"workout"}]};
+    if (/^\/api\/admin\/content\/cms\/[^/]+\/versions$/.test(path)) return {items:[]};
+    const match=path.match(/^\/api\/admin\/content\/cms\/([^/?]+)$/);
+    if (match) return localAdminPreviewItems.find((item)=>item.content_id===decodeURIComponent(match[1])) || localAdminPreviewItems[0];
+    throw new Error("local_admin_preview_route_missing");
+  };
   const localPreviewLessons = [
     {content_id:"preview-mobility",content_type:"lesson",title:"Мобилити для спины",description:"Плавная практика для подвижности спины. Тренируйтесь в комфортном темпе.",duration_seconds:2160,access_level:"premium",status:"published",has_cover:false,preview_cover_url:"/miniapp/assets/member-v3/hero.jpg",has_video:true,video_media_id:"preview-video",locked:false,categories:[{slug:"mobility",title:"Мобилити"}]},
     {content_id:"preview-posture",content_type:"lesson",title:"Шея и осанка",description:"Мягкая тренировка без оборудования.",duration_seconds:1200,access_level:"premium",status:"published",has_cover:false,preview_cover_url:"/miniapp/assets/member-v3/meditation.jpg",has_video:false,locked:false,categories:[{slug:"posture",title:"Осанка"}]},
@@ -572,6 +597,8 @@
   window.addEventListener("resize", applyMemberDesktopLayout);
   const api = (path, options = {}) => localMemberPreview && path.startsWith("/api/member/")
     ? Promise.resolve(localPreviewPayload(path))
+    : localAdminContentPreview && path.startsWith("/api/admin/content")
+      ? Promise.resolve(localAdminPreviewPayload(path))
     : fetch(path, {
     method: "GET", headers: {Authorization: `Bearer ${sessionToken}`},
     cache: "no-store", credentials: "omit", signal: options.signal,
@@ -1287,6 +1314,7 @@
     contentMediaUploadId = null;
     contentMediaPendingFile = null;
     contentMediaPendingType = null;
+    contentMediaUploadInFlight = false;
     contentCoverFile.value = "";
     contentVideoFile.value = "";
     contentAudioFile.value = "";
@@ -1294,6 +1322,10 @@
     contentMediaPreview.replaceChildren(text("span", "Предварительный просмотр", "schedule-image-loading"));
     contentMediaSummary.replaceChildren();
     contentMediaMessage.textContent = "";
+    contentVideoSelection.textContent = "Выберите MP4 или WebM";
+    contentMediaProgress.hidden = true;
+    contentMediaProgress.setAttribute("aria-valuenow", "0");
+    contentMediaProgress.firstElementChild.style.width = "0%";
   };
   const resetScheduleUpload = () => {
     clearScheduleUploadUrls();
@@ -2897,9 +2929,11 @@
     const video = (item.media || []).find((entry) => entry.media_type === "video");
     const audio = (item.media || []).find((entry) => entry.media_type === "audio");
     contentCoverCurrent.replaceChildren(text("span", cover ? "Загружаем обложку…" : "Обложка не прикреплена", "schedule-image-loading"));
-    contentVideoCurrent.textContent = video
-      ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
-      : "Видео не прикреплено";
+    contentVideoCurrent.textContent = contentMediaPendingType === "video" && contentMediaPendingFile
+      ? `Выбрано: ${contentMediaPendingFile.name} · ещё не загружено`
+      : video
+        ? `MP4 · ${Math.ceil(video.size_bytes / 1024 / 1024)} МиБ · версия ${video.version}`
+        : "Видео не прикреплено";
     contentAudioCurrent.textContent = audio
       ? `MP3 · ${Math.ceil(audio.size_bytes / 1024 / 1024)} МиБ · версия ${audio.version}`
       : "Аудио не прикреплено";
@@ -2912,6 +2946,23 @@
     addRemove(contentVideoCurrent, video, "видео");
     addRemove(contentAudioCurrent, audio, "аудио");
   }
+  const selectedMediaLabel = (file) => file
+    ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} МиБ · ожидает загрузки`
+    : "Выберите MP4 или WebM";
+  const setContentUploadProgress = (percent) => {
+    const value = Math.max(0, Math.min(100, Number(percent) || 0));
+    contentMediaProgress.hidden = false;
+    contentMediaProgress.setAttribute("aria-valuenow", String(value));
+    contentMediaProgress.firstElementChild.style.width = `${value}%`;
+  };
+  const rememberPendingContentMedia = (mediaType, file) => {
+    contentMediaPendingFile = file || null;
+    contentMediaPendingType = file ? mediaType : null;
+    if (mediaType === "video") {
+      contentVideoSelection.textContent = selectedMediaLabel(file);
+      if (file) contentVideoCurrent.textContent = `Выбрано: ${file.name} · ещё не загружено`;
+    }
+  };
   const previewContentMediaRemove = (media, label) => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
     const mode = `media/${encodeURIComponent(media.media_id)}/remove`;
@@ -2928,6 +2979,7 @@
   };
   const showLocalContentMedia = (mediaType) => {
     const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
+    rememberPendingContentMedia(mediaType, file);
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     contentMediaLocalUrl = file ? URL.createObjectURL(file) : null;
     contentMediaLocalType = file ? mediaType : null;
@@ -2943,7 +2995,8 @@
       contentMediaConfirmation.hidden = false;
       return Promise.resolve();
     }
-    const file = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
+    const selectedFile = mediaType === "cover" ? contentCoverFile.files[0] : mediaType === "audio" ? contentAudioFile.files[0] : contentVideoFile.files[0];
+    const file = selectedFile || (contentMediaPendingType === mediaType ? contentMediaPendingFile : null);
     if (!file) {
       contentMediaMessage.textContent = "Выберите файл.";
       contentMediaConfirmation.hidden = false;
@@ -3009,29 +3062,32 @@
     });
   };
   const confirmContentMedia = () => {
-    if ((!contentMediaUploadId && !contentMediaPendingFile) || !currentCmsContent) return Promise.resolve();
+    if ((!contentMediaUploadId && !contentMediaPendingFile) || !currentCmsContent || contentMediaUploadInFlight) return Promise.resolve();
     if (!contentStudioCanStartMedia(contentEditorDirty)) {
       contentMediaMessage.textContent = "Сначала сохраните изменения материала, затем загрузите медиа.";
       return Promise.resolve();
     }
+    contentMediaUploadInFlight = true;
     contentMediaConfirm.disabled = true;
     contentMediaMessage.textContent = "Загружаем и прикрепляем…";
+    setContentUploadProgress(0);
     const operation = contentMediaPendingFile
       ? uploadContentMediaDirect(
           currentCmsContent.content_id, contentMediaPendingType,
           contentMediaPendingFile,
-          (percent) => { contentMediaMessage.textContent = `Загружаем напрямую в хранилище… ${percent}%`; },
+          (percent) => { setContentUploadProgress(percent); contentMediaMessage.textContent = `Загружаем напрямую в хранилище… ${percent}%`; },
         )
       : postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`);
     return operation
       .then((result) => {
         if (result.status !== "completed") throw new Error(result.failure_category || result.status);
+        setContentUploadProgress(100);
         return loadCmsContentDetails(currentCmsContent.content_id);
       }).catch((error) => {
         contentMediaMessage.textContent = error.message === "content_version_changed"
           ? "Материал изменился после проверки. Обновите данные и повторите."
-          : "Не удалось прикрепить файл. Повторите безопасную проверку.";
-      }).finally(() => { contentMediaConfirm.disabled = false; });
+          : "Загрузка не завершена. Файл и черновик сохранены — повторите попытку.";
+      }).finally(() => { contentMediaUploadInFlight = false; contentMediaConfirm.disabled = false; });
   };
   const cancelContentMedia = () => {
     const request = contentMediaUploadId
@@ -3062,11 +3118,15 @@
     }).then((result) => { if (result.status !== "completed") throw new Error(result.failure_category || result.status); });
   };
   const createCmsDraft = () => {
+    if (contentCreateInFlight) return Promise.resolve(null);
     const files = [
       ["cover", contentCreateCoverFile.files[0]],
       ["video", contentCreateVideoFile.files[0]],
       ["audio", contentCreateAudioFile.files[0]],
     ];
+    contentCreateInFlight = true;
+    document.getElementById("content-create-submit").disabled = true;
+    document.getElementById("content-create-publish").disabled = true;
     contentCreateMessage.textContent = "Создаём черновик…";
     const payload = {
       content_type: contentCreateType.value, title: contentCreateTitle.value,
@@ -3092,7 +3152,12 @@
         return null;
       }
       if (result.status === "media_failed") {
-        contentMediaMessage.textContent = "Черновик сохранён. Медиа загрузить не удалось. Добавьте файл ещё раз.";
+        if (result.failedMedia) {
+          rememberPendingContentMedia(result.failedMedia.mediaType, result.failedMedia.file);
+          contentMediaPreview.replaceChildren(text("span", `Выбрано: ${result.failedMedia.file.name}`, "schedule-image-loading"));
+          contentMediaConfirmation.hidden = false;
+        }
+        contentMediaMessage.textContent = "Черновик сохранён. Файл не потерян — повторите загрузку.";
         status.textContent = "Черновик сохранён, медиа требует повторной загрузки";
         return null;
       }
@@ -3115,6 +3180,10 @@
         : error.message === "unsupported_video_format" ? "Этот формат пока не поддерживается. Загрузите MP4."
         : contentErrorMessage(error, {content_type: contentCreateType.value});
       return null;
+    }).finally(() => {
+      contentCreateInFlight = false;
+      document.getElementById("content-create-submit").disabled = false;
+      document.getElementById("content-create-publish").disabled = false;
     });
   };
   const saveCmsDraft = ({reload = true} = {}) => {
@@ -3463,7 +3532,7 @@
     loadMemberHome().catch(showApiError);
     return;
   }
-  if (!webApp || !webApp.initData) {
+  if ((!webApp || !webApp.initData) && !localAdminContentPreview) {
     status.textContent = "Мини-приложение пока доступно только администраторам.";
     identity.hidden = true;
     return;
@@ -3731,11 +3800,19 @@
     contentCreateVideoLabel.hidden = recipe || nutrition;
     contentCreateAudioLabel.hidden = !meditation;
   });
+  contentCreateVideoFile.addEventListener("change", () => {
+    const file = contentCreateVideoFile.files[0];
+    contentCreateVideoSelection.textContent = selectedMediaLabel(file);
+    contentCreateVideoSelection.classList.toggle("selected", Boolean(file));
+  });
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
   document.getElementById("content-audio-validate").addEventListener("click", () => validateContentMedia("audio"));
   contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
-  contentVideoFile.addEventListener("change", () => showLocalContentMedia("video"));
+  contentVideoFile.addEventListener("change", () => {
+    showLocalContentMedia("video");
+    contentVideoSelection.classList.toggle("selected", Boolean(contentVideoFile.files[0]));
+  });
   contentAudioFile.addEventListener("change", () => showLocalContentMedia("audio"));
   contentMediaConfirm.addEventListener("click", confirmContentMedia);
   contentMediaCancel.addEventListener("click", cancelContentMedia);
@@ -3858,7 +3935,9 @@
   });
   document.getElementById("content-unsaved-discard").addEventListener("click", () => { setContentEditorDirty(false); runPendingContentNavigation(); });
   document.getElementById("content-unsaved-cancel").addEventListener("click", () => { pendingContentNavigation = null; contentUnsavedDialog.close(); });
-  fetch("/api/admin/session", {
+  const initialSession = localAdminContentPreview
+    ? Promise.resolve({session:{token:"local-admin-preview-only"},admin:true,identityData:{telegram_id:0,profile:{first_name:"Наталия",username:"local_preview"}}})
+    : fetch("/api/admin/session", {
     method: "POST", headers: {Authorization: `tma ${webApp.initData}`},
     cache: "no-store", credentials: "omit",
   }).then((response) => {
@@ -3869,8 +3948,10 @@
       if (!memberResponse.ok) throw new Error("telegram_session_expired");
       return memberResponse.json().then((session) => ({session,admin:false}));
     });
-  }).then(({session,admin}) => {
+  });
+  initialSession.then(({session,admin,identityData:previewIdentity}) => {
     sessionToken=session.token;
+    if (localAdminContentPreview) return {admin:true,identityData:previewIdentity};
     if (admin) return api("/api/admin/me").then((identityData) => ({admin:true,identityData}));
     realMemberMode=true; memberEntitled=Boolean(session.access && session.access.has_active_access);
     document.getElementById("member-greeting").textContent=session.profile && session.profile.first_name ? `Здравствуйте, ${session.profile.first_name}!` : "Здравствуйте!";
@@ -3895,6 +3976,45 @@
       requestFullscreenSupported: typeof webApp.requestFullscreen === "function",
     });
     telegramId.textContent=String(identityData.telegram_id); identity.hidden=false; bottomNav.hidden=false;
+    if (localAdminContentPreview) {
+      document.body.classList.add("admin-content-local-preview");
+      document.getElementById("member-mode-label").textContent="Локальный preview · тестовые данные";
+      const previewScreen=new URLSearchParams(window.location.search).get("screen") || "list";
+      if(previewScreen === "create") {
+        showScreen("content-create");
+        return loadTaxonomy(contentCreateType.value,contentCreateTaxonomy);
+      }
+      if(["editor","upload","success","error"].includes(previewScreen)) {
+        cmsContentItems=localAdminPreviewItems;
+        return loadCmsContentDetails("preview-draft").then(()=>{
+          if(previewScreen === "upload") {
+            document.body.classList.add("admin-content-upload-preview");
+            const previewFile={name:"mobility-spine-gentle-morning-practice-full-lesson-2026.mp4",type:"video/mp4",size:187*1024*1024};
+            rememberPendingContentMedia("video",previewFile);
+            contentVideoSelection.classList.add("selected");
+            contentMediaConfirmation.hidden=false;
+            contentMediaSummary.replaceChildren(text("strong","Мобилити для спины"),text("span","Видео"),text("span","video/mp4 · 187.0 МиБ"));
+            contentMediaMessage.textContent="Загружаем напрямую в защищённое хранилище… 64%";
+            setContentUploadProgress(64);
+          } else if(previewScreen === "success") {
+            contentLifecycleCard.hidden=false;
+            contentLifecycleTitle.textContent="Материал опубликован";
+            contentLifecycleMessage.textContent="Урок доступен участникам клуба.";
+            contentLifecyclePreview.replaceChildren(text("strong","Мобилити для спины"),text("span","✓ Видео обработано"),text("span","✓ Материал опубликован"));
+            contentLifecyclePreview.hidden=false;
+            contentLifecyclePreviewButton.hidden=true;
+          } else if(previewScreen === "error") {
+            contentLifecycleCard.hidden=false;
+            contentLifecycleTitle.textContent="Ошибка загрузки";
+            contentLifecycleMessage.textContent="Видео не загружено. Черновик и выбранный файл сохранены — повторите попытку.";
+            contentLifecyclePreview.replaceChildren(text("strong","mobility-spine.mp4"),text("span","187.0 МиБ · MP4"),text("span","Соединение прервано"));
+            contentLifecyclePreview.hidden=false;
+            contentLifecyclePreviewButton.textContent="Повторить загрузку";
+          }
+        });
+      }
+      return loadContent();
+    }
     return loadDashboard().then(() => {
       window.setTimeout(() => {
         loadAdminNotificationAcknowledgements()

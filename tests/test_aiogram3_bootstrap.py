@@ -10950,7 +10950,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("contentStudioCreateDraft", javascript)
         self.assertIn("contentStudioSaveRecipe", javascript)
 
-        self.assertIn("Черновик сохранён. Медиа загрузить не удалось.", javascript)
+        self.assertIn("Черновик сохранён. Файл не потерян — повторите загрузку.", javascript)
         self.assertIn("content-unsaved-dialog", index)
         self.assertIn("Выйти без сохранения", index)
         self.assertIn("data-studio-panel=\"editor\"", index)
