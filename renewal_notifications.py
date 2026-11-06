@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 WARNING_3D = "renewal_warning_3d"
 WARNING_1D = "renewal_warning_1d"
 WARNING_TYPES = (WARNING_3D, WARNING_1D)
+RECURRING_TERMS_VERSION = "recurring-checkout-v2"
 
 
 class RenewalNotificationError(ValueError):
@@ -38,9 +39,38 @@ def format_eur(amount_minor):
     return f"{amount:.2f}".replace(".00", "").replace(".", ",") + " €"
 
 
-def recurring_checkout_disclosure(tariff_code):
+def recurring_price_snapshot(price, tariff_code, expected_price_id):
+    validate_price_for_terms(price, tariff_code, expected_price_id=expected_price_id)
+    recurring = value(price, "recurring")
+    snapshot = {
+        "tariff_code": tariff_code,
+        "price_id": value(price, "id"),
+        "amount_minor": int(value(price, "unit_amount")),
+        "currency": str(value(price, "currency")).lower(),
+        "interval": value(recurring, "interval"),
+        "interval_count": int(value(recurring, "interval_count") or 1),
+        "terms_version": RECURRING_TERMS_VERSION,
+    }
+    snapshot["fingerprint"] = hashlib.sha256(
+        ":".join(str(snapshot[key]) for key in (
+            "tariff_code", "price_id", "amount_minor", "currency",
+            "interval", "interval_count", "terms_version",
+        )).encode()
+    ).hexdigest()
+    return snapshot
+
+
+def recurring_checkout_disclosure(tariff_code, price_snapshot):
     terms = subscription_terms(tariff_code)
-    amount = format_eur(terms["amount_minor"])
+    if (
+        not isinstance(price_snapshot, dict)
+        or price_snapshot.get("tariff_code") != tariff_code
+        or price_snapshot.get("terms_version") != RECURRING_TERMS_VERSION
+        or int(price_snapshot.get("amount_minor") or -1) != terms["amount_minor"]
+        or price_snapshot.get("currency") != "eur"
+    ):
+        raise RenewalNotificationError("unverified_recurring_terms")
+    amount = format_eur(price_snapshot["amount_minor"])
     return (
         f"Ваш абонемент — {terms['label']}, {amount}.\n\n"
         "Подписка продлевается автоматически. По окончании оплаченного периода "
@@ -51,8 +81,11 @@ def recurring_checkout_disclosure(tariff_code):
     )
 
 
-def validate_price_for_terms(price, tariff_code):
+def validate_price_for_terms(price, tariff_code, expected_price_id=None):
     terms = subscription_terms(tariff_code)
+    price_id = value(price, "id")
+    if not price_id or (expected_price_id is not None and price_id != expected_price_id):
+        raise RenewalNotificationError("stripe_price_identity_mismatch")
     if value(price, "active") is False:
         raise RenewalNotificationError("stripe_price_inactive")
     if str(value(price, "currency") or "").lower() != "eur":
@@ -76,15 +109,24 @@ def upcoming_snapshot(subscription, invoice, now=None, timezone_name="Europe/Mos
         raise RenewalNotificationError("auto_renew_disabled")
     subscription_id = value(subscription, "id")
     invoice_subscription = value(invoice, "subscription")
-    if not subscription_id or (invoice_subscription and invoice_subscription != subscription_id):
+    if not subscription_id or invoice_subscription != subscription_id:
         raise RenewalNotificationError("invoice_subscription_mismatch")
     amount_due = value(invoice, "amount_due")
     currency = str(value(invoice, "currency") or "").lower()
-    period_end = (
-        value(invoice, "next_payment_attempt")
-        or value(invoice, "period_start")
-        or value(subscription, "current_period_end")
-    )
+    current_period_end = value(subscription, "current_period_end")
+    trial_end = value(subscription, "trial_end")
+    authoritative_boundary = trial_end if status == "trialing" else current_period_end
+    invoice_boundary = value(invoice, "next_payment_attempt") or value(invoice, "period_start")
+    if not authoritative_boundary or not invoice_boundary:
+        raise RenewalNotificationError("upcoming_billing_date_unconfirmed")
+    try:
+        authoritative_boundary = int(authoritative_boundary)
+        invoice_boundary = int(invoice_boundary)
+    except (TypeError, ValueError):
+        raise RenewalNotificationError("upcoming_billing_date_unconfirmed") from None
+    if invoice_boundary != authoritative_boundary:
+        raise RenewalNotificationError("upcoming_billing_date_mismatch")
+    period_end = invoice_boundary
     if amount_due is None or int(amount_due) <= 0:
         raise RenewalNotificationError("upcoming_amount_unconfirmed")
     if not currency or not period_end:

@@ -350,12 +350,13 @@ from renewal_notifications import (
     WARNING_1D,
     WARNING_3D,
     WARNING_TYPES,
+    RECURRING_TERMS_VERSION,
     RenewalNotificationError,
     delivery_key as renewal_warning_delivery_key,
+    recurring_price_snapshot,
     recurring_checkout_disclosure,
     subscription_terms,
     upcoming_snapshot,
-    validate_price_for_terms,
     warning_text as renewal_warning_text,
 )
 from weekly_report import (
@@ -2103,9 +2104,9 @@ def get_tariffs_keyboard(show_trial=True):
     if show_trial:
         rows.append([InlineKeyboardButton(text="🌟 Пробная неделя", callback_data="sub_trial")])
     rows.extend([
-        [InlineKeyboardButton(text="💳 1 месяц (50€)", callback_data="sub_1")],
-        [InlineKeyboardButton(text="💳 6 месяцев (240€)", callback_data="sub_6")],
-        [InlineKeyboardButton(text="💳 12 месяцев (410€)", callback_data="sub_12")],
+        [InlineKeyboardButton(text="💳 1 месяц", callback_data="sub_1")],
+        [InlineKeyboardButton(text="💳 6 месяцев", callback_data="sub_6")],
+        [InlineKeyboardButton(text="💳 12 месяцев", callback_data="sub_12")],
     ])
     return inline_keyboard(rows)
 
@@ -13365,16 +13366,96 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+RECURRING_CONFIRMATION_TTL_SECONDS = 15 * 60
+
+
+def recurring_price_env_name(sub_type):
+    return {"sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}.get(sub_type)
+
+
+async def current_recurring_price_snapshot(sub_type):
+    price_env = recurring_price_env_name(sub_type)
+    price_id = os.getenv(price_env) if price_env else None
+    if not price_id:
+        raise RenewalNotificationError("recurring_price_not_configured")
+    price = await asyncio.to_thread(stripe.Price.retrieve, price_id)
+    return recurring_price_snapshot(price, sub_type, price_id)
+
+
+def recurring_confirmation_is_current(confirmation, user_id, sub_type, token):
+    if not isinstance(confirmation, dict):
+        return False
+    try:
+        created_at = float(confirmation.get("created_at"))
+        confirmed_user_id = int(confirmation.get("user_id"))
+    except (TypeError, ValueError):
+        return False
+    price_env = recurring_price_env_name(sub_type)
+    return bool(
+        token
+        and confirmation.get("token") == token
+        and confirmed_user_id == int(user_id)
+        and confirmation.get("tariff_code") == sub_type
+        and confirmation.get("terms_version") == RECURRING_TERMS_VERSION
+        and confirmation.get("price_id") == (os.getenv(price_env) if price_env else None)
+        and 0 <= time.time() - created_at <= RECURRING_CONFIRMATION_TTL_SECONDS
+    )
+
+
+async def validated_current_recurring_confirmation(confirmation, sub_type):
+    if not isinstance(confirmation, dict):
+        return None
+    current_price = await current_recurring_price_snapshot(sub_type)
+    if (
+        current_price.get("fingerprint") != confirmation.get("fingerprint")
+        or current_price.get("price_id") != confirmation.get("price_id")
+        or current_price.get("terms_version") != confirmation.get("terms_version")
+    ):
+        return None
+    return current_price
+
+
 @router.callback_query(F.data.startswith('confirm_recurring:'), StateFilter('*'))
 async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMContext):
-    sub_type = callback.data.split(':', 1)[1]
-    price_env = {"sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}.get(sub_type)
-    if not price_env or not os.getenv(price_env):
-        await callback.answer("Тариф временно недоступен.", show_alert=True)
+    parts = callback.data.split(':')
+    if len(parts) != 3:
+        await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
+        return
+    _, sub_type, token = parts
+    confirmation = (await state.get_data()).get("recurring_checkout_confirmation")
+    if not recurring_confirmation_is_current(
+        confirmation, callback.from_user.id, sub_type, token,
+    ):
+        await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
         return
     try:
-        price = await asyncio.to_thread(stripe.Price.retrieve, os.getenv(price_env))
-        validate_price_for_terms(price, sub_type)
+        current_price = await validated_current_recurring_confirmation(
+            confirmation, sub_type,
+        )
+    except Exception as error:
+        logging.error(
+            "RECURRING_PRICE_CONFIRMATION_FAILED: tariff=%s, reason=%s",
+            sub_type, type(error).__name__,
+        )
+        current_price = None
+    if current_price is None:
+        await callback.answer("Условия тарифа изменились. Выберите тариф заново.", show_alert=True)
+        return
+    await process_payment(
+        callback, state, selected_sub_type=sub_type,
+        recurring_confirmation=confirmation,
+    )
+
+
+@router.callback_query(F.data.startswith('sub_'), StateFilter('*'))
+async def show_recurring_payment_terms(callback: types.CallbackQuery, state: FSMContext):
+    sub_type = callback.data
+    if sub_type == "sub_trial":
+        await process_payment(callback, state)
+        return
+    try:
+        price_snapshot = await current_recurring_price_snapshot(sub_type)
+        disclosure = recurring_checkout_disclosure(sub_type, price_snapshot)
     except Exception as error:
         logging.error(
             "RECURRING_PRICE_VALIDATION_FAILED: tariff=%s, reason=%s",
@@ -13385,26 +13466,19 @@ async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMCon
             show_alert=True,
         )
         return
-    await process_payment(callback, state, selected_sub_type=sub_type)
-
-
-@router.callback_query(F.data.startswith('sub_'), StateFilter('*'))
-async def show_recurring_payment_terms(callback: types.CallbackQuery, state: FSMContext):
-    sub_type = callback.data
-    if sub_type == "sub_trial":
-        await process_payment(callback, state)
-        return
-    try:
-        disclosure = recurring_checkout_disclosure(sub_type)
-    except RenewalNotificationError:
-        await callback.answer("Этот тариф больше недоступен.", show_alert=True)
-        return
+    confirmation_token = secrets.token_urlsafe(8)
+    await state.update_data(recurring_checkout_confirmation={
+        **price_snapshot,
+        "user_id": int(callback.from_user.id),
+        "token": confirmation_token,
+        "created_at": time.time(),
+    })
     await callback.message.answer(
         disclosure,
         reply_markup=inline_keyboard([
             [InlineKeyboardButton(
                 text="Подтверждаю и перехожу к оплате",
-                callback_data=f"confirm_recurring:{sub_type}",
+                callback_data=f"confirm_recurring:{sub_type}:{confirmation_token}",
             )],
             [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="back_to_tariffs")],
         ]),
@@ -13412,7 +13486,10 @@ async def show_recurring_payment_terms(callback: types.CallbackQuery, state: FSM
     await callback.answer()
 
 
-async def process_payment(callback: types.CallbackQuery, state: FSMContext, selected_sub_type=None):
+async def process_payment(
+    callback: types.CallbackQuery, state: FSMContext, selected_sub_type=None,
+    recurring_confirmation=None,
+):
     sub_type = selected_sub_type or callback.data
     price_map = {
         "sub_trial": "PRICE_TRIAL",
@@ -13828,6 +13905,29 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext, sele
     if not price_id:
         await callback.answer("Ошибка конфигурации тарифа.", show_alert=True)
         return
+
+    if mode == "subscription" and selected_sub_type is not None:
+        try:
+            current_price = await validated_current_recurring_confirmation(
+                recurring_confirmation, sub_type,
+            )
+        except Exception as error:
+            logging.error(
+                "RECURRING_PRICE_REVALIDATION_FAILED: tariff=%s, reason=%s",
+                sub_type, type(error).__name__,
+            )
+            await callback.answer(
+                "Условия тарифа изменились. Выберите тариф заново.",
+                show_alert=True,
+            )
+            return
+        if current_price is None:
+            await callback.answer(
+                "Условия тарифа изменились. Выберите тариф заново.",
+                show_alert=True,
+            )
+            return
+        price_id = current_price["price_id"]
 
     try:
         session_params = {
