@@ -962,6 +962,137 @@ MIGRATION_BASELINE_REQUIREMENTS = {
             },
         },
     },
+    "0036_zoom_v2_access_gating": {
+        "tables": (
+            "bookable_classes", "class_bookings", "class_refund_operations",
+            "class_payment_operations",
+        ),
+        "columns": {
+            "bookable_classes": (
+                "booking_model", "lifecycle_status", "published_at",
+                "settlement_due_at", "unlimited_capacity",
+            ),
+            "class_bookings": (
+                "booking_model", "booking_type", "access_status",
+                "payment_state", "payment_generation",
+                "stripe_authorized_at", "authorization_expires_at",
+                "consent_version", "consented_at",
+                "cancellation_requested_at", "cancellation_reason",
+                "attendance_status", "attendance_recorded_at",
+                "attendance_recorded_by", "settlement_status",
+                "settlement_due_at", "settled_at", "last_access_check_at",
+            ),
+            "class_payment_operations": (
+                "operation_id", "booking_id", "operation_type",
+                "payment_generation", "idempotency_key", "status",
+                "stripe_payment_intent_id", "stripe_event_id", "amount",
+                "currency", "owner_id", "lease_until", "claim_generation",
+                "attempt_count", "next_attempt_at", "last_error",
+                "created_at", "updated_at", "completed_at",
+            ),
+        },
+        "indexes": (
+            "bookable_classes_v2_lifecycle_idx",
+            "class_bookings_v2_access_idx",
+            "class_bookings_v2_authorization_expiry_idx",
+            "class_bookings_v2_settlement_idx",
+            "class_payment_operations_intent_type_uidx",
+            "class_payment_operations_due_idx",
+            "class_payment_operations_booking_idx",
+        ),
+        "constraints": {
+            "bookable_classes_booking_model_check": {
+                "table": "bookable_classes",
+                "definition_contains": ("legacy_capture_now", "authorization_v2"),
+                "validated": True,
+            },
+            "class_bookings_v2_shape_check": {
+                "table": "class_bookings",
+                "definition_contains": ("access_required", "booked_guest", "legacy_capture_now"),
+                "validated": True,
+            },
+            "class_payment_operations_status_check": {
+                "table": "class_payment_operations",
+                "definition_contains": ("pending", "processing", "retryable_failed", "completed"),
+                "validated": True,
+            },
+        },
+    },
+    "0037_zoom_v2_pending_booking_type": {
+        "tables": ("class_bookings",),
+        "columns": {
+            "class_bookings": (
+                "booking_model", "booking_type", "access_status",
+                "payment_state", "settlement_status",
+            ),
+        },
+        "indexes": (),
+        "constraints": {
+            "class_bookings_v2_shape_check": {
+                "table": "class_bookings",
+                "definition_contains": (
+                    "authorization_v2", "pending", "subscription", "guest",
+                    "access_required", "booked_guest",
+                ),
+                "validated": True,
+            },
+        },
+    },
+    "0038_zoom_v2_authorization_durability": {
+        "tables": ("class_bookings", "class_payment_operations"),
+        "columns": {
+            "class_bookings": (
+                "consent_terms_hash", "consent_terms_code",
+                "consent_class_ends_at", "consent_cancellation_cutoff_at",
+                "stripe_capture_before", "capture_before_verified_at",
+                "capture_before_source", "authorization_reconciliation_status",
+                "authorization_last_reconciled_at", "authorization_review_reason",
+            ),
+            "class_payment_operations": (
+                "stripe_request_id", "request_started_at", "response_recorded_at",
+                "reconciliation_status", "stripe_last_checked_at",
+                "manual_review_reason",
+            ),
+        },
+        "indexes": (
+            "class_payment_operations_stripe_request_uidx",
+            "class_payment_operations_reconciliation_idx",
+        ),
+        "constraints": {
+            "class_bookings_v2_guest_capture_fence": {
+                "table": "class_bookings",
+                "definition_contains": ("booked_guest", "verified", "24 hours"),
+                "validated": False,
+            },
+            "class_bookings_v2_capture_before_check": {
+                "table": "class_bookings",
+                "definition_contains": ("stripe_capture_before", "capture_before_verified_at"),
+                "validated": True,
+            },
+        },
+    },
+    "0039_renewal_notification_history": {
+        "tables": ("message_delivery_events",),
+        "columns": {
+            "message_delivery_events": (
+                "stripe_subscription_id", "billing_reference", "notification_kind",
+                "scheduled_for", "amount_minor", "currency", "telegram_message_id",
+            ),
+        },
+        "indexes": ("message_delivery_events_renewal_history_idx",),
+        "constraints": {
+            "message_delivery_events_renewal_kind_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("notification_kind", "renewal_warning_3d", "renewal_warning_1d"),
+                "validated": False,
+            },
+            "message_delivery_events_renewal_amount_check": {
+                "table": "message_delivery_events",
+                "definition_contains": ("amount_minor", ">=", "0"),
+                "validated": False,
+            },
+        },
+    },
 }
 
 BASELINE_REQUIRED_TABLES = MIGRATION_BASELINE_REQUIREMENTS["0002_checkout_and_hardening_tables"]["tables"] + (

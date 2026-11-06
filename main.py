@@ -122,6 +122,26 @@ from bookable_classes import (
     update_admin_class,
     update_admin_class_status,
 )
+from zoom_v2_service import (
+    ZoomV2ServiceError,
+    check_v2_zoom_access,
+    create_or_get_v2_booking,
+    create_v2_class,
+    list_v2_member_classes,
+    reconcile_v2_booking_access,
+)
+from zoom_v2_payments import (
+    PAYMENT_KIND as ZOOM_V2_PAYMENT_KIND,
+    ZoomV2PaymentError,
+    apply_stripe_authorization,
+    attach_payment_intent,
+    authorization_owner,
+    mark_request_uncertain,
+    payment_terms,
+    prepare_authorization,
+    prepare_cancel_operation,
+    finish_cancel_operation,
+)
 from failed_subscription_termination import (
     RETRYABLE_STATUSES as FAILED_TERMINATION_RETRYABLE_STATUSES,
     claim_termination as claim_failed_subscription_termination,
@@ -325,6 +345,19 @@ from scheduled_jobs import (
     process_already_claimed_delivery,
     process_claimed_delivery,
     save_delivery_invite_link,
+)
+from renewal_notifications import (
+    WARNING_1D,
+    WARNING_3D,
+    WARNING_TYPES,
+    RECURRING_TERMS_VERSION,
+    RenewalNotificationError,
+    delivery_key as renewal_warning_delivery_key,
+    recurring_price_snapshot,
+    recurring_checkout_disclosure,
+    subscription_terms,
+    upcoming_snapshot,
+    warning_text as renewal_warning_text,
 )
 from weekly_report import (
     MOSCOW_TZ,
@@ -625,6 +658,8 @@ checkout_session_cache = {}
 checkout_retry_state = {}
 checkout_session_cache_lock = asyncio.Lock()
 SCHEDULER_JOBS_REGISTERED = False
+RENEWAL_WARNINGS_ENABLED = os.getenv("RENEWAL_WARNINGS_ENABLED", "false").strip().lower() == "true"
+RENEWAL_WARNING_DEFAULT_TIMEZONE = os.getenv("RENEWAL_WARNING_DEFAULT_TIMEZONE", "Europe/Moscow")
 
 
 def inline_keyboard(rows):
@@ -2069,9 +2104,9 @@ def get_tariffs_keyboard(show_trial=True):
     if show_trial:
         rows.append([InlineKeyboardButton(text="🌟 Пробная неделя", callback_data="sub_trial")])
     rows.extend([
-        [InlineKeyboardButton(text="💳 1 месяц (50€)", callback_data="sub_1")],
-        [InlineKeyboardButton(text="💳 6 месяцев (240€)", callback_data="sub_6")],
-        [InlineKeyboardButton(text="💳 12 месяцев (410€)", callback_data="sub_12")],
+        [InlineKeyboardButton(text="💳 1 месяц", callback_data="sub_1")],
+        [InlineKeyboardButton(text="💳 6 месяцев", callback_data="sub_6")],
+        [InlineKeyboardButton(text="💳 12 месяцев", callback_data="sub_12")],
     ])
     return inline_keyboard(rows)
 
@@ -4350,6 +4385,151 @@ def enqueue_user_payment_success_message(cur, event_id, telegram_id, purpose, ex
     )
 
 
+async def retrieve_renewal_warning_snapshot(stripe_subscription_id, now=None):
+    subscription = await asyncio.to_thread(
+        stripe.Subscription.retrieve,
+        stripe_subscription_id,
+    )
+    invoice = await asyncio.to_thread(
+        stripe.Invoice.create_preview,
+        subscription=stripe_subscription_id,
+    )
+    return upcoming_snapshot(
+        subscription,
+        invoice,
+        now=now,
+        timezone_name=RENEWAL_WARNING_DEFAULT_TIMEZONE,
+    )
+
+
+def fetch_renewal_warning_candidates():
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT telegram_id, stripe_subscription_id
+            FROM users
+            WHERE paid = TRUE
+              AND auto_renew = TRUE
+              AND blocked_bot IS NOT TRUE
+              AND stripe_subscription_id IS NOT NULL
+            ORDER BY telegram_id
+            """
+        )
+        return cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
+
+
+def persist_renewal_warning(telegram_id, snapshot, warning_type):
+    key = renewal_warning_delivery_key(snapshot, warning_type)
+    payload = stripe_delivery_payload(
+        renewal_warning_text(snapshot, warning_type),
+        keyboard_kind="subscription_management",
+        stripe_subscription_id=snapshot["stripe_subscription_id"],
+        billing_reference=snapshot["billing_reference"],
+        billing_at=snapshot["billing_at"].isoformat(),
+        amount_minor=snapshot["amount_minor"],
+        currency=snapshot["currency"],
+        warning_type=warning_type,
+    )
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO message_delivery_events (
+                delivery_key, telegram_id, delivery_type, status, attempt_count,
+                payload_json, next_attempt_at, stripe_subscription_id,
+                billing_reference, notification_kind, scheduled_for,
+                amount_minor, currency
+            )
+            VALUES (%s, %s, %s, 'pending', 0, %s, NOW(), %s, %s, %s, NOW(), %s, %s)
+            ON CONFLICT (delivery_key) DO NOTHING
+            RETURNING delivery_key
+            """,
+            (
+                key, int(telegram_id), warning_type,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                snapshot["stripe_subscription_id"], snapshot["billing_reference"],
+                warning_type, snapshot["amount_minor"], snapshot["currency"],
+            ),
+        )
+        created = cur.fetchone() is not None
+        conn.commit()
+        return created
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def record_renewal_warning_skip(telegram_id, stripe_subscription_id, reason):
+    logging.warning(
+        "RENEWAL_WARNING_SKIPPED: user_hash=%s, subscription_id=%s, reason=%s",
+        safe_delivery_hash(telegram_id), safe_log_id(stripe_subscription_id), reason,
+    )
+
+
+async def enqueue_due_renewal_warnings(now=None):
+    if not RENEWAL_WARNINGS_ENABLED:
+        logging.info("RENEWAL_WARNINGS_DISABLED")
+        return {"checked": 0, "enqueued": 0, "skipped": 0}
+    checked = enqueued = skipped = 0
+    for telegram_id, stripe_subscription_id in await run_sync_db(fetch_renewal_warning_candidates):
+        checked += 1
+        try:
+            snapshot = await retrieve_renewal_warning_snapshot(stripe_subscription_id, now=now)
+            warning_type = snapshot.get("warning_type")
+            if warning_type not in WARNING_TYPES:
+                continue
+            if await run_sync_db(persist_renewal_warning, telegram_id, snapshot, warning_type):
+                enqueued += 1
+        except Exception as error:
+            skipped += 1
+            record_renewal_warning_skip(telegram_id, stripe_subscription_id, type(error).__name__)
+    logging.info(
+        "RENEWAL_WARNING_CHECK_COMPLETED: checked=%s, enqueued=%s, skipped=%s",
+        checked, enqueued, skipped,
+    )
+    return {"checked": checked, "enqueued": enqueued, "skipped": skipped}
+
+
+async def renewal_warning_delivery_is_current(payload, telegram_id):
+    expected_subscription = payload.get("stripe_subscription_id")
+    if not expected_subscription:
+        return False, "missing_subscription_identity"
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT stripe_subscription_id, auto_renew, paid
+            FROM users WHERE telegram_id = %s
+            """,
+            (int(telegram_id),),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not row or row[0] != expected_subscription or not row[1] or not row[2]:
+        return False, "local_subscription_no_longer_renewable"
+    try:
+        snapshot = await retrieve_renewal_warning_snapshot(expected_subscription)
+    except Exception as error:
+        raise RuntimeError("renewal_warning_stripe_recheck_failed") from error
+    if snapshot["billing_reference"] != payload.get("billing_reference"):
+        return False, "upcoming_invoice_changed"
+    if snapshot.get("warning_type") != payload.get("warning_type"):
+        return False, "warning_window_changed"
+    return True, None
+
+
 def enqueue_stripe_user_message(cur, event_id, telegram_id, purpose, text, keyboard_kind=None, parse_mode=None,
                                 delivery_type=None, delivery_key_override=None, **extra):
     return enqueue_message_delivery(
@@ -5670,6 +5850,10 @@ def stripe_delivery_reply_markup(payload):
         return get_failed_subscription_actions_keyboard()
     if keyboard_kind == "tariffs":
         return get_tariffs_keyboard(show_trial=bool(payload.get("show_trial", False)))
+    if keyboard_kind == "subscription_management":
+        return inline_keyboard([[
+            InlineKeyboardButton(text="Управление подпиской", callback_data="subscription_management")
+        ]])
     return None
 
 
@@ -13182,9 +13366,162 @@ async def show_choice(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+RECURRING_CONFIRMATION_TTL_SECONDS = 15 * 60
+
+
+def recurring_price_env_name(sub_type):
+    return {"sub_1": "PRICE_1M", "sub_6": "PRICE_6M", "sub_12": "PRICE_12M"}.get(sub_type)
+
+
+async def current_recurring_price_snapshot(sub_type):
+    price_env = recurring_price_env_name(sub_type)
+    price_id = os.getenv(price_env) if price_env else None
+    if not price_id:
+        raise RenewalNotificationError("recurring_price_not_configured")
+    price = await asyncio.to_thread(stripe.Price.retrieve, price_id)
+    return recurring_price_snapshot(price, sub_type, price_id)
+
+
+def recurring_confirmation_is_current(confirmation, user_id, sub_type, token):
+    if not isinstance(confirmation, dict):
+        return False
+    try:
+        created_at = float(confirmation.get("created_at"))
+        confirmed_user_id = int(confirmation.get("user_id"))
+    except (TypeError, ValueError):
+        return False
+    price_env = recurring_price_env_name(sub_type)
+    return bool(
+        token
+        and confirmation.get("token") == token
+        and confirmed_user_id == int(user_id)
+        and confirmation.get("tariff_code") == sub_type
+        and confirmation.get("terms_version") == RECURRING_TERMS_VERSION
+        and confirmation.get("price_id") == (os.getenv(price_env) if price_env else None)
+        and 0 <= time.time() - created_at <= RECURRING_CONFIRMATION_TTL_SECONDS
+    )
+
+
+async def validated_current_recurring_confirmation(confirmation, sub_type):
+    if not isinstance(confirmation, dict):
+        return None
+    current_price = await current_recurring_price_snapshot(sub_type)
+    if (
+        current_price.get("fingerprint") != confirmation.get("fingerprint")
+        or current_price.get("price_id") != confirmation.get("price_id")
+        or current_price.get("terms_version") != confirmation.get("terms_version")
+    ):
+        return None
+    return current_price
+
+
+async def consume_recurring_confirmation_once(state, token):
+    storage = getattr(state, "storage", None)
+    key = getattr(state, "key", None)
+    consume = getattr(storage, "consume_data_value_once", None)
+    if key is None or not callable(consume):
+        logging.error("RECURRING_CONFIRMATION_ATOMIC_STORAGE_UNAVAILABLE")
+        return None
+    return await consume(
+        key, "recurring_checkout_confirmation", "token", token,
+    )
+
+
+def recurring_confirmation_idempotency_seed(confirmation):
+    values = (
+        confirmation.get("terms_version"),
+        confirmation.get("user_id"),
+        confirmation.get("tariff_code"),
+        confirmation.get("price_id"),
+        confirmation.get("fingerprint"),
+        confirmation.get("token"),
+    )
+    return "recurring-confirmation:" + hashlib.sha256(
+        ":".join(str(value) for value in values).encode("utf-8")
+    ).hexdigest()
+
+
+@router.callback_query(F.data.startswith('confirm_recurring:'), StateFilter('*'))
+async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split(':')
+    if len(parts) != 3:
+        await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
+        return
+    _, sub_type, token = parts
+    candidate = (await state.get_data()).get("recurring_checkout_confirmation")
+    if not recurring_confirmation_is_current(
+        candidate, callback.from_user.id, sub_type, token,
+    ):
+        await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
+        return
+    confirmation = await consume_recurring_confirmation_once(state, token)
+    if confirmation is None:
+        await callback.answer("Это подтверждение уже использовано.", show_alert=True)
+        return
+    try:
+        current_price = await validated_current_recurring_confirmation(
+            confirmation, sub_type,
+        )
+    except Exception as error:
+        logging.error(
+            "RECURRING_PRICE_CONFIRMATION_FAILED: tariff=%s, reason=%s",
+            sub_type, type(error).__name__,
+        )
+        current_price = None
+    if current_price is None:
+        await callback.answer("Условия тарифа изменились. Выберите тариф заново.", show_alert=True)
+        return
+    await process_payment(
+        callback, state, selected_sub_type=sub_type,
+        recurring_confirmation=confirmation,
+        checkout_idempotency_seed=recurring_confirmation_idempotency_seed(confirmation),
+    )
+
+
 @router.callback_query(F.data.startswith('sub_'), StateFilter('*'))
-async def process_payment(callback: types.CallbackQuery, state: FSMContext):
+async def show_recurring_payment_terms(callback: types.CallbackQuery, state: FSMContext):
     sub_type = callback.data
+    if sub_type == "sub_trial":
+        await process_payment(callback, state)
+        return
+    try:
+        price_snapshot = await current_recurring_price_snapshot(sub_type)
+        disclosure = recurring_checkout_disclosure(sub_type, price_snapshot)
+    except Exception as error:
+        logging.error(
+            "RECURRING_PRICE_VALIDATION_FAILED: tariff=%s, reason=%s",
+            sub_type, type(error).__name__,
+        )
+        await callback.answer(
+            "Не удалось подтвердить условия тарифа в Stripe. Попробуйте позже.",
+            show_alert=True,
+        )
+        return
+    confirmation_token = secrets.token_urlsafe(8)
+    await state.update_data(recurring_checkout_confirmation={
+        **price_snapshot,
+        "user_id": int(callback.from_user.id),
+        "token": confirmation_token,
+        "created_at": time.time(),
+    })
+    await callback.message.answer(
+        disclosure,
+        reply_markup=inline_keyboard([
+            [InlineKeyboardButton(
+                text="Подтверждаю и перехожу к оплате",
+                callback_data=f"confirm_recurring:{sub_type}:{confirmation_token}",
+            )],
+            [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="back_to_tariffs")],
+        ]),
+    )
+    await callback.answer()
+
+
+async def process_payment(
+    callback: types.CallbackQuery, state: FSMContext, selected_sub_type=None,
+    recurring_confirmation=None, checkout_idempotency_seed=None,
+):
+    sub_type = selected_sub_type or callback.data
     price_map = {
         "sub_trial": "PRICE_TRIAL",
         "sub_1": "PRICE_1M",
@@ -13600,6 +13937,29 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка конфигурации тарифа.", show_alert=True)
         return
 
+    if mode == "subscription" and selected_sub_type is not None:
+        try:
+            current_price = await validated_current_recurring_confirmation(
+                recurring_confirmation, sub_type,
+            )
+        except Exception as error:
+            logging.error(
+                "RECURRING_PRICE_REVALIDATION_FAILED: tariff=%s, reason=%s",
+                sub_type, type(error).__name__,
+            )
+            await callback.answer(
+                "Условия тарифа изменились. Выберите тариф заново.",
+                show_alert=True,
+            )
+            return
+        if current_price is None:
+            await callback.answer(
+                "Условия тарифа изменились. Выберите тариф заново.",
+                show_alert=True,
+            )
+            return
+        price_id = current_price["price_id"]
+
     try:
         session_params = {
             'payment_method_types': ['card'],
@@ -13626,7 +13986,10 @@ async def process_payment(callback: types.CallbackQuery, state: FSMContext):
         claim_cur = claim_conn.cursor()
         checkout_record = None
         try:
-            claim_result = claim_checkout_session_record(claim_cur, user_id, sub_type, mode)
+            claim_result = claim_checkout_session_record(
+                claim_cur, user_id, sub_type, mode,
+                idempotency_seed=checkout_idempotency_seed,
+            )
             checkout_record = claim_result["record"]
             claim_conn.commit()
         finally:
@@ -13922,6 +14285,58 @@ async def cancel_subscription(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Ошибка отмены подписки {safe_log_id(sub_id)}: {e}")
         await callback.answer("Ошибка при отмене. Напишите администратору.", show_alert=True)
+
+
+@router.callback_query(F.data == "subscription_management", StateFilter('*'))
+async def subscription_management(callback: types.CallbackQuery):
+    user_id = int(callback.from_user.id)
+    conn = get_db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT stripe_subscription_id, auto_renew, expiry_date FROM users WHERE telegram_id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not row or not row[0]:
+        await callback.answer("Активная Stripe-подписка не найдена.", show_alert=True)
+        return
+    subscription_id, auto_renew, expiry_date = row
+    lines = ["💳 Моя подписка", ""]
+    keyboard = []
+    if auto_renew:
+        try:
+            snapshot = await retrieve_renewal_warning_snapshot(subscription_id)
+            amount = (
+                f"{snapshot['amount_minor'] / 100:.2f} {snapshot['currency'].upper()}"
+            )
+            lines.extend([
+                f"Следующее списание: {snapshot['billing_at'].strftime('%d.%m.%Y')}",
+                f"Сумма: {amount}",
+                "Автопродление: включено",
+            ])
+        except Exception:
+            lines.extend([
+                "Автопродление: включено",
+                "Точные данные следующего счёта сейчас недоступны. Попробуйте позже.",
+            ])
+        keyboard.append([InlineKeyboardButton(
+            text="❌ Отключить автопродление", callback_data="cancel_subscription",
+        )])
+    else:
+        expiry_text = expiry_date.strftime('%d.%m.%Y') if expiry_date else "не определена"
+        lines.extend([
+            "Автопродление: отключено",
+            f"Доступ сохранён до: {expiry_text}",
+        ])
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=inline_keyboard(keyboard) if keyboard else None,
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "failed_subscription_payment_action", StateFilter('*'))
@@ -15264,6 +15679,16 @@ async def outbox_status_command(message: types.Message):
             LIMIT 10
         """)
         failed_rows = cur.fetchall()
+        cur.execute("""
+            SELECT telegram_id, notification_kind, scheduled_for, sent_at,
+                   amount_minor, currency, status, attempt_count,
+                   telegram_message_id, last_error
+            FROM message_delivery_events
+            WHERE notification_kind IN ('renewal_warning_3d', 'renewal_warning_1d')
+            ORDER BY COALESCE(sent_at, scheduled_for) DESC NULLS LAST
+            LIMIT 10
+        """)
+        renewal_rows = cur.fetchall()
     finally:
         cur.close()
         conn.close()
@@ -15310,6 +15735,25 @@ async def outbox_status_command(message: types.Message):
                 f"error_category: {safe_error_category(last_error)}",
                 "",
             ])
+    if renewal_rows:
+        lines.extend(["", "Recent renewal warnings:"])
+        for row in renewal_rows:
+            (
+                telegram_id, notification_kind, scheduled_for, sent_at,
+                amount_minor, currency, status, attempt_count,
+                telegram_message_id, last_error,
+            ) = row
+            amount_text = (
+                f"{int(amount_minor) / 100:.2f} {(currency or '').upper()}"
+                if amount_minor is not None else "unknown"
+            )
+            lines.append(
+                f"{notification_kind}: user={safe_log_id(telegram_id)}, amount={amount_text}, "
+                f"status={status}, scheduled={fmt_outbox_dt(scheduled_for)}, "
+                f"sent={fmt_outbox_dt(sent_at)}, attempts={attempt_count}, "
+                f"telegram_message_id={telegram_message_id or 'none'}, "
+                f"error={safe_error_category(last_error)}"
+            )
     text = "\n".join(lines).strip()
     if len(text) > 4000:
         text = text[:3997] + "..."
@@ -16624,6 +17068,44 @@ async def test_grace(message: types.Message, command: CommandObject):
     await message.reply(f"✅ Установлен grace period для {user_id} на 24 часа.")
     await bot.send_message(int(user_id), "⚠️ Тестовое: не удалось списать оплату. У вас есть 24 часа для исправления.")
 
+async def process_zoom_v2_payment_intent_event(event_object, event_id):
+    metadata = stripe_value(event_object, "metadata") or {}
+    if metadata.get("payment_kind") != ZOOM_V2_PAYMENT_KIND:
+        return False
+    intent_id = stripe_value(event_object, "id")
+    intent = await asyncio.to_thread(
+        stripe.PaymentIntent.retrieve, intent_id, expand=["latest_charge"],
+    )
+    result = await run_sync_db(
+        apply_stripe_authorization, get_db_conn, intent, event_id=event_id,
+    )
+    if result.get("cancel_required"):
+        booking_id = (stripe_value(intent, "metadata") or {}).get("booking_id")
+        generation = int((stripe_value(intent, "metadata") or {}).get("payment_generation", -1))
+        operation = await run_sync_db(
+            prepare_cancel_operation, get_db_conn, booking_id, generation,
+            result.get("status"),
+        )
+        if operation["status"] != "completed":
+            try:
+                await asyncio.to_thread(
+                    stripe.PaymentIntent.cancel, operation["payment_intent_id"],
+                    idempotency_key=operation["idempotency_key"],
+                )
+            except Exception as error:
+                await run_sync_db(
+                    finish_cancel_operation, get_db_conn,
+                    operation["operation_id"], success=False,
+                    error=error.__class__.__name__,
+                )
+                raise
+            await run_sync_db(
+                finish_cancel_operation, get_db_conn,
+                operation["operation_id"], success=True,
+            )
+    return True
+
+
 async def stripe_webhook(request):
     payload = await request.read()
     sig_header = request.headers.get('Stripe-Signature')
@@ -16704,6 +17186,24 @@ async def stripe_webhook(request):
             claim_result,
         )
         return web.Response(status=200)
+
+    if event_type in (
+        "payment_intent.amount_capturable_updated",
+        "payment_intent.payment_failed",
+        "payment_intent.canceled",
+    ):
+        try:
+            handled = await process_zoom_v2_payment_intent_event(event_object, event_id)
+            if handled:
+                await mark_event_processed(event_id, claim_generation)
+                return web.Response(status=200)
+        except Exception:
+            await release_event_processing(event_id, claim_generation)
+            logging.exception(
+                "ZOOM_V2_PAYMENT_WEBHOOK_FAILED event_id=%s event_type=%s",
+                safe_log_id(event_id), event_type,
+            )
+            return web.Response(status=500)
 
     try:
 
@@ -22524,6 +23024,15 @@ async def scheduled_check_subscriptions_and_reminders():
     )
 
 
+async def scheduled_enqueue_due_renewal_warnings():
+    return await run_scheduled_with_lock(
+        "enqueue_due_renewal_warnings",
+        datetime.utcnow().date().isoformat(),
+        enqueue_due_renewal_warnings,
+        lease_minutes=120,
+    )
+
+
 async def scheduled_process_expired_access():
     return await run_scheduled_with_lock(
         "process_expired_access",
@@ -22729,6 +23238,7 @@ async def process_pending_message_deliveries(limit=25):
         claim_generation,
     ) in deliveries:
         sending_user_message = False
+        sent_message = None
         payload = {}
         try:
             if delivery_type == TELEGRAM_UNBAN_COMPENSATION_DELIVERY_TYPE:
@@ -22747,6 +23257,24 @@ async def process_pending_message_deliveries(limit=25):
                     continue
             else:
                 payload = json.loads(payload_json or "{}")
+            if delivery_type in WARNING_TYPES:
+                still_current, stale_reason = await renewal_warning_delivery_is_current(payload, telegram_id)
+                if not still_current:
+                    cancel_conn = get_db_conn()
+                    cancel_cur = cancel_conn.cursor()
+                    try:
+                        result = mark_delivery_cancelled(
+                            cancel_cur, delivery_key, claim_generation, stale_reason,
+                        )
+                        if result == "cancelled":
+                            cancel_conn.commit()
+                        else:
+                            cancel_conn.rollback()
+                            log_stale_delivery_claim(delivery_key, "renewal_warning_cancel")
+                    finally:
+                        cancel_cur.close()
+                        cancel_conn.close()
+                    continue
             if payload.get("keyboard_kind") == "billing_portal":
                 check_conn = get_db_conn()
                 check_cur = check_conn.cursor()
@@ -23331,7 +23859,7 @@ async def process_pending_message_deliveries(limit=25):
                 if not text:
                     raise ValueError("invalid_stripe_admin_message_payload")
                 sending_user_message = True
-                await bot.send_message(
+                sent_message = await bot.send_message(
                     int(telegram_id),
                     text,
                     parse_mode=payload.get("parse_mode"),
@@ -23353,7 +23881,7 @@ async def process_pending_message_deliveries(limit=25):
                 if not text:
                     raise ValueError(f"delivery text missing for {delivery_type}")
                 sending_user_message = True
-                await bot.send_message(
+                sent_message = await bot.send_message(
                     int(telegram_id),
                     text,
                     reply_markup=await stripe_delivery_reply_markup_for_user(payload, telegram_id),
@@ -23408,6 +23936,18 @@ async def process_pending_message_deliveries(limit=25):
                         source=payload.get("source") or ACCESS_RESTORE_SOURCE_ADMIN,
                         new_expiry=effective_expiry,
                         notes=f"delivery_key={safe_delivery_hash(delivery_key)}; admin_action_id={payload.get('admin_action_id') or 'none'}",
+                    )
+                elif delivery_type in WARNING_TYPES and sending_user_message:
+                    telegram_message_id = getattr(sent_message, "message_id", None)
+                    sent_cur.execute(
+                        """
+                        UPDATE message_delivery_events
+                        SET telegram_message_id = %s
+                        WHERE delivery_key = %s
+                          AND status = 'processing'
+                          AND claim_generation = %s
+                        """,
+                        (telegram_message_id, delivery_key, claim_generation),
                     )
                 sent_result = mark_delivery_sent(sent_cur, delivery_key, claim_generation)
                 if sent_result != "sent":
@@ -23793,6 +24333,16 @@ def register_scheduler_jobs_once():
     )
 
     scheduler.add_job(
+        scheduled_enqueue_due_renewal_warnings,
+        'cron',
+        hour=9,
+        minute=0,
+        misfire_grace_time=300,
+        coalesce=True,
+        max_instances=1,
+    )
+
+    scheduler.add_job(
         scheduled_process_expired_access,
         'cron',
         minute=5,
@@ -24079,6 +24629,9 @@ def _member_test_ids():
 def member_rollout_allowed(telegram_id):
     return os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true" or int(telegram_id) in _member_test_ids()
 
+def zoom_v2_api_enabled():
+    return os.getenv("ZOOM_V2_API_ENABLED", "false").strip().lower() == "true"
+
 def authenticate_member_session(request):
     try:
         raw=parse_bearer_authorization(request.headers.get("Authorization"))
@@ -24257,6 +24810,121 @@ def bookable_class_error_response(error):
     return apply_miniapp_security_headers(web.json_response(
         {"error": error.category}, status=error.status,
     ))
+
+
+def zoom_v2_error_response(error):
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": error.category}, status=error.status,
+    ))
+
+
+def zoom_v2_feature_response():
+    return apply_miniapp_security_headers(web.json_response(
+        {"error": "zoom_v2_not_enabled"}, status=404,
+    ))
+
+
+async def miniapp_member_zoom_v2_classes(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            list_v2_member_classes, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            limit=request.query.get("limit", "50"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_book(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            create_or_get_v2_booking, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    status = 200 if result.get("idempotent") else 201
+    return apply_miniapp_security_headers(web.json_response(result, status=status))
+
+
+async def miniapp_member_zoom_v2_reconcile(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            reconcile_v2_booking_access, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_access(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        result = await run_sync_db(
+            check_v2_zoom_access, get_db_conn,
+            request["miniapp_member"].telegram_id,
+            request.match_info.get("class_id"),
+        )
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result))
+
+
+async def miniapp_member_zoom_v2_payment_terms(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    return apply_miniapp_security_headers(web.json_response(payment_terms()))
+
+
+async def miniapp_member_zoom_v2_authorize(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    try:
+        body=await request.json(); session=request["miniapp_member"]
+        prepared=await run_sync_db(prepare_authorization,get_db_conn,session.telegram_id,
+            request.match_info.get("class_id"),consent_version=body.get("consent_version"),
+            consent_hash=body.get("terms_hash"),explicit_consent=body.get("explicit_consent"))
+        owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        if owner.get("payment_intent_id"):
+            intent=await asyncio.to_thread(stripe.PaymentIntent.retrieve,owner["payment_intent_id"])
+        else:
+            try:
+                intent=await asyncio.to_thread(stripe.PaymentIntent.create,
+                    amount=1000,currency="eur",capture_method="manual",payment_method_types=["card"],
+                    metadata={"payment_kind":ZOOM_V2_PAYMENT_KIND,"booking_id":prepared["booking_id"],
+                              "payment_generation":str(prepared.get("generation") or 1)},
+                    idempotency_key=prepared["idempotency_key"])
+            except Exception:
+                await run_sync_db(mark_request_uncertain,get_db_conn,prepared["operation_id"]); raise
+            await run_sync_db(attach_payment_intent,get_db_conn,prepared["operation_id"],intent.id,
+                              getattr(getattr(intent,"last_response",None),"request_id",None))
+        return apply_miniapp_security_headers(web.json_response({"status":intent.status,
+            "client_secret":intent.client_secret,"amount":1000,"currency":"eur"}))
+    except ZoomV2PaymentError as error:
+        return zoom_v2_error_response(error)
+
+
+async def miniapp_member_zoom_v2_authorization_state(request):
+    if not zoom_v2_api_enabled(): return zoom_v2_feature_response()
+    try:
+        session=request["miniapp_member"]
+        owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        if owner.get("payment_intent_id"):
+            intent=await asyncio.to_thread(stripe.PaymentIntent.retrieve,owner["payment_intent_id"],expand=["latest_charge"])
+            await run_sync_db(apply_stripe_authorization,get_db_conn,intent)
+            owner=await run_sync_db(authorization_owner,get_db_conn,session.telegram_id,request.match_info.get("class_id"))
+        owner.pop("payment_intent_id",None)
+        return apply_miniapp_security_headers(web.json_response(owner))
+    except ZoomV2PaymentError as error: return zoom_v2_error_response(error)
 
 
 async def miniapp_member_class_booking(request):
@@ -25935,6 +26603,29 @@ async def miniapp_admin_classes(request):
     return apply_miniapp_security_headers(web.json_response(result, status=201))
 
 
+async def miniapp_admin_zoom_v2_class_create(request):
+    if not zoom_v2_api_enabled():
+        return zoom_v2_feature_response()
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ZoomV2ServiceError("invalid_request")
+        result = await run_sync_db(
+            create_v2_class, get_db_conn,
+            request["miniapp_admin"].telegram_id,
+            title=payload.get("title"),
+            description=payload.get("description"),
+            starts_at=payload.get("starts_at"),
+            published_at=payload.get("published_at"),
+            zoom_url=payload.get("zoom_url"),
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return zoom_v2_error_response(ZoomV2ServiceError("invalid_request"))
+    except ZoomV2ServiceError as error:
+        return zoom_v2_error_response(error)
+    return apply_miniapp_security_headers(web.json_response(result, status=201))
+
+
 async def miniapp_admin_class_update(request):
     try:
         result = update_admin_class(
@@ -26622,6 +27313,20 @@ def create_app():
         app.router.add_post('/api/member/classes/{class_id}/book',miniapp_member_class_booking)
     if not _route_exists(app,"GET","/api/member/classes"):
         app.router.add_get('/api/member/classes',miniapp_member_bookings)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes"):
+        app.router.add_get('/api/member/zoom-v2/classes', miniapp_member_zoom_v2_classes)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/book"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/book', miniapp_member_zoom_v2_book)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/reconcile"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/reconcile', miniapp_member_zoom_v2_reconcile)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/access"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/access', miniapp_member_zoom_v2_access)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/payment-terms"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/payment-terms', miniapp_member_zoom_v2_payment_terms)
+    if not _route_exists(app, "POST", "/api/member/zoom-v2/classes/{class_id}/authorize"):
+        app.router.add_post('/api/member/zoom-v2/classes/{class_id}/authorize', miniapp_member_zoom_v2_authorize)
+    if not _route_exists(app, "GET", "/api/member/zoom-v2/classes/{class_id}/authorization"):
+        app.router.add_get('/api/member/zoom-v2/classes/{class_id}/authorization', miniapp_member_zoom_v2_authorization_state)
     if not _route_exists(app,"GET","/api/member/content"):
         app.router.add_get('/api/member/content',miniapp_member_content_list)
     if not _route_exists(app,"GET","/api/member/content/{content_id}/media/{media_id}"):
@@ -26813,6 +27518,8 @@ def create_app():
         app.router.add_get('/api/admin/classes', miniapp_admin_classes)
     if not _route_exists(app, "POST", "/api/admin/classes"):
         app.router.add_post('/api/admin/classes', miniapp_admin_classes)
+    if not _route_exists(app, "POST", "/api/admin/zoom-v2/classes"):
+        app.router.add_post('/api/admin/zoom-v2/classes', miniapp_admin_zoom_v2_class_create)
     if not _route_exists(app, "PUT", "/api/admin/classes/{class_id}"):
         app.router.add_put('/api/admin/classes/{class_id}', miniapp_admin_class_update)
     if not _route_exists(app, "GET", "/api/admin/classes/{class_id}/bookings"):

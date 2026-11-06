@@ -1,5 +1,6 @@
 import contextlib
 import asyncio
+import concurrent.futures
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
@@ -76,6 +77,14 @@ from bookable_classes import (
     prepare_class_booking,
     update_admin_class,
     update_admin_class_status,
+)
+from zoom_v2_service import (
+    ZoomV2ServiceError,
+    check_v2_zoom_access,
+    create_or_get_v2_booking,
+    create_v2_class,
+    list_v2_member_classes,
+    reconcile_v2_booking_access,
 )
 from content_cms import (
     ContentCmsError,
@@ -313,6 +322,33 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with conn.cursor() as cur:
             cur.execute("SET TIME ZONE 'UTC'")
         return conn
+
+    def test_renewal_warning_history_is_durable_and_idempotent_real_postgres(self):
+        run_migrations(self.get_conn)
+        main = import_main()
+        billing_at = datetime.utcnow() + timedelta(days=3)
+        snapshot = {
+            "stripe_subscription_id": "sub_renewal_history",
+            "billing_reference": "a" * 64,
+            "billing_at": billing_at,
+            "amount_minor": 4250,
+            "currency": "eur",
+        }
+        with mock.patch.object(main, "get_db_conn", side_effect=self.get_conn):
+            self.assertTrue(main.persist_renewal_warning(98001, snapshot, "renewal_warning_3d"))
+            self.assertFalse(main.persist_renewal_warning(98001, snapshot, "renewal_warning_3d"))
+        row = self.query_one(
+            """
+            SELECT COUNT(*), MIN(stripe_subscription_id), MIN(billing_reference),
+                   MIN(notification_kind), MIN(amount_minor), MIN(currency), MIN(status)
+            FROM message_delivery_events
+            WHERE telegram_id = 98001
+            """
+        )
+        self.assertEqual(
+            row,
+            (1, "sub_renewal_history", "a" * 64, "renewal_warning_3d", 4250, "eur", "pending"),
+        )
 
     def test_miniapp_admin_sessions_migration_is_idempotent_and_constrained(self):
         first = run_migrations(self.get_conn)
@@ -855,8 +891,8 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             "sent_last_24h": 1,
         })
         self.assertEqual(dashboard["system"]["migrations"], {
-            "count": 36,
-            "latest": "0035_r2_content_media",
+            "count": 40,
+            "latest": "0039_renewal_notification_history",
         })
         self.assertEqual(dashboard["system"]["scheduler"], {
             "known_jobs": 9,
@@ -2412,7 +2448,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
     def test_empty_database_migrations_versions_checksums_and_idempotency(self):
         run_migrations(self.get_conn)
         migrations = load_migrations()
-        self.assertEqual(len(migrations), 36)
+        self.assertEqual(len(migrations), 40)
         rows = self.query_all("SELECT version, checksum, baseline FROM schema_migrations ORDER BY version")
         self.assertEqual([(m["version"], m["checksum"], False) for m in migrations], rows)
         self.assertEqual(self.query_one("""
@@ -3180,6 +3216,704 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self.query_one("SELECT storage_kind,sha256 FROM content_media WHERE media_id=%s", (r2_media_id,)),
             ("r2", None),
         )
+
+    def test_zoom_v2_migration_preserves_legacy_bookings_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pre_v2_dir = Path(tmpdir)
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name < "0036_zoom_v2_access_gating.sql":
+                    (pre_v2_dir / migration.name).write_bytes(migration.read_bytes())
+            run_migrations(self.get_conn, migrations_dir=pre_v2_dir)
+
+        telegram_id = 936001
+        class_id = str(uuid.uuid4())
+        booking_id = str(uuid.uuid4())
+        refund_id = str(uuid.uuid4())
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE)",
+                    (telegram_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO bookable_classes (
+                        class_id,title,description,starts_at,duration_minutes,
+                        zoom_url,price_amount,currency,capacity,
+                        minimum_participants,booking_deadline,status,
+                        created_by_telegram_id,confirmed_at
+                    ) VALUES (
+                        %s,'Legacy class','Existing capture-now row',
+                        NOW()+INTERVAL '2 days',60,'https://zoom.example/legacy',
+                        1000,'eur',20,3,NOW()+INTERVAL '1 day','confirmed',1,NOW()
+                    )
+                    """,
+                    (class_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO class_bookings (
+                        booking_id,class_id,telegram_id,status,amount,currency,
+                        stripe_checkout_session_id,stripe_payment_intent_id,
+                        checkout_generation,paid_at
+                    ) VALUES (%s,%s,%s,'paid',1000,'eur',%s,%s,2,NOW())
+                    """,
+                    (booking_id, class_id, telegram_id,
+                     "cs_legacy_936001", "pi_legacy_936001"),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO class_refund_operations (
+                        operation_id,booking_id,stripe_payment_intent_id,status,
+                        claim_generation,attempt_count,stripe_refund_id,completed_at
+                    ) VALUES (%s,%s,%s,'completed',1,1,%s,NOW())
+                    """,
+                    (refund_id, booking_id, "pi_legacy_936001", "re_legacy_936001"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        legacy_before = self.query_one(
+            """
+            SELECT c.class_id,c.title,c.description,c.starts_at,c.duration_minutes,
+                   c.zoom_url,c.price_amount,c.currency,c.capacity,
+                   c.minimum_participants,c.booking_deadline,c.status,
+                   b.booking_id,b.telegram_id,b.status,b.amount,b.currency,
+                   b.stripe_checkout_session_id,b.stripe_payment_intent_id,
+                   b.checkout_generation,b.paid_at,
+                   r.operation_id,r.status,r.stripe_refund_id,r.completed_at
+            FROM bookable_classes c
+            JOIN class_bookings b ON b.class_id=c.class_id
+            JOIN class_refund_operations r ON r.booking_id=b.booking_id
+            WHERE b.booking_id=%s
+            """,
+            (booking_id,),
+        )
+
+        first = run_migrations(self.get_conn)
+        second = run_migrations(self.get_conn)
+        self.assertIn("0036_zoom_v2_access_gating", first["applied"])
+        self.assertEqual(first["applied"], second["applied"])
+        self.assertEqual(
+            self.query_one(
+                "SELECT COUNT(*) FROM schema_migrations "
+                "WHERE version='0036_zoom_v2_access_gating'"
+            )[0],
+            1,
+        )
+
+        legacy_after = self.query_one(
+            """
+            SELECT c.class_id,c.title,c.description,c.starts_at,c.duration_minutes,
+                   c.zoom_url,c.price_amount,c.currency,c.capacity,
+                   c.minimum_participants,c.booking_deadline,c.status,
+                   b.booking_id,b.telegram_id,b.status,b.amount,b.currency,
+                   b.stripe_checkout_session_id,b.stripe_payment_intent_id,
+                   b.checkout_generation,b.paid_at,
+                   r.operation_id,r.status,r.stripe_refund_id,r.completed_at
+            FROM bookable_classes c
+            JOIN class_bookings b ON b.class_id=c.class_id
+            JOIN class_refund_operations r ON r.booking_id=b.booking_id
+            WHERE b.booking_id=%s
+            """,
+            (booking_id,),
+        )
+        self.assertEqual(legacy_before, legacy_after)
+        self.assertEqual(self.query_one(
+            """
+            SELECT c.booking_model,c.lifecycle_status,c.unlimited_capacity,
+                   b.booking_model,b.booking_type,b.access_status,
+                   b.payment_state,b.settlement_status
+            FROM bookable_classes c
+            JOIN class_bookings b ON b.class_id=c.class_id
+            WHERE b.booking_id=%s
+            """,
+            (booking_id,),
+        ), (
+            "legacy_capture_now", None, False,
+            "legacy_capture_now", None, None, None, None,
+        ))
+
+        old_admin_item = next(
+            item for item in list_admin_classes(self.get_conn)["items"]
+            if item["class_id"] == class_id
+        )
+        old_member_item = next(
+            item for item in list_member_classes(self.get_conn, telegram_id)["items"]
+            if item["class_id"] == class_id
+        )
+        self.assertEqual(old_admin_item["status"], "confirmed")
+        self.assertEqual(old_member_item["viewer_booking_status"], "paid")
+        self.assertEqual(old_member_item["zoom_url"], "https://zoom.example/legacy")
+
+    def test_zoom_v2_previous_0036_checksum_upgrades_forward_to_0037(self):
+        migrations = load_migrations()
+        expected_0036 = next(
+            item["checksum"] for item in migrations
+            if item["version"] == "0036_zoom_v2_access_gating"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            through_0036 = Path(tmpdir)
+            for migration in migrations:
+                if migration["version"] <= "0036_zoom_v2_access_gating":
+                    (through_0036 / migration["path"].name).write_text(
+                        migration["sql"], encoding="utf-8",
+                    )
+            initial = run_migrations(self.get_conn, migrations_dir=through_0036)
+        self.assertEqual(initial["applied"][-1], "0036_zoom_v2_access_gating")
+        stored_before = self.query_one(
+            "SELECT checksum FROM schema_migrations "
+            "WHERE version='0036_zoom_v2_access_gating'"
+        )[0]
+        self.assertEqual(stored_before, expected_0036)
+
+        upgraded = run_migrations(self.get_conn)
+        self.assertIn("0038_zoom_v2_authorization_durability", upgraded["applied"])
+        self.assertEqual(upgraded["applied"][-1], "0039_renewal_notification_history")
+        self.assertEqual(self.query_one(
+            "SELECT checksum FROM schema_migrations "
+            "WHERE version='0036_zoom_v2_access_gating'"
+        )[0], stored_before)
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM schema_migrations "
+            "WHERE version='0037_zoom_v2_pending_booking_type'"
+        )[0], 1)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                self.assertTrue(migration_schema_matches(
+                    cur, "0037_zoom_v2_pending_booking_type"
+                ))
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_zoom_v2_0038_preserves_rows_and_enforces_authorization_durability(self):
+        migrations = load_migrations()
+        prior = {
+            item["version"]: item["checksum"] for item in migrations
+            if item["version"] in (
+                "0036_zoom_v2_access_gating", "0037_zoom_v2_pending_booking_type",
+            )
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            through_0037 = Path(tmpdir)
+            for migration in migrations:
+                if migration["version"] <= "0037_zoom_v2_pending_booking_type":
+                    (through_0037 / migration["path"].name).write_text(
+                        migration["sql"], encoding="utf-8",
+                    )
+            initial = run_migrations(self.get_conn, migrations_dir=through_0037)
+        self.assertEqual(initial["applied"][-1], "0037_zoom_v2_pending_booking_type")
+        legacy = create_admin_class(self.get_conn, 1, {
+            "title": "Legacy before 0038", "description": None,
+            "starts_at": (datetime.now(timezone.utc) + timedelta(days=3)).isoformat(),
+            "duration_minutes": 60, "zoom_url": "https://zoom.example/legacy-0038",
+            "price_amount": 1000, "capacity": 10, "minimum_participants": 3,
+            "booking_deadline": (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(),
+        })
+        legacy_before = self.query_one(
+            "SELECT title,status,booking_model FROM bookable_classes WHERE class_id=%s",
+            (legacy["class_id"],),
+        )
+        result = run_migrations(self.get_conn)
+        self.assertIn("0038_zoom_v2_authorization_durability", result["applied"])
+        self.assertEqual(result["applied"][-1], "0039_renewal_notification_history")
+        self.assertEqual(self.query_one(
+            "SELECT title,status,booking_model FROM bookable_classes WHERE class_id=%s",
+            (legacy["class_id"],),
+        ), legacy_before)
+        self.assertEqual(dict(self.query_all(
+            "SELECT version,checksum FROM schema_migrations WHERE version IN (%s,%s)",
+            ("0036_zoom_v2_access_gating", "0037_zoom_v2_pending_booking_type"),
+        )), prior)
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        starts_at = now + timedelta(days=2)
+        user_id = 936150
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE)", (user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        created = create_v2_class(
+            self.get_conn, 1, title="0038 durable", starts_at=starts_at,
+            published_at=now, zoom_url="https://zoom.example/0038",
+        )
+        booking = create_or_get_v2_booking(
+            self.get_conn, user_id, created["class_id"], now=now,
+        )
+        class_end = starts_at + timedelta(hours=1)
+        cutoff = starts_at - timedelta(hours=24)
+        capture_before = class_end + timedelta(hours=24)
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        "UPDATE class_bookings SET booking_type='guest',access_status='booked_guest',payment_state='authorized' WHERE booking_id=%s",
+                        (booking["booking_id"],),
+                    )
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE class_bookings SET booking_type='guest',
+                        consent_version='zoom-v2-guest-v1',consented_at=%s,
+                        consent_terms_hash=%s,consent_terms_code='guest-24h-v1',
+                        consent_class_ends_at=%s,consent_cancellation_cutoff_at=%s,
+                        stripe_capture_before=%s,capture_before_verified_at=%s,
+                        capture_before_source='stripe_charge_card_capture_before',
+                        authorization_reconciliation_status='verified',
+                        authorization_last_reconciled_at=%s
+                    WHERE booking_id=%s
+                    """,
+                    (now.replace(tzinfo=None), "a" * 64, class_end.replace(tzinfo=None),
+                     cutoff.replace(tzinfo=None), capture_before.replace(tzinfo=None),
+                     now.replace(tzinfo=None), now.replace(tzinfo=None), booking["booking_id"]),
+                )
+                cur.execute(
+                    "UPDATE class_bookings SET access_status='booked_guest',payment_state='authorized' WHERE booking_id=%s",
+                    (booking["booking_id"],),
+                )
+                cur.execute(
+                    """INSERT INTO class_payment_operations
+                    (operation_id,booking_id,operation_type,payment_generation,idempotency_key,
+                     status,reconciliation_status,stripe_request_id,request_started_at)
+                    VALUES (%s,%s,'authorize',1,%s,'processing','request_uncertain',%s,%s)""",
+                    (str(uuid.uuid4()), booking["booking_id"], "zoom-v2:authorize:durable",
+                     "req_0038_unique", now.replace(tzinfo=None)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        row = self.query_one(
+            "SELECT stripe_capture_before,consent_terms_hash,authorization_reconciliation_status FROM class_bookings WHERE booking_id=%s",
+            (booking["booking_id"],),
+        )
+        self.assertEqual(row[0], capture_before.replace(tzinfo=None))
+        self.assertEqual(row[1].strip(), "a" * 64)
+        self.assertEqual(row[2], "verified")
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """INSERT INTO class_payment_operations
+                        (operation_id,booking_id,operation_type,payment_generation,idempotency_key,
+                         status,reconciliation_status,stripe_request_id)
+                        VALUES (%s,%s,'cancel',1,%s,'pending','pending','req_0038_unique')""",
+                        (str(uuid.uuid4()), booking["booking_id"], "zoom-v2:cancel:duplicate"),
+                    )
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_zoom_v2_schema_enforces_payment_operation_identity_and_states(self):
+        run_migrations(self.get_conn)
+        telegram_id = 936101
+        class_id = str(uuid.uuid4())
+        booking_id = str(uuid.uuid4())
+        operation_id = str(uuid.uuid4())
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE),(%s,FALSE)",
+                    (telegram_id, telegram_id + 1),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO bookable_classes (
+                        class_id,title,starts_at,duration_minutes,zoom_url,
+                        price_amount,currency,capacity,minimum_participants,
+                        booking_deadline,status,created_by_telegram_id,
+                        booking_model,lifecycle_status,unlimited_capacity,published_at
+                    ) VALUES (
+                        %s,'V2 class',NOW()+INTERVAL '5 days',60,
+                        'https://zoom.example/v2',1000,'eur',500,3,
+                        NOW()+INTERVAL '4 days','draft',1,
+                        'authorization_v2','open',TRUE,NOW()
+                    )
+                    """,
+                    (class_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO class_bookings (
+                        booking_id,class_id,telegram_id,status,amount,currency,
+                        booking_model,booking_type,access_status,payment_state,
+                        payment_generation,consent_version,consented_at,
+                        settlement_status,stripe_payment_intent_id,
+                        stripe_authorized_at,authorization_expires_at,
+                        consent_terms_hash,consent_terms_code,
+                        consent_class_ends_at,consent_cancellation_cutoff_at,
+                        stripe_capture_before,capture_before_verified_at,
+                        capture_before_source,authorization_reconciliation_status
+                    ) VALUES (
+                        %s,%s,%s,'pending',1000,'eur','authorization_v2','guest',
+                        'booked_guest','authorized',1,'zoom-v2-2026-10',NOW(),
+                        'none','pi_v2_936101',NOW(),NOW()+INTERVAL '6 days',
+                        repeat('a',64),'guest-24h-v1',NOW()+INTERVAL '5 days 1 hour',
+                        NOW()+INTERVAL '4 days',NOW()+INTERVAL '6 days 1 hour',NOW(),
+                        'stripe_charge_card_capture_before','verified'
+                    )
+                    """,
+                    (booking_id, class_id, telegram_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO class_payment_operations (
+                        operation_id,booking_id,operation_type,payment_generation,
+                        idempotency_key,status,stripe_payment_intent_id,amount,currency
+                    ) VALUES (%s,%s,'authorize',1,%s,'completed',%s,1000,'eur')
+                    """,
+                    (operation_id, booking_id, "zoom-v2:authorize:936101:1", "pi_v2_936101"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(self.query_one(
+            """
+            SELECT booking_model,booking_type,access_status,payment_state,
+                   payment_generation,consent_version,settlement_status
+            FROM class_bookings WHERE booking_id=%s
+            """,
+            (booking_id,),
+        ), (
+            "authorization_v2", "guest", "booked_guest", "authorized",
+            1, "zoom-v2-2026-10", "none",
+        ))
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO class_payment_operations (
+                            operation_id,booking_id,operation_type,payment_generation,
+                            idempotency_key,status,stripe_payment_intent_id
+                        ) VALUES (%s,%s,'authorize',1,%s,'pending',%s)
+                        """,
+                        (str(uuid.uuid4()), booking_id,
+                         "zoom-v2:authorize:duplicate", "pi_v2_other"),
+                    )
+            conn.rollback()
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO class_payment_operations (
+                            operation_id,booking_id,operation_type,payment_generation,
+                            idempotency_key,status,stripe_payment_intent_id
+                        ) VALUES (%s,%s,'capture',1,%s,'pending',%s)
+                        """,
+                        (str(uuid.uuid4()), booking_id,
+                         "zoom-v2:authorize:936101:1", "pi_v2_936101"),
+                    )
+            conn.rollback()
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO class_payment_operations (
+                            operation_id,booking_id,operation_type,payment_generation,
+                            idempotency_key,status,stripe_payment_intent_id
+                        ) VALUES (%s,%s,'capture',1,%s,'pending',%s)
+                        """,
+                        (str(uuid.uuid4()), booking_id,
+                         "zoom-v2:capture:wrong-intent", "pi_wrong_booking"),
+                    )
+            conn.rollback()
+            with conn.cursor() as cur:
+                with self.assertRaises(psycopg2.IntegrityError):
+                    cur.execute(
+                        """
+                        INSERT INTO class_bookings (
+                            booking_id,class_id,telegram_id,status,amount,currency,
+                            booking_model,booking_type,access_status,payment_state,
+                            settlement_status
+                        ) VALUES (%s,%s,%s,'pending',1000,'eur',
+                                  'authorization_v2','guest','invented','none','none')
+                        """,
+                        (str(uuid.uuid4()), class_id, telegram_id + 1),
+                    )
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_zoom_v2_service_books_by_canonical_access_and_restores_after_renewal(self):
+        run_migrations(self.get_conn)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        starts_at = now + timedelta(days=5)
+        active_id, expiring_id, guest_id = 936201, 936202, 936203
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (telegram_id,paid,expiry_date,payment_failed)
+                    VALUES
+                        (%s,TRUE,%s,FALSE),
+                        (%s,TRUE,%s,FALSE),
+                        (%s,FALSE,NULL,FALSE)
+                    """,
+                    (
+                        active_id, (starts_at + timedelta(days=2)).replace(tzinfo=None),
+                        expiring_id, (starts_at - timedelta(days=1)).replace(tzinfo=None),
+                        guest_id,
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        created = create_v2_class(
+            self.get_conn, 1, title="Zoom v2 access",
+            description="Contract-backed booking",
+            starts_at=starts_at, published_at=now,
+            zoom_url="https://zoom.example/v2-access",
+        )
+        self.assertEqual(created["duration_minutes"], 60)
+        self.assertEqual(created["price_amount"], 1000)
+        self.assertTrue(created["unlimited_capacity"])
+        class_id = created["class_id"]
+        self.assertEqual(self.query_one(
+            """
+            SELECT status,booking_model,lifecycle_status,capacity,unlimited_capacity
+            FROM bookable_classes WHERE class_id=%s
+            """,
+            (class_id,),
+        ), ("draft", "authorization_v2", "open", 500, True))
+
+        active = create_or_get_v2_booking(
+            self.get_conn, active_id, class_id, now=now,
+        )
+        expiring = create_or_get_v2_booking(
+            self.get_conn, expiring_id, class_id, now=now,
+        )
+        guest = create_or_get_v2_booking(
+            self.get_conn, guest_id, class_id, now=now,
+        )
+        self.assertEqual(active["access_status"], "booked_subscription")
+        self.assertEqual(active["booking_type"], "subscription")
+        self.assertFalse(active["payment_required"])
+        self.assertEqual(expiring["access_status"], "access_required")
+        self.assertEqual(guest["access_status"], "access_required")
+        self.assertTrue(expiring["payment_required"])
+        self.assertEqual(expiring["booking_type"], "pending")
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM class_payment_operations"
+        )[0], 0)
+
+        guest_classes = list_v2_member_classes(
+            self.get_conn, guest_id, now=now,
+        )
+        self.assertEqual(len(guest_classes["items"]), 1)
+        self.assertEqual(
+            guest_classes["items"][0]["booking_id"], guest["booking_id"],
+        )
+        self.assertEqual(
+            guest_classes["items"][0]["booking_status"], "access_required",
+        )
+        self.assertEqual(
+            guest_classes["items"][0]["access_unavailable_reason"],
+            "subscription_does_not_cover_class_start",
+        )
+        self.assertEqual(guest_classes["items"][0]["available_actions"], [
+            {"type": "renew_subscription"},
+            {"type": "authorize_one_time", "amount": 1000, "currency": "eur"},
+        ])
+        self.assertNotIn("zoom_url", guest_classes["items"][0])
+        active_classes = list_v2_member_classes(
+            self.get_conn, active_id, now=now,
+        )
+        self.assertEqual(
+            active_classes["items"][0]["booking_id"], active["booking_id"],
+        )
+        self.assertNotEqual(
+            active_classes["items"][0]["booking_id"], guest["booking_id"],
+        )
+        self.assertEqual(self.query_one(
+            """
+            SELECT COUNT(*) FROM class_bookings
+            WHERE class_id=%s AND stripe_payment_intent_id IS NOT NULL
+            """,
+            (class_id,),
+        )[0], 0)
+
+        self.assertEqual(
+            check_v2_zoom_access(self.get_conn, active_id, class_id, now=now),
+            {"allowed": True, "reason": "access_confirmed"},
+        )
+        self.assertEqual(
+            check_v2_zoom_access(self.get_conn, expiring_id, class_id, now=now),
+            {"allowed": False, "reason": "access_required"},
+        )
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET paid=TRUE,expiry_date=%s WHERE telegram_id=%s",
+                    ((starts_at + timedelta(days=30)).replace(tzinfo=None), expiring_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        restored = reconcile_v2_booking_access(
+            self.get_conn, expiring_id, class_id, now=now,
+        )
+        self.assertTrue(restored["changed"])
+        self.assertEqual(restored["access_status"], "booked_subscription")
+        duplicate_reconcile = reconcile_v2_booking_access(
+            self.get_conn, expiring_id, class_id, now=now,
+        )
+        self.assertFalse(duplicate_reconcile["changed"])
+        self.assertTrue(check_v2_zoom_access(
+            self.get_conn, expiring_id, class_id, now=now,
+        )["allowed"])
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE users SET paid=FALSE,expiry_date=%s WHERE telegram_id=%s",
+                    ((now - timedelta(seconds=1)).replace(tzinfo=None), active_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            check_v2_zoom_access(self.get_conn, active_id, class_id, now=now),
+            {"allowed": False, "reason": "subscription_access_expired"},
+        )
+
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE bookable_classes SET lifecycle_status='cancelled' WHERE class_id=%s",
+                    (class_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(
+            check_v2_zoom_access(self.get_conn, expiring_id, class_id, now=now),
+            {"allowed": False, "reason": "class_cancelled"},
+        )
+        cancelled = list_v2_member_classes(
+            self.get_conn, expiring_id, now=now,
+        )["items"][0]
+        self.assertEqual(cancelled["booking_status"], "cancelled")
+        self.assertEqual(cancelled["access_unavailable_reason"], "class_cancelled")
+
+    def test_zoom_v2_booking_is_idempotent_under_concurrent_requests(self):
+        run_migrations(self.get_conn)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        telegram_id = 936301
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE)",
+                    (telegram_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        created = create_v2_class(
+            self.get_conn, 1, title="Concurrent v2 class",
+            starts_at=now + timedelta(days=3), published_at=now,
+            zoom_url="https://zoom.example/v2-concurrent",
+        )
+
+        def book_once(_index):
+            return create_or_get_v2_booking(
+                self.get_conn, telegram_id, created["class_id"], now=now,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(book_once, range(16)))
+        self.assertEqual({item["booking_id"] for item in results}, {results[0]["booking_id"]})
+        self.assertEqual({item["access_status"] for item in results}, {"access_required"})
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM class_bookings WHERE class_id=%s AND telegram_id=%s",
+            (created["class_id"], telegram_id),
+        )[0], 1)
+        self.assertEqual(sum(not item["idempotent"] for item in results), 1)
+
+    def test_zoom_v2_service_rejects_invalid_transitions_and_leaves_legacy_untouched(self):
+        run_migrations(self.get_conn)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        telegram_id = 936401
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id,paid) VALUES (%s,FALSE)",
+                    (telegram_id,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        legacy = create_admin_class(self.get_conn, 1, {
+            "title": "Legacy remains legacy",
+            "starts_at": (now + timedelta(days=2)).isoformat(),
+            "booking_deadline": (now + timedelta(days=1)).isoformat(),
+            "duration_minutes": 60,
+            "zoom_url": "https://zoom.example/legacy-untouched",
+            "price_amount": 1000,
+            "capacity": 10,
+            "minimum_participants": 3,
+        })
+        legacy_before = self.query_one(
+            "SELECT status,booking_model FROM bookable_classes WHERE class_id=%s",
+            (legacy["class_id"],),
+        )
+        with self.assertRaisesRegex(ZoomV2ServiceError, "legacy_class_not_supported"):
+            create_or_get_v2_booking(
+                self.get_conn, telegram_id, legacy["class_id"], now=now,
+            )
+        self.assertEqual(legacy_before, self.query_one(
+            "SELECT status,booking_model FROM bookable_classes WHERE class_id=%s",
+            (legacy["class_id"],),
+        ))
+        self.assertEqual(self.query_one(
+            "SELECT COUNT(*) FROM class_bookings WHERE class_id=%s",
+            (legacy["class_id"],),
+        )[0], 0)
+
+        v2 = create_v2_class(
+            self.get_conn, 1, title="Invalid transition v2",
+            starts_at=now + timedelta(days=4), published_at=now,
+            zoom_url="https://zoom.example/v2-invalid-transition",
+        )
+        created = create_or_get_v2_booking(
+            self.get_conn, telegram_id, v2["class_id"], now=now,
+        )
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE class_bookings SET access_status='cancelled_early' "
+                    "WHERE booking_id=%s",
+                    (created["booking_id"],),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(ValueError, "booking_not_access_reconcilable"):
+            reconcile_v2_booking_access(
+                self.get_conn, telegram_id, v2["class_id"], now=now,
+            )
 
     def test_member_media_lookup_requires_published_live_relationship_real_postgres(self):
         run_migrations(self.get_conn)
@@ -6446,6 +7180,26 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 second.update_data(key, {"second": 2}),
             )
             self.assertEqual(await first.get_data(key), {"step": 1, "first": 1, "second": 2})
+
+            await first.update_data(key, {
+                "recurring_checkout_confirmation": {
+                    "token": "one-time-token",
+                    "price_id": "price_1m",
+                },
+            })
+            consumed = await asyncio.gather(
+                first.consume_data_value_once(
+                    key, "recurring_checkout_confirmation", "token", "one-time-token",
+                ),
+                second.consume_data_value_once(
+                    key, "recurring_checkout_confirmation", "token", "one-time-token",
+                ),
+            )
+            self.assertEqual(sum(value is not None for value in consumed), 1)
+            self.assertTrue(next(value for value in consumed if value)["consumed_at"])
+            self.assertTrue(
+                (await first.get_data(key))["recurring_checkout_confirmation"]["consumed_at"],
+            )
 
             conn = self.get_conn()
             cur = conn.cursor()
@@ -13268,10 +14022,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         removal_incident = system["removals"]["latest_retryable_incident"]
         self.assertTrue(removal_incident.startswith("removal:"))
         self.assertEqual(system["database"], {"pool_available": 4, "pool_used": 1})
-        self.assertEqual(system["migrations"]["count"], 36)
+        self.assertEqual(system["migrations"]["count"], 40)
         self.assertEqual(
             system["migrations"]["latest"],
-            "0035_r2_content_media",
+            "0039_renewal_notification_history",
         )
         self.assertLessEqual(len(system["scheduler"]["recent_runs"]), 20)
         system_json = json.dumps(system)

@@ -2611,6 +2611,80 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await first.get_data(key), {"first": 1, "second": 2})
         self.assertTrue(all(conn.closed for conn in connections))
 
+    async def test_postgres_fsm_storage_consumes_confirmation_atomically_once(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        record_lock = threading.Lock()
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+        key_params = (10, 20, 30, 0, "", "default")
+        records = {
+            key_params: {
+                "state": None,
+                "data_json": {
+                    "recurring_checkout_confirmation": {"token": "token-1", "price_id": "price_1m"},
+                },
+            },
+        }
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+                self.lock_held = False
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                if normalized.startswith("SELECT data_json") and "FOR UPDATE" in normalized:
+                    record_lock.acquire()
+                    self.lock_held = True
+                    record = records.get(params[:6])
+                    self.row = (record["data_json"],) if record else None
+                    return
+                if normalized.startswith("UPDATE aiogram_fsm_states"):
+                    records[params[1:7]]["data_json"] = adapted_json_value(params[0])
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                if self.lock_held:
+                    self.lock_held = False
+                    record_lock.release()
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        first = PostgresFSMStorage(FsmConnection)
+        second = PostgresFSMStorage(FsmConnection)
+        results = await asyncio.gather(
+            first.consume_data_value_once(
+                key, "recurring_checkout_confirmation", "token", "token-1",
+            ),
+            second.consume_data_value_once(
+                key, "recurring_checkout_confirmation", "token", "token-1",
+            ),
+        )
+
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertTrue(next(result for result in results if result)["consumed_at"])
+        self.assertTrue(
+            records[key_params]["data_json"]["recurring_checkout_confirmation"]["consumed_at"],
+        )
+
     async def test_first_purchase_recovery_delivery_skips_when_no_longer_due(self):
         delivery = (
             self.main.first_purchase_recovery_delivery_key(123),
@@ -3083,7 +3157,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handlers_are_registered_on_native_aiogram3_router(self):
         self.assertEqual(len(self.main.router.message.handlers), 78)
-        self.assertEqual(len(self.main.router.callback_query.handlers), 42)
+        self.assertEqual(len(self.main.router.callback_query.handlers), 44)
 
     async def test_ast_handler_inventory_matches_expected_commands_and_callbacks(self):
         source = Path(self.main.__file__).read_text()
@@ -3115,7 +3189,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
                     callback_filters.append(text)
 
         self.assertEqual(len(message_handlers), 78)
-        self.assertEqual(len(callback_handlers), 42)
+        self.assertEqual(len(callback_handlers), 44)
         self.assertEqual(
             commands,
             [
@@ -3137,6 +3211,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(callback_handlers), len(set(callback_handlers)))
         self.assertEqual(catch_all_messages, [])
         self.assertTrue(any("F.data.startswith('sub_')" in item for item in callback_filters))
+        self.assertTrue(any("confirm_recurring:" in item for item in callback_filters))
+        self.assertTrue(any("subscription_management" in item for item in callback_filters))
         self.assertTrue(any("F.data == 'retry_payment'" in item for item in callback_filters))
         self.assertTrue(any("admin_billing_portal:start" in item for item in callback_filters))
         self.assertTrue(any("admin_billing_portal:cancel" in item for item in callback_filters))
@@ -3154,7 +3230,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         exact = {
             "confirm_promo", "cancel_promo", "feedback_join", "feedback_question",
             "feedback_think", "to_desc", "to_rules", "to_choice", "retry_payment",
-            "back_to_tariffs", "cancel_subscription", "show_renew_options",
+            "back_to_tariffs", "cancel_subscription", "subscription_management", "show_renew_options",
             "continue_onboarding_after_free_lesson",
         }
         prefix_covered = {"sub_trial", "sub_1", "sub_6", "sub_12", "admin_menu:back"}
@@ -7486,7 +7562,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         for call in set_webhook.await_args_list:
             self.assertEqual(call.kwargs["secret_token"], TEST_ENV["WEBHOOK_SECRET"])
         self.assertEqual(get_info.await_count, 2)
-        self.assertEqual(len(fake_scheduler.jobs), 12)
+        self.assertEqual(len(fake_scheduler.jobs), 13)
         self.assertTrue(hasattr(self.main, "scheduled_apply_reserved_gifts"))
         self.assertTrue(hasattr(self.main, "scheduled_process_bookable_class_deadlines"))
         self.assertEqual(fake_scheduler.start_calls, 1)
@@ -10948,7 +11024,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("contentStudioCreateDraft", javascript)
         self.assertIn("contentStudioSaveRecipe", javascript)
 
-        self.assertIn("Черновик сохранён. Медиа загрузить не удалось.", javascript)
+        self.assertIn("Черновик сохранён. Файл не потерян — повторите загрузку.", javascript)
         self.assertIn("content-unsaved-dialog", index)
         self.assertIn("Выйти без сохранения", index)
         self.assertIn("data-studio-panel=\"editor\"", index)
@@ -11052,7 +11128,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('id="member-shell-header"', index)
         self.assertIn("Закрытый клуб", index)
         self.assertIn("Натальи Ребковец", index)
-        self.assertEqual(index.count("data-member-nav="), 4)
+        self.assertEqual(index.count("data-member-nav="), 8)
+        self.assertIn('id="member-side-nav"', index)
+        self.assertEqual(index[index.index('id="member-side-nav"'):index.index('</aside>', index.index('id="member-side-nav"'))].count("data-member-nav="), 4)
+        self.assertEqual(index[index.index('id="member-bottom-nav"'):].count("data-member-nav="), 4)
         self.assertIn('data-member-nav="member-home"', index)
         self.assertIn('data-member-nav="member-library"', index)
         self.assertIn('data-member-nav="member-schedule"', index)
@@ -11094,8 +11173,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((member_asset_dir / "meditation-calm.jpg").is_file())
         self.assertIn("data:image/jpeg;base64,", stylesheet)
         self.assertIn("member-hero-media", index)
-        self.assertIn("member-meditation-media", index)
-        self.assertIn('data-member-icon="strength"', index)
+        self.assertIn('id="member-direction-grid"', index)
+        self.assertIn('data-member-icon="home"', index)
         self.assertIn("createElementNS", javascript)
         self.assertIn("hydrateMemberIcons", javascript)
         self.assertIn("loadMemberSchedule", javascript)

@@ -1229,6 +1229,43 @@ class CriticalBotSafetyTests(unittest.TestCase):
         sql = "\n".join(query for query, _ in cur.queries)
         self.assertNotIn("INSERT INTO checkout_sessions", sql)
 
+    def test_recurring_confirmation_seed_is_stable_and_unknown_retry_reuses_key(self):
+        checkout_safety = __import__("checkout_safety")
+        expected_key = checkout_safety.stable_checkout_idempotency_key(
+            1, "sub_1", "recurring-confirmation:stable-seed",
+        )
+        first_cur = FakeCursor(fetches=[
+            None,
+            None,
+            (70, None, None, "creating", None, expected_key, datetime.utcnow()),
+        ])
+        created = checkout_safety.claim_checkout_session_record(
+            first_cur, 1, "sub_1", "subscription",
+            idempotency_seed="recurring-confirmation:stable-seed",
+        )
+        self.assertEqual(created["action"], "create")
+        insert_params = next(
+            params for query, params in first_cur.queries
+            if "INSERT INTO checkout_sessions" in query
+        )
+        self.assertEqual(insert_params[3], expected_key)
+
+        old = datetime.utcnow() - timedelta(hours=3)
+        retry_cur = FakeCursor(fetches=[
+            None,
+            (70, None, None, "creation_unknown", None, expected_key, old),
+        ])
+        recovered = checkout_safety.claim_checkout_session_record(
+            retry_cur, 1, "sub_1", "subscription",
+            idempotency_seed="recurring-confirmation:stable-seed",
+        )
+        self.assertEqual(recovered["action"], "retry_create")
+        self.assertEqual(recovered["record"]["idempotency_key"], expected_key)
+        self.assertNotIn(
+            "INSERT INTO checkout_sessions",
+            "\n".join(query for query, _ in retry_cur.queries),
+        )
+
     def test_stale_creating_retries_same_key_without_insert(self):
         old = datetime.utcnow() - timedelta(minutes=3)
         cur = FakeCursor(fetches=[None, (8, None, None, "creating", None, "idem_creating", old)])

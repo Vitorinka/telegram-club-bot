@@ -448,6 +448,45 @@ class ContentStudioFrontendTests(unittest.TestCase):
         """)
         self.assertEqual(result, {"clean": True, "dirty": False})
 
+    def test_failed_media_keeps_the_exact_file_for_retry(self):
+        result = self.run_node(r"""
+          const core = require('./miniapp/app.js');
+          (async()=>{
+            const video={name:'lesson.mp4',type:'video/mp4',size:2048};
+            const result=await core.contentStudioCreateDraft({
+              files:[['cover',undefined],['video',video]],
+              createDraft:async()=>({content_id:'draft'}),
+              saveDomain:async()=>{},
+              attachMedia:async(_draft,kind,file)=>{if(kind==='video' && file) throw new Error('offline');},
+              openDraft:async()=>{},
+            });
+            console.log(JSON.stringify({status:result.status,kind:result.failedMedia.mediaType,same:result.failedMedia.file===video,name:result.failedMedia.file.name}));
+          })();
+        """)
+        self.assertEqual(result, {
+            "status": "media_failed", "kind": "video",
+            "same": True, "name": "lesson.mp4",
+        })
+
+    def test_content_studio_selected_upload_and_local_preview_contract(self):
+        html = INDEX_HTML.read_text()
+        source = APP_JS.read_text()
+        styles = STYLES_CSS.read_text()
+        for element_id in (
+            "content-create-video-selection", "content-video-selection",
+            "content-media-progress",
+        ):
+            self.assertEqual(html.count(f'id="{element_id}"'), 1)
+        self.assertIn('rememberPendingContentMedia(mediaType, file)', source)
+        self.assertIn('Файл и черновик сохранены — повторите попытку.', source)
+        self.assertIn('contentMediaUploadInFlight', source)
+        self.assertIn('setContentUploadProgress(percent)', source)
+        self.assertIn('get("preview") === "admin-content"', source)
+        self.assertIn('.studio-upload-progress', styles)
+        self.assertIn('.admin-content-local-preview::before', styles)
+        self.assertIn('overflow-wrap:anywhere', styles)
+        self.assertIn('grid-template-columns:minmax(0,1fr)', styles)
+
     def test_stale_category_falls_back_and_only_cover_can_override_preview(self):
         result = self.run_node(r"""
           const core = require('./miniapp/app.js');

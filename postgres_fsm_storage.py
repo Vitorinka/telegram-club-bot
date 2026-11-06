@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 from typing import Any, Dict, Mapping, Optional
@@ -84,6 +85,17 @@ class PostgresFSMStorage(BaseStorage):
         if not isinstance(data, dict):
             raise DataNotDictLikeError(f"Data must be a dict or dict-like object, got {type(data).__name__}")
         return await asyncio.to_thread(self._update_data_sync, key, data.copy())
+
+    async def consume_data_value_once(
+        self, key: StorageKey, field_name: str, token_field: str, expected_token: str,
+    ) -> Optional[Dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._consume_data_value_once_sync,
+            key,
+            field_name,
+            token_field,
+            expected_token,
+        )
 
     async def close(self) -> None:
         pass
@@ -218,6 +230,55 @@ class PostgresFSMStorage(BaseStorage):
             self._delete_empty_record(cur, params)
             conn.commit()
             return current_data.copy()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
+
+    def _consume_data_value_once_sync(self, key, field_name, token_field, expected_token):
+        conn = self.conn_factory()
+        cur = conn.cursor()
+        try:
+            params = self.key_params(key)
+            cur.execute("""
+                SELECT data_json
+                FROM aiogram_fsm_states
+                WHERE bot_id = %s
+                  AND chat_id = %s
+                  AND user_id = %s
+                  AND thread_id = %s
+                  AND business_connection_id = %s
+                  AND destiny = %s
+                FOR UPDATE
+            """, params)
+            row = cur.fetchone()
+            current_data = decode_fsm_data(row[0]) if row else {}
+            value = current_data.get(field_name)
+            if (
+                not isinstance(value, dict)
+                or value.get(token_field) != expected_token
+                or value.get("consumed_at")
+            ):
+                conn.commit()
+                return None
+            consumed = value.copy()
+            consumed["consumed_at"] = datetime.now(timezone.utc).isoformat()
+            current_data[field_name] = consumed
+            cur.execute("""
+                UPDATE aiogram_fsm_states
+                SET data_json = %s,
+                    updated_at = NOW()
+                WHERE bot_id = %s
+                  AND chat_id = %s
+                  AND user_id = %s
+                  AND thread_id = %s
+                  AND business_connection_id = %s
+                  AND destiny = %s
+            """, (Json(current_data),) + params)
+            conn.commit()
+            return consumed.copy()
         except Exception:
             conn.rollback()
             raise
