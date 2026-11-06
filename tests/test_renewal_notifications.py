@@ -165,12 +165,35 @@ class RenewalNotificationSchedulingTests(unittest.IsolatedAsyncioTestCase):
     class State:
         def __init__(self):
             self.data = {}
+            self.storage = self
+            self.key = "renewal-test-state"
+            self.consume_lock = asyncio.Lock()
 
         async def update_data(self, **kwargs):
             self.data.update(kwargs)
 
         async def get_data(self):
             return dict(self.data)
+
+        async def consume_data_value_once(
+            self, key, field_name, token_field, expected_token,
+        ):
+            self.assert_key(key)
+            async with self.consume_lock:
+                value = self.data.get(field_name)
+                if (
+                    not isinstance(value, dict)
+                    or value.get(token_field) != expected_token
+                    or value.get("consumed_at")
+                ):
+                    return None
+                consumed = dict(value, consumed_at="2026-11-06T20:00:00+00:00")
+                self.data[field_name] = consumed
+                return dict(consumed)
+
+        def assert_key(self, key):
+            if key != self.key:
+                raise AssertionError("unexpected storage key")
 
     async def test_tariff_buttons_do_not_claim_unverified_amounts(self):
         keyboard = main.get_tariffs_keyboard(show_trial=False)
@@ -224,7 +247,7 @@ class RenewalNotificationSchedulingTests(unittest.IsolatedAsyncioTestCase):
         process_payment.assert_not_awaited()
         self.assertIn("устарели", foreign_callback.answer.await_args.args[0])
 
-    async def test_confirmation_rechecks_price_and_repeated_callback_reuses_context(self):
+    async def test_confirmation_is_consumed_once(self):
         callback = self.callback()
         state = self.State()
         with patch.object(main.stripe.Price, "retrieve", return_value=self.price()):
@@ -235,10 +258,40 @@ class RenewalNotificationSchedulingTests(unittest.IsolatedAsyncioTestCase):
              patch.object(main, "process_payment", AsyncMock()) as process_payment:
             await main.confirm_recurring_payment(callback, state)
             await main.confirm_recurring_payment(callback, state)
-        self.assertEqual(process_payment.await_count, 2)
-        for call in process_payment.await_args_list:
-            self.assertEqual(call.kwargs["selected_sub_type"], "sub_1")
-            self.assertEqual(call.kwargs["recurring_confirmation"]["price_id"], "price_1m")
+        process_payment.assert_awaited_once()
+        call = process_payment.await_args
+        self.assertEqual(call.kwargs["selected_sub_type"], "sub_1")
+        self.assertEqual(call.kwargs["recurring_confirmation"]["price_id"], "price_1m")
+        self.assertTrue(call.kwargs["checkout_idempotency_seed"].startswith("recurring-confirmation:"))
+        self.assertIn("уже использовано", callback.answer.await_args_list[-1].args[0])
+
+    async def test_concurrent_confirmation_callbacks_have_one_winner(self):
+        callback = self.callback()
+        state = self.State()
+        with patch.object(main.stripe.Price, "retrieve", return_value=self.price()):
+            await main.show_recurring_payment_terms(callback, state)
+        confirmation = state.data["recurring_checkout_confirmation"]
+        callback.data = f"confirm_recurring:sub_1:{confirmation['token']}"
+        with patch.object(main.stripe.Price, "retrieve", return_value=self.price()), \
+             patch.object(main, "process_payment", AsyncMock()) as process_payment:
+            await asyncio.gather(
+                main.confirm_recurring_payment(callback, state),
+                main.confirm_recurring_payment(callback, state),
+            )
+        process_payment.assert_awaited_once()
+
+    async def test_same_confirmation_has_stable_checkout_idempotency_seed(self):
+        confirmation = {
+            "terms_version": RECURRING_TERMS_VERSION,
+            "user_id": 123,
+            "tariff_code": "sub_1",
+            "price_id": "price_1m",
+            "fingerprint": "fingerprint",
+            "token": "one-time-token",
+        }
+        first = main.recurring_confirmation_idempotency_seed(confirmation)
+        second = main.recurring_confirmation_idempotency_seed(dict(confirmation))
+        self.assertEqual(first, second)
 
     async def test_price_change_after_terms_blocks_confirmation(self):
         callback = self.callback()

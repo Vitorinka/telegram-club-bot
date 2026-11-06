@@ -24,7 +24,9 @@ def stable_checkout_idempotency_key(telegram_id, tariff_code, created_at=None):
     return "checkout_" + hashlib.sha256(seed).hexdigest()[:40]
 
 
-def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None):
+def claim_checkout_session_record(
+    cur, telegram_id, tariff_code, mode, now=None, idempotency_seed=None,
+):
     """Atomically reserve one open Checkout per user/tariff."""
     now = now or datetime.utcnow()
     stale_before = now - timedelta(seconds=CHECKOUT_CREATING_LEASE_SECONDS)
@@ -94,7 +96,9 @@ def claim_checkout_session_record(cur, telegram_id, tariff_code, mode, now=None)
         )
 
     created_at = now
-    idempotency_key = stable_checkout_idempotency_key(telegram_id, tariff_code, created_at.isoformat())
+    idempotency_key = stable_checkout_idempotency_key(
+        telegram_id, tariff_code, idempotency_seed or created_at.isoformat(),
+    )
     cur.execute(
         """
         INSERT INTO checkout_sessions (

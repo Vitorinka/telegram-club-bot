@@ -2611,6 +2611,80 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await first.get_data(key), {"first": 1, "second": 2})
         self.assertTrue(all(conn.closed for conn in connections))
 
+    async def test_postgres_fsm_storage_consumes_confirmation_atomically_once(self):
+        from aiogram.fsm.storage.base import StorageKey
+        from postgres_fsm_storage import PostgresFSMStorage
+
+        record_lock = threading.Lock()
+        key = StorageKey(bot_id=10, chat_id=20, user_id=30)
+        key_params = (10, 20, 30, 0, "", "default")
+        records = {
+            key_params: {
+                "state": None,
+                "data_json": {
+                    "recurring_checkout_confirmation": {"token": "token-1", "price_id": "price_1m"},
+                },
+            },
+        }
+
+        class FsmCursor:
+            def __init__(self):
+                self.row = None
+                self.lock_held = False
+
+            def execute(self, query, params=None):
+                params = tuple(params or ())
+                normalized = " ".join(query.split())
+                if normalized.startswith("SELECT data_json") and "FOR UPDATE" in normalized:
+                    record_lock.acquire()
+                    self.lock_held = True
+                    record = records.get(params[:6])
+                    self.row = (record["data_json"],) if record else None
+                    return
+                if normalized.startswith("UPDATE aiogram_fsm_states"):
+                    records[params[1:7]]["data_json"] = adapted_json_value(params[0])
+
+            def fetchone(self):
+                return self.row
+
+            def close(self):
+                if self.lock_held:
+                    self.lock_held = False
+                    record_lock.release()
+
+        class FsmConnection:
+            def __init__(self):
+                self.cursor_obj = FsmCursor()
+
+            def cursor(self):
+                return self.cursor_obj
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        first = PostgresFSMStorage(FsmConnection)
+        second = PostgresFSMStorage(FsmConnection)
+        results = await asyncio.gather(
+            first.consume_data_value_once(
+                key, "recurring_checkout_confirmation", "token", "token-1",
+            ),
+            second.consume_data_value_once(
+                key, "recurring_checkout_confirmation", "token", "token-1",
+            ),
+        )
+
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertTrue(next(result for result in results if result)["consumed_at"])
+        self.assertTrue(
+            records[key_params]["data_json"]["recurring_checkout_confirmation"]["consumed_at"],
+        )
+
     async def test_first_purchase_recovery_delivery_skips_when_no_longer_due(self):
         delivery = (
             self.main.first_purchase_recovery_delivery_key(123),

@@ -7181,6 +7181,26 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(await first.get_data(key), {"step": 1, "first": 1, "second": 2})
 
+            await first.update_data(key, {
+                "recurring_checkout_confirmation": {
+                    "token": "one-time-token",
+                    "price_id": "price_1m",
+                },
+            })
+            consumed = await asyncio.gather(
+                first.consume_data_value_once(
+                    key, "recurring_checkout_confirmation", "token", "one-time-token",
+                ),
+                second.consume_data_value_once(
+                    key, "recurring_checkout_confirmation", "token", "one-time-token",
+                ),
+            )
+            self.assertEqual(sum(value is not None for value in consumed), 1)
+            self.assertTrue(next(value for value in consumed if value)["consumed_at"])
+            self.assertTrue(
+                (await first.get_data(key))["recurring_checkout_confirmation"]["consumed_at"],
+            )
+
             conn = self.get_conn()
             cur = conn.cursor()
             try:

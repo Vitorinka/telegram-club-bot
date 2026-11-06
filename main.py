@@ -13415,6 +13415,32 @@ async def validated_current_recurring_confirmation(confirmation, sub_type):
     return current_price
 
 
+async def consume_recurring_confirmation_once(state, token):
+    storage = getattr(state, "storage", None)
+    key = getattr(state, "key", None)
+    consume = getattr(storage, "consume_data_value_once", None)
+    if key is None or not callable(consume):
+        logging.error("RECURRING_CONFIRMATION_ATOMIC_STORAGE_UNAVAILABLE")
+        return None
+    return await consume(
+        key, "recurring_checkout_confirmation", "token", token,
+    )
+
+
+def recurring_confirmation_idempotency_seed(confirmation):
+    values = (
+        confirmation.get("terms_version"),
+        confirmation.get("user_id"),
+        confirmation.get("tariff_code"),
+        confirmation.get("price_id"),
+        confirmation.get("fingerprint"),
+        confirmation.get("token"),
+    )
+    return "recurring-confirmation:" + hashlib.sha256(
+        ":".join(str(value) for value in values).encode("utf-8")
+    ).hexdigest()
+
+
 @router.callback_query(F.data.startswith('confirm_recurring:'), StateFilter('*'))
 async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split(':')
@@ -13422,11 +13448,15 @@ async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
         return
     _, sub_type, token = parts
-    confirmation = (await state.get_data()).get("recurring_checkout_confirmation")
+    candidate = (await state.get_data()).get("recurring_checkout_confirmation")
     if not recurring_confirmation_is_current(
-        confirmation, callback.from_user.id, sub_type, token,
+        candidate, callback.from_user.id, sub_type, token,
     ):
         await callback.answer("Условия оплаты устарели. Выберите тариф заново.", show_alert=True)
+        return
+    confirmation = await consume_recurring_confirmation_once(state, token)
+    if confirmation is None:
+        await callback.answer("Это подтверждение уже использовано.", show_alert=True)
         return
     try:
         current_price = await validated_current_recurring_confirmation(
@@ -13444,6 +13474,7 @@ async def confirm_recurring_payment(callback: types.CallbackQuery, state: FSMCon
     await process_payment(
         callback, state, selected_sub_type=sub_type,
         recurring_confirmation=confirmation,
+        checkout_idempotency_seed=recurring_confirmation_idempotency_seed(confirmation),
     )
 
 
@@ -13488,7 +13519,7 @@ async def show_recurring_payment_terms(callback: types.CallbackQuery, state: FSM
 
 async def process_payment(
     callback: types.CallbackQuery, state: FSMContext, selected_sub_type=None,
-    recurring_confirmation=None,
+    recurring_confirmation=None, checkout_idempotency_seed=None,
 ):
     sub_type = selected_sub_type or callback.data
     price_map = {
@@ -13955,7 +13986,10 @@ async def process_payment(
         claim_cur = claim_conn.cursor()
         checkout_record = None
         try:
-            claim_result = claim_checkout_session_record(claim_cur, user_id, sub_type, mode)
+            claim_result = claim_checkout_session_record(
+                claim_cur, user_id, sub_type, mode,
+                idempotency_seed=checkout_idempotency_seed,
+            )
             checkout_record = claim_result["record"]
             claim_conn.commit()
         finally:
