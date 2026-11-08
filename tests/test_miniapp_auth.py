@@ -55,12 +55,29 @@ class MiniAppAuthTests(unittest.TestCase):
 
     def test_valid_member_identity_uses_same_signature_and_freshness_checks(self):
         identity = miniapp_auth.validate_telegram_member_init_data(
-            signed_init_data({"id": 99, "first_name": "Member"}),
+            signed_init_data({"id": 99, "first_name": "Member", "photo_url": "https://t.me/i/userpic/320/member.jpg"}),
             BOT_TOKEN,
             now=NOW,
         )
         self.assertEqual(identity.telegram_id, 99)
         self.assertEqual(identity.first_name, "Member")
+        self.assertEqual(identity.photo_url, "https://t.me/i/userpic/320/member.jpg")
+
+    def test_member_photo_url_requires_signed_https_identity_data(self):
+        identity = miniapp_auth.validate_telegram_member_init_data(
+            signed_init_data({"id": 99, "photo_url": "javascript:alert(1)"}),
+            BOT_TOKEN,
+            now=NOW,
+        )
+        self.assertIsNone(identity.photo_url)
+
+    def test_member_photo_url_rejects_unapproved_https_host(self):
+        identity = miniapp_auth.validate_telegram_member_init_data(
+            signed_init_data({"id": 99, "photo_url": "https://example.com/avatar.jpg"}),
+            BOT_TOKEN,
+            now=NOW,
+        )
+        self.assertIsNone(identity.photo_url)
 
     def test_member_identity_cannot_be_forged(self):
         raw = signed_init_data({"id": 99})

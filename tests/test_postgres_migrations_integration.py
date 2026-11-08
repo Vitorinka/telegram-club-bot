@@ -3026,6 +3026,21 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         serialized = json.dumps(list_content_media(self.get_conn, draft["content_id"]))
         self.assertNotIn(object_key, serialized)
         self.assertNotIn("server_reference", serialized)
+        abandoned_upload_id = str(uuid.uuid4())
+        create_r2_media_upload(
+            self.get_conn, 1, draft["content_id"], "cover", "cover.png",
+            "image/png", 1024, f"content/{draft['content_id']}/{uuid.uuid4()}.png",
+            abandoned_upload_id,
+        )
+        self.assertEqual(
+            cancel_media_upload(self.get_conn, abandoned_upload_id, 1)["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            get_r2_media_upload(self.get_conn, abandoned_upload_id, 1)["status"],
+            "cancelled",
+        )
+        self.assertEqual(len(list_content_media(self.get_conn, draft["content_id"])), 1)
 
     def test_r2_migration_preserves_existing_telegram_rows_and_storage_guarantees(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -14118,7 +14133,7 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                         ('2026-06', 'telegram_secret_file_june', 9000, NOW() - INTERVAL '5 months', NOW()),
                         ('2026-07', 'telegram_secret_file_july', 9001, NOW() - INTERVAL '4 months', NOW()),
                         ('2026-08', 'telegram_secret_file_august', 9002, NOW() - INTERVAL '3 months', NOW()),
-                        ('2026-09', 'telegram_secret_file_september', 9003, NOW() - INTERVAL '2 months', NOW()),
+                        ('2026-09', 'telegram_secret_file_september', 9003, NOW() - INTERVAL '2 months', TIMESTAMP '2026-11-08 09:34:55.189003'),
                         ('2026-10', 'telegram_secret_file_october', 9004, NOW() - INTERVAL '1 month', NOW())
                     """
                 )
@@ -14192,12 +14207,33 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         self.assertEqual(details["period_label"], "Сентябрь 2026")
         self.assertTrue(details["has_image"])
         self.assertFalse(details["has_join_link"])
-        serialized = json.dumps({"list": default, "details": details})
+        response_payload = {"list": default, "details": details}
+        serialized = json.dumps(response_payload)
         for forbidden in (
-            "telegram_secret_file", "uploaded_by_telegram_id", "9003",
-            "zoom", "password", "token",
+            "telegram_secret_file", "uploaded_by_telegram_id", "zoom",
+            "password", "token",
         ):
             self.assertNotIn(forbidden, serialized.lower())
+
+        def response_leaf_values(value):
+            if isinstance(value, dict):
+                return [
+                    leaf
+                    for child in value.values()
+                    for leaf in response_leaf_values(child)
+                ]
+            if isinstance(value, list):
+                return [
+                    leaf
+                    for child in value
+                    for leaf in response_leaf_values(child)
+                ]
+            return [value]
+
+        response_values = response_leaf_values(response_payload)
+        self.assertNotIn(9003, response_values)
+        self.assertNotIn("9003", response_values)
+        self.assertIn("2026-11-08T09:34:55.189003", response_values)
 
         self.assertEqual(
             get_admin_schedule_image_file_id(self.get_conn, "2026-09"),

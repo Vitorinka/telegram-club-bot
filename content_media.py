@@ -254,8 +254,10 @@ def cancel_media_upload(get_connection, upload_id, admin_id):
     try:
         cur.execute("""
             UPDATE content_media_uploads SET status='cancelled', media_bytes=''::bytea,
-                byte_size=0, telegram_file_id=NULL, consumed_at=NOW(), updated_at=NOW()
-            WHERE upload_id=%s AND admin_telegram_id=%s AND status='pending'
+                byte_size=CASE WHEN storage_kind='r2' THEN byte_size ELSE 0 END,
+                telegram_file_id=NULL, consumed_at=NOW(), updated_at=NOW()
+            WHERE upload_id=%s AND admin_telegram_id=%s
+              AND (status='pending' OR (status='uploading' AND storage_kind='r2'))
             RETURNING upload_id
         """, (upload_id, int(admin_id)))
         if not cur.fetchone():

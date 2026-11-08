@@ -488,7 +488,7 @@ def build_miniapp_security_headers(r2_config):
             "script-src 'self' https://telegram.org; "
             "style-src 'self'; "
             f"connect-src 'self'{r2_source}; "
-            "img-src 'self' data: blob:; "
+            "img-src 'self' data: blob: https://t.me https://*.t.me https://telegram.org https://*.telegram.org https://telesco.pe https://*.telesco.pe; "
             f"media-src 'self' blob:{r2_source}; "
             "base-uri 'none'; form-action 'none'; "
             "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
@@ -24627,7 +24627,12 @@ def _member_test_ids():
     return result
 
 def member_rollout_allowed(telegram_id):
-    return os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true" or int(telegram_id) in _member_test_ids()
+    member_id = int(telegram_id)
+    return (
+        os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true"
+        or member_id in ADMIN_IDS
+        or member_id in _member_test_ids()
+    )
 
 def zoom_v2_api_enabled():
     return os.getenv("ZOOM_V2_API_ENABLED", "false").strip().lower() == "true"
@@ -24747,7 +24752,7 @@ async def miniapp_member_auth(request):
         access=member_access(get_db_conn,identity.telegram_id)
     except MiniAppAuthError as error: return miniapp_auth_error_response(error.status)
     except MemberSessionError as error: return member_error(error)
-    return apply_miniapp_security_headers(web.json_response({"token":token,"expires_at":session.expires_at.isoformat(),"authenticated":True,"profile":{"first_name":identity.first_name,"username":identity.username},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}},status=201))
+    return apply_miniapp_security_headers(web.json_response({"token":token,"expires_at":session.expires_at.isoformat(),"authenticated":True,"profile":{"first_name":identity.first_name,"username":identity.username,"photo_url":getattr(identity,"photo_url",None)},"access":{"has_active_access":access["has_active_access"],"expires_at":access["expires_at"]}},status=201))
 
 async def miniapp_member_me(request):
     access=await async_member_request_access(request)

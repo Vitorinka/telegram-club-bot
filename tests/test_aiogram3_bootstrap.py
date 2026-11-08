@@ -10165,7 +10165,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 401)
 
-        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "false", "MEMBER_APP_TEST_IDS": "42"}, clear=False):
+        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "false", "MEMBER_APP_TEST_IDS": "42"}, clear=False), patch.object(
+            self.main, "ADMIN_IDS", [1]
+        ):
+            self.assertTrue(self.main.member_rollout_allowed(1))
             self.assertTrue(self.main.member_rollout_allowed(42))
             self.assertFalse(self.main.member_rollout_allowed(43))
         with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "true", "MEMBER_APP_TEST_IDS": ""}, clear=False):
@@ -10197,7 +10200,8 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             app, "tma signed-init-data", path="/api/member/auth", method="POST"
         )
         identity = SimpleNamespace(
-            telegram_id=77, first_name="Telegram Name", username="member"
+            telegram_id=77, first_name="Telegram Name", username="member",
+            photo_url="https://cdn.example/member.jpg",
         )
         session = SimpleNamespace(
             telegram_id=77, first_name="Telegram Name", session_id="member-session",
@@ -10220,6 +10224,7 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 201)
         payload = json.loads(response.text)
         self.assertEqual(payload["profile"]["first_name"], "Telegram Name")
+        self.assertEqual(payload["profile"]["photo_url"], "https://cdn.example/member.jpg")
         self.assertFalse(payload["access"]["has_active_access"])
         create_session.assert_called_once_with(
             self.main.get_db_conn, 77, "Telegram Name"

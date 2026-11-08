@@ -687,6 +687,74 @@ body.member-preview-mode .member-admin-create[hidden] { display: none; }
   .dashboard-more { display: block; }
 }
 
+/* P0 Telegram WebView editor: one scroll surface and no overlapping action bars. */
+@media (max-width: 1023px) {
+  body:not(.member-preview-mode):has(#content-details:not([hidden])),
+  body:not(.member-preview-mode):has(#content-create:not([hidden])) {
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+  }
+  body:not(.member-preview-mode):has(#content-details:not([hidden])) .hero-card,
+  body:not(.member-preview-mode):has(#content-create:not([hidden])) .hero-card {
+    display: none !important;
+  }
+  body:not(.member-preview-mode) #content-details .studio-toolbar {
+    position: static;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    margin-top: max(2px, env(safe-area-inset-top));
+  }
+  body:not(.member-preview-mode) #content-details .studio-editor-actions {
+    position: static;
+    margin-top: 10px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    box-shadow: none;
+  }
+  body:not(.member-preview-mode) #content-details,
+  body:not(.member-preview-mode) #content-create {
+    min-height: min(100dvh, var(--tg-viewport-height, 100dvh));
+    padding-bottom: calc(20px + env(safe-area-inset-bottom));
+  }
+  body:not(.member-preview-mode) #content-media-confirmation .confirmation-actions,
+  body:not(.member-preview-mode) #content-details .authoring-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  body:not(.member-preview-mode) #content-media-confirmation button,
+  body:not(.member-preview-mode) #content-details .authoring-actions button {
+    width: 100%;
+    min-height: 42px;
+    padding-inline: 10px;
+  }
+}
+
+body:not(.member-preview-mode) > #bottom-nav.editor-navigation-hidden {
+  display: none !important;
+}
+
+/* The editor already owns save/publish controls in its content cards.
+   The legacy floating footer duplicated them and covered fields in desktop/WebView. */
+body:not(.member-preview-mode) #content-details .studio-editor-actions {
+  display: none !important;
+}
+
+@media (max-width: 430px) {
+  body:not(.member-preview-mode) #content-details .studio-editor-title strong {
+    max-width: 48vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  body:not(.member-preview-mode) #content-details .studio-toolbar button {
+    min-height: 38px;
+    padding: 5px 8px;
+    font-size: 11px;
+  }
+  body:not(.member-preview-mode) .studio-file-picker span,
+  body:not(.member-preview-mode) #content-video-current,
+  body:not(.member-preview-mode) #content-audio-current {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
 /* Reference-aligned Users directory and canonical profile. */
 body:not(.member-preview-mode) #users-screen,
 body:not(.member-preview-mode) #user-details { --users-accent: var(--soul-teal); color: #161d2d; }

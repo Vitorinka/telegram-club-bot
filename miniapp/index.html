@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Админ-платформа</title>
-  <link rel="stylesheet" href="/miniapp/styles.css">
+  <link rel="stylesheet" href="/miniapp/styles.css?v=20261107-content-studio-p0">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/miniapp/app.js" defer></script>
+  <script src="/miniapp/app.js?v=20261107-content-studio-p0" defer></script>
 </head>
 <body>
   <main class="shell" aria-live="polite">
@@ -164,7 +164,7 @@
           <label>Загрузить или заменить
             <input id="content-cover-file" type="file" accept="image/jpeg,image/png,image/webp">
           </label>
-          <button id="content-cover-validate" type="button">Продолжить с обложкой</button>
+          <button id="content-cover-validate" type="button" hidden>Проверить обложку</button>
         </section>
         <section id="content-video-control" class="content-media-control">
           <h3>Видео</h3>
@@ -173,7 +173,7 @@
             <input id="content-video-file" type="file" accept="video/mp4,video/webm,.mp4,.webm">
             <span id="content-video-selection">Выберите MP4 или WebM</span>
           </label>
-          <button id="content-video-validate" type="button">Продолжить с видео</button>
+          <button id="content-video-validate" type="button" hidden>Проверить видео</button>
         </section>
         <section id="content-audio-control" class="content-media-control" hidden>
           <h3>Аудио</h3><p class="hint">MP3/M4A/WAV/OGG · до 2 ГБ</p>
@@ -181,16 +181,16 @@
           <label>Загрузить или заменить
             <input id="content-audio-file" type="file" accept="audio/mpeg,audio/mp4,audio/wav,audio/ogg,.mp3,.m4a,.wav,.ogg">
           </label>
-          <button id="content-audio-validate" type="button">Продолжить с аудио</button>
+          <button id="content-audio-validate" type="button" hidden>Проверить аудио</button>
         </section>
         <section id="content-media-confirmation" hidden>
-          <h3>Подтверждение</h3>
+          <h3>Состояние загрузки</h3>
           <div id="content-media-preview" class="schedule-preview"><span class="schedule-image-loading">Предварительный просмотр</span></div>
           <div id="content-media-summary" class="confirmation-summary"></div>
           <p id="content-media-message" class="hint" aria-live="polite"></p>
           <div id="content-media-progress" class="studio-upload-progress" role="progressbar" aria-label="Загрузка файла" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden><span></span></div>
           <div class="confirmation-actions">
-            <button id="content-media-confirm" type="button">Сохранить медиа</button>
+            <button id="content-media-confirm" type="button">Загрузить и сохранить</button>
             <button id="content-media-cancel" class="secondary" type="button">Отмена</button>
           </div>
         </section>
