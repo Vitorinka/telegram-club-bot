@@ -24627,7 +24627,12 @@ def _member_test_ids():
     return result
 
 def member_rollout_allowed(telegram_id):
-    return os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true" or int(telegram_id) in _member_test_ids()
+    member_id = int(telegram_id)
+    return (
+        os.getenv("MEMBER_APP_ENABLED", "false").strip().lower() == "true"
+        or member_id in ADMIN_IDS
+        or member_id in _member_test_ids()
+    )
 
 def zoom_v2_api_enabled():
     return os.getenv("ZOOM_V2_API_ENABLED", "false").strip().lower() == "true"

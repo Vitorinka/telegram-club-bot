@@ -10165,7 +10165,10 @@ class Aiogram3BootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 401)
 
-        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "false", "MEMBER_APP_TEST_IDS": "42"}, clear=False):
+        with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "false", "MEMBER_APP_TEST_IDS": "42"}, clear=False), patch.object(
+            self.main, "ADMIN_IDS", [1]
+        ):
+            self.assertTrue(self.main.member_rollout_allowed(1))
             self.assertTrue(self.main.member_rollout_allowed(42))
             self.assertFalse(self.main.member_rollout_allowed(43))
         with patch.dict(os.environ, {"MEMBER_APP_ENABLED": "true", "MEMBER_APP_TEST_IDS": ""}, clear=False):
