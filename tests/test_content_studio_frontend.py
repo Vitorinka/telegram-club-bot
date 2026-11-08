@@ -357,7 +357,7 @@ class ContentStudioFrontendTests(unittest.TestCase):
             list:core.adminShellNavigationVisible('content'),
           }));
         """)
-        self.assertEqual(result, {"editor": False, "create": True, "list": True})
+        self.assertEqual(result, {"editor": True, "create": True, "list": True})
         html = INDEX_HTML.read_text()
         styles = STYLES_CSS.read_text()
         source = APP_JS.read_text()
@@ -365,6 +365,31 @@ class ContentStudioFrontendTests(unittest.TestCase):
         self.assertIn('bottomNav.classList.toggle("editor-navigation-hidden"', source)
         self.assertIn('> #bottom-nav.editor-navigation-hidden', styles)
         self.assertNotIn('#content-create:not([hidden])) > .bottom-nav', styles)
+
+    def test_figma_content_studio_replaces_legacy_shell_without_losing_cms_hooks(self):
+        html = INDEX_HTML.read_text()
+        styles = STYLES_CSS.read_text()
+        source = APP_JS.read_text()
+        self.assertNotIn('class="card studio-legacy"', html)
+        self.assertNotIn('class="studio-create-options"', html)
+        self.assertIn('class="studio-table-head"', html)
+        self.assertIn('class="studio-create-layout"', html)
+        self.assertIn('class="studio-current-summary"', html)
+        self.assertIn('data-status-count="published"', html)
+        self.assertIn('renderContentStatusCount', source)
+        self.assertIn('renderCreateContentPreview', source)
+        self.assertIn('Figma nodes 11:162, 12:2, 221:1805, 141:377, 141:425, 223:315', styles)
+
+    def test_figma_editor_keeps_single_authoritative_media_state_machine(self):
+        html = INDEX_HTML.read_text()
+        source = APP_JS.read_text()
+        self.assertEqual(html.count('id="content-media-confirmation"'), 1)
+        self.assertEqual(html.count('id="content-media-confirm"'), 1)
+        self.assertEqual(html.count('id="content-media-progress"'), 1)
+        for stage in ("selected", "uploading", "verifying", "saved", "failed"):
+            self.assertIn(f'{stage}: "', source)
+        self.assertIn('uploadContentMediaDirect(', source)
+        self.assertIn('/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize', source)
 
     def test_admin_screen_model_has_exactly_one_visible_screen(self):
         output = self.run_node("""
