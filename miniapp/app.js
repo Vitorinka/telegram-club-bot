@@ -20,6 +20,111 @@
     return null;
   };
   const contentStudioCanStartMedia = (dirty) => !dirty;
+  const contentMediaIntentUsable = (intent, now = Date.now(), safetySeconds = 30) => {
+    if (!intent || !intent.upload_id || !intent.upload_url) return false;
+    const receivedAt = Number(intent.client_received_at);
+    const ttlMs = Number(intent.expires_in) * 1000;
+    return Number.isFinite(receivedAt) && Number.isFinite(ttlMs) && ttlMs > 0
+      && now < receivedAt + ttlMs - Math.max(0, Number(safetySeconds) || 0) * 1000;
+  };
+  const contentMediaIntentMustRotate = (error) => {
+    const category = String(error && error.message || "");
+    const status = Number(error && error.status || 0);
+    return [400, 401, 403, 404].includes(status)
+      || ["content_media_upload_not_found", "content_media_upload_not_ready",
+        "object_storage_metadata_mismatch", "content_version_changed"].includes(category);
+  };
+  const contentMediaFinalizeCanRetryPut = (error) =>
+    ["object_storage_object_missing", "object_storage_head_failed"].includes(String(error && error.message || ""));
+  const runContentMediaDirectUpload = async ({
+    intent, createIntent, putObject, finalize, cancelIntent = async () => null,
+    onIntent = () => {}, onStage = () => {}, onProgress, now = () => Date.now(),
+  }) => {
+    let activeIntent = intent || null;
+    const discardIntent = async () => {
+      const stale = activeIntent;
+      activeIntent = null;
+      onIntent(null);
+      if (stale && stale.upload_id) await Promise.resolve(cancelIntent(stale)).catch(() => null);
+    };
+    if (activeIntent) {
+      try {
+        onStage("verifying");
+        const recovered = await finalize(activeIntent);
+        if (recovered && recovered.status === "completed") {
+          onStage("saved");
+          return {result: recovered, intent: activeIntent, recovered: true};
+        }
+        const error = new Error(recovered && (recovered.failure_category || recovered.status) || "content_media_upload_not_ready");
+        if (!contentMediaFinalizeCanRetryPut(error)) throw error;
+      } catch (error) {
+        if (!contentMediaFinalizeCanRetryPut(error)) {
+          if (!contentMediaIntentUsable(activeIntent, now()) || contentMediaIntentMustRotate(error)) {
+            await discardIntent();
+          } else {
+            throw error;
+          }
+        } else if (!contentMediaIntentUsable(activeIntent, now())) {
+          await discardIntent();
+        }
+      }
+    }
+    if (!activeIntent) {
+      const created = await createIntent();
+      activeIntent = {...created, client_received_at: now()};
+      onIntent(activeIntent);
+    }
+    onStage("uploading");
+    try {
+      await putObject(activeIntent, onProgress);
+    } catch (error) {
+      if (!contentMediaIntentUsable(activeIntent, now()) || contentMediaIntentMustRotate(error)) {
+        await discardIntent();
+      }
+      throw error;
+    }
+    onStage("verifying");
+    const result = await finalize(activeIntent);
+    if (!result || result.status !== "completed") throw new Error(result && (result.failure_category || result.status) || "content_media_upload_not_ready");
+    onStage("saved");
+    return {result, intent: activeIntent, recovered: false};
+  };
+  const contentMediaOperationIsCurrent = ({operationGeneration, operationContentId, currentGeneration, currentContentId}) =>
+    operationGeneration === currentGeneration && String(operationContentId) === String(currentContentId);
+  const createContentMediaOperationGate = () => {
+    let activeToken = null;
+    return {
+      begin(token) {
+        if (activeToken !== null) return false;
+        activeToken = token;
+        return true;
+      },
+      end(token) {
+        if (activeToken === token) activeToken = null;
+      },
+      clear() { activeToken = null; },
+      isActive() { return activeToken !== null; },
+    };
+  };
+  const refreshContentMediaAfterFinalize = async (refresh) => {
+    try {
+      await refresh();
+      return {saved: true, synchronized: true};
+    } catch (error) {
+      return {saved: true, synchronized: false, error};
+    }
+  };
+  const safeTelegramPhotoUrl = (value) => {
+    try {
+      const parsed = new URL(String(value || ""));
+      const host = parsed.hostname.toLowerCase();
+      return parsed.protocol === "https:" && (
+        host === "t.me" || host.endsWith(".t.me")
+        || host === "telegram.org" || host.endsWith(".telegram.org")
+        || host === "telesco.pe" || host.endsWith(".telesco.pe")
+      ) ? parsed.href : null;
+    } catch (_error) { return null; }
+  };
   const contentStudioEffectiveCategory = (items, selected) => {
     const available = new Set(items.flatMap((item) => (item.categories || []).map((entry) => entry.id)));
     return selected !== "all" && available.has(selected) ? selected : "all";
@@ -36,6 +141,7 @@
   const contentStudioSaveRecipe = ({saveMetadata, saveRecipe, reload}) =>
     saveMetadata().then(saveRecipe).then(reload);
   const adminScreenIsVisible = (activeScreen, candidateScreen) => activeScreen === candidateScreen;
+  const adminShellNavigationVisible = (activeScreen) => activeScreen !== "content-details";
   const adminSearchMatches = (values, query) => {
     const normalized=String(query || "").trim().toLocaleLowerCase("ru");
     return normalized.length >= 2 && values.some((value)=>String(value || "").toLocaleLowerCase("ru").includes(normalized));
@@ -106,11 +212,7 @@
   const adminProfilePresentation = (user = {}) => {
     const displayName = [user.first_name,user.last_name].filter(Boolean).join(" ") || user.username || "Администратор";
     const initials = [user.first_name,user.last_name].filter(Boolean).map((part)=>String(part).slice(0,1)).join("").slice(0,2).toUpperCase() || "A";
-    let photoUrl = null;
-    try {
-      const parsed = new URL(String(user.photo_url || ""));
-      if (parsed.protocol === "https:") photoUrl = parsed.href;
-    } catch (_error) { photoUrl = null; }
+    const photoUrl = safeTelegramPhotoUrl(user.photo_url);
     return {displayName,initials,photoUrl};
   };
   const contentStudioCreateDraft = ({files, createDraft, saveDomain, attachMedia, openDraft}) => {
@@ -163,7 +265,7 @@
     return {src:objectUrl, objectUrl};
   };
   if (typeof module !== "undefined" && module.exports && typeof document === "undefined") {
-    module.exports = {adminScreenIsVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft, memberVideoSource};
+    module.exports = {adminScreenIsVisible, adminShellNavigationVisible, adminSearchMatches, adminNotificationUnreadCount, adminSystemIncidentKey, collectAdminNotificationKeys, adminNotificationUnknownUnread, adminNotificationOverflowCount, orderAdminNotificationItems, adminNotificationPanelPage, createBoundedTaskQueue, getOrCreateCachedResource, hydrateAdminNotificationReadState, persistAdminNotificationRead, adminProfilePresentation, safeTelegramPhotoUrl, contentStudioCanStartMedia, contentStudioEffectiveCategory, contentStudioCoverUrl, contentStudioMediaPreflightError, contentStudioMove, contentStudioSaveRecipe, contentStudioCreateDraft, contentMediaIntentUsable, contentMediaIntentMustRotate, runContentMediaDirectUpload, contentMediaOperationIsCurrent, createContentMediaOperationGate, refreshContentMediaAfterFinalize, memberVideoSource};
     return;
   }
   const webApp = (window.Telegram && window.Telegram.WebApp) || {};
@@ -411,7 +513,9 @@
   let contentMediaPendingFile = null;
   let contentMediaPendingType = null;
   let contentMediaDirectIntent = null;
-  let contentMediaUploadInFlight = false;
+  let contentMediaRefreshOnlyId = null;
+  const contentMediaUploadGate = createContentMediaOperationGate();
+  let contentMediaSelectionGeneration = 0;
   let contentCreateInFlight = false;
   let objectStorageStatusPromise = null;
   let contentMediaLocalUrl = null;
@@ -590,14 +694,12 @@
     memberHeroPhoto.dataset.fallback = fallback;
     memberHeroPhoto.style.backgroundImage = `url("${fallback}")`;
     if (!photoUrl) return;
-    let parsed;
-    try { parsed = new URL(photoUrl); }
-    catch (_error) { return; }
-    if (parsed.protocol !== "https:") return;
+    const safePhotoUrl = safeTelegramPhotoUrl(photoUrl);
+    if (!safePhotoUrl) return;
     const candidate = new Image();
-    candidate.onload = () => { memberHeroPhoto.style.backgroundImage = `url("${parsed.href}")`; };
+    candidate.onload = () => { memberHeroPhoto.style.backgroundImage = `url("${safePhotoUrl}")`; };
     candidate.onerror = () => { memberHeroPhoto.style.backgroundImage = `url("${fallback}")`; };
-    candidate.src = parsed.href;
+    candidate.src = safePhotoUrl;
   };
   const applyMemberDesktopLayout = () => {
     const desktop = window.matchMedia("(min-width: 900px)").matches;
@@ -1323,6 +1425,7 @@
     studioCoverUrls = [];
   };
   const resetContentMediaDraft = () => {
+    contentMediaSelectionGeneration += 1;
     if (contentMediaLocalUrl) URL.revokeObjectURL(contentMediaLocalUrl);
     if (contentMediaServerUrl) URL.revokeObjectURL(contentMediaServerUrl);
     contentMediaLocalUrl = null;
@@ -1332,7 +1435,8 @@
     contentMediaPendingFile = null;
     contentMediaPendingType = null;
     contentMediaDirectIntent = null;
-    contentMediaUploadInFlight = false;
+    contentMediaRefreshOnlyId = null;
+    contentMediaUploadGate.clear();
     contentCoverFile.value = "";
     contentVideoFile.value = "";
     contentAudioFile.value = "";
@@ -1384,6 +1488,8 @@
     if (!name.startsWith("member-")) {
       activeAdminScreen = adminRootScreen(name);
       document.body.dataset.adminScreen = activeAdminScreen;
+      document.body.dataset.adminView = name;
+      bottomNav.classList.toggle("editor-navigation-hidden", !adminShellNavigationVisible(name));
       syncAdminShellActions(name);
     }
     document.querySelectorAll("[data-nav]").forEach((node) => { node.classList.toggle("active", node.dataset.nav === adminRootScreen(name)); });
@@ -1452,19 +1558,24 @@
     xhr.send(file);
   });
   const uploadContentMediaDirect = (contentId, mediaType, file, onProgress, options = {}) => {
-    const intentPromise = options.intent ? Promise.resolve(options.intent) : writeAdminJson(
-      "POST", `/api/admin/content/cms/${encodeURIComponent(contentId)}/media/upload-intent`,
-      {media_type: mediaType, filename: file.name, content_type: file.type, size_bytes: file.size},
+    const finalize = (intent) => writeAdminJson(
+      "POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize`, {},
     );
-    return intentPromise.then((intent) => {
-      if (options.onIntent) options.onIntent(intent);
-      if (options.onStage) options.onStage("uploading");
-      return putDirectObject(intent.upload_url, intent.required_headers, file, onProgress).then(() => intent);
-    }).then((intent) => {
-      if (options.onStage) options.onStage("verifying");
-      return writeAdminJson("POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize`, {});
-    }).then((result) => {
-      if (options.onStage) options.onStage("saved");
+    return runContentMediaDirectUpload({
+      intent: options.intent,
+      createIntent: () => writeAdminJson(
+        "POST", `/api/admin/content/cms/${encodeURIComponent(contentId)}/media/upload-intent`,
+        {media_type: mediaType, filename: file.name, content_type: file.type, size_bytes: file.size},
+      ),
+      putObject: (intent) => putDirectObject(intent.upload_url, intent.required_headers, file, onProgress),
+      finalize,
+      cancelIntent: (intent) => writeAdminJson(
+        "POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/cancel`, {},
+      ),
+      onIntent: options.onIntent,
+      onStage: options.onStage,
+      onProgress,
+    }).then(({result}) => {
       return result;
     });
   };
@@ -2868,7 +2979,7 @@
       .then(() => { resetContentLifecycle(currentCmsContent); contentLifecycleCard.hidden = true; status.textContent = "Операция отменена"; })
       .catch(showApiError);
   };
-  const loadCmsContentDetails = (contentId) => {
+  const loadCmsContentDetails = (contentId, {propagateError = false} = {}) => {
     clearContentMediaUrls();
     resetContentMediaDraft();
     status.textContent = "Загружаем черновик…";
@@ -2927,7 +3038,10 @@
       loadContentVersions(item.content_id).catch(showApiError);
       showScreen("content-details");
       status.textContent = item.title;
-    }).catch(showApiError);
+    }).catch((error) => {
+      showApiError(error);
+      if (propagateError) throw error;
+    });
   };
   const mediaImage = (url, alt) => {
     const image = document.createElement("img");
@@ -3005,6 +3119,7 @@
     contentMediaProgress.firstElementChild.style.width = `${value}%`;
   };
   const rememberPendingContentMedia = (mediaType, file) => {
+    contentMediaSelectionGeneration += 1;
     contentMediaPendingFile = file || null;
     contentMediaPendingType = file ? mediaType : null;
     contentMediaDirectIntent = null;
@@ -3016,6 +3131,12 @@
       contentMediaConfirmation.hidden = false;
       setContentMediaStage("selected");
     }
+  };
+  const setContentMediaInputsDisabled = (disabled) => {
+    contentCoverFile.disabled = disabled;
+    contentVideoFile.disabled = disabled;
+    contentAudioFile.disabled = disabled;
+    contentMediaCancel.disabled = disabled;
   };
   const previewContentMediaRemove = (media, label) => {
     if (!currentCmsContent || currentCmsContent.status !== "draft") return Promise.resolve();
@@ -3116,13 +3237,32 @@
     });
   };
   const confirmContentMedia = () => {
-    if ((!contentMediaUploadId && !contentMediaPendingFile) || !currentCmsContent || contentMediaUploadInFlight) return Promise.resolve();
+    if (contentMediaRefreshOnlyId && !contentMediaUploadGate.isActive()) {
+      const contentId = contentMediaRefreshOnlyId;
+      return loadCmsContentDetails(contentId, {propagateError: true})
+        .then(() => { contentMediaRefreshOnlyId = null; contentMediaConfirm.textContent = "Загрузить и сохранить"; })
+        .catch(() => {
+          contentMediaRefreshOnlyId = contentId;
+          setContentMediaStage("saved", "Файл уже сохранён. Повторите синхронизацию карточки — повторная загрузка не требуется.");
+        });
+    }
+    if ((!contentMediaUploadId && !contentMediaPendingFile) || !currentCmsContent) return Promise.resolve();
     if (!contentStudioCanStartMedia(contentEditorDirty)) {
       contentMediaMessage.textContent = "Сначала сохраните изменения материала, затем загрузите медиа.";
       return Promise.resolve();
     }
-    contentMediaUploadInFlight = true;
+    const operationToken = {};
+    if (!contentMediaUploadGate.begin(operationToken)) return Promise.resolve();
     contentMediaConfirm.disabled = true;
+    setContentMediaInputsDisabled(true);
+    const operationGeneration = contentMediaSelectionGeneration;
+    const operationContentId = currentCmsContent.content_id;
+    const operationIsCurrent = () => contentMediaOperationIsCurrent({
+      operationGeneration,
+      operationContentId,
+      currentGeneration: contentMediaSelectionGeneration,
+      currentContentId: currentCmsContent && currentCmsContent.content_id,
+    });
     setContentMediaStage("uploading");
     setContentUploadProgress(0);
     const operation = contentMediaPendingFile
@@ -3132,18 +3272,38 @@
           (percent) => { setContentUploadProgress(percent); contentMediaMessage.textContent = `Загружаем напрямую в хранилище… ${percent}%`; },
           {
             intent: contentMediaDirectIntent,
-            onIntent: (intent) => { contentMediaDirectIntent = intent; },
-            onStage: (stage) => setContentMediaStage(stage),
+            onIntent: (intent) => { if (operationIsCurrent()) contentMediaDirectIntent = intent; },
+            onStage: (stage) => { if (operationIsCurrent()) setContentMediaStage(stage); },
           },
         )
       : postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`);
     return operation
       .then((result) => {
         if (result.status !== "completed") throw new Error(result.failure_category || result.status);
+        if (!operationIsCurrent()) return result;
+        contentMediaPendingFile = null;
+        contentMediaPendingType = null;
+        contentMediaDirectIntent = null;
+        contentCoverFile.value = "";
+        contentVideoFile.value = "";
+        contentAudioFile.value = "";
         setContentUploadProgress(100);
         setContentMediaStage("saved");
-        return loadCmsContentDetails(currentCmsContent.content_id);
+        contentMediaUploadGate.end(operationToken);
+        contentMediaConfirm.disabled = false;
+        setContentMediaInputsDisabled(false);
+        return refreshContentMediaAfterFinalize(
+          () => loadCmsContentDetails(operationContentId, {propagateError: true}),
+        ).then((refreshState) => {
+          if (refreshState.synchronized || !currentCmsContent || currentCmsContent.content_id !== operationContentId) return result;
+          contentMediaRefreshOnlyId = operationContentId;
+          setContentMediaStage("saved", "Файл сохранён. Не удалось обновить карточку — повторите синхронизацию без повторной загрузки.");
+          contentMediaConfirm.textContent = "Обновить карточку";
+          contentMediaConfirm.disabled = false;
+          return result;
+        });
       }).catch((error) => {
+        if (!operationIsCurrent()) return;
         setContentMediaStage("failed", error.message === "content_version_changed"
           ? "Материал изменился после проверки. Обновите данные и повторите."
           : error.message === "object_storage_object_missing"
@@ -3155,11 +3315,17 @@
                 : error.status
                   ? `Хранилище отклонило загрузку (HTTP ${error.status}). Проверьте CORS и повторите.`
                   : "Передача прервалась. Файл остаётся выбранным — повторите загрузку.");
-      }).finally(() => { contentMediaUploadInFlight = false; contentMediaConfirm.disabled = false; });
+      }).finally(() => {
+        if (!operationIsCurrent()) return;
+        contentMediaUploadGate.end(operationToken);
+        contentMediaConfirm.disabled = false;
+        setContentMediaInputsDisabled(false);
+      });
   };
   const cancelContentMedia = () => {
-    const request = contentMediaUploadId
-      ? postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/cancel`).catch(() => null)
+    const uploadId = contentMediaUploadId || (contentMediaDirectIntent && contentMediaDirectIntent.upload_id);
+    const request = uploadId
+      ? postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(uploadId)}/cancel`).catch(() => null)
       : Promise.resolve();
     return request.then(() => { resetContentMediaDraft(); status.textContent = "Загрузка медиа отменена"; });
   };
@@ -3547,7 +3713,12 @@
   const configureAdminProfile = (identityData) => {
     const telegramUser = webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user : {};
     const confirmedProfile = identityData.profile || {};
-    const profile = adminProfilePresentation({...telegramUser,first_name:confirmedProfile.first_name || telegramUser.first_name,username:confirmedProfile.username || telegramUser.username});
+    const profile = adminProfilePresentation({
+      ...telegramUser,
+      first_name: confirmedProfile.first_name || telegramUser.first_name,
+      username: confirmedProfile.username || telegramUser.username,
+      photo_url: confirmedProfile.photo_url || null,
+    });
     const renderAvatar = (element) => {
       if (!element) return;
       element.replaceChildren(); element.textContent=profile.initials;

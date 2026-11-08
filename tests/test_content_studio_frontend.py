@@ -256,19 +256,115 @@ class ContentStudioFrontendTests(unittest.TestCase):
         result = self.run_node(r"""
           const core=require('./miniapp/app.js');
           console.log(JSON.stringify({
-            photo:core.adminProfilePresentation({first_name:'Natalia',last_name:'SoulFit',photo_url:'https://cdn.example/avatar.jpg'}),
+            photo:core.adminProfilePresentation({first_name:'Natalia',last_name:'SoulFit',photo_url:'https://t.me/i/userpic/320/avatar.jpg'}),
             missing:core.adminProfilePresentation({first_name:'Natalia',last_name:'SoulFit'}),
-            unsafe:core.adminProfilePresentation({first_name:'Natalia',photo_url:'javascript:alert(1)'}),
+            unsafe:core.adminProfilePresentation({first_name:'Natalia',photo_url:'https://cdn.example/avatar.jpg'}),
           }));
         """)
         self.assertEqual(result["photo"], {
             "displayName": "Natalia SoulFit", "initials": "NS",
-            "photoUrl": "https://cdn.example/avatar.jpg",
+            "photoUrl": "https://t.me/i/userpic/320/avatar.jpg",
         })
         self.assertEqual(result["missing"]["initials"], "NS")
         self.assertIsNone(result["missing"]["photoUrl"])
         self.assertEqual(result["unsafe"]["initials"], "N")
         self.assertIsNone(result["unsafe"]["photoUrl"])
+        source = APP_JS.read_text()
+        self.assertIn("photo_url: confirmedProfile.photo_url || null", source)
+        self.assertNotIn("upload avatar", source.lower())
+
+    def test_direct_upload_recovers_lost_response_without_second_put_or_media_record(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          (async()=>{
+            let now=1000000, creates=0, puts=0, finalizes=0, objectExists=false, retained=null;
+            const common={
+              createIntent:async()=>{creates++;return {upload_id:'u1',upload_url:'https://r2.test/u1',expires_in:300};},
+              putObject:async()=>{puts++;objectExists=true;throw new Error('object_upload_failed');},
+              finalize:async()=>{finalizes++;if(!objectExists)throw new Error('object_storage_object_missing');return {status:'completed',media_id:'m1'};},
+              onIntent:(intent)=>{retained=intent;},
+              now:()=>now,
+            };
+            let firstFailed=false;
+            try { await core.runContentMediaDirectUpload(common); } catch (_) { firstFailed=true; }
+            const recovered=await core.runContentMediaDirectUpload({...common,intent:retained,putObject:async()=>{puts++;}});
+            console.log(JSON.stringify({firstFailed,creates,puts,finalizes,recovered:recovered.recovered,retained:retained.upload_id}));
+          })();
+        """)
+        self.assertEqual(result, {
+            "firstFailed": True, "creates": 1, "puts": 1,
+            "finalizes": 1, "recovered": True, "retained": "u1",
+        })
+
+    def test_direct_upload_rotates_expired_intent_and_cancels_old_upload_row(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          (async()=>{
+            let active=null,creates=0,puts=0,finalizes=0,cancels=[];
+            const expired={upload_id:'old',upload_url:'https://r2.test/old',expires_in:60,client_received_at:1000};
+            const outcome=await core.runContentMediaDirectUpload({
+              intent:expired,now:()=>100000,
+              createIntent:async()=>{creates++;return {upload_id:'new',upload_url:'https://r2.test/new',expires_in:300};},
+              putObject:async(intent)=>{puts++;active=intent.upload_id;},
+              finalize:async(intent)=>{finalizes++;if(intent.upload_id==='old')throw new Error('object_storage_object_missing');return {status:'completed',media_id:'m2'};},
+              cancelIntent:async(intent)=>{cancels.push(intent.upload_id);},
+              onIntent:(intent)=>{active=intent&&intent.upload_id;},
+            });
+            console.log(JSON.stringify({creates,puts,finalizes,cancels,active,result:outcome.result.status}));
+          })();
+        """)
+        self.assertEqual(result, {
+            "creates": 1, "puts": 1, "finalizes": 2,
+            "cancels": ["old"], "active": "new", "result": "completed",
+        })
+
+    def test_upload_gate_generation_and_post_finalize_refresh_are_behavioral(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          (async()=>{
+            const gate=core.createContentMediaOperationGate();
+            const first={}; const second={};
+            const firstStarted=gate.begin(first);
+            const duplicateStarted=gate.begin(second);
+            gate.end(second);
+            const stillLocked=gate.isActive();
+            gate.end(first);
+            const secondAfterFinish=gate.begin(second);
+            const current=core.contentMediaOperationIsCurrent({
+              operationGeneration:2,operationContentId:'a',currentGeneration:2,currentContentId:'a',
+            });
+            const switched=core.contentMediaOperationIsCurrent({
+              operationGeneration:2,operationContentId:'a',currentGeneration:3,currentContentId:'b',
+            });
+            let refreshCalls=0;
+            const refresh=await core.refreshContentMediaAfterFinalize(async()=>{refreshCalls++;throw new Error('offline');});
+            console.log(JSON.stringify({firstStarted,duplicateStarted,stillLocked,secondAfterFinish,current,switched,refreshCalls,saved:refresh.saved,synchronized:refresh.synchronized}));
+          })();
+        """)
+        self.assertEqual(result, {
+            "firstStarted": True, "duplicateStarted": False,
+            "stillLocked": True, "secondAfterFinish": True,
+            "current": True, "switched": False, "refreshCalls": 1,
+            "saved": True, "synchronized": False,
+        })
+
+    def test_admin_navigation_behavior_matches_real_dom_shell(self):
+        result = self.run_node(r"""
+          const core=require('./miniapp/app.js');
+          console.log(JSON.stringify({
+            editor:core.adminShellNavigationVisible('content-details'),
+            create:core.adminShellNavigationVisible('content-create'),
+            list:core.adminShellNavigationVisible('content'),
+          }));
+        """)
+        self.assertEqual(result, {"editor": False, "create": True, "list": True})
+        html = INDEX_HTML.read_text()
+        styles = STYLES_CSS.read_text()
+        source = APP_JS.read_text()
+        self.assertLess(html.index('<main class="shell"'), html.index('<nav id="bottom-nav"'))
+        self.assertIn('bottomNav.classList.toggle("editor-navigation-hidden"', source)
+        self.assertIn('> #bottom-nav.editor-navigation-hidden', styles)
+        self.assertNotIn('#content-create:not([hidden])) > .bottom-nav', styles)
 
     def test_admin_screen_model_has_exactly_one_visible_screen(self):
         output = self.run_node("""
@@ -479,7 +575,7 @@ class ContentStudioFrontendTests(unittest.TestCase):
             self.assertEqual(html.count(f'id="{element_id}"'), 1)
         self.assertIn('rememberPendingContentMedia(mediaType, file)', source)
         self.assertIn('Файл остаётся выбранным — повторите загрузку.', source)
-        self.assertIn('contentMediaUploadInFlight', source)
+        self.assertIn('contentMediaUploadGate.begin(operationToken)', source)
         self.assertIn('setContentUploadProgress(percent)', source)
         self.assertIn('onStage("verifying")', source)
         self.assertIn('intent: contentMediaDirectIntent', source)
@@ -499,7 +595,7 @@ class ContentStudioFrontendTests(unittest.TestCase):
         source = APP_JS.read_text()
         self.assertIn('#content-details .studio-toolbar', styles)
         self.assertIn('position: static', styles)
-        self.assertIn('#content-details:not([hidden])) > .bottom-nav', styles)
+        self.assertIn('> #bottom-nav.editor-navigation-hidden', styles)
         self.assertNotIn('#content-create:not([hidden])) > .bottom-nav', styles)
         self.assertIn('#content-details .studio-editor-actions', styles)
         self.assertIn('display: none !important', styles)

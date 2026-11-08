@@ -3026,6 +3026,21 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         serialized = json.dumps(list_content_media(self.get_conn, draft["content_id"]))
         self.assertNotIn(object_key, serialized)
         self.assertNotIn("server_reference", serialized)
+        abandoned_upload_id = str(uuid.uuid4())
+        create_r2_media_upload(
+            self.get_conn, 1, draft["content_id"], "cover", "cover.png",
+            "image/png", 1024, f"content/{draft['content_id']}/{uuid.uuid4()}.png",
+            abandoned_upload_id,
+        )
+        self.assertEqual(
+            cancel_media_upload(self.get_conn, abandoned_upload_id, 1)["status"],
+            "cancelled",
+        )
+        self.assertEqual(
+            get_r2_media_upload(self.get_conn, abandoned_upload_id, 1)["status"],
+            "cancelled",
+        )
+        self.assertEqual(len(list_content_media(self.get_conn, draft["content_id"])), 1)
 
     def test_r2_migration_preserves_existing_telegram_rows_and_storage_guarantees(self):
         with tempfile.TemporaryDirectory() as tmpdir:
