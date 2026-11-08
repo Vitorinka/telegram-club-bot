@@ -141,7 +141,7 @@
   const contentStudioSaveRecipe = ({saveMetadata, saveRecipe, reload}) =>
     saveMetadata().then(saveRecipe).then(reload);
   const adminScreenIsVisible = (activeScreen, candidateScreen) => activeScreen === candidateScreen;
-  const adminShellNavigationVisible = (activeScreen) => activeScreen !== "content-details";
+  const adminShellNavigationVisible = () => true;
   const adminSearchMatches = (values, query) => {
     const normalized=String(query || "").trim().toLocaleLowerCase("ru");
     return normalized.length >= 2 && values.some((value)=>String(value || "").toLocaleLowerCase("ru").includes(normalized));
@@ -2665,6 +2665,12 @@
       api(`/api/admin/content/cms?status=${encodeURIComponent(cmsContentStatus)}&limit=50`),
     ]).then(([data, cms]) => {
       cmsContentItems = cms.items || [];
+      renderContentStatusCount(cmsContentStatus, cms.items.length);
+      if (cmsContentStatus === "all") {
+        ["draft", "published", "archived"].forEach((entry) => {
+          renderContentStatusCount(entry, cms.items.filter((item) => item.status === entry).length);
+        });
+      }
       contentList.replaceChildren();
       data.items.forEach((item) => contentList.append(contentCard(item)));
       contentEmpty.hidden = data.items.length !== 0;
@@ -2724,6 +2730,18 @@
 
   const cmsTypeLabel = (contentType) => ({lesson: "Урок", meditation: "Медитация", recipe: "Рецепт", nutrition_material: "Материал нутрициолога"}[contentType] || contentType);
   const cmsStatusLabel = (value) => ({draft: "Черновик", published: "Опубликовано", archived: "Архив"}[value] || value);
+  const renderContentStatusCount = (status, count) => {
+    const target = document.querySelector(`[data-status-count="${status}"]`);
+    if (target) target.textContent = String(count);
+  };
+  const renderCreateContentPreview = () => {
+    const title = document.getElementById("content-create-preview-title");
+    const meta = document.getElementById("content-create-preview-meta");
+    if (!title || !meta) return;
+    title.textContent = contentCreateTitle.value.trim() || "Название материала";
+    const duration = contentCreateDuration.value.trim() || "Продолжительность авто";
+    meta.textContent = `${cmsTypeLabel(contentCreateType.value)} · Категория · ${duration}`;
+  };
   const setContentEditorDirty = (dirty = true) => {
     contentEditorDirty = dirty;
     contentEditorState.textContent = dirty ? "Есть несохранённые изменения" : "Все изменения сохранены ✓";
@@ -2743,7 +2761,7 @@
     contentUnsavedDialog.showModal();
   };
   const renderContentLivePreview = (item = currentCmsContent) => {
-    contentLivePreview.replaceChildren(text("p", "Предпросмотр участника", "eyebrow"));
+    contentLivePreview.replaceChildren(text("h2", "Текущая версия"));
     if (!item) {
       contentLivePreview.append(text("h2", "Выберите материал"), text("p", "Здесь появится безопасный preview.", "hint"));
       return;
@@ -2987,6 +3005,8 @@
       currentCmsContent = item;
       renderEditorLibrary();
       contentEditorTitle.textContent = item.title;
+      const summaryMeta = document.getElementById("content-editor-summary-meta");
+      if (summaryMeta) summaryMeta.textContent = `${cmsTypeLabel(item.content_type)} · ${item.duration_seconds ? formatDuration(item.duration_seconds) : "без длительности"} · ${cmsStatusLabel(item.status)}`;
       contentEditorStatus.textContent = cmsStatusLabel(item.status);
       contentEditorStatus.className = `badge studio-status ${item.status}`;
       contentEditorMenu.hidden = true;
@@ -3997,7 +4017,18 @@
   document.getElementById("content-create-publish").addEventListener("click", () => {
     createCmsDraft().then((item) => item ? previewContentLifecycle() : null).catch(() => null);
   });
-  contentCreateType.addEventListener("change", () => loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError));
+  contentCreateType.addEventListener("change", () => {
+    renderCreateContentPreview();
+    document.querySelectorAll("[data-create-type]").forEach((button) => button.classList.toggle("active", button.dataset.createType === contentCreateType.value));
+    loadTaxonomy(contentCreateType.value, contentCreateTaxonomy).catch(showApiError);
+  });
+  document.getElementById("content-create-type-tabs").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-create-type]");
+    if (!button) return;
+    contentCreateType.value = button.dataset.createType;
+    contentCreateType.dispatchEvent(new Event("change"));
+  });
+  [contentCreateTitle, contentCreateDuration].forEach((input) => input.addEventListener("input", renderCreateContentPreview));
   document.getElementById("content-edit-save").addEventListener("click", saveCurrentContent);
   const showContentPreviewPanel = () => {
     renderContentLivePreview();

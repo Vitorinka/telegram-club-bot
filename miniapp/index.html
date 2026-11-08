@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Админ-платформа</title>
-  <link rel="stylesheet" href="/miniapp/styles.css?v=20261107-content-studio-p0">
+  <link rel="stylesheet" href="/miniapp/styles.css?v=20261108-content-studio-figma-8">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <script src="/miniapp/app.js?v=20261107-content-studio-p0" defer></script>
+  <script src="/miniapp/app.js?v=20261108-content-studio-figma-8" defer></script>
 </head>
 <body>
   <main class="shell" aria-live="polite">
@@ -62,79 +62,71 @@
         <article class="card admin-overview-panel admin-system-overview"><header><div><h2>Система</h2><small>Состояние и техническая информация</small></div><button id="dashboard-open-system" class="admin-text-action" type="button">Подробнее →</button></header><div class="overview-metrics overview-system-metrics"><div><strong>Online</strong><small>База данных</small></div><div><strong id="dashboard-migration-count">—</strong><small>Миграции</small></div><div><strong id="dashboard-scheduler-count">—</strong><small>Задачи планировщика</small></div><div><strong id="dashboard-job-errors">—</strong><small>Ошибки за 24 часа</small></div></div></article>
       </div>
     </section>
-    <section id="content-screen" class="screen page" data-screen="content" hidden>
-      <header class="studio-heading"><div><p class="eyebrow">Редакционная студия</p><h1>Контент</h1><p>Управляйте уроками и материалами клуба.</p></div><button id="content-create-open" type="button">+ Создать материал</button></header>
-      <article class="card studio-filters">
+    <section id="content-screen" class="screen page studio-figma-page" data-screen="content" hidden>
+      <header class="studio-heading"><div><p class="eyebrow">Материалы клуба</p><h1><span class="studio-title-desktop">Контент-студия</span><span class="studio-title-mobile">Контент</span></h1><p>Материалы клуба: тренировки, медитации, рецепты и статьи</p></div><button id="content-create-open" type="button">+ Создать материал</button></header>
+      <article class="studio-filters">
         <div id="content-status-filters" class="studio-chips" aria-label="Статус материалов">
-          <button class="active" data-content-status="all" type="button">Все</button><button data-content-status="draft" type="button">Черновики</button><button data-content-status="published" type="button">Опубликованные</button><button data-content-status="archived" type="button">Архив</button>
+          <button class="active" data-content-status="all" type="button">Все <span data-status-count="all"></span></button><button data-content-status="published" type="button">Опубликованы <span data-status-count="published"></span></button><button data-content-status="draft" type="button">Черновики <span data-status-count="draft"></span></button><button data-content-status="archived" type="button">Архив <span data-status-count="archived"></span></button>
         </div>
-        <label class="search-label" for="content-search">Поиск по названию</label>
-        <input id="content-search" type="search" maxlength="80" autocomplete="off" placeholder="Название материала">
-        <div class="studio-filter-row"><select id="content-type" aria-label="Тип контента"><option value="all">Все типы</option><option value="lesson">Уроки</option><option value="meditation">Медитации</option><option value="recipe">Рецепты</option><option value="nutrition_material">Питание</option></select><select id="content-category" aria-label="Категория контента"><option value="all">Все категории</option></select></div>
+        <label class="studio-search" for="content-search"><span aria-hidden="true">⌕</span><input id="content-search" type="search" maxlength="80" autocomplete="off" placeholder="Поиск по названию, описанию или тегу"></label>
+        <div class="studio-filter-row"><select id="content-type" aria-label="Тип контента"><option value="all">Тип</option><option value="lesson">Урок</option><option value="meditation">Аудио</option><option value="recipe">Рецепт</option><option value="nutrition_material">Статья</option></select><select id="content-category" aria-label="Категория контента"><option value="all">Тема</option></select><button type="button" class="studio-filter-static" disabled>Доступ</button><button type="button" class="studio-filter-static" disabled>Дата</button></div>
       </article>
+      <div class="studio-table-head" aria-hidden="true"><span>Название</span><span>Формат</span><span>Категория</span><span>Статус</span></div>
       <div id="cms-content-list" class="studio-grid"></div>
       <p id="cms-content-empty" class="card" hidden>Материалов по выбранным фильтрам нет.</p>
-      <details class="card studio-legacy"><summary>Дополнительные материалы</summary><div id="content-list" class="user-list"></div><p id="content-empty" class="hint" hidden>Дополнительных материалов пока нет.</p></details>
-      <button id="content-dashboard-back" class="secondary" type="button">← К обзору</button>
+      <div class="studio-service-data" aria-hidden="true"><div id="content-list"></div><p id="content-empty" hidden></p><button id="content-dashboard-back" type="button">К обзору</button></div>
     </section>
-    <section id="content-create" class="screen page" data-screen="content-create" hidden>
-      <header class="studio-create-header"><button id="content-create-back" class="secondary" type="button" aria-label="Вернуться к контенту">←</button><div><p class="eyebrow">Новый материал</p><h1>Создать урок</h1><p>Заполните данные и прикрепите медиа.</p></div></header>
-      <article class="card studio-create-card">
-        <div class="studio-step"><span>1</span><div><strong>Основная информация</strong><small>Материал сначала сохранится как черновик</small></div></div>
-        <label>Тип
+    <section id="content-create" class="screen page studio-figma-page" data-screen="content-create" hidden>
+      <header class="studio-create-header"><button id="content-create-back" class="studio-back" type="button" aria-label="Вернуться к контенту">‹</button><div><p class="eyebrow">Контент / Материалы</p><h1>Новый материал</h1><p>Загрузка файлов и публикация без изменения кода</p></div></header>
+      <div class="studio-create-layout"><article class="studio-create-card">
+        <h2>Основная информация</h2>
+        <nav id="content-create-type-tabs" class="studio-create-type-tabs" aria-label="Тип материала"><button class="active" type="button" data-create-type="lesson">Урок</button><button type="button" data-create-type="nutrition_material">Статья</button><button type="button" data-create-type="recipe">Рецепт</button><button type="button" data-create-type="meditation">Аудио</button></nav>
+        <label>Тип материала
           <select id="content-create-type">
-            <option value="lesson">Новый урок</option>
-            <option value="meditation">Новая медитация</option>
-            <option value="recipe">Новый рецепт</option>
-            <option value="nutrition_material">Материал нутрициолога</option>
+            <option value="lesson">Урок</option><option value="meditation">Аудио</option><option value="recipe">Рецепт</option><option value="nutrition_material">Статья</option>
           </select>
         </label>
-        <label>Название <input id="content-create-title" type="text" maxlength="120" required></label>
-        <label>Доступ
-          <select id="content-create-access"><option value="paid">По подписке</option><option value="free">Бесплатно</option></select>
-        </label>
-        <details class="studio-create-options" open><summary>Описание и медиа</summary>
+        <label>Название <input id="content-create-title" type="text" maxlength="120" required placeholder="Введите название материала"></label>
         <input id="content-create-category" type="hidden">
         <fieldset id="content-create-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
-        <label class="authoring-field">Описание <textarea id="content-create-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
-        <label class="authoring-field">Длительность <input id="content-create-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04" pattern="[0-9]{1,3}:[0-9]{2}"></label>
+        <label class="authoring-field">Описание <textarea id="content-create-description" class="authoring-textarea" maxlength="5000" placeholder="Коротко о пользе и содержании"></textarea></label>
+        <label class="authoring-field">Длительность <input id="content-create-duration" class="duration-input" type="text" inputmode="numeric" placeholder="36:00" pattern="[0-9]{1,3}:[0-9]{2}"></label>
         <section id="content-create-recipe-fields" class="authoring-section" hidden>
           <h3>Рецепт</h3>
           <label class="authoring-field">Ингредиенты <textarea id="content-create-ingredients" class="authoring-textarea" maxlength="12000" placeholder="Один ингредиент на строку: Название | количество"></textarea></label>
           <label class="authoring-field">Шаги <textarea id="content-create-steps" class="authoring-textarea" maxlength="20000" placeholder="Один шаг приготовления на строку"></textarea></label>
         </section>
         <label id="content-create-body-label" class="authoring-field" hidden>Основной текст <textarea id="content-create-body" class="authoring-textarea" maxlength="30000"></textarea></label>
-        <section class="authoring-section">
-          <h3>Медиа</h3>
-          <label>Обложка <input id="content-create-cover-file" type="file" accept="image/jpeg,image/png,image/webp"></label>
-          <label id="content-create-video-label" class="studio-file-picker">Видео · MP4/WebM до 2 ГБ <input id="content-create-video-file" type="file" accept="video/mp4,video/webm,.mp4,.webm"><span id="content-create-video-selection">Выберите видеофайл</span></label>
-          <label id="content-create-audio-label" hidden>Аудио · MP3/M4A/WAV/OGG до 2 ГБ <input id="content-create-audio-file" type="file" accept="audio/mpeg,audio/mp4,audio/wav,audio/ogg,.mp3,.m4a,.wav,.ogg"></label>
-          <p class="hint">Файл проходит server-side validation и прикрепляется только при успешном сохранении черновика.</p>
+        <section class="authoring-section studio-create-media">
+          <h3>Файлы материала</h3>
+          <label class="studio-upload-tile">Обложка <input id="content-create-cover-file" type="file" accept="image/jpeg,image/png,image/webp"><span>+ Загрузить изображение</span></label>
+          <label id="content-create-video-label" class="studio-file-picker">Медиафайл <input id="content-create-video-file" type="file" accept="video/mp4,video/webm,.mp4,.webm"><span id="content-create-video-selection">Загрузить видео</span></label>
+          <label id="content-create-audio-label" class="studio-file-picker" hidden>Медиафайл <input id="content-create-audio-file" type="file" accept="audio/mpeg,audio/mp4,audio/wav,audio/ogg,.mp3,.m4a,.wav,.ogg"><span>Загрузить аудио</span></label>
+          <p class="hint">Файл считается прикреплённым только после server-side проверки и finalize.</p>
         </section>
-        </details>
+        <label>Доступ <select id="content-create-access"><option value="paid">Каталог всем · просмотр по подписке</option><option value="free">Бесплатно</option></select></label>
         <p id="content-create-message" class="hint">Материал будет создан только в статусе draft.</p>
-        <div class="authoring-actions"><button id="content-create-submit" type="button">Создать черновик</button><button id="content-create-publish" type="button">Создать и подготовить публикацию</button></div>
-      </article>
+      </article><aside class="studio-create-preview"><h2>Предпросмотр</h2><div class="studio-create-preview-cover">Предпросмотр обложки</div><h3 id="content-create-preview-title">Название материала</h3><p id="content-create-preview-meta">Тип · Категория · Продолжительность</p><div class="authoring-actions"><button id="content-create-submit" type="button">Сохранить черновик</button><button id="content-create-publish" type="button">Опубликовать</button></div></aside></div>
     </section>
-    <section id="content-details" class="screen page" data-screen="content-details" hidden>
-      <header class="studio-toolbar"><button id="content-back" class="secondary" type="button">← Контент</button><div class="studio-editor-title"><strong id="content-editor-title">Материал</strong><span id="content-editor-status" class="badge studio-status draft">Черновик</span></div><button id="content-editor-more" class="secondary" type="button" aria-expanded="false" aria-controls="content-editor-menu">⋯</button><span id="content-editor-state">Все изменения сохранены ✓</span></header>
+    <section id="content-details" class="screen page studio-figma-page" data-screen="content-details" hidden>
+      <header class="studio-toolbar"><button id="content-back" class="studio-back" type="button">‹</button><div class="studio-editor-title"><strong>Редактировать материал</strong><small id="content-editor-state">Все изменения сохранены ✓</small></div><span id="content-editor-status" class="badge studio-status draft">Черновик</span><button id="content-editor-more" class="secondary" type="button" aria-expanded="false" aria-controls="content-editor-menu">⋯</button></header>
       <nav id="content-editor-menu" class="card studio-editor-menu" aria-label="Действия с материалом" hidden><button id="content-menu-preview" type="button">Предпросмотр</button><button id="content-menu-history" type="button">История изменений</button><button id="content-menu-technical" type="button">Техническая информация</button></nav>
-      <div id="content-details-content" class="dashboard"></div>
-      <div id="content-studio-tabs" class="studio-mobile-tabs"><button class="active" data-studio-panel="editor" type="button">Редактор</button><button data-studio-panel="preview" type="button">Предпросмотр</button></div>
-      <div id="content-studio-workspace" class="studio-workspace"><aside id="content-editor-library" class="card studio-editor-library"><header><strong>Материалы</strong><button id="content-editor-new" class="secondary" type="button">+</button></header><div id="content-editor-library-list" class="studio-editor-library-list"></div></aside><article id="content-edit-card" class="card studio-editor" hidden>
-        <h2>Редактировать черновик</h2>
+      <div id="content-details-content" class="studio-service-data"></div>
+      <div id="content-studio-tabs" class="studio-service-data"><button class="active" data-studio-panel="editor" type="button">Редактор</button><button data-studio-panel="preview" type="button">Предпросмотр</button></div>
+      <div id="content-studio-workspace" class="studio-workspace"><aside id="content-editor-library" class="studio-service-data"><button id="content-editor-new" type="button">+</button><div id="content-editor-library-list"></div></aside><article id="content-edit-card" class="studio-editor" hidden>
+        <div class="studio-current-summary"><h2 id="content-editor-title">Материал</h2><p id="content-editor-summary-meta">Текущая версия материала</p></div>
         <label>Название <input id="content-edit-title" type="text" maxlength="120"></label>
         <input id="content-edit-category" type="hidden">
         <fieldset id="content-edit-taxonomy" class="taxonomy-fieldset" hidden><legend>Категории</legend><div class="taxonomy-options"></div></fieldset>
         <label class="authoring-field">Описание <textarea id="content-edit-description" class="authoring-textarea" maxlength="5000" placeholder="Абзацы, списки, ### подзаголовки и **жирный текст**"></textarea></label>
         <label class="authoring-field">Длительность <input id="content-edit-duration" class="duration-input" type="text" inputmode="numeric" placeholder="29:04"></label>
-        <label>Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
+        <label class="studio-service-field">Порядок <input id="content-edit-order" type="number" min="-100000" max="100000"></label>
         <label>Доступ
-          <select id="content-edit-access"><option value="paid">По подписке</option><option value="free">Бесплатно</option></select>
+          <select id="content-edit-access"><option value="paid">По активной подписке</option><option value="free">Бесплатно</option></select>
         </label>
         <p id="content-edit-message" class="hint"></p>
-        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить</button></div>
-      </article><aside id="content-live-preview" class="card studio-preview"><nav id="content-preview-modes" class="studio-preview-modes"><button class="active" type="button" data-preview-mode="lesson">Страница урока</button><button type="button" data-preview-mode="club">В клубе</button><button type="button" data-preview-mode="library">В библиотеке</button><button type="button" data-preview-mode="mobile">На мобильном</button></nav><p class="eyebrow">Предпросмотр участника</p><h2>Выберите материал</h2><p class="hint">Здесь отображается безопасный визуальный preview без публикации черновика.</p></aside></div>
+        <div class="authoring-actions"><button id="content-edit-save" type="button">Сохранить изменения в черновик</button></div>
+      </article><aside id="content-live-preview" class="studio-preview"><h2>Текущая версия</h2><nav id="content-preview-modes" class="studio-service-data"><button class="active" type="button" data-preview-mode="lesson">Страница урока</button><button type="button" data-preview-mode="club">В клубе</button><button type="button" data-preview-mode="library">В библиотеке</button><button type="button" data-preview-mode="mobile">На мобильном</button></nav><p class="eyebrow">Предпросмотр участника</p><h3>Выберите материал</h3><p class="hint">Здесь отображается безопасный preview текущей версии.</p></aside></div>
       <button id="content-create-revision" type="button" hidden>Редактировать</button>
       <article id="content-recipe-card" class="card" hidden>
         <h2>Рецепт</h2>
