@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from functools import wraps
 from urllib.parse import parse_qsl
+from urllib.parse import urlsplit
 
 
 MINIAPP_AUTH_MAX_AGE_SECONDS = 300
@@ -16,6 +17,7 @@ class MiniAppIdentity:
     telegram_id: int
     username: str | None = None
     first_name: str | None = None
+    photo_url: str | None = None
 
 
 class MiniAppAuthError(Exception):
@@ -111,10 +113,27 @@ def validate_telegram_init_data(
 
     username = user.get("username")
     first_name = user.get("first_name")
+    photo_url = user.get("photo_url")
+    if isinstance(photo_url, str) and len(photo_url) <= 2048:
+        parsed_photo = urlsplit(photo_url)
+        photo_host = (parsed_photo.hostname or "").lower()
+        allowed_photo_host = (
+            photo_host == "t.me"
+            or photo_host.endswith(".t.me")
+            or photo_host == "telegram.org"
+            or photo_host.endswith(".telegram.org")
+            or photo_host == "telesco.pe"
+            or photo_host.endswith(".telesco.pe")
+        )
+        if parsed_photo.scheme != "https" or not allowed_photo_host:
+            photo_url = None
+    else:
+        photo_url = None
     return MiniAppIdentity(
         telegram_id=telegram_id,
         username=username if isinstance(username, str) else None,
         first_name=first_name if isinstance(first_name, str) else None,
+        photo_url=photo_url,
     )
 
 

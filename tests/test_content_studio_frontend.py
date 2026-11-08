@@ -478,14 +478,33 @@ class ContentStudioFrontendTests(unittest.TestCase):
         ):
             self.assertEqual(html.count(f'id="{element_id}"'), 1)
         self.assertIn('rememberPendingContentMedia(mediaType, file)', source)
-        self.assertIn('Файл и черновик сохранены — повторите попытку.', source)
+        self.assertIn('Файл остаётся выбранным — повторите загрузку.', source)
         self.assertIn('contentMediaUploadInFlight', source)
         self.assertIn('setContentUploadProgress(percent)', source)
+        self.assertIn('onStage("verifying")', source)
+        self.assertIn('intent: contentMediaDirectIntent', source)
+        self.assertIn('contentMediaDirectIntent = intent', source)
+        self.assertIn('contentVideoFile.addEventListener("change"', source)
+        self.assertIn('validateContentMedia("video")', source)
+        self.assertIn('id="content-video-validate" type="button" hidden', html)
+        self.assertIn('Загрузить и сохранить', html)
         self.assertIn('get("preview") === "admin-content"', source)
         self.assertIn('.studio-upload-progress', styles)
         self.assertIn('.admin-content-local-preview::before', styles)
         self.assertIn('overflow-wrap:anywhere', styles)
         self.assertIn('grid-template-columns:minmax(0,1fr)', styles)
+
+    def test_telegram_editor_uses_one_scroll_surface_without_overlapping_nav(self):
+        styles = STYLES_CSS.read_text()
+        source = APP_JS.read_text()
+        self.assertIn('#content-details .studio-toolbar', styles)
+        self.assertIn('position: static', styles)
+        self.assertIn('#content-details:not([hidden])) > .bottom-nav', styles)
+        self.assertNotIn('#content-create:not([hidden])) > .bottom-nav', styles)
+        self.assertIn('#content-details .studio-editor-actions', styles)
+        self.assertIn('display: none !important', styles)
+        self.assertIn('--tg-viewport-height', source)
+        self.assertIn('viewportChanged', source)
 
     def test_stale_category_falls_back_and_only_cover_can_override_preview(self):
         result = self.run_node(r"""

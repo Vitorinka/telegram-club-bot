@@ -167,6 +167,13 @@
     return;
   }
   const webApp = (window.Telegram && window.Telegram.WebApp) || {};
+  const syncTelegramViewport = () => {
+    const height = Number(webApp.viewportHeight || window.innerHeight || 0);
+    if (height > 0) document.documentElement.style.setProperty("--tg-viewport-height", `${height}px`);
+  };
+  syncTelegramViewport();
+  window.addEventListener("resize", syncTelegramViewport);
+  if (typeof webApp.onEvent === "function") webApp.onEvent("viewportChanged", syncTelegramViewport);
   const status = document.getElementById("status");
   const identity = document.getElementById("identity");
   const telegramId = document.getElementById("telegram-id");
@@ -403,6 +410,7 @@
   let contentMediaUploadId = null;
   let contentMediaPendingFile = null;
   let contentMediaPendingType = null;
+  let contentMediaDirectIntent = null;
   let contentMediaUploadInFlight = false;
   let contentCreateInFlight = false;
   let objectStorageStatusPromise = null;
@@ -579,8 +587,17 @@
   let memberDesktopExpanded = false;
   const setMemberHeroPhoto = (photoUrl) => {
     const fallback = "/miniapp/assets/member-v3/hero.jpg";
-    memberHeroPhoto.style.backgroundImage = `url("${photoUrl || fallback}")`;
     memberHeroPhoto.dataset.fallback = fallback;
+    memberHeroPhoto.style.backgroundImage = `url("${fallback}")`;
+    if (!photoUrl) return;
+    let parsed;
+    try { parsed = new URL(photoUrl); }
+    catch (_error) { return; }
+    if (parsed.protocol !== "https:") return;
+    const candidate = new Image();
+    candidate.onload = () => { memberHeroPhoto.style.backgroundImage = `url("${parsed.href}")`; };
+    candidate.onerror = () => { memberHeroPhoto.style.backgroundImage = `url("${fallback}")`; };
+    candidate.src = parsed.href;
   };
   const applyMemberDesktopLayout = () => {
     const desktop = window.matchMedia("(min-width: 900px)").matches;
@@ -612,9 +629,9 @@
   const syncMemberAccess = (access) => {
     if (!realMemberMode || !access) return;
     memberEntitled = Boolean(access.has_active_access);
-    document.getElementById("member-continue").textContent = memberEntitled
-      ? (localMemberPreview ? "Продолжить занятие →" : "Выбрать тренировку")
-      : "Получить доступ";
+    const continueButton = document.getElementById("member-continue");
+    continueButton.hidden = !localMemberPreview;
+    continueButton.textContent = memberEntitled ? "Продолжить занятие →" : "Получить доступ";
     const statusLabel = document.getElementById("member-profile-access");
     if (statusLabel) {
       statusLabel.textContent = memberEntitled
@@ -1314,6 +1331,7 @@
     contentMediaUploadId = null;
     contentMediaPendingFile = null;
     contentMediaPendingType = null;
+    contentMediaDirectIntent = null;
     contentMediaUploadInFlight = false;
     contentCoverFile.value = "";
     contentVideoFile.value = "";
@@ -1360,6 +1378,7 @@
       contentMediaUploadId = null;
       contentMediaPendingFile = null;
       contentMediaPendingType = null;
+      contentMediaDirectIntent = null;
     }
     document.querySelectorAll("[data-screen]").forEach((node) => { node.hidden = !adminScreenIsVisible(name, node.dataset.screen); });
     if (!name.startsWith("member-")) {
@@ -1422,16 +1441,33 @@
     xhr.upload.addEventListener("progress", (event) => {
       if (event.lengthComputable && onProgress) onProgress(Math.round((event.loaded / event.total) * 100));
     });
-    xhr.addEventListener("load", () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error("object_upload_failed")));
+    xhr.addEventListener("load", () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      const error = new Error("object_upload_failed");
+      error.status = xhr.status;
+      reject(error);
+    });
     xhr.addEventListener("error", () => reject(new Error("object_upload_failed")));
     xhr.addEventListener("abort", () => reject(new Error("object_upload_interrupted")));
     xhr.send(file);
   });
-  const uploadContentMediaDirect = (contentId, mediaType, file, onProgress) =>
-    writeAdminJson("POST", `/api/admin/content/cms/${encodeURIComponent(contentId)}/media/upload-intent`, {
-      media_type: mediaType, filename: file.name, content_type: file.type, size_bytes: file.size,
-    }).then((intent) => putDirectObject(intent.upload_url, intent.required_headers, file, onProgress).then(() => intent))
-      .then((intent) => writeAdminJson("POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize`, {}));
+  const uploadContentMediaDirect = (contentId, mediaType, file, onProgress, options = {}) => {
+    const intentPromise = options.intent ? Promise.resolve(options.intent) : writeAdminJson(
+      "POST", `/api/admin/content/cms/${encodeURIComponent(contentId)}/media/upload-intent`,
+      {media_type: mediaType, filename: file.name, content_type: file.type, size_bytes: file.size},
+    );
+    return intentPromise.then((intent) => {
+      if (options.onIntent) options.onIntent(intent);
+      if (options.onStage) options.onStage("uploading");
+      return putDirectObject(intent.upload_url, intent.required_headers, file, onProgress).then(() => intent);
+    }).then((intent) => {
+      if (options.onStage) options.onStage("verifying");
+      return writeAdminJson("POST", `/api/admin/content/media/uploads/${encodeURIComponent(intent.upload_id)}/finalize`, {});
+    }).then((result) => {
+      if (options.onStage) options.onStage("saved");
+      return result;
+    });
+  };
   const writeMemberJson = (method, path, body) => fetch(path, {
     method,
     headers: {Authorization: `Bearer ${sessionToken}`, "Content-Type": "application/json"},
@@ -2947,8 +2983,21 @@
     addRemove(contentAudioCurrent, audio, "аудио");
   }
   const selectedMediaLabel = (file) => file
-    ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} МиБ · ожидает загрузки`
+    ? `${file.name} · ${(file.size / 1024 / 1024).toFixed(1)} МиБ · выбран`
     : "Выберите MP4 или WebM";
+  const contentMediaStageLabels = {
+    selected: "Файл выбран. Нажмите «Загрузить», чтобы начать передачу.",
+    uploading: "Загрузка в защищённое хранилище…",
+    verifying: "Проверяем загруженный файл на сервере…",
+    saved: "Медиа сохранено и готово к публикации.",
+    failed: "Загрузка не завершена. Исправьте причину и повторите.",
+  };
+  const setContentMediaStage = (stage, message = null) => {
+    contentMediaConfirmation.dataset.stage = stage;
+    contentMediaMessage.textContent = message || contentMediaStageLabels[stage] || "";
+    contentMediaConfirm.textContent = stage === "failed" ? "Повторить загрузку" : "Загрузить и сохранить";
+    contentMediaConfirm.hidden = stage === "saved";
+  };
   const setContentUploadProgress = (percent) => {
     const value = Math.max(0, Math.min(100, Number(percent) || 0));
     contentMediaProgress.hidden = false;
@@ -2958,9 +3007,14 @@
   const rememberPendingContentMedia = (mediaType, file) => {
     contentMediaPendingFile = file || null;
     contentMediaPendingType = file ? mediaType : null;
+    contentMediaDirectIntent = null;
     if (mediaType === "video") {
       contentVideoSelection.textContent = selectedMediaLabel(file);
-      if (file) contentVideoCurrent.textContent = `Выбрано: ${file.name} · ещё не загружено`;
+      if (file) contentVideoCurrent.textContent = `Выбрано: ${file.name} · не загружено`;
+    }
+    if (file) {
+      contentMediaConfirmation.hidden = false;
+      setContentMediaStage("selected");
     }
   };
   const previewContentMediaRemove = (media, label) => {
@@ -3021,7 +3075,7 @@
           text("span", mediaType === "cover" ? "Обложка" : mediaType === "audio" ? "Аудио" : "Видео"),
           text("span", `${file.type} · ${(file.size / 1024 / 1024).toFixed(1)} МиБ`)
         );
-        contentMediaMessage.textContent = "Файл будет загружен напрямую в защищённое хранилище после подтверждения.";
+        setContentMediaStage("selected");
         contentMediaConfirmation.hidden = false;
         return null;
       }
@@ -3054,10 +3108,10 @@
         });
       }).catch((error) => {
         contentMediaUploadId = null;
-        contentMediaMessage.textContent = error.message === "content_media_too_large"
+        setContentMediaStage("failed", error.message === "content_media_too_large"
           ? "Файл превышает допустимый размер."
           : mediaType === "audio" ? "Этот формат пока не поддерживается. Загрузите MP3."
-          : "Файл не прошёл безопасную проверку.";
+          : "Файл не прошёл безопасную проверку.");
       });
     });
   };
@@ -3069,24 +3123,38 @@
     }
     contentMediaUploadInFlight = true;
     contentMediaConfirm.disabled = true;
-    contentMediaMessage.textContent = "Загружаем и прикрепляем…";
+    setContentMediaStage("uploading");
     setContentUploadProgress(0);
     const operation = contentMediaPendingFile
       ? uploadContentMediaDirect(
           currentCmsContent.content_id, contentMediaPendingType,
           contentMediaPendingFile,
           (percent) => { setContentUploadProgress(percent); contentMediaMessage.textContent = `Загружаем напрямую в хранилище… ${percent}%`; },
+          {
+            intent: contentMediaDirectIntent,
+            onIntent: (intent) => { contentMediaDirectIntent = intent; },
+            onStage: (stage) => setContentMediaStage(stage),
+          },
         )
       : postAdmin(`/api/admin/content/media/uploads/${encodeURIComponent(contentMediaUploadId)}/confirm`);
     return operation
       .then((result) => {
         if (result.status !== "completed") throw new Error(result.failure_category || result.status);
         setContentUploadProgress(100);
+        setContentMediaStage("saved");
         return loadCmsContentDetails(currentCmsContent.content_id);
       }).catch((error) => {
-        contentMediaMessage.textContent = error.message === "content_version_changed"
+        setContentMediaStage("failed", error.message === "content_version_changed"
           ? "Материал изменился после проверки. Обновите данные и повторите."
-          : "Загрузка не завершена. Файл и черновик сохранены — повторите попытку.";
+          : error.message === "object_storage_object_missing"
+            ? "Файл не найден в хранилище. Повторите загрузку."
+            : error.message === "object_storage_metadata_mismatch"
+              ? "Размер или тип загруженного файла не совпал. Выберите файл заново."
+              : error.message === "object_storage_head_failed"
+                ? "Хранилище временно недоступно. Повторите проверку позже."
+                : error.status
+                  ? `Хранилище отклонило загрузку (HTTP ${error.status}). Проверьте CORS и повторите.`
+                  : "Передача прервалась. Файл остаётся выбранным — повторите загрузку.");
       }).finally(() => { contentMediaUploadInFlight = false; contentMediaConfirm.disabled = false; });
   };
   const cancelContentMedia = () => {
@@ -3808,12 +3876,19 @@
   document.getElementById("content-cover-validate").addEventListener("click", () => validateContentMedia("cover"));
   document.getElementById("content-video-validate").addEventListener("click", () => validateContentMedia("video"));
   document.getElementById("content-audio-validate").addEventListener("click", () => validateContentMedia("audio"));
-  contentCoverFile.addEventListener("change", () => showLocalContentMedia("cover"));
+  contentCoverFile.addEventListener("change", () => {
+    showLocalContentMedia("cover");
+    validateContentMedia("cover");
+  });
   contentVideoFile.addEventListener("change", () => {
     showLocalContentMedia("video");
     contentVideoSelection.classList.toggle("selected", Boolean(contentVideoFile.files[0]));
+    validateContentMedia("video");
   });
-  contentAudioFile.addEventListener("change", () => showLocalContentMedia("audio"));
+  contentAudioFile.addEventListener("change", () => {
+    showLocalContentMedia("audio");
+    validateContentMedia("audio");
+  });
   contentMediaConfirm.addEventListener("click", confirmContentMedia);
   contentMediaCancel.addEventListener("click", cancelContentMedia);
   contentLifecyclePreviewButton.addEventListener("click", previewContentLifecycle);
@@ -3958,7 +4033,7 @@
     const profileName=document.getElementById("member-profile-name");
     if (profileName) profileName.textContent=session.profile && session.profile.first_name ? session.profile.first_name : "Профиль";
     syncMemberAccess(session.access);
-    setMemberHeroPhoto(webApp.initDataUnsafe && webApp.initDataUnsafe.user ? webApp.initDataUnsafe.user.photo_url : "");
+    setMemberHeroPhoto(session.profile && session.profile.photo_url ? session.profile.photo_url : "");
     applyMemberDesktopLayout();
     return {admin:false,identityData:null};
   }).then(({admin,identityData}) => {
